@@ -73,6 +73,7 @@ dependencies = [
 name = "arbitro-server"
 version = "0.1.0"
 dependencies = [
+ "arbitro-client",
  "arbitro-engine",
  "arbitro-proto",
  "arbitro-store",

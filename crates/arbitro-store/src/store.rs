@@ -42,7 +42,7 @@ pub enum StoreError {
 ///
 /// `&mut self` for writes, `&self` for reads.
 /// Single-threaded access guaranteed by the engine (one lock per stream).
-pub trait Store {
+pub trait Store: Send {
     // ── Lifecycle ────────────────────────────────────────────────────
 
     /// Initialize the store — open files, create dirs, recover state.
