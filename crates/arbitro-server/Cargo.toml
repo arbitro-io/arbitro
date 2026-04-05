@@ -1,0 +1,22 @@
+[package]
+name    = "arbitro-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arbitro-server"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+arbitro-proto  = { path = "../arbitro-proto" }
+arbitro-engine = { path = "../arbitro-engine" }
+arbitro-store  = { path = "../arbitro-store" }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes          = { workspace = true }
+zerocopy       = { workspace = true }

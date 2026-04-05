@@ -75,8 +75,11 @@ impl Engine {
             Action::Publish => {
                 publish::on_publish(&self.ctx, conn_id, &frame, &mut self.scratch);
             }
-            Action::Ack | Action::Nack => {
+            Action::Ack => {
                 system::on_ack(&self.ctx, conn_id, &frame);
+            }
+            Action::Nack => {
+                system::on_nack(&self.ctx, conn_id, &frame);
             }
             // Everything else is cold path
             _ => self.dispatch_cold(action, conn_id, &frame),
@@ -155,6 +158,22 @@ impl Engine {
             }
             Action::ListConsumers => {
                 subscribe::on_list_consumers(&self.ctx, conn_id, stream_id, env_seq);
+            }
+            Action::Fetch => {
+                let view = arbitro_proto::wire::subscribe::FetchView::new(frame.body());
+                let consumer_id = view.consumer_id();
+                let max_msgs = view.max_msgs();
+                let fetched = {
+                    let mut drains = self.ctx.drains.lock().unwrap();
+                    if let Some(drain) = drains.get_mut(&stream_id) {
+                        self.ctx.streams.with(stream_id, |slot| {
+                            drain.fetch(consumer_id, max_msgs, &*slot.store, self.ctx.transport.as_ref())
+                        }).unwrap_or(0)
+                    } else {
+                        0
+                    }
+                };
+                reply::send_ok(self.ctx.transport.as_ref(), conn_id, stream_id, env_seq, fetched as u64);
             }
             Action::Ping => {
                 system::on_ping(&self.ctx, conn_id, frame);

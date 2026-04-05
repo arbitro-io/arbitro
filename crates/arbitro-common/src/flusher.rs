@@ -24,6 +24,12 @@ pub struct FlushConfig {
     pub interval_ms: u32,
 }
 
+impl Default for FlushConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FlushConfig {
     pub fn new() -> Self {
         Self {

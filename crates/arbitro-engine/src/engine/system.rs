@@ -1,4 +1,4 @@
-//! System handlers — connect, disconnect, ack, ping.
+//! System handlers — connect, disconnect, ack, nack, ping, stats.
 
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -22,6 +22,7 @@ pub fn on_connect(ctx: &Context, conn_id: ConnId, token: &[u8]) {
     conns.insert(conn_id, ConnState {
         conn_id,
         authenticated: true,
+        subscriptions: Vec::new(),
     });
     ctx.metrics.connections.fetch_add(1, Relaxed);
 }
@@ -40,7 +41,7 @@ pub fn on_disconnect(ctx: &Context, conn_id: ConnId) {
     ctx.metrics.connections.fetch_sub(1, Relaxed);
 }
 
-/// Handle an Ack frame.
+/// Handle an Ack frame — release credit, may trigger delivery of pending entries.
 #[inline]
 pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let stream_id = frame.stream_id();
@@ -52,7 +53,9 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let acked = {
         let mut drains = ctx.drains.lock().unwrap();
         if let Some(drain) = drains.get_mut(&stream_id) {
-            drain.ack(consumer_id, seq)
+            ctx.streams.with(stream_id, |slot| {
+                drain.on_ack(consumer_id, seq, &*slot.store, ctx.transport.as_ref())
+            }).unwrap_or(false)
         } else {
             false
         }
@@ -64,6 +67,32 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     }
 
     ctx.metrics.msgs_out.fetch_add(1, Relaxed);
+}
+
+/// Handle a Nack frame — release credit, mark for redelivery.
+#[inline]
+pub fn on_nack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
+    let stream_id = frame.stream_id();
+    let body = frame.body();
+    let view = AckView::new(body);
+    let consumer_id = view.consumer_id();
+    let seq = view.sequence();
+
+    let nacked = {
+        let mut drains = ctx.drains.lock().unwrap();
+        if let Some(drain) = drains.get_mut(&stream_id) {
+            ctx.streams.with(stream_id, |slot| {
+                drain.on_nack(consumer_id, seq, &*slot.store, ctx.transport.as_ref())
+            }).unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    if !nacked {
+        let env_seq = frame.envelope().env_seq.get();
+        reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, seq, ErrorCode::ConsumerNotFound);
+    }
 }
 
 /// Handle Stats request — respond with metrics snapshot.
@@ -104,7 +133,6 @@ pub fn on_stats(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
 
 /// Handle Ping — respond with Pong.
 pub fn on_ping(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
-    // Pong is the same envelope with action swapped to Pong
     use arbitro_proto::action::Action;
     use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
     use zerocopy::IntoBytes;

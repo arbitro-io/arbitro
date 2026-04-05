@@ -19,6 +19,8 @@ pub struct Consumer {
     pub credit_map: Option<CreditMap>,
     /// Total messages delivered (not yet acked).
     pub pending_count: u32,
+    /// Sequences that were nacked and need redelivery.
+    pub nacked: Vec<u64>,
 }
 
 impl Consumer {
@@ -37,6 +39,7 @@ impl Consumer {
             deliver_seq: start_seq,
             credit_map,
             pending_count: 0,
+            nacked: Vec::new(),
         }
     }
 

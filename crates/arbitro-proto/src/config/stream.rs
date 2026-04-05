@@ -22,6 +22,7 @@ pub struct StreamConfigBuilder {
 }
 
 impl StreamConfig {
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &[u8]) -> StreamConfigBuilder {
         StreamConfigBuilder {
             name: Box::from(name),

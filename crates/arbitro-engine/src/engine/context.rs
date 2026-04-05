@@ -32,6 +32,8 @@ pub struct Context {
 pub struct ConnState {
     pub conn_id: ConnId,
     pub authenticated: bool,
+    /// (stream_id, consumer_id) pairs bound to this connection.
+    pub subscriptions: Vec<(u32, u32)>,
 }
 
 impl Context {

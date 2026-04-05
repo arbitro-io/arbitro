@@ -1,7 +1,8 @@
 //! Publish handler — the hot path.
 //!
-//! Zero allocations: uses scratch buffers for batch entry refs.
-//! Single lock per stream: append + deliver inline.
+//! Publish ONLY appends to the store and signals the drain.
+//! It does NOT know about consumers or delivery.
+//! The drain owns all delivery logic.
 
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -19,6 +20,12 @@ pub struct PublishScratch {
     entries: Vec<EntryRef<'static>>,
 }
 
+impl Default for PublishScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PublishScratch {
     pub fn new() -> Self {
         Self {
@@ -28,6 +35,8 @@ impl PublishScratch {
 }
 
 /// Handle a Publish frame (batch of entries).
+/// Responsibilities: parse, validate, append, signal drain, reply.
+/// Does NOT deliver — the drain does that via wake().
 #[inline]
 pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch: &mut PublishScratch) {
     let stream_id = frame.stream_id();
@@ -58,7 +67,7 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
     let timestamp = current_timestamp();
     let entry_count = scratch.entries.len();
 
-    // Single lock: append to store, then read back for delivery
+    // Single lock: append to store
     let result = ctx.streams.with_mut(stream_id, |slot| {
         let info = slot.store.info();
         let cfg = &slot.config;
@@ -79,19 +88,20 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
         let first_seq = slot.store.append_batch(&scratch.entries, timestamp)
             .map_err(|_| ErrorCode::StreamFull)?;
 
-        // Read back from store for delivery — borrows existing Box<[u8]>, no new allocs
-        let stored = slot.store.read_range(first_seq, first_seq + entry_count as u64)
-            .unwrap_or_default();
-
-        Ok((first_seq, entry_count, stored))
+        Ok((first_seq, entry_count))
     });
 
     match result {
-        Some(Ok((first_seq, count, stored))) => {
-            // Deliver inline — entries already owned by store, `stored` is cloned but necessary
-            let mut drains = ctx.drains.lock().unwrap();
-            if let Some(drain) = drains.get_mut(&stream_id) {
-                drain.deliver_batch(&stored, ctx.transport.as_ref());
+        Some(Ok((first_seq, count))) => {
+            // Signal drain: "new data available"
+            // Lock order: drains → streams (never reverse, prevents deadlock)
+            {
+                let mut drains = ctx.drains.lock().unwrap();
+                if let Some(drain) = drains.get_mut(&stream_id) {
+                    ctx.streams.with(stream_id, |slot| {
+                        drain.wake(&*slot.store, ctx.transport.as_ref(), first_seq, count);
+                    });
+                }
             }
 
             ctx.metrics.msgs_in.fetch_add(count as u64, Relaxed);

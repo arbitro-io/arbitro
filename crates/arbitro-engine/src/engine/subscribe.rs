@@ -96,17 +96,25 @@ pub fn on_delete_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
 }
 
 /// Bind a consumer to a connection (subscribe). Cold path.
+/// Also delivers backlog from where the consumer left off.
 pub fn on_subscribe(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, consumer_id: u32) {
     let bound = {
         let mut drains = ctx.drains.lock().unwrap();
         if let Some(drain) = drains.get_mut(&stream_id) {
-            drain.bind(consumer_id, conn_id)
+            ctx.streams.with(stream_id, |slot| {
+                drain.on_bind(consumer_id, conn_id, &*slot.store, ctx.transport.as_ref())
+            }).unwrap_or(false)
         } else {
             false
         }
     };
 
     if bound {
+        // Track subscription on connection state
+        let mut conns = ctx.connections.lock().unwrap();
+        if let Some(state) = conns.get_mut(&conn_id) {
+            state.subscriptions.push((stream_id, consumer_id));
+        }
         reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, consumer_id as u64);
     } else {
         reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerNotFound);

@@ -17,6 +17,7 @@ pub enum Action {
     // 0x03xx — Subscription
     Subscribe     = 0x0301,
     Unsubscribe   = 0x0302,
+    Fetch         = 0x0303,
 
     // 0x04xx — Stream management
     CreateStream  = 0x0401,
@@ -59,6 +60,7 @@ impl Action {
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
+            0x0303 => Some(Self::Fetch),
 
             0x0401 => Some(Self::CreateStream),
             0x0402 => Some(Self::DeleteStream),

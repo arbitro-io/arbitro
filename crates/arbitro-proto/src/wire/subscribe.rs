@@ -30,6 +30,15 @@ pub struct UnsubscribeAction {
 }
 const _: () = assert!(core::mem::size_of::<UnsubscribeAction>() == 8);
 
+/// 8B — Fetch (pull) N messages for a consumer.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub struct FetchFixed {
+    pub consumer_id: U32,
+    pub max_msgs: U32,
+}
+const _: () = assert!(core::mem::size_of::<FetchFixed>() == 8);
+
 // ── Lazy views ──────────────────────────────────────────────────────────────
 
 pub struct SubscribeView<'a> {
@@ -79,4 +88,24 @@ impl<'a> UnsubscribeView<'a> {
     pub fn consumer_id(&self) -> u32 {
         UnsubscribeAction::ref_from_bytes(&self.buf[..core::mem::size_of::<UnsubscribeAction>()]).unwrap().consumer_id.get()
     }
+}
+
+pub struct FetchView<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> FetchView<'a> {
+    #[inline(always)]
+    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+
+    #[inline(always)]
+    fn fixed(&self) -> &FetchFixed {
+        FetchFixed::ref_from_bytes(&self.buf[..core::mem::size_of::<FetchFixed>()]).unwrap()
+    }
+
+    #[inline(always)]
+    pub fn consumer_id(&self) -> u32 { self.fixed().consumer_id.get() }
+
+    #[inline(always)]
+    pub fn max_msgs(&self) -> u32 { self.fixed().max_msgs.get() }
 }

@@ -58,8 +58,8 @@ pub fn patterns_overlap(a: &[u8], b: &[u8]) -> bool {
             (t1, t2) if t1.is_empty() && t2.is_empty() => return ra.is_empty() && rb.is_empty(),
             // One exhausted, other has more tokens = no overlap
             // (unless the other is `>`)
-            (t, _) if t.is_empty() => return false,
-            (_, t) if t.is_empty() => return false,
+            ([], _) => return false,
+            (_, []) => return false,
             // `>` on either side = overlap (matches anything remaining)
             (b">", _) | (_, b">") => return true,
             // `*` matches any single token = could overlap

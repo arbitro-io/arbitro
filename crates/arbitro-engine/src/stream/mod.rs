@@ -49,6 +49,12 @@ pub struct StreamMap {
     shards: Box<[Mutex<Shard>]>,
 }
 
+impl Default for StreamMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamMap {
     pub fn new() -> Self {
         let shards: Vec<Mutex<Shard>> = (0..SHARD_COUNT)

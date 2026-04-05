@@ -12,6 +12,12 @@ pub struct MemoryStore {
     total_bytes: u64,
 }
 
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
@@ -113,7 +119,7 @@ impl Store for MemoryStore {
             messages: self.entries.len() as u64,
             bytes: self.total_bytes,
             first_seq: self.first_seq,
-            last_seq: if self.next_seq > 1 { self.next_seq - 1 } else { 0 },
+            last_seq: self.next_seq.saturating_sub(1),
         }
     }
 }

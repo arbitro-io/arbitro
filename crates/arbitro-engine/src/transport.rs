@@ -41,6 +41,24 @@ pub trait Transport: Send + Sync {
     fn close(&self, conn_id: ConnId);
 }
 
+/// Blanket impl so `Arc<T>` can be used wherever `Transport` is expected.
+impl<T: Transport> Transport for std::sync::Arc<T> {
+    fn init(&self) { (**self).init() }
+    fn shutdown(&self) { (**self).shutdown() }
+
+    #[inline]
+    fn send(&self, conn_id: ConnId, data: &[u8]) -> bool {
+        (**self).send(conn_id, data)
+    }
+
+    #[inline]
+    fn send_parts(&self, conn_id: ConnId, parts: &[&[u8]]) -> bool {
+        (**self).send_parts(conn_id, parts)
+    }
+
+    fn close(&self, conn_id: ConnId) { (**self).close(conn_id) }
+}
+
 /// No-op transport for testing and benchmarks.
 pub struct NoopTransport;
 

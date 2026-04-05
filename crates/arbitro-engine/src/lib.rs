@@ -18,6 +18,12 @@ pub struct EngineBuilder {
     auth: Option<Box<dyn Auth>>,
 }
 
+impl Default for EngineBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EngineBuilder {
     pub fn new() -> Self {
         Self {

@@ -36,6 +36,7 @@ pub struct ConsumerConfigBuilder {
 
 impl ConsumerConfig {
     /// Start building. `stream_name` is hashed to `stream_id` via FNV-1a.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &[u8], stream_name: &[u8]) -> ConsumerConfigBuilder {
         ConsumerConfigBuilder {
             name: Box::from(name),
@@ -53,6 +54,7 @@ impl ConsumerConfig {
 
     /// Build a ConsumerConfig directly from wire fields (cold path).
     /// Used by the engine when parsing CreateConsumer frames.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_wire(
         stream_id: u32,
         name: &[u8],
