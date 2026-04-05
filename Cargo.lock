@@ -65,6 +65,7 @@ dependencies = [
  "arbitro-common",
  "arbitro-proto",
  "arbitro-store",
+ "bytes",
  "zerocopy",
 ]
 

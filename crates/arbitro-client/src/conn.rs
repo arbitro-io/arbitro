@@ -136,30 +136,44 @@ async fn send_connect(tx: &mpsc::Sender<Bytes>) {
     let _ = tx.send(Bytes::from(frame)).await;
 }
 
-/// Read loop — reads frames from TCP, dispatches to inner.
+/// Read loop — reads frames from TCP using BytesMut ring buffer (zero alloc after warmup).
 async fn read_loop(inner: &Arc<Inner>, mut reader: tokio::net::tcp::OwnedReadHalf) {
-    let mut header_buf = [0u8; ENVELOPE_SIZE];
+    use bytes::BytesMut;
 
-    while reader.read_exact(&mut header_buf).await.is_ok() {
-        let msg_len = u32::from_le_bytes([
-            header_buf[8], header_buf[9], header_buf[10], header_buf[11],
-        ]) as usize;
+    let mut buf = BytesMut::with_capacity(64 * 1024); // 64KB initial, grows monotonically
 
-        let total = ENVELOPE_SIZE + msg_len;
-        let mut frame = vec![0u8; total];
-        frame[..ENVELOPE_SIZE].copy_from_slice(&header_buf);
-
-        if msg_len > 0
-            && reader.read_exact(&mut frame[ENVELOPE_SIZE..]).await.is_err()
-        {
-            break;
+    loop {
+        // Ensure we have at least ENVELOPE_SIZE bytes
+        while buf.len() < ENVELOPE_SIZE {
+            match reader.read_buf(&mut buf).await {
+                Ok(0) => return, // EOF
+                Ok(_) => {}
+                Err(_) => return,
+            }
         }
 
+        // Parse msg_len from envelope
+        let msg_len = u32::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11],
+        ]) as usize;
+        let total = ENVELOPE_SIZE + msg_len;
+
+        // Read until we have the full frame
+        while buf.len() < total {
+            match reader.read_buf(&mut buf).await {
+                Ok(0) => return, // EOF
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+
+        // Split off the frame — O(1), no copy. buf retains remaining data + capacity.
+        let frame = buf.split_to(total);
         inner.on_frame(&frame);
     }
 }
 
-/// Write loop — drains channel, coalesces, writes to TCP.
+/// Write loop — drains channel, coalesces, writes with write_vectored.
 async fn write_loop(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<Bytes>,
@@ -176,14 +190,53 @@ async fn write_loop(
             batch.push(frame);
         }
 
-        for frame in &batch {
-            if writer.write_all(frame).await.is_err() {
-                return;
-            }
-        }
+        // Single frame: write_all. Multiple: write_vectored for one syscall.
+        let failed = if batch.len() == 1 {
+            writer.write_all(&batch[0]).await.is_err()
+        } else {
+            write_all_vectored(&mut writer, &batch).await.is_err()
+        };
 
+        if failed { return; }
         batch.clear();
     }
+}
+
+/// Write all frames via write_vectored. Handles partial writes.
+async fn write_all_vectored(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    frames: &[Bytes],
+) -> std::io::Result<()> {
+    use std::io::IoSlice;
+
+    let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
+    let total: usize = frames.iter().map(|f| f.len()).sum();
+    let mut written = 0usize;
+
+    while written < total {
+        let n = writer.write_vectored(&slices).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"));
+        }
+        written += n;
+
+        // Advance past consumed slices
+        let mut skip = n;
+        while !slices.is_empty() && skip >= slices[0].len() {
+            skip -= slices[0].len();
+            slices.remove(0);
+        }
+        if skip > 0 && !slices.is_empty() {
+            // Partial write — fall back to write_all for remainder
+            let remaining_idx = frames.len() - slices.len();
+            writer.write_all(&frames[remaining_idx][skip..]).await?;
+            for frame in &frames[remaining_idx + 1..] {
+                writer.write_all(frame).await?;
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Max sequences per BatchAck frame.
@@ -267,7 +320,7 @@ fn flush_batch_acks(
         let group = &sorted[i..j];
         for chunk in group.chunks(ACK_BATCH_MAX) {
             build_batch_ack_frame(stream_id, consumer_id, chunk, buf);
-            let _ = write_tx.try_send(Bytes::copy_from_slice(buf));
+            let _ = write_tx.try_send(Bytes::from(buf.clone()));
         }
 
         i = j;
@@ -276,6 +329,8 @@ fn flush_batch_acks(
 
 /// Build a single Ack or Nack frame (32B). Used for nacks.
 fn build_ack_frame(action: Action, stream_id: u32, consumer_id: u32, seq: u64) -> Bytes {
+    use bytes::BytesMut;
+
     let envelope = Envelope {
         action: U16::new(action.as_u16()),
         flags: 0,
@@ -285,13 +340,13 @@ fn build_ack_frame(action: Action, stream_id: u32, consumer_id: u32, seq: u64) -
         env_seq: U32::new(0),
     };
 
-    let mut buf = [0u8; ENVELOPE_SIZE + 16];
-    buf[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
+    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE + 16);
+    buf.extend_from_slice(envelope.as_bytes());
     // Ack body: [8 seq][4 consumer_id][4 pad]
-    buf[ENVELOPE_SIZE..ENVELOPE_SIZE+8].copy_from_slice(&seq.to_le_bytes());
-    buf[ENVELOPE_SIZE+8..ENVELOPE_SIZE+12].copy_from_slice(&consumer_id.to_le_bytes());
-
-    Bytes::copy_from_slice(&buf)
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.extend_from_slice(&consumer_id.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 4]); // pad
+    buf.freeze()
 }
 
 /// Build a BatchAck frame into `buf`.

@@ -1,15 +1,15 @@
 //! Benchmark: end-to-end throughput.
 //!
-//! Two measurements per mode:
-//!   1. Publish throughput — time to publish N messages
-//!   2. Full cycle — publish + receive all N messages
+//! Three measurements per mode:
+//!   1. Publish throughput — time to publish N messages (batch)
+//!   2. Delivery throughput — publish backlog, then measure subscribe + receive only
+//!   3. Full cycle — publish + subscribe + receive (+ ack) measured together
 //!
 //! Modes: fire_forget (AckPolicy::None) vs explicit_ack (AckPolicy::Explicit).
-//! Single server instance. Streams recreated between iterations for large N
-//! to prevent unbounded store growth.
+//! Single server instance. Streams recreated between iterations.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use tokio::runtime::Runtime;
@@ -55,16 +55,36 @@ async fn connect(addr: &str) -> Client {
         .expect("client must connect")
 }
 
-/// Max entries per publish_batch (count is u16).
 const CHUNK: usize = 50_000;
 
-/// Publish N messages in chunks of CHUNK.
 async fn publish_n(client: &Client, stream: &[u8], entries: &[(&[u8], &[u8])], n: u32) {
     let mut remaining = n as usize;
     while remaining > 0 {
         let batch_size = remaining.min(entries.len());
         client.publish_batch(stream, &entries[..batch_size]).await.expect("publish");
         remaining -= batch_size;
+    }
+}
+
+async fn receive_n(sub: &mut arbitro_client::SubscriptionHandle, n: u32) {
+    let mut received = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while received < n {
+        match tokio::time::timeout_at(deadline, sub.next()).await {
+            Ok(Some(_)) => received += 1,
+            _ => panic!("timeout after {received}/{n} msgs"),
+        }
+    }
+}
+
+async fn receive_and_ack_n(sub: &mut arbitro_client::SubscriptionHandle, n: u32) {
+    let mut received = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while received < n {
+        match tokio::time::timeout_at(deadline, sub.next()).await {
+            Ok(Some(msg)) => { msg.ack(); received += 1; }
+            _ => panic!("timeout after {received}/{n} msgs"),
+        }
     }
 }
 
@@ -86,12 +106,12 @@ fn bench_e2e(c: &mut Criterion) {
         let mtime = if n >= 1_000_000 { Duration::from_secs(30) } else { Duration::from_secs(5) };
         let samples = if n >= 1_000_000 { 10 } else { 100 };
 
-        // ── Fire-and-forget: publish throughput ─────────────────
+        // ── 1. Publish throughput ──────────────────────────────────
         {
-            let sname = format!("ff_pub_{n}").into_bytes();
+            let sname = format!("pub_{n}").into_bytes();
             let scfg = StreamConfig::new(&sname).build();
 
-            let mut group = c.benchmark_group("publish_fire_forget");
+            let mut group = c.benchmark_group("publish");
             group.throughput(Throughput::Elements(n as u64));
             group.measurement_time(mtime);
             group.sample_size(samples);
@@ -99,7 +119,6 @@ fn bench_e2e(c: &mut Criterion) {
             group.bench_function(format!("{n}msg_64B"), |b| {
                 b.iter(|| {
                     rt.block_on(async {
-                        // Recreate stream each iteration to avoid unbounded growth
                         client.delete_stream(&sname).await.ok();
                         client.create_stream(&scfg).await.expect("create");
                         publish_n(&client, &sname, &entries, n).await;
@@ -110,71 +129,49 @@ fn bench_e2e(c: &mut Criterion) {
             rt.block_on(client.delete_stream(&sname)).ok();
         }
 
-        // ── Fire-and-forget: full cycle ─────────────────────────
+        // ── 2. Delivery fire-forget (backlog → subscribe → measure receive) ──
         {
-            let sname = format!("ff_cycle_{n}").into_bytes();
+            let sname = format!("ff_d_{n}").into_bytes();
             let scfg = StreamConfig::new(&sname).build();
             let ccfg = ConsumerConfig::new(b"ff_c", &sname)
                 .filter(b">")
                 .ack_policy(AckPolicy::None)
                 .build();
 
-            let mut group = c.benchmark_group("cycle_fire_forget");
+            let mut group = c.benchmark_group("deliver_fire_forget");
             group.throughput(Throughput::Elements(n as u64));
             group.measurement_time(mtime);
             group.sample_size(samples);
 
             group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        client.delete_stream(&sname).await.ok();
-                        client.create_stream(&scfg).await.expect("create");
-                        let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                        let mut sub = consumer.subscribe(None).await.expect("subscribe");
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        rt.block_on(async {
+                            // Setup (NOT timed): fresh stream + publish backlog
+                            client.delete_stream(&sname).await.ok();
+                            client.create_stream(&scfg).await.expect("create");
+                            publish_n(&client, &sname, &entries, n).await;
 
-                        publish_n(&client, &sname, &entries, n).await;
+                            // Timed: subscribe + receive
+                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
+                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
-                        let mut received = 0u32;
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        while received < n {
-                            match tokio::time::timeout_at(deadline, sub.next()).await {
-                                Ok(Some(_)) => received += 1,
-                                _ => panic!("timeout after {received}/{n} msgs"),
-                            }
-                        }
-                    });
+                            let start = Instant::now();
+                            receive_n(&mut sub, n).await;
+                            total += start.elapsed();
+                        });
+                    }
+                    total
                 });
             });
             group.finish();
             rt.block_on(client.delete_stream(&sname)).ok();
         }
 
-        // ── Explicit ack: publish throughput ────────────────────
+        // ── 3. Delivery explicit ack (backlog → subscribe → measure receive + ack) ──
         {
-            let sname = format!("ack_pub_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname).build();
-
-            let mut group = c.benchmark_group("publish_explicit_ack");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
-
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        client.delete_stream(&sname).await.ok();
-                        client.create_stream(&scfg).await.expect("create");
-                        publish_n(&client, &sname, &entries, n).await;
-                    });
-                });
-            });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
-        }
-
-        // ── Explicit ack: full cycle ────────────────────────────
-        {
-            let sname = format!("ack_cycle_{n}").into_bytes();
+            let sname = format!("ack_d_{n}").into_bytes();
             let scfg = StreamConfig::new(&sname).build();
             let max_inflight: u16 = if n >= 1_000_000 { 60_000 } else { 1000 };
             let ccfg = ConsumerConfig::new(b"ack_c", &sname)
@@ -184,30 +181,108 @@ fn bench_e2e(c: &mut Criterion) {
                 .ack_wait_ms(60_000)
                 .build();
 
-            let mut group = c.benchmark_group("cycle_explicit_ack");
+            let mut group = c.benchmark_group("deliver_explicit_ack");
             group.throughput(Throughput::Elements(n as u64));
             group.measurement_time(mtime);
             group.sample_size(samples);
 
             group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter(|| {
-                    rt.block_on(async {
-                        client.delete_stream(&sname).await.ok();
-                        client.create_stream(&scfg).await.expect("create");
-                        let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                        let mut sub = consumer.subscribe(None).await.expect("subscribe");
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        rt.block_on(async {
+                            // Setup (NOT timed)
+                            client.delete_stream(&sname).await.ok();
+                            client.create_stream(&scfg).await.expect("create");
+                            publish_n(&client, &sname, &entries, n).await;
 
-                        publish_n(&client, &sname, &entries, n).await;
+                            // Timed: subscribe + receive + ack
+                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
+                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
-                        let mut received = 0u32;
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        while received < n {
-                            match tokio::time::timeout_at(deadline, sub.next()).await {
-                                Ok(Some(msg)) => { msg.ack(); received += 1; }
-                                _ => panic!("timeout after {received}/{n} msgs"),
-                            }
-                        }
-                    });
+                            let start = Instant::now();
+                            receive_and_ack_n(&mut sub, n).await;
+                            total += start.elapsed();
+                        });
+                    }
+                    total
+                });
+            });
+            group.finish();
+            rt.block_on(client.delete_stream(&sname)).ok();
+        }
+
+        // ── 4. Full cycle fire-forget (publish + receive measured together) ──
+        {
+            let sname = format!("ff_f_{n}").into_bytes();
+            let scfg = StreamConfig::new(&sname).build();
+            let ccfg = ConsumerConfig::new(b"ff_fc", &sname)
+                .filter(b">")
+                .ack_policy(AckPolicy::None)
+                .build();
+
+            let mut group = c.benchmark_group("full_cycle_fire_forget");
+            group.throughput(Throughput::Elements(n as u64));
+            group.measurement_time(mtime);
+            group.sample_size(samples);
+
+            group.bench_function(format!("{n}msg_64B"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        rt.block_on(async {
+                            client.delete_stream(&sname).await.ok();
+                            client.create_stream(&scfg).await.expect("create");
+                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
+                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
+
+                            let start = Instant::now();
+                            publish_n(&client, &sname, &entries, n).await;
+                            receive_n(&mut sub, n).await;
+                            total += start.elapsed();
+                        });
+                    }
+                    total
+                });
+            });
+            group.finish();
+            rt.block_on(client.delete_stream(&sname)).ok();
+        }
+
+        // ── 5. Full cycle explicit ack (publish + receive + ack measured together) ──
+        {
+            let sname = format!("ack_f_{n}").into_bytes();
+            let scfg = StreamConfig::new(&sname).build();
+            let max_inflight: u16 = if n >= 1_000_000 { 60_000 } else { 1000 };
+            let ccfg = ConsumerConfig::new(b"ack_fc", &sname)
+                .filter(b">")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(max_inflight)
+                .ack_wait_ms(60_000)
+                .build();
+
+            let mut group = c.benchmark_group("full_cycle_explicit_ack");
+            group.throughput(Throughput::Elements(n as u64));
+            group.measurement_time(mtime);
+            group.sample_size(samples);
+
+            group.bench_function(format!("{n}msg_64B"), |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        rt.block_on(async {
+                            client.delete_stream(&sname).await.ok();
+                            client.create_stream(&scfg).await.expect("create");
+                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
+                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
+
+                            let start = Instant::now();
+                            publish_n(&client, &sname, &entries, n).await;
+                            receive_and_ack_n(&mut sub, n).await;
+                            total += start.elapsed();
+                        });
+                    }
+                    total
                 });
             });
             group.finish();

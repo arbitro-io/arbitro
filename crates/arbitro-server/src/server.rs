@@ -230,9 +230,9 @@ async fn read_loop(
     transport.remove(conn_id);
 }
 
-/// Write loop — drains channel, coalesces frames, writes to TCP.
+/// Write loop — drains channel, coalesces frames, writes with write_vectored.
 async fn write_loop(
-    conn_id: u64,
+    _conn_id: u64,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<Bytes>,
 ) {
@@ -250,23 +250,57 @@ async fn write_loop(
             batch.push(frame);
         }
 
-        // Write all frames — sequential write_all for each frame.
-        // Tokio's AsyncWriteExt doesn't have write_all_vectored,
-        // but TCP_NODELAY + coalescing gives us batching at the app level.
-        let mut failed = false;
-        for frame in &batch {
-            if let Err(e) = writer.write_all(frame).await {
-                tracing::debug!(conn_id, error = %e, "write error");
-                failed = true;
-                break;
-            }
-        }
+        // Single frame: write_all (no IoSlice overhead)
+        // Multiple frames: write_vectored for single syscall
+        let failed = if batch.len() == 1 {
+            writer.write_all(&batch[0]).await.is_err()
+        } else {
+            write_all_vectored(&mut writer, &batch).await.is_err()
+        };
+
         if failed {
             break;
         }
 
         batch.clear();
     }
+}
+
+/// Write all frames via write_vectored. Handles partial writes.
+async fn write_all_vectored(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    frames: &[Bytes],
+) -> std::io::Result<()> {
+    use std::io::IoSlice;
+
+    let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
+    let total: usize = frames.iter().map(|f| f.len()).sum();
+    let mut written = 0usize;
+
+    while written < total {
+        let n = writer.write_vectored(&slices).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"));
+        }
+        written += n;
+
+        // Advance past consumed slices
+        let mut skip = n;
+        while !slices.is_empty() && skip >= slices[0].len() {
+            skip -= slices[0].len();
+            slices.remove(0);
+        }
+        if skip > 0 && !slices.is_empty() {
+            // Partial write in the middle of a slice — fall back to write_all for remainder
+            let remaining_frame_idx = frames.len() - slices.len();
+            writer.write_all(&frames[remaining_frame_idx][skip..]).await?;
+            for frame in &frames[remaining_frame_idx + 1..] {
+                writer.write_all(frame).await?;
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Build a Disconnect frame to notify the engine of client departure.

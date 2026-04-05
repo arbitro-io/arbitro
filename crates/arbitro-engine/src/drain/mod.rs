@@ -21,6 +21,8 @@ use frame_builder::{
 };
 use subscription::Subscription;
 
+use bytes::BytesMut;
+
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode};
 use arbitro_proto::ids::ConnId;
 use arbitro_proto::wire::envelope::ENVELOPE_SIZE;
@@ -35,15 +37,15 @@ const BATCH_SIZE: usize = 256;
 struct DrainScratch {
     /// Collected seq numbers to deliver.
     seqs: Vec<u64>,
-    /// Reusable buffer for building batch frames.
-    frame_buf: Vec<u8>,
+    /// Reusable buffer for building batch frames. BytesMut so we can freeze → Bytes zero-copy.
+    frame_buf: BytesMut,
 }
 
 impl DrainScratch {
     fn new() -> Self {
         Self {
             seqs: Vec::with_capacity(BATCH_SIZE),
-            frame_buf: Vec::with_capacity(16 * 1024), // 16KB initial, grows monotonically
+            frame_buf: BytesMut::with_capacity(16 * 1024), // 16KB initial, grows monotonically
         }
     }
 }
@@ -189,7 +191,6 @@ impl ReactiveDrain {
 
             if is_queue {
                 // Queue: round-robin — each msg goes to one subscription.
-                // Build one batch frame per subscription that receives entries.
                 let sub_count = self.consumers[ci].subscriptions.len();
                 if sub_count == 0 { continue; }
 
@@ -198,8 +199,7 @@ impl ReactiveDrain {
                     let conn_id = self.consumers[ci].subscriptions[0].conn_id;
                     send_batch(store, &self.scratch.seqs, consumer_id, stream_id, conn_id, transport, &mut self.scratch.frame_buf);
                 } else {
-                    // Multiple subs: round-robin assignment, then batch per conn.
-                    // For simplicity, send per-entry (queue with N subs is rare in practice).
+                    // Multiple subs: round-robin assignment, send per-entry (rare case).
                     for si in 0..self.scratch.seqs.len() {
                         let seq = self.scratch.seqs[si];
                         let conn_id = self.consumers[ci].subscriptions[self.queue_idx % sub_count].conn_id;
@@ -211,16 +211,16 @@ impl ReactiveDrain {
                 }
             } else {
                 // Fanout: every subscription gets the full batch.
-                // Build ONE batch frame, send to each subscription.
                 let subs = &self.consumers[ci].subscriptions;
                 if subs.len() == 1 {
                     let conn_id = subs[0].conn_id;
                     send_batch(store, &self.scratch.seqs, consumer_id, stream_id, conn_id, transport, &mut self.scratch.frame_buf);
                 } else {
-                    // Build batch frame once into scratch, send to each sub
+                    // Build batch frame once, freeze to Bytes, clone (Arc bump) per sub
                     build_batch_frame(store, &self.scratch.seqs, consumer_id, stream_id, &mut self.scratch.frame_buf);
+                    let frame = self.scratch.frame_buf.split().freeze();
                     for sub in subs {
-                        transport.send(sub.conn_id, &self.scratch.frame_buf);
+                        transport.send_bytes(sub.conn_id, frame.clone());
                     }
                 }
             }
@@ -368,13 +368,15 @@ fn get_next_messages(
 
 /// Build a batch RepBatch frame into `buf` from store entries.
 /// Layout: [16B envelope][8B RepBatchFixed][N × (14B entry_header + subject + payload)]
+///
+/// Uses BytesMut so caller can freeze → Bytes for zero-copy send.
 #[inline]
 fn build_batch_frame(
     store: &dyn Store,
     seqs: &[u64],
     consumer_id: u32,
     stream_id: u32,
-    buf: &mut Vec<u8>,
+    buf: &mut BytesMut,
 ) {
     buf.clear();
     let count = seqs.len() as u16;
@@ -405,6 +407,7 @@ fn build_batch_frame(
 }
 
 /// Build and send a batch RepBatch frame to a single connection.
+/// Builds into BytesMut, freezes to Bytes, sends via send_bytes (zero-copy).
 #[inline]
 fn send_batch(
     store: &dyn Store,
@@ -413,10 +416,12 @@ fn send_batch(
     stream_id: u32,
     conn_id: ConnId,
     transport: &dyn Transport,
-    buf: &mut Vec<u8>,
+    buf: &mut BytesMut,
 ) {
     build_batch_frame(store, seqs, consumer_id, stream_id, buf);
-    transport.send(conn_id, buf);
+    // split() returns the current content as BytesMut and leaves buf empty but with capacity.
+    // freeze() converts to Bytes (Arc-backed, zero-copy).
+    transport.send_bytes(conn_id, buf.split().freeze());
 }
 
 /// Send a single entry to a connection. Stack envelope + scatter write.

@@ -9,3 +9,4 @@ arbitro-proto  = { path = "../arbitro-proto" }
 arbitro-common = { path = "../arbitro-common" }
 arbitro-store  = { path = "../arbitro-store" }
 zerocopy       = { workspace = true }
+bytes          = { workspace = true }

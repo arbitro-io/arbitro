@@ -1,14 +1,14 @@
 //! TokioTransport — implements arbitro_engine::Transport over TCP.
 //!
 //! Each connection has a bounded write channel. The Transport trait's
-//! send/send_parts methods enqueue frames into the channel.
-//! The write loop drains the channel and writes to TCP.
+//! send/send_bytes/send_parts methods enqueue frames into the channel.
+//! The write loop drains the channel and writes to TCP with write_vectored.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use arbitro_engine::Transport;
@@ -112,35 +112,40 @@ impl TokioTransport {
         let sessions = self.sessions.lock().unwrap();
         sessions.keys().copied().collect()
     }
-}
 
-impl Transport for TokioTransport {
-    fn send(&self, conn_id: ConnId, data: &[u8]) -> bool {
+    /// Clone the sender for a connection — used when the caller needs to
+    /// enqueue without holding the sessions lock.
+    fn try_send_to(&self, conn_id: ConnId, frame: Bytes) -> bool {
         let sessions = self.sessions.lock().unwrap();
         if let Some(session) = sessions.get(&conn_id) {
-            // try_send for backpressure — if full, slow consumer
-            match session.tx.try_send(Bytes::copy_from_slice(data)) {
+            match session.tx.try_send(frame) {
                 Ok(()) => true,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(conn_id, "slow consumer, dropping");
-                    false
-                }
+                Err(mpsc::error::TrySendError::Full(_)) => false,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
         } else {
             false
         }
     }
+}
+
+impl Transport for TokioTransport {
+    fn send(&self, conn_id: ConnId, data: &[u8]) -> bool {
+        self.try_send_to(conn_id, Bytes::copy_from_slice(data))
+    }
+
+    /// Zero-copy send — takes ownership of the Bytes. No copy.
+    fn send_bytes(&self, conn_id: ConnId, data: Bytes) -> bool {
+        self.try_send_to(conn_id, data)
+    }
 
     fn send_parts(&self, conn_id: ConnId, parts: &[&[u8]]) -> bool {
-        // Concatenate parts into a single Bytes for the channel.
-        // This is on the engine thread, not the hot path of the transport itself.
         let total: usize = parts.iter().map(|p| p.len()).sum();
-        let mut buf = Vec::with_capacity(total);
+        let mut buf = BytesMut::with_capacity(total);
         for part in parts {
             buf.extend_from_slice(part);
         }
-        self.send(conn_id, &buf)
+        self.try_send_to(conn_id, buf.freeze())
     }
 
     fn close(&self, conn_id: ConnId) {
