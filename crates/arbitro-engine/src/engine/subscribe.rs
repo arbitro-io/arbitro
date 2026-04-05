@@ -1,5 +1,6 @@
 //! Subscribe/unsubscribe and consumer management handlers.
 
+use arbitro_proto::action::Action;
 use arbitro_proto::config::{ConsumerConfig, DeliverMode, DeliverPolicy};
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::ids::ConnId;
@@ -128,4 +129,99 @@ pub fn on_unsubscribe(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u
     } else {
         reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerNotFound);
     }
+}
+
+/// Get consumer info. Cold path.
+///
+/// Response body (all little-endian):
+/// [4 consumer_id][4 stream_id][2 max_inflight][1 ack_policy][1 deliver_policy]
+/// [1 deliver_mode][3 pad][4 ack_wait_ms][8 start_seq][4 pending_count][8 deliver_seq]
+/// [4 name_len][name...][4 filter_count][filter_0_len][filter_0]...
+pub fn on_get_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, consumer_id: u32) {
+    let consumers = ctx.consumers.lock().unwrap();
+    let config = match consumers.get(&(stream_id, consumer_id)) {
+        Some(cfg) => cfg.clone(),
+        None => {
+            drop(consumers);
+            reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerNotFound);
+            return;
+        }
+    };
+    drop(consumers);
+
+    // Get runtime state from drain
+    let (pending_count, deliver_seq) = {
+        let drains = ctx.drains.lock().unwrap();
+        if let Some(drain) = drains.get(&stream_id) {
+            if let Some(c) = drain.find_consumer(consumer_id) {
+                (c.pending_count, c.deliver_seq)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        }
+    };
+
+    let buf = serialize_consumer_info(&config, pending_count, deliver_seq);
+    reply::send_data(ctx.transport.as_ref(), conn_id, Action::RepOk, stream_id, env_seq, &buf);
+}
+
+/// List all consumers on a stream. Cold path.
+///
+/// Response body: [4 count][consumer_info_0][consumer_info_1]...
+pub fn on_list_consumers(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32) {
+    let consumers = ctx.consumers.lock().unwrap();
+    let stream_consumers: Vec<_> = consumers.iter()
+        .filter(|(&(sid, _), _)| sid == stream_id)
+        .map(|(_, cfg)| cfg.clone())
+        .collect();
+    drop(consumers);
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(stream_consumers.len() as u32).to_le_bytes());
+
+    let drains = ctx.drains.lock().unwrap();
+    for cfg in &stream_consumers {
+        let (pending, deliver_seq) = if let Some(drain) = drains.get(&stream_id) {
+            if let Some(c) = drain.find_consumer(cfg.consumer_id) {
+                (c.pending_count, c.deliver_seq)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+        buf.extend_from_slice(&serialize_consumer_info(cfg, pending, deliver_seq));
+    }
+    drop(drains);
+
+    reply::send_data(ctx.transport.as_ref(), conn_id, Action::RepOk, stream_id, env_seq, &buf);
+}
+
+/// Serialize a consumer config + runtime state into bytes. Cold path.
+fn serialize_consumer_info(config: &ConsumerConfig, pending_count: u32, deliver_seq: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + config.name.len());
+
+    buf.extend_from_slice(&config.consumer_id.to_le_bytes());
+    buf.extend_from_slice(&config.stream_id.to_le_bytes());
+    buf.extend_from_slice(&config.max_inflight.to_le_bytes());
+    buf.push(config.ack_policy as u8);
+    buf.push(config.deliver_policy as u8);
+    buf.push(config.deliver_mode as u8);
+    buf.extend_from_slice(&[0u8; 3]); // pad
+    buf.extend_from_slice(&config.ack_wait_ms.to_le_bytes());
+    buf.extend_from_slice(&config.start_seq.to_le_bytes());
+    buf.extend_from_slice(&pending_count.to_le_bytes());
+    buf.extend_from_slice(&deliver_seq.to_le_bytes());
+    buf.extend_from_slice(&(config.name.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&config.name);
+
+    buf.extend_from_slice(&(config.filters.len() as u32).to_le_bytes());
+    for filter in config.filters.iter() {
+        buf.extend_from_slice(&(filter.len() as u32).to_le_bytes());
+        buf.extend_from_slice(filter);
+    }
+
+    buf
 }

@@ -125,6 +125,37 @@ impl Engine {
                 let view = arbitro_proto::wire::stream::DrainSubjectView::new(frame.body());
                 management::on_drain_subject(&self.ctx, conn_id, stream_id, env_seq, view.subject());
             }
+            Action::GetStream => {
+                management::on_get_stream(&self.ctx, conn_id, stream_id, env_seq);
+            }
+            Action::ListStreams => {
+                management::on_list_streams(&self.ctx, conn_id, env_seq);
+            }
+            Action::CreateConsumer => {
+                let view = arbitro_proto::wire::manager::CreateConsumerView::new(frame.body());
+                let config = arbitro_proto::config::ConsumerConfig::from_wire(
+                    view.stream_id(),
+                    view.name(),
+                    view.subject(),
+                    view.max_inflight(),
+                    view.deliver_policy(),
+                    view.deliver_mode(),
+                    view.ack_wait_ms(),
+                    view.start_seq(),
+                );
+                subscribe::on_create_consumer(&self.ctx, conn_id, stream_id, env_seq, config);
+            }
+            Action::DeleteConsumer => {
+                let view = arbitro_proto::wire::manager::DeleteConsumerView::new(frame.body());
+                subscribe::on_delete_consumer(&self.ctx, conn_id, stream_id, env_seq, view.consumer_id());
+            }
+            Action::GetConsumer => {
+                let view = arbitro_proto::wire::manager::GetConsumerView::new(frame.body());
+                subscribe::on_get_consumer(&self.ctx, conn_id, stream_id, env_seq, view.consumer_id());
+            }
+            Action::ListConsumers => {
+                subscribe::on_list_consumers(&self.ctx, conn_id, stream_id, env_seq);
+            }
             Action::Ping => {
                 system::on_ping(&self.ctx, conn_id, frame);
             }
@@ -135,7 +166,10 @@ impl Engine {
             Action::Disconnect => {
                 system::on_disconnect(&self.ctx, conn_id);
             }
-            // Server-to-client or not yet implemented
+            Action::Stats => {
+                system::on_stats(&self.ctx, conn_id, frame);
+            }
+            // Server-to-client only — never received from clients
             _ => {
                 reply::send_error(
                     self.ctx.transport.as_ref(), conn_id, 0, env_seq, 0,

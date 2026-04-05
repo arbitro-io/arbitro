@@ -50,6 +50,37 @@ impl ConsumerConfig {
             start_seq: 0,
         }
     }
+
+    /// Build a ConsumerConfig directly from wire fields (cold path).
+    /// Used by the engine when parsing CreateConsumer frames.
+    pub fn from_wire(
+        stream_id: u32,
+        name: &[u8],
+        subject: &[u8],
+        max_inflight: u16,
+        deliver_policy: u8,
+        deliver_mode: u8,
+        ack_wait_ms: u32,
+        start_seq: u64,
+    ) -> ConsumerConfig {
+        ConsumerConfig {
+            name: Box::from(name),
+            consumer_id: 0, // server-assigned
+            stream_id,
+            filters: if subject.is_empty() {
+                Box::from([])
+            } else {
+                Box::from([Box::from(subject)])
+            },
+            subject_limits: Box::from([]),
+            max_inflight,
+            ack_policy: if max_inflight > 0 { AckPolicy::Explicit } else { AckPolicy::None },
+            deliver_policy: DeliverPolicy::from_u8(deliver_policy).unwrap_or(DeliverPolicy::All),
+            deliver_mode: DeliverMode::from_u8(deliver_mode).unwrap_or(DeliverMode::Fanout),
+            ack_wait_ms,
+            start_seq,
+        }
+    }
 }
 
 impl ConsumerConfigBuilder {

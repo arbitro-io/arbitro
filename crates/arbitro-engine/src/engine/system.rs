@@ -66,6 +66,42 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     ctx.metrics.msgs_out.fetch_add(1, Relaxed);
 }
 
+/// Handle Stats request — respond with metrics snapshot.
+pub fn on_stats(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
+    use arbitro_proto::action::Action;
+    use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
+    use arbitro_proto::wire::metrics::StatsResponse;
+    use zerocopy::IntoBytes;
+    use zerocopy::byteorder::little_endian::{U16, U32, U64};
+
+    let env_seq = frame.envelope().env_seq.get();
+    let snap = ctx.metrics.snapshot();
+
+    let response = StatsResponse {
+        request_id: U64::new(env_seq as u64),
+        connections: U64::new(snap.connections),
+        total_msgs_in: U64::new(snap.msgs_in),
+        total_msgs_out: U64::new(snap.msgs_out),
+        total_bytes_in: U64::new(snap.bytes_in),
+        total_bytes_out: U64::new(snap.bytes_out),
+        streams: U64::new(snap.streams),
+        consumers: U64::new(snap.consumers),
+    };
+
+    let envelope = Envelope {
+        action: U16::new(Action::StatsReply.as_u16()),
+        flags: 0,
+        _rsv: 0,
+        stream_id: U32::new(0),
+        msg_len: U32::new(core::mem::size_of::<StatsResponse>() as u32),
+        env_seq: U32::new(env_seq),
+    };
+
+    let mut env_buf = [0u8; ENVELOPE_SIZE];
+    env_buf.copy_from_slice(envelope.as_bytes());
+    ctx.transport.send_parts(conn_id, &[&env_buf, response.as_bytes()]);
+}
+
 /// Handle Ping — respond with Pong.
 pub fn on_ping(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     // Pong is the same envelope with action swapped to Pong
