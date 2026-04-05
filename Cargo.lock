@@ -27,11 +27,14 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 name = "arbitro-benches"
 version = "0.1.0"
 dependencies = [
+ "arbitro-client",
  "arbitro-engine",
  "arbitro-proto",
+ "arbitro-server",
  "arbitro-store",
  "bytes",
  "criterion",
+ "tokio",
  "tokio-uring",
  "zerocopy",
 ]

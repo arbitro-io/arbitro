@@ -1,175 +1,207 @@
-//! Benchmark: publish throughput with NoopTransport.
+//! Benchmark: end-to-end publish throughput (client → server → reply).
 //!
-//! Measures pure engine publish path — append + signal drain.
+//! Every group starts with a smoke test (small even number) that panics
+//! if the publish didn't actually succeed. This guarantees we measure
+//! real work, not a silent no-op.
+//!
 //! Max 1000 messages per iteration (bench safety rule).
 
-use criterion::{criterion_group, criterion_main, Criterion, BatchSize};
-use zerocopy::IntoBytes;
-use zerocopy::byteorder::little_endian::{U16, U32};
+use std::sync::Arc;
+use std::time::Duration;
 
-use arbitro_engine::{EngineBuilder, NoopTransport};
-use arbitro_proto::action::Action;
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use arbitro_proto::wire::publish::PublishEntry;
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use tokio::runtime::Runtime;
 
-/// Build a publish frame with `count` entries, each with the given subject and payload.
-fn build_publish_frame(stream_id: u32, subject: &[u8], payload: &[u8], count: u16) -> Vec<u8> {
-    let entry_size = 12 + subject.len() + payload.len();
-    let body_size = 2 + entry_size * count as usize;
+use arbitro_client::Client;
+use arbitro_engine::EngineBuilder;
+use arbitro_server::{ArbitroServer, Config, TokioTransport};
 
-    let envelope = Envelope {
-        action: U16::new(Action::Publish.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(stream_id),
-        msg_len: U32::new(body_size as u32),
-        env_seq: U32::new(1),
+// ── Infrastructure ───────────────────────────────────────────────
+
+fn portpicker() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+async fn start_server() -> String {
+    let port = portpicker();
+    let addr = format!("127.0.0.1:{port}");
+
+    let config = Config {
+        listen_addr: addr.clone(),
+        max_connections: 100,
+        write_buffer_cap: 8192,
+        idle_timeout: Duration::from_secs(60),
+        keepalive_interval: Duration::from_secs(30),
+        shutdown_timeout: Duration::from_secs(2),
     };
 
-    let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body_size);
-    frame.extend_from_slice(envelope.as_bytes());
+    let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
+    let engine = EngineBuilder::new()
+        .transport(transport.clone())
+        .build();
+    let server = ArbitroServer::new(config, engine, transport);
 
-    // Body: [2 count][entries...]
-    frame.extend_from_slice(&count.to_le_bytes());
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
 
-    let entry = PublishEntry {
-        data_len: U32::new(payload.len() as u32),
-        subj_len: U16::new(subject.len() as u16),
-        reply_len: U16::new(0),
-        flags: 0,
-        _pad: [0u8; 3],
-    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
 
-    for _ in 0..count {
-        frame.extend_from_slice(entry.as_bytes());
-        frame.extend_from_slice(subject);
-        frame.extend_from_slice(payload);
+async fn connected_client(addr: &str) -> Client {
+    let client = Client::connect_with_timeout(addr, Duration::from_secs(3))
+        .await
+        .expect("client must connect");
+    client
+        .create_stream(b"bench", 0, 0, 0)  // 0 = unlimited
+        .await
+        .expect("stream must be created");
+    client
+}
+
+// ── Smoke tests ──────────────────────────────────────────────────
+
+async fn smoke_single(client: &Client, n: u32) {
+    for i in 0..n {
+        let seq = client
+            .publish(b"bench", b"bench.smoke", &i.to_le_bytes())
+            .await
+            .expect("smoke publish failed");
+        assert!(seq >= 1, "smoke: seq must be >= 1, got {seq}");
     }
-
-    frame
 }
 
-/// Build a CreateStream frame.
-fn build_create_stream_frame(name: &[u8]) -> Vec<u8> {
-    use arbitro_proto::wire::stream::CreateStreamFixed;
-    use zerocopy::byteorder::little_endian::U64;
-
-    let fixed = CreateStreamFixed {
-        name_len: U16::new(name.len() as u16),
-        _pad: U16::new(0),
-        max_msgs: U64::new(0),
-        max_bytes: U64::new(0),
-        max_age_secs: U64::new(0),
-        replicas: 1,
-        journal_kind: 0,
-        retention: 0,
-        _pad2: 0,
-    };
-
-    let body_len = 32 + name.len();
-    let envelope = Envelope {
-        action: U16::new(Action::CreateStream.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(body_len as u32),
-        env_seq: U32::new(0),
-    };
-
-    let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body_len);
-    frame.extend_from_slice(envelope.as_bytes());
-    frame.extend_from_slice(fixed.as_bytes());
-    frame.extend_from_slice(name);
-    frame
+async fn smoke_batch(client: &Client, n: usize) {
+    let payload = vec![0u8; 64];
+    let entries: Vec<(&[u8], &[u8])> = (0..n)
+        .map(|_| (b"bench.smoke" as &[u8], payload.as_slice()))
+        .collect();
+    let seq = client
+        .publish_batch(b"bench", &entries)
+        .await
+        .expect("smoke batch failed");
+    assert!(seq >= 1, "smoke batch: seq must be >= 1, got {seq}");
 }
 
-fn bench_publish_single(c: &mut Criterion) {
-    let mut group = c.benchmark_group("publish");
-    group.measurement_time(std::time::Duration::from_secs(5));
+// ── Benchmarks ───────────────────────────────────────────────────
 
-    // Single message publish
-    group.bench_function("single_msg_64B", |b| {
-        b.iter_batched(
-            || {
-                let mut engine = EngineBuilder::new()
-                    .transport(NoopTransport)
-                    .build();
+fn bench_throughput(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
 
-                let create = build_create_stream_frame(b"bench");
-                engine.process_frame(1, &create);
-
-                let payload = vec![0u8; 64];
-                let frame = build_publish_frame(
-                    arbitro_proto::config::fnv1a_32(b"bench"),
-                    b"bench.test",
-                    &payload,
-                    1,
-                );
-                (engine, frame)
-            },
-            |(mut engine, frame)| {
-                engine.process_frame(1, &frame);
-            },
-            BatchSize::SmallInput,
-        );
+    // Start server + connect client once for all benches.
+    let (_addr, client) = rt.block_on(async {
+        let addr = start_server().await;
+        let client = connected_client(&addr).await;
+        (addr, client)
     });
 
-    // Batch of 100 messages
-    group.bench_function("batch_100_msg_64B", |b| {
-        b.iter_batched(
-            || {
-                let mut engine = EngineBuilder::new()
-                    .transport(NoopTransport)
-                    .build();
-
-                let create = build_create_stream_frame(b"bench");
-                engine.process_frame(1, &create);
-
-                let payload = vec![0u8; 64];
-                let frame = build_publish_frame(
-                    arbitro_proto::config::fnv1a_32(b"bench"),
-                    b"bench.test",
-                    &payload,
-                    100,
-                );
-                (engine, frame)
-            },
-            |(mut engine, frame)| {
-                engine.process_frame(1, &frame);
-            },
-            BatchSize::SmallInput,
-        );
+    // Smoke tests — small even numbers to prove it works.
+    rt.block_on(async {
+        smoke_single(&client, 2).await;
+        smoke_batch(&client, 4).await;
+        smoke_single(&client, 10).await;
     });
 
-    // Batch of 1000 messages (max per safety rule)
-    group.bench_function("batch_1000_msg_64B", |b| {
-        b.iter_batched(
-            || {
-                let mut engine = EngineBuilder::new()
-                    .transport(NoopTransport)
-                    .build();
+    let payload_64 = vec![0u8; 64];
+    let payload_1k = vec![0u8; 1024];
 
-                let create = build_create_stream_frame(b"bench");
-                engine.process_frame(1, &create);
+    let mut group = c.benchmark_group("e2e_publish");
+    group.measurement_time(Duration::from_secs(5));
 
-                let payload = vec![0u8; 64];
-                let frame = build_publish_frame(
-                    arbitro_proto::config::fnv1a_32(b"bench"),
-                    b"bench.test",
-                    &payload,
-                    1000,
-                );
-                (engine, frame)
-            },
-            |(mut engine, frame)| {
-                engine.process_frame(1, &frame);
-            },
-            BatchSize::SmallInput,
-        );
+    // --- Single publish, 64B ---
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("single_64B", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish(b"bench", b"bench.msg", &payload_64)
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // --- Single publish, 1KB ---
+    group.throughput(Throughput::Bytes(1024));
+    group.bench_function("single_1KB", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish(b"bench", b"bench.msg", &payload_1k)
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // --- Batch 10, 64B ---
+    group.throughput(Throughput::Elements(10));
+    group.bench_function("batch10_64B", |b| {
+        let entries: Vec<(&[u8], &[u8])> = (0..10)
+            .map(|_| (b"bench.msg" as &[u8], payload_64.as_slice()))
+            .collect();
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish_batch(b"bench", &entries)
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // --- Batch 100, 64B ---
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("batch100_64B", |b| {
+        let entries: Vec<(&[u8], &[u8])> = (0..100)
+            .map(|_| (b"bench.msg" as &[u8], payload_64.as_slice()))
+            .collect();
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish_batch(b"bench", &entries)
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // --- Batch 1000, 64B (max per safety rule) ---
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("batch1000_64B", |b| {
+        let entries: Vec<(&[u8], &[u8])> = (0..1000)
+            .map(|_| (b"bench.msg" as &[u8], payload_64.as_slice()))
+            .collect();
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish_batch(b"bench", &entries)
+                    .await
+                    .unwrap();
+            });
+        });
+    });
+
+    // --- Batch 100, 1KB ---
+    group.throughput(Throughput::Bytes(100 * 1024));
+    group.bench_function("batch100_1KB", |b| {
+        let entries: Vec<(&[u8], &[u8])> = (0..100)
+            .map(|_| (b"bench.msg" as &[u8], payload_1k.as_slice()))
+            .collect();
+        b.iter(|| {
+            rt.block_on(async {
+                client
+                    .publish_batch(b"bench", &entries)
+                    .await
+                    .unwrap();
+            });
+        });
     });
 
     group.finish();
 }
 
-criterion_group!(benches, bench_publish_single);
+criterion_group!(benches, bench_throughput);
 criterion_main!(benches);

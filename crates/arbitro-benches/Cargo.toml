@@ -5,11 +5,14 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-zerocopy      = { workspace = true }
-bytes         = { workspace = true }
-arbitro-proto = { path = "../arbitro-proto" }
+zerocopy       = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { workspace = true }
+arbitro-proto  = { path = "../arbitro-proto" }
 arbitro-engine = { path = "../arbitro-engine" }
 arbitro-store  = { path = "../arbitro-store" }
+arbitro-server = { path = "../arbitro-server" }
+arbitro-client = { path = "../arbitro-client" }
 
 [dev-dependencies]
 criterion = { workspace = true }
