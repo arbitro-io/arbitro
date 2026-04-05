@@ -102,7 +102,7 @@ impl JournalKind {
 }
 
 /// FNV-1a hash → u32. Deterministic, no-std.
-pub(crate) fn fnv1a_32(data: &[u8]) -> u32 {
+pub fn fnv1a_32(data: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in data {
         h ^= b as u32;
