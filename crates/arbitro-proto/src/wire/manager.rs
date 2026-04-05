@@ -3,10 +3,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ── Consumer management ─────────────────────────────────────────────────────
 
-/// 24B fixed — Create a consumer. Variable name + subject follow.
+/// 28B fixed — Create a consumer. Variable name + subject follow.
 ///
 /// ```text
-/// [2 name_len][2 subj_len][4 stream_id][2 max_inflight][1 deliver_policy][1 deliver_mode][4 ack_wait_ms][8 start_seq]
+/// [2 name_len][2 subj_len][4 stream_id][2 max_inflight][1 ack_policy][1 deliver_policy][1 deliver_mode][3 pad][4 ack_wait_ms][8 start_seq]
 /// ```
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
@@ -15,14 +15,16 @@ pub struct CreateConsumerFixed {
     pub subj_len: U16,
     pub stream_id: U32,
     pub max_inflight: U16,
+    pub ack_policy: u8,
     pub deliver_policy: u8,
     pub deliver_mode: u8,
+    pub _pad: [u8; 3],
     pub ack_wait_ms: U32,
     pub start_seq: U64,
 }
 
 pub const CREATE_CONSUMER_FIXED_SIZE: usize = core::mem::size_of::<CreateConsumerFixed>();
-const _: () = assert!(CREATE_CONSUMER_FIXED_SIZE == 24);
+const _: () = assert!(CREATE_CONSUMER_FIXED_SIZE == 28);
 
 /// 8B — Delete a consumer by ID.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
@@ -80,6 +82,9 @@ impl<'a> CreateConsumerView<'a> {
 
     #[inline(always)]
     pub fn max_inflight(&self) -> u16 { self.fixed().max_inflight.get() }
+
+    #[inline(always)]
+    pub fn ack_policy(&self) -> u8 { self.fixed().ack_policy }
 
     #[inline(always)]
     pub fn deliver_policy(&self) -> u8 { self.fixed().deliver_policy }

@@ -53,11 +53,14 @@ impl Consumer {
         body.extend_from_slice(&0u64.to_le_bytes()); // start_seq
         body.extend_from_slice(subj);
 
-        self.inner.request(Action::Subscribe, self.stream_id, &body).await?;
-
-        // Create local subscription for demux
+        // Register local subscription BEFORE sending Subscribe to server.
+        // The server delivers backlog during on_bind (inside the Subscribe handling),
+        // so Deliver frames can arrive before RepOk. The subscription must already
+        // exist to receive them.
         let sub_id = self.next_sub_id.fetch_add(1, Relaxed);
-        let (tx, rx) = mpsc::channel(1024);
+        // Large buffer to avoid drops under burst. Real back-pressure (async send)
+        // requires making on_frame async — tracked as future improvement.
+        let (tx, rx) = mpsc::channel(1_048_576);
 
         let subscription = Subscription {
             stream_id: self.stream_id,
@@ -69,6 +72,14 @@ impl Consumer {
         {
             let mut subs = self.inner.subscriptions.lock().unwrap();
             subs.insert(sub_id, subscription);
+        }
+
+        // Now send Subscribe to server — backlog Deliver frames will find the local sub.
+        if let Err(e) = self.inner.request(Action::Subscribe, self.stream_id, &body).await {
+            // Cleanup on failure
+            let mut subs = self.inner.subscriptions.lock().unwrap();
+            subs.remove(&sub_id);
+            return Err(e);
         }
 
         Ok(SubscriptionHandle { rx, _id: sub_id })

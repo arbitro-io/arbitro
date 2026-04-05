@@ -2,7 +2,10 @@
 //!
 //! Publish ONLY appends to the store and signals the drain.
 //! It does NOT know about consumers or delivery.
-//! The drain owns all delivery logic.
+//! The drain task delivers reactively via deliver_cycle().
+//!
+//! ONE lock: append + signal under the same shard lock (R19).
+//! RepOk sent OUTSIDE the lock — publisher unblocked immediately.
 
 use core::sync::atomic::Ordering::Relaxed;
 
@@ -35,8 +38,7 @@ impl PublishScratch {
 }
 
 /// Handle a Publish frame (batch of entries).
-/// Responsibilities: parse, validate, append, signal drain, reply.
-/// Does NOT deliver — the drain does that via wake().
+/// ONE lock: validate + append + signal (R19). RepOk OUTSIDE lock.
 #[inline]
 pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch: &mut PublishScratch) {
     let stream_id = frame.stream_id();
@@ -67,7 +69,7 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
     let timestamp = current_timestamp();
     let entry_count = scratch.entries.len();
 
-    // Single lock: append to store
+    // ── ONE lock: validate + append + signal (R19) ─────────────────
     let result = ctx.streams.with_mut(stream_id, |slot| {
         let info = slot.store.info();
         let cfg = &slot.config;
@@ -88,22 +90,16 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
         let first_seq = slot.store.append_batch(&scratch.entries, timestamp)
             .map_err(|_| ErrorCode::StreamFull)?;
 
+        // Signal drain task (non-blocking, O(1)).
+        // Delivery is the drain task's job, NOT publish's.
+        slot.signal.release();
+
         Ok((first_seq, entry_count))
     });
 
+    // ── RepOk OUTSIDE lock — publisher unblocked ────────────────────
     match result {
         Some(Ok((first_seq, count))) => {
-            // Signal drain: "new data available"
-            // Lock order: drains → streams (never reverse, prevents deadlock)
-            {
-                let mut drains = ctx.drains.lock().unwrap();
-                if let Some(drain) = drains.get_mut(&stream_id) {
-                    ctx.streams.with(stream_id, |slot| {
-                        drain.wake(&*slot.store, ctx.transport.as_ref(), first_seq, count);
-                    });
-                }
-            }
-
             ctx.metrics.msgs_in.fetch_add(count as u64, Relaxed);
             let bytes: u64 = scratch.entries.iter()
                 .map(|e| (e.subject.len() + e.payload.len()) as u64)
@@ -122,8 +118,9 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
 }
 
 /// Monotonic timestamp in milliseconds.
+/// Public for use by Fetch handler.
 #[inline]
-fn current_timestamp() -> u64 {
+pub fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

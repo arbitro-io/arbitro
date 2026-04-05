@@ -88,6 +88,28 @@ impl Store for MemoryStore {
         Ok(self.entries[s..e].to_vec())
     }
 
+    #[inline]
+    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry)) -> Result<bool, StoreError> {
+        match self.seq_to_idx(seq) {
+            Some(idx) => {
+                f(&self.entries[idx]);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry)) -> Result<(), StoreError> {
+        let s = self.seq_to_idx(start).unwrap_or(0);
+        let e = self.seq_to_idx(end.saturating_sub(1))
+            .map(|i| i + 1)
+            .unwrap_or(self.entries.len());
+        for entry in &self.entries[s..e] {
+            f(entry);
+        }
+        Ok(())
+    }
+
     fn purge(&mut self) -> u64 {
         let count = self.entries.len() as u64;
         self.entries.clear();
@@ -238,5 +260,42 @@ mod tests {
         s.append(EntryRef { subject: b"x", payload: b"y" }, 0).unwrap();
         let seq = s.append_batch(&[], 0).unwrap();
         assert_eq!(seq, 2); // next would be 2
+    }
+
+    #[test]
+    fn get_borrows_without_clone() {
+        let mut s = MemoryStore::new();
+        s.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 1000).unwrap();
+
+        let mut found = false;
+        let ok = s.get(1, &mut |entry| {
+            assert_eq!(&*entry.subject, b"orders.created");
+            assert_eq!(&*entry.payload, b"{}");
+            assert_eq!(entry.timestamp, 1000);
+            found = true;
+        }).unwrap();
+        assert!(ok);
+        assert!(found);
+
+        // Not found
+        let ok = s.get(999, &mut |_| panic!("should not be called")).unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn for_each_borrows_without_clone() {
+        let mut s = MemoryStore::new();
+        for i in 0..5u8 {
+            s.append(EntryRef { subject: b"x", payload: &[i] }, 0).unwrap();
+        }
+
+        let mut count = 0u32;
+        let mut seqs = Vec::new();
+        s.for_each(2, 5, &mut |entry| {
+            seqs.push(entry.seq);
+            count += 1;
+        }).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(seqs, vec![2, 3, 4]);
     }
 }

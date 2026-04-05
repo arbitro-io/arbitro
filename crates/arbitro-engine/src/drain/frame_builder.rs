@@ -9,7 +9,7 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use arbitro_proto::wire::delivery::{RepOkAction, RepErrorAction};
+use arbitro_proto::wire::delivery::{RepOkAction, RepErrorAction, RepBatchFixed, DeliveryEntryHeader, REP_BATCH_FIXED_SIZE, DELIVERY_ENTRY_HEADER_SIZE};
 
 /// Build a RepOk frame (Envelope 16B + RepOkAction 16B = 32B) on the stack.
 #[inline]
@@ -74,6 +74,49 @@ pub fn build_delivery_envelope(stream_id: u32, msg_len: u32, seq: u32) -> [u8; E
     };
     let mut buf = [0u8; ENVELOPE_SIZE];
     buf.copy_from_slice(envelope.as_bytes());
+    buf
+}
+
+/// Build a RepBatch envelope (16B) for batch delivery.
+/// msg_len = REP_BATCH_FIXED_SIZE + sum of all entry sizes.
+#[inline]
+pub fn build_rep_batch_envelope(stream_id: u32, msg_len: u32) -> [u8; ENVELOPE_SIZE] {
+    let envelope = Envelope {
+        action: U16::new(Action::RepBatch.as_u16()),
+        flags: 0,
+        _rsv: 0,
+        stream_id: U32::new(stream_id),
+        msg_len: U32::new(msg_len),
+        env_seq: U32::new(0),
+    };
+    let mut buf = [0u8; ENVELOPE_SIZE];
+    buf.copy_from_slice(envelope.as_bytes());
+    buf
+}
+
+/// Build the RepBatchFixed header (8B) on the stack.
+#[inline]
+pub fn build_rep_batch_fixed(consumer_id: u32, count: u16) -> [u8; REP_BATCH_FIXED_SIZE] {
+    let fixed = RepBatchFixed {
+        consumer_id: U32::new(consumer_id),
+        count: U16::new(count),
+        _pad: U16::new(0),
+    };
+    let mut buf = [0u8; REP_BATCH_FIXED_SIZE];
+    buf.copy_from_slice(fixed.as_bytes());
+    buf
+}
+
+/// Build a DeliveryEntryHeader (14B) on the stack.
+#[inline]
+pub fn build_entry_header(seq: u64, subj_len: u16, data_len: u32) -> [u8; DELIVERY_ENTRY_HEADER_SIZE] {
+    let header = DeliveryEntryHeader {
+        seq: U64::new(seq),
+        subj_len: U16::new(subj_len),
+        data_len: U32::new(data_len),
+    };
+    let mut buf = [0u8; DELIVERY_ENTRY_HEADER_SIZE];
+    buf.copy_from_slice(header.as_bytes());
     buf
 }
 

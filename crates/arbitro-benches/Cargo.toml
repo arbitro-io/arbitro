@@ -21,10 +21,6 @@ criterion = { workspace = true }
 tokio-uring = { workspace = true }
 
 [[bench]]
-name    = "batch_vs_single"
-harness = false
-
-[[bench]]
 name    = "decode_cost"
 harness = false
 
@@ -34,4 +30,16 @@ harness = false
 
 [[bench]]
 name    = "publish_throughput"
+harness = false
+
+[[bench]]
+name    = "e2e_throughput"
+harness = false
+
+[[bench]]
+name    = "store_compare"
+harness = false
+
+[[bench]]
+name    = "drain_steps"
 harness = false

@@ -7,7 +7,7 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_proto::action::Action;
-use arbitro_proto::config::fnv1a_32;
+use arbitro_proto::config::{ConsumerConfig, StreamConfig, fnv1a_32};
 use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction};
 use arbitro_proto::wire::publish::PublishEntry;
 use arbitro_proto::wire::stream::{CreateStreamFixed, DeleteStreamFixed};
@@ -60,29 +60,23 @@ impl Client {
 
     // ── Stream management ────────────────────────────────────────
 
-    /// Create a stream.
-    pub async fn create_stream(
-        &self,
-        name: &[u8],
-        max_msgs: u64,
-        max_bytes: u64,
-        max_age_secs: u64,
-    ) -> Result<(), ClientError> {
+    /// Create a stream from config.
+    pub async fn create_stream(&self, config: &StreamConfig) -> Result<(), ClientError> {
         let fixed = CreateStreamFixed {
-            name_len: U16::new(name.len() as u16),
+            name_len: U16::new(config.name.len() as u16),
             _pad: U16::new(0),
-            max_msgs: U64::new(max_msgs),
-            max_bytes: U64::new(max_bytes),
-            max_age_secs: U64::new(max_age_secs),
-            replicas: 1,
-            journal_kind: 0, // memory
-            retention: 0,    // limits
+            max_msgs: U64::new(config.max_msgs),
+            max_bytes: U64::new(config.max_bytes),
+            max_age_secs: U64::new(config.max_age_secs),
+            replicas: config.replicas,
+            journal_kind: config.journal_kind as u8,
+            retention: config.retention as u8,
             _pad2: 0,
         };
 
-        let mut body = Vec::with_capacity(32 + name.len());
+        let mut body = Vec::with_capacity(32 + config.name.len());
         body.extend_from_slice(fixed.as_bytes());
-        body.extend_from_slice(name);
+        body.extend_from_slice(&config.name);
 
         self.inner.request(Action::CreateStream, 0, &body).await?;
         Ok(())
@@ -106,37 +100,31 @@ impl Client {
 
     // ── Consumer management ──────────────────────────────────────
 
-    /// Create a consumer on a stream. Returns a Consumer handle.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_consumer(
-        &self,
-        stream_name: &[u8],
-        consumer_name: &[u8],
-        subject: &[u8],
-        max_inflight: u16,
-        deliver_policy: u8,
-        deliver_mode: u8,
-        ack_wait_ms: u32,
-    ) -> Result<Consumer, ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+    /// Create a consumer from config. Returns a Consumer handle.
+    pub async fn create_consumer(&self, config: &ConsumerConfig) -> Result<Consumer, ClientError> {
+        let stream_id = config.stream_id;
+
+        // Serialize first filter as subject (empty if no filters).
+        let subject = config.filters.first().map(|f| f.as_ref()).unwrap_or(b"");
 
         let fixed = CreateConsumerFixed {
-            name_len: U16::new(consumer_name.len() as u16),
+            name_len: U16::new(config.name.len() as u16),
             subj_len: U16::new(subject.len() as u16),
             stream_id: U32::new(stream_id),
-            max_inflight: U16::new(max_inflight),
-            deliver_policy,
-            deliver_mode,
-            ack_wait_ms: U32::new(ack_wait_ms),
-            start_seq: U64::new(0),
+            max_inflight: U16::new(config.max_inflight),
+            ack_policy: config.ack_policy as u8,
+            deliver_policy: config.deliver_policy as u8,
+            deliver_mode: config.deliver_mode as u8,
+            _pad: [0u8; 3],
+            ack_wait_ms: U32::new(config.ack_wait_ms),
+            start_seq: U64::new(config.start_seq),
         };
 
-        let mut body = Vec::with_capacity(24 + consumer_name.len() + subject.len());
+        let mut body = Vec::with_capacity(28 + config.name.len() + subject.len());
         body.extend_from_slice(fixed.as_bytes());
-        body.extend_from_slice(consumer_name);
+        body.extend_from_slice(&config.name);
         body.extend_from_slice(subject);
 
-        // ref_seq in RepOk carries the assigned consumer_id
         let consumer_id = self.inner.request(Action::CreateConsumer, stream_id, &body).await? as u32;
 
         Ok(Consumer::new(self.inner.clone(), consumer_id, stream_id))
@@ -218,33 +206,6 @@ impl Client {
         }
 
         self.inner.request(Action::Publish, stream_id, &body).await
-    }
-
-    /// Fire-and-forget publish — no reply expected.
-    pub fn publish_fire_forget(
-        &self,
-        stream_name: &[u8],
-        subject: &[u8],
-        payload: &[u8],
-    ) {
-        let stream_id = fnv1a_32(stream_name);
-
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0u8; 3],
-        };
-
-        let body_len = 2 + 12 + subject.len() + payload.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u16.to_le_bytes());
-        body.extend_from_slice(entry.as_bytes());
-        body.extend_from_slice(subject);
-        body.extend_from_slice(payload);
-
-        self.inner.fire_and_forget(Action::Publish, stream_id, &body);
     }
 
     // ── Connection state ─────────────────────────────────────────

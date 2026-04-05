@@ -1,4 +1,7 @@
 //! Subscribe/unsubscribe and consumer management handlers.
+//!
+//! All drain access through streams.with_mut — no global drains Mutex.
+//! Drain lives inside StreamSlot (R8, R19).
 
 use arbitro_proto::action::Action;
 use arbitro_proto::config::{ConsumerConfig, DeliverMode, DeliverPolicy};
@@ -17,31 +20,34 @@ pub fn on_create_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
     config.consumer_id = consumer_id;
     config.stream_id = stream_id;
 
-    // Verify stream exists
-    let stream_exists = ctx.streams.with(stream_id, |_| ()).is_some();
-    if !stream_exists {
-        reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::StreamNotFound);
-        return;
-    }
-
-    // Check filter overlap for Queue mode consumers
+    // Check filter overlap for Queue mode consumers (needs read access to drain)
     if config.deliver_mode == DeliverMode::Queue {
-        let drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get(&stream_id) {
-            for existing in drain.iter_consumers() {
+        let overlap = ctx.streams.with(stream_id, |slot| {
+            for existing in slot.drain.iter_consumers() {
                 if existing.config.deliver_mode != DeliverMode::Queue {
                     continue;
                 }
-                // Check each filter pair for overlap
                 for new_filter in config.filters.iter() {
                     for existing_filter in existing.config.filters.iter() {
                         if patterns_overlap(new_filter, existing_filter) {
-                            reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerFilterOverlap);
-                            return;
+                            return true;
                         }
                     }
                 }
             }
+            false
+        });
+
+        match overlap {
+            Some(true) => {
+                reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerFilterOverlap);
+                return;
+            }
+            None => {
+                reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::StreamNotFound);
+                return;
+            }
+            Some(false) => {} // no overlap, proceed
         }
     }
 
@@ -56,12 +62,14 @@ pub fn on_create_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
         DeliverPolicy::ByStartSeq => config.start_seq,
     };
 
-    // Register in drain
-    {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            drain.add_consumer(config.clone(), start_seq);
-        }
+    // Register in drain (inside StreamSlot)
+    let registered = ctx.streams.with_mut(stream_id, |slot| {
+        slot.drain.add_consumer(config.clone(), start_seq);
+    });
+
+    if registered.is_none() {
+        reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::StreamNotFound);
+        return;
     }
 
     // Store consumer config
@@ -76,14 +84,9 @@ pub fn on_create_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
 
 /// Delete a consumer. Cold path.
 pub fn on_delete_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, consumer_id: u32) {
-    let removed = {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            drain.remove_consumer(consumer_id)
-        } else {
-            false
-        }
-    };
+    let removed = ctx.streams.with_mut(stream_id, |slot| {
+        slot.drain.remove_consumer(consumer_id)
+    }).unwrap_or(false);
 
     if removed {
         let mut consumers = ctx.consumers.lock().unwrap();
@@ -96,18 +99,15 @@ pub fn on_delete_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
 }
 
 /// Bind a consumer to a connection (subscribe). Cold path.
-/// Also delivers backlog from where the consumer left off.
+/// Signals drain to deliver backlog.
 pub fn on_subscribe(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, consumer_id: u32) {
-    let bound = {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            ctx.streams.with(stream_id, |slot| {
-                drain.on_bind(consumer_id, conn_id, &*slot.store, ctx.transport.as_ref())
-            }).unwrap_or(false)
-        } else {
-            false
+    let bound = ctx.streams.with_mut(stream_id, |slot| {
+        let result = slot.drain.bind(consumer_id, conn_id);
+        if result {
+            slot.signal.release();
         }
-    };
+        result
+    }).unwrap_or(false);
 
     if bound {
         // Track subscription on connection state
@@ -123,14 +123,9 @@ pub fn on_subscribe(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32
 
 /// Unbind a consumer from a connection (unsubscribe). Cold path.
 pub fn on_unsubscribe(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, consumer_id: u32) {
-    let unbound = {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            drain.unbind(consumer_id)
-        } else {
-            false
-        }
-    };
+    let unbound = ctx.streams.with_mut(stream_id, |slot| {
+        slot.drain.unbind(consumer_id, conn_id)
+    }).unwrap_or(false);
 
     if unbound {
         reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, consumer_id as u64);
@@ -157,19 +152,14 @@ pub fn on_get_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: 
     };
     drop(consumers);
 
-    // Get runtime state from drain
-    let (pending_count, deliver_seq) = {
-        let drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get(&stream_id) {
-            if let Some(c) = drain.find_consumer(consumer_id) {
-                (c.pending_count, c.deliver_seq)
-            } else {
-                (0, 0)
-            }
+    // Get runtime state from drain (inside StreamSlot)
+    let (pending_count, deliver_seq) = ctx.streams.with(stream_id, |slot| {
+        if let Some(c) = slot.drain.find_consumer(consumer_id) {
+            (c.pending_count, c.deliver_seq)
         } else {
             (0, 0)
         }
-    };
+    }).unwrap_or((0, 0));
 
     let buf = serialize_consumer_info(&config, pending_count, deliver_seq);
     reply::send_data(ctx.transport.as_ref(), conn_id, Action::RepOk, stream_id, env_seq, &buf);
@@ -189,20 +179,16 @@ pub fn on_list_consumers(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq
     let mut buf = Vec::new();
     buf.extend_from_slice(&(stream_consumers.len() as u32).to_le_bytes());
 
-    let drains = ctx.drains.lock().unwrap();
     for cfg in &stream_consumers {
-        let (pending, deliver_seq) = if let Some(drain) = drains.get(&stream_id) {
-            if let Some(c) = drain.find_consumer(cfg.consumer_id) {
+        let (pending, deliver_seq) = ctx.streams.with(stream_id, |slot| {
+            if let Some(c) = slot.drain.find_consumer(cfg.consumer_id) {
                 (c.pending_count, c.deliver_seq)
             } else {
                 (0, 0)
             }
-        } else {
-            (0, 0)
-        };
+        }).unwrap_or((0, 0));
         buf.extend_from_slice(&serialize_consumer_info(cfg, pending, deliver_seq));
     }
-    drop(drains);
 
     reply::send_data(ctx.transport.as_ref(), conn_id, Action::RepOk, stream_id, env_seq, &buf);
 }

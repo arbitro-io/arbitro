@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use arbitro_engine::EngineBuilder;
 use arbitro_server::{ArbitroServer, Config, TokioTransport};
 
 #[tokio::main]
@@ -16,12 +15,6 @@ async fn main() -> std::io::Result<()> {
 
     let config = Config::from_env();
     let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
-
-    // Build engine with the shared transport
-    let engine = EngineBuilder::new()
-        .transport(transport.clone())
-        .build();
-
-    let server = ArbitroServer::new(config, engine, transport);
+    let server = ArbitroServer::new(config, transport);
     server.run().await
 }

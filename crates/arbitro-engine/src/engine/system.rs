@@ -1,10 +1,13 @@
 //! System handlers — connect, disconnect, ack, nack, ping, stats.
+//!
+//! Ack/nack access drain via streams.with_mut (shard lock) — no global Mutex.
+//! Signal drain after credit change to trigger pending deliveries.
 
 use core::sync::atomic::Ordering::Relaxed;
 
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::ids::ConnId;
-use arbitro_proto::wire::delivery::AckView;
+use arbitro_proto::wire::delivery::{AckView, BatchAckView};
 use arbitro_proto::wire::envelope::FrameView;
 
 use super::context::{Context, ConnState};
@@ -29,19 +32,30 @@ pub fn on_connect(ctx: &Context, conn_id: ConnId, token: &[u8]) {
 
 /// Handle a disconnection — cleanup all subscriptions.
 pub fn on_disconnect(ctx: &Context, conn_id: ConnId) {
-    // Unbind all consumers on this connection
-    let mut drains = ctx.drains.lock().unwrap();
-    for drain in drains.values_mut() {
-        drain.unbind_conn(conn_id);
-    }
-    drop(drains);
+    // Get subscription list for this connection
+    let subs = {
+        let mut conns = ctx.connections.lock().unwrap();
+        conns.remove(&conn_id)
+            .map(|cs| cs.subscriptions)
+            .unwrap_or_default()
+    };
 
-    let mut conns = ctx.connections.lock().unwrap();
-    conns.remove(&conn_id);
+    // Unbind from each stream's drain (one shard lock per stream)
+    // Collect unique stream_ids to avoid locking the same shard twice
+    let mut seen_streams = Vec::new();
+    for &(stream_id, _) in &subs {
+        if !seen_streams.contains(&stream_id) {
+            seen_streams.push(stream_id);
+            ctx.streams.with_mut(stream_id, |slot| {
+                slot.drain.unbind_conn(conn_id);
+            });
+        }
+    }
+
     ctx.metrics.connections.fetch_sub(1, Relaxed);
 }
 
-/// Handle an Ack frame — release credit, may trigger delivery of pending entries.
+/// Handle an Ack frame — release credit, signal drain for pending deliveries.
 #[inline]
 pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let stream_id = frame.stream_id();
@@ -50,16 +64,14 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let consumer_id = view.consumer_id();
     let seq = view.sequence();
 
-    let acked = {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            ctx.streams.with(stream_id, |slot| {
-                drain.on_ack(consumer_id, seq, &*slot.store, ctx.transport.as_ref())
-            }).unwrap_or(false)
-        } else {
-            false
+    // Single shard lock: release credit + signal drain
+    let acked = ctx.streams.with_mut(stream_id, |slot| {
+        let result = slot.drain.on_ack(consumer_id, seq);
+        if result {
+            slot.signal.release();
         }
-    };
+        result
+    }).unwrap_or(false);
 
     if !acked {
         let env_seq = frame.envelope().env_seq.get();
@@ -69,7 +81,28 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     ctx.metrics.msgs_out.fetch_add(1, Relaxed);
 }
 
-/// Handle a Nack frame — release credit, mark for redelivery.
+/// Handle a BatchAck frame — release credit for all sequences, signal drain.
+#[inline]
+pub fn on_batch_ack(ctx: &Context, _conn_id: ConnId, frame: &FrameView<'_>) {
+    let stream_id = frame.stream_id();
+    let body = frame.body();
+    let view = BatchAckView::new(body);
+    let consumer_id = view.consumer_id();
+
+    // Collect sequences into a stack-allocated or small vec
+    let seqs: Vec<u64> = view.sequences().collect();
+
+    ctx.streams.with_mut(stream_id, |slot| {
+        let count = slot.drain.on_batch_ack(consumer_id, &seqs);
+        if count > 0 {
+            slot.signal.release();
+        }
+    });
+
+    ctx.metrics.msgs_out.fetch_add(seqs.len() as u64, Relaxed);
+}
+
+/// Handle a Nack frame — release credit, queue for redelivery, signal drain.
 #[inline]
 pub fn on_nack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let stream_id = frame.stream_id();
@@ -78,16 +111,14 @@ pub fn on_nack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
     let consumer_id = view.consumer_id();
     let seq = view.sequence();
 
-    let nacked = {
-        let mut drains = ctx.drains.lock().unwrap();
-        if let Some(drain) = drains.get_mut(&stream_id) {
-            ctx.streams.with(stream_id, |slot| {
-                drain.on_nack(consumer_id, seq, &*slot.store, ctx.transport.as_ref())
-            }).unwrap_or(false)
-        } else {
-            false
+    // Single shard lock: release credit + nack + signal drain
+    let nacked = ctx.streams.with_mut(stream_id, |slot| {
+        let result = slot.drain.on_nack(consumer_id, seq);
+        if result {
+            slot.signal.release();
         }
-    };
+        result
+    }).unwrap_or(false);
 
     if !nacked {
         let env_seq = frame.envelope().env_seq.get();

@@ -9,13 +9,15 @@ use tokio::sync::{mpsc, watch};
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
-use arbitro_engine::Engine;
+use arbitro_engine::{Engine, EngineBuilder, Transport};
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::wire::delivery::RepErrorAction;
 
 use crate::config::Config;
+use crate::drain_task;
+use crate::gate::Gate;
 use crate::transport::TokioTransport;
 
 /// The running server.
@@ -26,7 +28,27 @@ pub struct ArbitroServer {
 }
 
 impl ArbitroServer {
-    pub fn new(config: Config, engine: Engine, transport: Arc<TokioTransport>) -> Self {
+    pub fn new(config: Config, transport: Arc<TokioTransport>) -> Self {
+        let streams_for_factory = Arc::new(std::sync::Mutex::new(None::<std::sync::Arc<arbitro_engine::stream::StreamMap>>));
+        let transport_for_factory: Arc<dyn Transport> = transport.clone();
+        let streams_clone = streams_for_factory.clone();
+
+        let signal_factory: arbitro_engine::SignalFactory = Box::new(move |stream_id| {
+            let gate = Arc::new(Gate::new());
+            let streams = streams_clone.lock().unwrap().clone()
+                .expect("streams must be set before creating streams");
+            drain_task::spawn_drain_task(stream_id, gate.clone(), streams, transport_for_factory.clone());
+            gate
+        });
+
+        let engine = EngineBuilder::new()
+            .transport(transport.clone())
+            .signal_factory(signal_factory)
+            .build();
+
+        // Set the streams Arc so the factory can use it
+        *streams_for_factory.lock().unwrap() = Some(engine.streams().clone());
+
         Self { config, engine, transport }
     }
 

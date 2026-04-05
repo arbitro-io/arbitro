@@ -11,11 +11,15 @@ pub use engine::context::Context;
 pub use auth::{Auth, AllowAll};
 pub use transport::{Transport, NoopTransport};
 pub use metrics::{Metrics, MetricsSnapshot};
+pub use drain::signal::{DrainSignal, NullSignal};
+pub use drain::ReactiveDrain;
+pub use engine::context::SignalFactory;
 
 /// Builder for constructing an Engine with custom transport and auth.
 pub struct EngineBuilder {
     transport: Option<Box<dyn Transport>>,
     auth: Option<Box<dyn Auth>>,
+    signal_factory: Option<SignalFactory>,
 }
 
 impl Default for EngineBuilder {
@@ -29,6 +33,7 @@ impl EngineBuilder {
         Self {
             transport: None,
             auth: None,
+            signal_factory: None,
         }
     }
 
@@ -42,10 +47,18 @@ impl EngineBuilder {
         self
     }
 
+    pub fn signal_factory(mut self, f: SignalFactory) -> Self {
+        self.signal_factory = Some(f);
+        self
+    }
+
     pub fn build(self) -> Engine {
         let transport = self.transport.unwrap_or_else(|| Box::new(NoopTransport));
         let auth = self.auth.unwrap_or_else(|| Box::new(AllowAll));
-        let ctx = Context::new(transport, auth);
+        let mut ctx = Context::new(transport, auth);
+        if let Some(f) = self.signal_factory {
+            ctx.signal_factory = f;
+        }
         Engine::new(ctx)
     }
 }
@@ -54,7 +67,7 @@ impl EngineBuilder {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use arbitro_proto::action::Action;
     use arbitro_proto::config::StreamConfig;

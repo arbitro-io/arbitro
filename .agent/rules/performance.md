@@ -41,6 +41,6 @@ Every design decision must respect the hardware. No exceptions.
 
 ## Lock Discipline
 
-19. **Single lock per stream** — one `Mutex` per drain. Append + deliver under the same lock, inline.
+19. **Single lock per stream** — one `Mutex` per drain. Append under shard lock, release fast, signal drain.
 20. **No lock contention across streams** — sharded `StreamMap` (64-way). Streams never share locks.
-21. **No channels on hot path** — inline delivery, not channel-based. Channels = extra syscall + allocation.
+21. **Batch delivery** — drain collects entries per consumer, sends one frame per batch via `write_vectored`. Never one send per message.

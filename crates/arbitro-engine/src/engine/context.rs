@@ -1,25 +1,36 @@
 //! Context — shared broker state passed to all engine handlers.
+//!
+//! No global drains Mutex. Drain lives inside StreamSlot, accessed
+//! via the stream's shard lock. Single lock per stream (R19).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use arbitro_proto::config::ConsumerConfig;
 use arbitro_proto::ids::ConnId;
 
 use crate::auth::Auth;
-use crate::drain::ReactiveDrain;
+use crate::drain::signal::{DrainSignal, NullSignal};
 use crate::metrics::Metrics;
 use crate::stream::StreamMap;
 use crate::transport::Transport;
 
+/// Factory for creating drain signals. The server provides Gate; tests use NullSignal.
+pub type SignalFactory = Box<dyn Fn(u32) -> Arc<dyn DrainSignal> + Send + Sync>;
+
+/// Default factory — NullSignal (no async drain task).
+pub fn null_signal_factory() -> SignalFactory {
+    Box::new(|_stream_id| Arc::new(NullSignal))
+}
+
 /// Shared broker state — passed to all engine handlers.
 pub struct Context {
-    pub streams: StreamMap,
-    /// drain_id keyed by stream_id
-    pub drains: Mutex<HashMap<u32, ReactiveDrain>>,
+    pub streams: Arc<StreamMap>,
     pub transport: Box<dyn Transport>,
     pub auth: Box<dyn Auth>,
     pub metrics: Metrics,
+    /// Factory for creating drain signals per stream.
+    pub signal_factory: SignalFactory,
     /// Consumer configs indexed by (stream_id, consumer_id).
     pub consumers: Mutex<HashMap<(u32, u32), ConsumerConfig>>,
     /// Next consumer_id counter.
@@ -39,11 +50,11 @@ pub struct ConnState {
 impl Context {
     pub fn new(transport: Box<dyn Transport>, auth: Box<dyn Auth>) -> Self {
         Self {
-            streams: StreamMap::new(),
-            drains: Mutex::new(HashMap::new()),
+            streams: Arc::new(StreamMap::new()),
             transport,
             auth,
             metrics: Metrics::new(),
+            signal_factory: null_signal_factory(),
             consumers: Mutex::new(HashMap::new()),
             next_consumer_id: Mutex::new(1),
             connections: Mutex::new(HashMap::new()),
@@ -56,15 +67,5 @@ impl Context {
         let v = *id;
         *id += 1;
         v
-    }
-
-    /// Get or create a drain for a stream.
-    pub fn get_or_create_drain(&self, stream_id: u32) -> bool {
-        let mut drains = self.drains.lock().unwrap();
-        if drains.contains_key(&stream_id) {
-            return false;
-        }
-        drains.insert(stream_id, ReactiveDrain::new(stream_id));
-        true
     }
 }

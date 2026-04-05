@@ -11,7 +11,7 @@ use zerocopy::byteorder::little_endian::{U16, U32};
 
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_proto::wire::delivery::{RepErrorAction, RepOkAction};
+use arbitro_proto::wire::delivery::{RepErrorAction, RepOkAction, RepBatchView};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
 
 use crate::error::ClientError;
@@ -144,8 +144,8 @@ impl Inner {
         }
     }
 
-    /// Send a fire-and-forget frame (no reply expected).
-    pub(crate) fn fire_and_forget(
+    /// Send a frame with no reply expected (internal use only, e.g. Pong).
+    fn send_no_reply(
         &self,
         action: Action,
         stream_id: u32,
@@ -180,7 +180,8 @@ impl Inner {
         match action {
             Some(Action::RepOk) => self.on_rep_ok(env.env_seq.get(), body),
             Some(Action::RepError) => self.on_rep_error(env.env_seq.get(), body),
-            Some(Action::Deliver) => self.on_deliver(env.stream_id.get(), body),
+            Some(Action::Deliver) => self.on_deliver(env.stream_id.get(), env.env_seq.get(), body),
+            Some(Action::RepBatch) => self.on_rep_batch(env.stream_id.get(), body),
             Some(Action::Ping) => self.on_ping(body),
             Some(Action::Connected) => { /* handled in connect handshake */ }
             _ => {
@@ -222,28 +223,23 @@ impl Inner {
     }
 
     /// Deliver frame: demux to local subscribers.
-    fn on_deliver(&self, stream_id: u32, body: &[u8]) {
-        // body format: per entry [8 seq][2 subj_len][subject][payload...]
-        // For now we parse entries and dispatch to matching subscribers.
+    /// Server body format: [2 subj_len][subject][payload]
+    /// Sequence comes from envelope env_seq (u32).
+    fn on_deliver(&self, stream_id: u32, env_seq: u32, body: &[u8]) {
         let subs = self.subscriptions.lock().unwrap();
 
-        // Parse single entry from delivery body.
-        // Format: [8 seq][2 subj_len][subject][payload]
-        if body.len() < 10 {
+        if body.len() < 2 {
             return;
         }
 
-        let seq = u64::from_le_bytes([
-            body[0], body[1], body[2], body[3],
-            body[4], body[5], body[6], body[7],
-        ]);
-        let subj_len = u16::from_le_bytes([body[8], body[9]]) as usize;
+        let seq = env_seq as u64;
+        let subj_len = u16::from_le_bytes([body[0], body[1]]) as usize;
 
-        if 10 + subj_len > body.len() {
+        if 2 + subj_len > body.len() {
             return;
         }
-        let subject = &body[10..10 + subj_len];
-        let payload = &body[10 + subj_len..];
+        let subject = &body[2..2 + subj_len];
+        let payload = &body[2 + subj_len..];
 
         for sub in subs.values() {
             if sub.stream_id == stream_id && sub.matches(subject) {
@@ -260,12 +256,39 @@ impl Inner {
         }
     }
 
+    /// RepBatch frame: batch of delivered entries for a consumer.
+    /// Body format: [8B RepBatchFixed][N × (14B entry_header + subject + payload)]
+    fn on_rep_batch(&self, stream_id: u32, body: &[u8]) {
+        let view = RepBatchView::new(body);
+        let consumer_id = view.consumer_id();
+        let subs = self.subscriptions.lock().unwrap();
+
+        for entry in view.entries() {
+            for sub in subs.values() {
+                if sub.stream_id == stream_id
+                    && sub.consumer_id == consumer_id
+                    && sub.matches(entry.subject)
+                {
+                    let msg = Message {
+                        seq: entry.seq,
+                        subject: Box::from(entry.subject),
+                        payload: Bytes::copy_from_slice(entry.payload),
+                        consumer_id,
+                        stream_id,
+                        ack_tx: self.ack_tx.clone(),
+                    };
+                    let _ = sub.tx.try_send(msg);
+                }
+            }
+        }
+    }
+
     fn on_ping(&self, body: &[u8]) {
         // Reply with Pong
         let mut pong_body = [0u8; 8];
         if body.len() >= 8 {
             pong_body.copy_from_slice(&body[..8]);
         }
-        self.fire_and_forget(Action::Pong, 0, &pong_body);
+        self.send_no_reply(Action::Pong, 0, &pong_body);
     }
 }

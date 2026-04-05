@@ -31,6 +31,11 @@ impl Engine {
         }
     }
 
+    /// Get the shared stream map. Used by the server to create drain tasks.
+    pub fn streams(&self) -> &std::sync::Arc<crate::stream::StreamMap> {
+        &self.ctx.streams
+    }
+
     /// Initialize all components — transport, auth, load metadata.
     /// Called once before processing any frames.
     pub fn init(&mut self) {
@@ -71,7 +76,7 @@ impl Engine {
         };
 
         match action {
-            // Hot path — publish, ack, nack
+            // Hot path — publish, ack, nack, batch_ack
             Action::Publish => {
                 publish::on_publish(&self.ctx, conn_id, &frame, &mut self.scratch);
             }
@@ -80,6 +85,9 @@ impl Engine {
             }
             Action::Nack => {
                 system::on_nack(&self.ctx, conn_id, &frame);
+            }
+            Action::BatchAck => {
+                system::on_batch_ack(&self.ctx, conn_id, &frame);
             }
             // Everything else is cold path
             _ => self.dispatch_cold(action, conn_id, &frame),
@@ -141,6 +149,7 @@ impl Engine {
                     view.name(),
                     view.subject(),
                     view.max_inflight(),
+                    view.ack_policy(),
                     view.deliver_policy(),
                     view.deliver_mode(),
                     view.ack_wait_ms(),
@@ -163,16 +172,11 @@ impl Engine {
                 let view = arbitro_proto::wire::subscribe::FetchView::new(frame.body());
                 let consumer_id = view.consumer_id();
                 let max_msgs = view.max_msgs();
-                let fetched = {
-                    let mut drains = self.ctx.drains.lock().unwrap();
-                    if let Some(drain) = drains.get_mut(&stream_id) {
-                        self.ctx.streams.with(stream_id, |slot| {
-                            drain.fetch(consumer_id, max_msgs, &*slot.store, self.ctx.transport.as_ref())
-                        }).unwrap_or(0)
-                    } else {
-                        0
-                    }
-                };
+                // Fetch via shard lock — no global drains Mutex
+                let fetched = self.ctx.streams.with_mut(stream_id, |slot| {
+                    let now_ts = publish::current_timestamp();
+                    slot.drain.fetch(consumer_id, max_msgs, &*slot.store, self.ctx.transport.as_ref(), now_ts)
+                }).unwrap_or(0);
                 reply::send_ok(self.ctx.transport.as_ref(), conn_id, stream_id, env_seq, fetched as u64);
             }
             Action::Ping => {

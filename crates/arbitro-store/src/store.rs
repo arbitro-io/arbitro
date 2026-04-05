@@ -63,10 +63,20 @@ pub trait Store: Send {
     fn append_batch(&mut self, entries: &[EntryRef<'_>], timestamp: u64) -> Result<u64, StoreError>;
 
     /// Read a single entry by sequence.
+    #[deprecated(note = "use get() for zero-alloc callback-based read")]
     fn read(&self, seq: u64) -> Result<Option<Entry>, StoreError>;
 
     /// Read a range [start, end) of entries.
+    #[deprecated(note = "use for_each() for zero-alloc callback-based read")]
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry>, StoreError>;
+
+    /// Zero-alloc: calls `f` with a borrowed entry at `seq`.
+    /// Returns `Ok(true)` if found, `Ok(false)` if not found.
+    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry)) -> Result<bool, StoreError>;
+
+    /// Zero-alloc: calls `f` for each entry in `[start..end)`.
+    /// Borrows directly from internal storage — no cloning.
+    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry)) -> Result<(), StoreError>;
 
     // ── Management ──────────────────────────────────────────────────
 

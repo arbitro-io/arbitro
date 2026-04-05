@@ -1,26 +1,33 @@
 //! Consumer — registered consumer with delivery state.
 //!
-//! Each consumer tracks: which connection it's on, its filters,
-//! ack state, and credit map for flow control.
+//! Each consumer tracks: its subscriptions (connections), filters,
+//! ack state, credit map, nacked queue, and deferred queue.
+
+use std::collections::VecDeque;
 
 use arbitro_common::credit_map::CreditMap;
 use arbitro_common::subject::subject_matches;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode};
 use arbitro_proto::ids::{ConnId, Sequence};
 
+use super::subscription::Subscription;
+
 /// A registered consumer attached to a stream.
 pub struct Consumer {
     pub config: ConsumerConfig,
-    /// Connection this consumer is currently bound to (0 = not connected).
-    pub conn_id: ConnId,
+    /// Active subscriptions (connections receiving from this consumer).
+    pub subscriptions: Vec<Subscription>,
     /// Next sequence to deliver from the journal.
     pub deliver_seq: Sequence,
     /// Credit map for per-subject flow control (only with AckPolicy::Explicit).
     pub credit_map: Option<CreditMap>,
-    /// Total messages delivered (not yet acked).
+    /// Total messages delivered but not yet acked.
     pub pending_count: u32,
-    /// Sequences that were nacked and need redelivery.
-    pub nacked: Vec<u64>,
+    /// Sequences nacked — need redelivery. O(1) pop_front.
+    pub nacked: VecDeque<u64>,
+    /// Sequences deferred due to per-subject credit limits.
+    /// Retry when credit frees (ack releases subject slot).
+    pub deferred: VecDeque<u64>,
 }
 
 impl Consumer {
@@ -35,18 +42,31 @@ impl Consumer {
 
         Self {
             config,
-            conn_id: 0,
+            subscriptions: Vec::new(),
             deliver_seq: start_seq,
             credit_map,
             pending_count: 0,
-            nacked: Vec::new(),
+            nacked: VecDeque::new(),
+            deferred: VecDeque::new(),
         }
+    }
+
+    /// Add a subscription binding this consumer to a connection.
+    pub fn add_subscription(&mut self, sub: Subscription) {
+        self.subscriptions.push(sub);
+    }
+
+    /// Remove all subscriptions for a given connection.
+    /// Returns true if any were removed.
+    pub fn remove_conn(&mut self, conn_id: ConnId) -> bool {
+        let before = self.subscriptions.len();
+        self.subscriptions.retain(|s| s.conn_id != conn_id);
+        self.subscriptions.len() < before
     }
 
     /// Does this consumer's filters match the given subject?
     #[inline]
     pub fn matches(&self, subject: &[u8]) -> bool {
-        // No filters = match everything
         if self.config.filters.is_empty() {
             return true;
         }
@@ -56,20 +76,24 @@ impl Consumer {
     /// Is this consumer connected and ready to receive?
     #[inline]
     pub fn is_active(&self) -> bool {
-        self.conn_id != 0
+        !self.subscriptions.is_empty()
+    }
+
+    /// Check global inflight credit only (ignores per-subject limits).
+    #[inline]
+    pub fn has_global_credit(&self) -> bool {
+        if self.config.ack_policy == AckPolicy::None {
+            return true;
+        }
+        self.config.max_inflight == 0 || self.pending_count < self.config.max_inflight as u32
     }
 
     /// Check if we have credit to deliver a message for this subject.
     #[inline]
     pub fn has_credit(&self, subject: &[u8]) -> bool {
-        if self.config.ack_policy == AckPolicy::None {
-            return true;
-        }
-        // Global inflight check
-        if self.config.max_inflight > 0 && self.pending_count >= self.config.max_inflight as u32 {
+        if !self.has_global_credit() {
             return false;
         }
-        // Per-subject check
         if let Some(ref cm) = self.credit_map {
             return cm.has_credit(subject);
         }
@@ -162,6 +186,7 @@ mod tests {
     fn fire_and_forget_always_has_credit() {
         let c = fanout_consumer(b"c1", b"ORDERS");
         assert!(c.has_credit(b"orders.created"));
+        assert!(c.has_global_credit());
     }
 
     #[test]
@@ -184,9 +209,31 @@ mod tests {
     }
 
     #[test]
-    fn active_when_connected() {
+    fn active_when_subscribed() {
         let mut c = fanout_consumer(b"c1", b"ORDERS");
-        c.conn_id = 42;
+        c.add_subscription(Subscription::new(42));
         assert!(c.is_active());
+    }
+
+    #[test]
+    fn remove_conn_clears_subscriptions() {
+        let mut c = fanout_consumer(b"c1", b"ORDERS");
+        c.add_subscription(Subscription::new(42));
+        c.add_subscription(Subscription::new(42));
+        c.add_subscription(Subscription::new(99));
+
+        assert!(c.remove_conn(42));
+        assert_eq!(c.subscriptions.len(), 1);
+        assert_eq!(c.subscriptions[0].conn_id, 99);
+    }
+
+    #[test]
+    fn nacked_is_vecdeque() {
+        let mut c = fanout_consumer(b"c1", b"ORDERS");
+        c.nacked.push_back(1);
+        c.nacked.push_back(2);
+        c.nacked.push_back(3);
+        assert_eq!(c.nacked.pop_front(), Some(1)); // O(1)
+        assert_eq!(c.nacked.len(), 2);
     }
 }

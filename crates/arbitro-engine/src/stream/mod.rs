@@ -2,30 +2,47 @@
 //!
 //! Lookup by stream_id (FNV-1a u32). Each shard is its own Mutex,
 //! so streams on different shards never contend.
+//!
+//! StreamSlot owns: config + store + drain + signal.
+//! The drain lives here (not in a separate HashMap) so publish
+//! can append + signal under a SINGLE shard lock (R19).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use arbitro_proto::config::StreamConfig;
 use arbitro_store::{MemoryStore, Store, StoreInfo};
 
+use crate::drain::ReactiveDrain;
+use crate::drain::signal::DrainSignal;
+#[cfg(test)]
+use crate::drain::signal::NullSignal;
+
 const SHARD_COUNT: usize = 64;
 const SHARD_MASK: u32 = (SHARD_COUNT as u32) - 1;
 
-/// A single stream: config + journal store.
+/// A single stream: config + journal store + drain + signal.
 pub struct StreamSlot {
     pub config: StreamConfig,
     pub store: Box<dyn Store>,
+    pub drain: ReactiveDrain,
+    pub signal: Arc<dyn DrainSignal>,
 }
 
 impl StreamSlot {
-    pub fn new(config: StreamConfig) -> Self {
+    pub fn new(config: StreamConfig, signal: Arc<dyn DrainSignal>) -> Self {
+        let stream_id = config.stream_id;
         let store: Box<dyn Store> = match config.journal_kind {
             arbitro_proto::config::JournalKind::Memory => Box::new(MemoryStore::new()),
             // Disk journals provided by arbitro-server via factory
             _ => Box::new(MemoryStore::new()),
         };
-        Self { config, store }
+        Self {
+            config,
+            store,
+            drain: ReactiveDrain::new(stream_id),
+            signal,
+        }
     }
 
     #[inline]
@@ -68,14 +85,14 @@ impl StreamMap {
         (stream_id & SHARD_MASK) as usize
     }
 
-    /// Insert a stream. Returns false if already exists.
-    pub fn insert(&self, config: StreamConfig) -> bool {
+    /// Insert a stream with a drain signal. Returns false if already exists.
+    pub fn insert(&self, config: StreamConfig, signal: Arc<dyn DrainSignal>) -> bool {
         let id = config.stream_id;
         let mut shard = self.shards[Self::shard_idx(id)].lock().unwrap();
         if shard.streams.contains_key(&id) {
             return false;
         }
-        shard.streams.insert(id, StreamSlot::new(config));
+        shard.streams.insert(id, StreamSlot::new(config, signal));
         true
     }
 
@@ -136,13 +153,17 @@ mod tests {
         StreamConfig::new(name).build()
     }
 
+    fn null_signal() -> Arc<dyn DrainSignal> {
+        Arc::new(NullSignal)
+    }
+
     #[test]
     fn insert_and_lookup() {
         let map = StreamMap::new();
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
 
-        assert!(map.insert(cfg));
+        assert!(map.insert(cfg, null_signal()));
         assert!(map.with(id, |s| s.config.stream_id).is_some());
     }
 
@@ -152,8 +173,8 @@ mod tests {
         let cfg1 = test_config(b"ORDERS");
         let cfg2 = test_config(b"ORDERS");
 
-        assert!(map.insert(cfg1));
-        assert!(!map.insert(cfg2));
+        assert!(map.insert(cfg1, null_signal()));
+        assert!(!map.insert(cfg2, null_signal()));
     }
 
     #[test]
@@ -162,7 +183,7 @@ mod tests {
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
 
-        map.insert(cfg);
+        map.insert(cfg, null_signal());
         assert!(map.remove(id).is_some());
         assert!(map.with(id, |_| ()).is_none());
     }
@@ -172,7 +193,7 @@ mod tests {
         let map = StreamMap::new();
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
-        map.insert(cfg);
+        map.insert(cfg, null_signal());
 
         let seq = map.with_mut(id, |slot| {
             slot.store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 1000)
@@ -186,9 +207,9 @@ mod tests {
     #[test]
     fn count_and_list() {
         let map = StreamMap::new();
-        map.insert(test_config(b"A"));
-        map.insert(test_config(b"B"));
-        map.insert(test_config(b"C"));
+        map.insert(test_config(b"A"), null_signal());
+        map.insert(test_config(b"B"), null_signal());
+        map.insert(test_config(b"C"), null_signal());
 
         assert_eq!(map.count(), 3);
         assert_eq!(map.list_configs().len(), 3);
@@ -197,11 +218,23 @@ mod tests {
     #[test]
     fn different_shards_no_contention() {
         let map = StreamMap::new();
-        // Insert streams that should land in different shards
         for i in 0u32..128 {
             let name = format!("STREAM_{}", i);
-            map.insert(test_config(name.as_bytes()));
+            map.insert(test_config(name.as_bytes()), null_signal());
         }
         assert_eq!(map.count(), 128);
+    }
+
+    #[test]
+    fn stream_slot_has_drain() {
+        let map = StreamMap::new();
+        let cfg = test_config(b"ORDERS");
+        let id = cfg.stream_id;
+        map.insert(cfg, null_signal());
+
+        // Drain is accessible via StreamSlot
+        map.with_mut(id, |slot| {
+            assert_eq!(slot.drain.consumer_count(), 0);
+        });
     }
 }

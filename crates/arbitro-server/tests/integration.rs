@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arbitro_client::{Client, ConnState};
-use arbitro_engine::EngineBuilder;
+use arbitro_proto::config::{AckPolicy, ConsumerConfig, StreamConfig};
 use arbitro_server::{ArbitroServer, Config, TokioTransport};
 
 /// Start a server on a random port, return the address.
@@ -22,10 +22,7 @@ async fn start_server() -> String {
     };
 
     let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
-    let engine = EngineBuilder::new()
-        .transport(transport.clone())
-        .build();
-    let server = ArbitroServer::new(config, engine, transport);
+    let server = ArbitroServer::new(config, transport);
 
     tokio::spawn(async move {
         let _ = server.run().await;
@@ -59,9 +56,8 @@ async fn create_stream_and_publish() {
         .expect("connect");
 
     // Create a stream
-    let result = client
-        .create_stream(b"orders", 100_000, 0, 0)
-        .await;
+    let cfg = StreamConfig::new(b"orders").max_msgs(100_000).build();
+    let result = client.create_stream(&cfg).await;
     assert!(result.is_ok(), "create_stream failed: {:?}", result.err());
 
     // Publish a message
@@ -79,7 +75,8 @@ async fn publish_batch() {
         .await
         .expect("connect");
 
-    client.create_stream(b"events", 100_000, 0, 0).await.unwrap();
+    let cfg = StreamConfig::new(b"events").max_msgs(100_000).build();
+    client.create_stream(&cfg).await.unwrap();
 
     let entries: Vec<(&[u8], &[u8])> = vec![
         (b"events.a", b"payload1"),
@@ -105,21 +102,64 @@ async fn publish_to_nonexistent_stream_fails() {
 }
 
 #[tokio::test]
-async fn fire_and_forget_does_not_block() {
+async fn publish_burst_does_not_block() {
     let addr = start_server().await;
     let client = Client::connect_with_timeout(&addr, Duration::from_secs(3))
         .await
         .expect("connect");
 
-    client.create_stream(b"fast", 100_000, 0, 0).await.unwrap();
+    let cfg = StreamConfig::new(b"fast").max_msgs(100_000).build();
+    client.create_stream(&cfg).await.unwrap();
 
-    // Fire-and-forget should not block
+    // Rapid publish should not block
     for i in 0..100u32 {
-        client.publish_fire_forget(b"fast", b"fast.msg", &i.to_le_bytes());
+        client.publish(b"fast", b"fast.msg", &i.to_le_bytes()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn publish_then_subscribe_receives() {
+    let addr = start_server().await;
+    let client = Client::connect_with_timeout(&addr, Duration::from_secs(3))
+        .await
+        .expect("connect");
+
+    // Create stream
+    let stream_cfg = StreamConfig::new(b"sub_test").build();
+    client.create_stream(&stream_cfg).await.unwrap();
+
+    // Create consumer (fire-and-forget)
+    let consumer_cfg = ConsumerConfig::new(b"my_consumer", b"sub_test")
+        .filter(b">")
+        .ack_policy(AckPolicy::None)
+        .build();
+    let consumer = client.create_consumer(&consumer_cfg).await.expect("create consumer");
+
+    // Publish 4 messages BEFORE subscribing
+    for i in 0u32..4 {
+        client.publish(b"sub_test", b"sub_test.msg", &i.to_le_bytes()).await.unwrap();
     }
 
-    // Give time for writes to flush
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Now subscribe — should receive backlog
+    let mut sub = consumer.subscribe(None).await.expect("subscribe");
+
+    let mut received = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+            Ok(Some(msg)) => {
+                eprintln!("  received msg seq={} subject={:?} payload_len={}", msg.seq, std::str::from_utf8(&msg.subject), msg.payload.len());
+                received += 1;
+                if received >= 4 { break; }
+            }
+            Ok(None) => {
+                panic!("subscription closed after {received} msgs");
+            }
+            Err(_) => {
+                panic!("timeout after {received}/4 msgs");
+            }
+        }
+    }
+    assert_eq!(received, 4);
 }
 
 #[tokio::test]

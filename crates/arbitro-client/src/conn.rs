@@ -186,7 +186,14 @@ async fn write_loop(
     }
 }
 
+/// Max sequences per BatchAck frame.
+const ACK_BATCH_MAX: usize = 256;
+
 /// Process ack/nack commands from Message handles.
+///
+/// Accumulates acks: recv first, drain with try_recv, group by
+/// (stream_id, consumer_id), send one BatchAck frame per group.
+/// Nacks go individually (rare, latency-sensitive).
 async fn ack_loop(inner: Arc<Inner>, write_tx: mpsc::Sender<Bytes>) {
     let mut rx = {
         let mut guard = inner.ack_rx.lock().unwrap();
@@ -196,25 +203,78 @@ async fn ack_loop(inner: Arc<Inner>, write_tx: mpsc::Sender<Bytes>) {
         }
     };
 
+    // Scratch buffers — reused across iterations, capacity grows monotonically.
+    let mut pending_acks: Vec<(u32, u32, u64)> = Vec::with_capacity(ACK_BATCH_MAX);
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(4096);
+
     while let Some(cmd) = rx.recv().await {
-        let frame = match cmd {
-            AckCmd::Ack { stream_id, consumer_id, seq } => {
-                build_ack_frame(Action::Ack, stream_id, consumer_id, seq)
-            }
-            AckCmd::Nack { stream_id, consumer_id, seq } => {
-                build_ack_frame(Action::Nack, stream_id, consumer_id, seq)
-            }
-        };
-        if write_tx.try_send(frame).is_err() {
-            // Write channel full or closed — ack will be retried after reconnect
-            continue;
+        // Process first command
+        process_ack_cmd(cmd, &mut pending_acks, &write_tx);
+
+        // Drain all available — coalesce into batch
+        while let Ok(cmd) = rx.try_recv() {
+            process_ack_cmd(cmd, &mut pending_acks, &write_tx);
+        }
+
+        // Flush accumulated acks as BatchAck frames
+        if !pending_acks.is_empty() {
+            flush_batch_acks(&pending_acks, &write_tx, &mut batch_buf);
+            pending_acks.clear();
         }
     }
-
-    // Put rx back so reconnect can reuse it
-    // (won't happen since rx is consumed, but ack_loop only runs once)
 }
 
+/// Route a single AckCmd: acks go to pending batch, nacks send immediately.
+#[inline]
+fn process_ack_cmd(
+    cmd: AckCmd,
+    pending_acks: &mut Vec<(u32, u32, u64)>,
+    write_tx: &mpsc::Sender<Bytes>,
+) {
+    match cmd {
+        AckCmd::Ack { stream_id, consumer_id, seq } => {
+            pending_acks.push((stream_id, consumer_id, seq));
+        }
+        AckCmd::Nack { stream_id, consumer_id, seq } => {
+            let frame = build_ack_frame(Action::Nack, stream_id, consumer_id, seq);
+            let _ = write_tx.try_send(frame);
+        }
+    }
+}
+
+/// Group pending acks by (stream_id, consumer_id) and send BatchAck frames.
+fn flush_batch_acks(
+    pending: &[(u32, u32, u64)],
+    write_tx: &mpsc::Sender<Bytes>,
+    buf: &mut Vec<u8>,
+) {
+    // Sort by (stream_id, consumer_id) so we can group in one pass.
+    // For the common case (single consumer), this is a no-op.
+    let mut sorted: Vec<(u32, u32, u64)> = pending.to_vec();
+    sorted.sort_unstable_by_key(|&(sid, cid, _)| (sid, cid));
+
+    let mut i = 0;
+    while i < sorted.len() {
+        let (stream_id, consumer_id, _) = sorted[i];
+
+        // Find the end of this group
+        let mut j = i;
+        while j < sorted.len() && sorted[j].0 == stream_id && sorted[j].1 == consumer_id {
+            j += 1;
+        }
+
+        // Send in chunks of ACK_BATCH_MAX
+        let group = &sorted[i..j];
+        for chunk in group.chunks(ACK_BATCH_MAX) {
+            build_batch_ack_frame(stream_id, consumer_id, chunk, buf);
+            let _ = write_tx.try_send(Bytes::copy_from_slice(buf));
+        }
+
+        i = j;
+    }
+}
+
+/// Build a single Ack or Nack frame (32B). Used for nacks.
 fn build_ack_frame(action: Action, stream_id: u32, consumer_id: u32, seq: u64) -> Bytes {
     let envelope = Envelope {
         action: U16::new(action.as_u16()),
@@ -232,6 +292,42 @@ fn build_ack_frame(action: Action, stream_id: u32, consumer_id: u32, seq: u64) -
     buf[ENVELOPE_SIZE+8..ENVELOPE_SIZE+12].copy_from_slice(&consumer_id.to_le_bytes());
 
     Bytes::copy_from_slice(&buf)
+}
+
+/// Build a BatchAck frame into `buf`.
+///
+/// Wire: [16B envelope][8B BatchAckFixed][N × 8B seq]
+fn build_batch_ack_frame(
+    stream_id: u32,
+    consumer_id: u32,
+    seqs: &[(u32, u32, u64)], // (stream_id, consumer_id, seq) — all same group
+    buf: &mut Vec<u8>,
+) {
+    let count = seqs.len() as u16;
+    let body_len = 8 + (seqs.len() * 8); // BatchAckFixed + N × u64
+
+    buf.clear();
+
+    // Envelope
+    let envelope = Envelope {
+        action: U16::new(Action::BatchAck.as_u16()),
+        flags: 0,
+        _rsv: 0,
+        stream_id: U32::new(stream_id),
+        msg_len: U32::new(body_len as u32),
+        env_seq: U32::new(0),
+    };
+    buf.extend_from_slice(envelope.as_bytes());
+
+    // BatchAckFixed: [4 consumer_id][2 count][2 pad]
+    buf.extend_from_slice(&consumer_id.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    // Sequences
+    for &(_, _, seq) in seqs {
+        buf.extend_from_slice(&seq.to_le_bytes());
+    }
 }
 
 /// Simple pseudo-random using thread-local state (no dependency needed).
