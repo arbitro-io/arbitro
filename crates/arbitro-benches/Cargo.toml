@@ -5,11 +5,16 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-zerocopy = { workspace = true }
-bytes    = { workspace = true }
+zerocopy      = { workspace = true }
+bytes         = { workspace = true }
+arbitro-proto = { path = "../arbitro-proto" }
+arbitro-engine = { path = "../arbitro-engine" }
+arbitro-store  = { path = "../arbitro-store" }
 
 [dev-dependencies]
-criterion   = { workspace = true }
+criterion = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-uring = { workspace = true }
 
 [[bench]]
@@ -22,4 +27,8 @@ harness = false
 
 [[bench]]
 name    = "action_dispatch"
+harness = false
+
+[[bench]]
+name    = "publish_throughput"
 harness = false
