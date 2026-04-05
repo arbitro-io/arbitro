@@ -1,0 +1,16 @@
+services:
+  arbitro:
+    build: .
+    ports:
+      - "4222:4222"
+    environment:
+      ARBITRO_LISTEN: "0.0.0.0:4222"
+      ARBITRO_MAX_CONNECTIONS: "10000"
+      ARBITRO_IDLE_TIMEOUT: "300"
+      ARBITRO_KEEPALIVE_INTERVAL: "30"
+    volumes:
+      - arbitro-data:/data
+    restart: unless-stopped
+
+volumes:
+  arbitro-data:
