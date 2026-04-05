@@ -41,6 +41,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitro-engine"
+version = "0.1.0"
+dependencies = [
+ "arbitro-common",
+ "arbitro-proto",
+ "arbitro-store",
+ "zerocopy",
+]
+
+[[package]]
 name = "arbitro-proto"
 version = "0.1.0"
 dependencies = [

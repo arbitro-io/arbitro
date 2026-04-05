@@ -8,6 +8,7 @@ pub enum Action {
     Publish       = 0x0101,
 
     // 0x02xx — Delivery
+    Deliver       = 0x0200,
     Ack           = 0x0201,
     Nack          = 0x0202,
     RepOk         = 0x0203,
@@ -50,6 +51,7 @@ impl Action {
         match v {
             0x0101 => Some(Self::Publish),
 
+            0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
             0x0202 => Some(Self::Nack),
             0x0203 => Some(Self::RepOk),

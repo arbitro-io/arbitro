@@ -4,7 +4,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// 32B fixed — Create a stream. Variable name follows.
 ///
 /// ```text
-/// [2 name_len][2 pad][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][2 pad]
+/// [2 name_len][2 pad][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 pad]
 /// ```
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
@@ -16,7 +16,8 @@ pub struct CreateStreamFixed {
     pub max_age_secs: U64,
     pub replicas: u8,
     pub journal_kind: u8,
-    pub _pad2: [u8; 2],
+    pub retention: u8,
+    pub _pad2: u8,
 }
 
 pub const CREATE_STREAM_FIXED_SIZE: usize = core::mem::size_of::<CreateStreamFixed>();
@@ -100,6 +101,9 @@ impl<'a> CreateStreamView<'a> {
 
     #[inline(always)]
     pub fn journal_kind(&self) -> u8 { self.fixed().journal_kind }
+
+    #[inline(always)]
+    pub fn retention(&self) -> u8 { self.fixed().retention }
 }
 
 pub struct DeleteStreamView<'a> {

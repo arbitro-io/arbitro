@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["crates/arbitro-benches", "crates/arbitro-common", "crates/arbitro-proto", "crates/arbitro-store"]
+members  = ["crates/arbitro-benches", "crates/arbitro-common", "crates/arbitro-engine", "crates/arbitro-proto", "crates/arbitro-store"]
 
 [workspace.package]
 version = "0.1.0"

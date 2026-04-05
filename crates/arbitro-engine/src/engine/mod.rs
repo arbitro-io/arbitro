@@ -1,0 +1,147 @@
+//! Engine — frame dispatch to handlers.
+//!
+//! All frames enter through `process_frame`. Hot actions (Publish, Ack)
+//! are dispatched first for branch prediction.
+
+pub mod context;
+pub mod management;
+pub mod publish;
+pub mod reply;
+pub mod subscribe;
+pub mod system;
+
+use arbitro_proto::action::Action;
+use arbitro_proto::error::ErrorCode;
+use arbitro_proto::ids::ConnId;
+use arbitro_proto::wire::envelope::FrameView;
+
+use context::Context;
+
+/// The engine — owns context and scratch buffers.
+pub struct Engine {
+    pub ctx: Context,
+    scratch: publish::PublishScratch,
+}
+
+impl Engine {
+    pub fn new(ctx: Context) -> Self {
+        Self {
+            ctx,
+            scratch: publish::PublishScratch::new(),
+        }
+    }
+
+    /// Initialize all components — transport, auth, load metadata.
+    /// Called once before processing any frames.
+    pub fn init(&mut self) {
+        self.ctx.transport.init();
+        self.ctx.auth.init();
+    }
+
+    /// Graceful shutdown — flush stores, close transport, shutdown auth.
+    pub fn shutdown(&mut self) {
+        // Shutdown all stream stores
+        let configs = self.ctx.streams.list_configs();
+        for cfg in &configs {
+            self.ctx.streams.with_mut(cfg.stream_id, |slot| {
+                let _ = slot.store.shutdown();
+            });
+        }
+
+        self.ctx.auth.shutdown();
+        self.ctx.transport.shutdown();
+    }
+
+    /// Main entry point — dispatch a raw frame.
+    /// Hot actions first for branch prediction.
+    #[inline]
+    pub fn process_frame(&mut self, conn_id: ConnId, buf: &[u8]) {
+        let frame = FrameView::new(buf);
+
+        let action = match frame.action() {
+            Some(a) => a,
+            None => {
+                let env_seq = frame.envelope().env_seq.get();
+                reply::send_error(
+                    self.ctx.transport.as_ref(), conn_id, 0, env_seq, 0,
+                    ErrorCode::UnknownAction,
+                );
+                return;
+            }
+        };
+
+        match action {
+            // Hot path — publish, ack, nack
+            Action::Publish => {
+                publish::on_publish(&self.ctx, conn_id, &frame, &mut self.scratch);
+            }
+            Action::Ack | Action::Nack => {
+                system::on_ack(&self.ctx, conn_id, &frame);
+            }
+            // Everything else is cold path
+            _ => self.dispatch_cold(action, conn_id, &frame),
+        }
+    }
+
+    /// Cold path dispatch — subscriptions, management, system.
+    fn dispatch_cold(&self, action: Action, conn_id: ConnId, frame: &FrameView<'_>) {
+        let stream_id = frame.stream_id();
+        let env_seq = frame.envelope().env_seq.get();
+
+        match action {
+            Action::Subscribe => {
+                let view = arbitro_proto::wire::subscribe::SubscribeView::new(frame.body());
+                subscribe::on_subscribe(&self.ctx, conn_id, stream_id, env_seq, view.consumer_id());
+            }
+            Action::Unsubscribe => {
+                let view = arbitro_proto::wire::subscribe::UnsubscribeView::new(frame.body());
+                subscribe::on_unsubscribe(&self.ctx, conn_id, stream_id, env_seq, view.consumer_id());
+            }
+            Action::CreateStream => {
+                let view = arbitro_proto::wire::stream::CreateStreamView::new(frame.body());
+                let config = arbitro_proto::config::StreamConfig::new(view.name())
+                    .max_msgs(view.max_msgs())
+                    .max_bytes(view.max_bytes())
+                    .max_age_secs(view.max_age_secs())
+                    .replicas(view.replicas())
+                    .journal_kind(
+                        arbitro_proto::config::JournalKind::from_u8(view.journal_kind())
+                            .unwrap_or(arbitro_proto::config::JournalKind::Memory),
+                    )
+                    .retention(
+                        arbitro_proto::config::RetentionPolicy::from_u8(view.retention())
+                            .unwrap_or(arbitro_proto::config::RetentionPolicy::Limits),
+                    )
+                    .build();
+                management::on_create_stream(&self.ctx, conn_id, env_seq, config);
+            }
+            Action::DeleteStream => {
+                management::on_delete_stream(&self.ctx, conn_id, stream_id, env_seq);
+            }
+            Action::PurgeStream => {
+                management::on_purge_stream(&self.ctx, conn_id, stream_id, env_seq);
+            }
+            Action::DrainSubject => {
+                let view = arbitro_proto::wire::stream::DrainSubjectView::new(frame.body());
+                management::on_drain_subject(&self.ctx, conn_id, stream_id, env_seq, view.subject());
+            }
+            Action::Ping => {
+                system::on_ping(&self.ctx, conn_id, frame);
+            }
+            Action::Connect => {
+                let view = arbitro_proto::wire::system::ConnectView::new(frame.body());
+                system::on_connect(&self.ctx, conn_id, view.auth_token());
+            }
+            Action::Disconnect => {
+                system::on_disconnect(&self.ctx, conn_id);
+            }
+            // Server-to-client or not yet implemented
+            _ => {
+                reply::send_error(
+                    self.ctx.transport.as_ref(), conn_id, 0, env_seq, 0,
+                    ErrorCode::UnknownAction,
+                );
+            }
+        }
+    }
+}

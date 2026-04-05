@@ -43,6 +43,18 @@ pub enum StoreError {
 /// `&mut self` for writes, `&self` for reads.
 /// Single-threaded access guaranteed by the engine (one lock per stream).
 pub trait Store {
+    // ── Lifecycle ────────────────────────────────────────────────────
+
+    /// Initialize the store — open files, create dirs, recover state.
+    /// Called once before any reads/writes. Default: no-op.
+    fn init(&mut self) -> Result<(), StoreError> { Ok(()) }
+
+    /// Graceful shutdown — flush buffers, sync to disk, close handles.
+    /// Called once on engine shutdown. Default: no-op.
+    fn shutdown(&mut self) -> Result<(), StoreError> { Ok(()) }
+
+    // ── Hot path ────────────────────────────────────────────────────
+
     /// Append a single message. Returns the assigned sequence.
     fn append(&mut self, entry: EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError>;
 
@@ -55,6 +67,8 @@ pub trait Store {
 
     /// Read a range [start, end) of entries.
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry>, StoreError>;
+
+    // ── Management ──────────────────────────────────────────────────
 
     /// Delete all messages. Stream survives. Returns deleted count.
     fn purge(&mut self) -> u64;
