@@ -1,0 +1,8 @@
+[package]
+name = "arbitro-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arbitro-proto = { path = "../arbitro-proto" }

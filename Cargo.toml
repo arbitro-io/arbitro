@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members  = ["crates/arbitro-benches", "crates/arbitro-common", "crates/arbitro-proto", "crates/arbitro-store"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+zerocopy  = { version = "0.8", features = ["derive"] }
+bytes     = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[workspace.dependencies.tokio-uring]
+version = "0.5"

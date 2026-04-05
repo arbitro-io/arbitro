@@ -1,0 +1,25 @@
+[package]
+name = "arbitro-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+zerocopy = { workspace = true }
+bytes    = { workspace = true }
+
+[dev-dependencies]
+criterion   = { workspace = true }
+tokio-uring = { workspace = true }
+
+[[bench]]
+name    = "batch_vs_single"
+harness = false
+
+[[bench]]
+name    = "decode_cost"
+harness = false
+
+[[bench]]
+name    = "action_dispatch"
+harness = false
