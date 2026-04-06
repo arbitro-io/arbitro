@@ -117,10 +117,14 @@ fn bench_e2e(c: &mut Criterion) {
             group.sample_size(samples);
 
             group.bench_function(format!("{n}msg_64B"), |b| {
+                // Setup (OUTSIDE timing): fresh stream
+                rt.block_on(async {
+                    client.delete_stream(&sname).await.ok();
+                    client.create_stream(&scfg).await.expect("create");
+                });
+
                 b.iter(|| {
                     rt.block_on(async {
-                        client.delete_stream(&sname).await.ok();
-                        client.create_stream(&scfg).await.expect("create");
                         publish_n(&client, &sname, &entries, n).await;
                     });
                 });
@@ -148,15 +152,14 @@ fn bench_e2e(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         rt.block_on(async {
-                            // Setup (NOT timed): fresh stream + publish backlog
+                            // Setup (NOT timed): fresh stream + publish backlog + consumer
                             client.delete_stream(&sname).await.ok();
                             client.create_stream(&scfg).await.expect("create");
                             publish_n(&client, &sname, &entries, n).await;
-
-                            // Timed: subscribe + receive
                             let consumer = client.create_consumer(&ccfg).await.expect("consumer");
                             let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
+                            // Timed: receive only
                             let start = Instant::now();
                             receive_n(&mut sub, n).await;
                             total += start.elapsed();
@@ -195,11 +198,10 @@ fn bench_e2e(c: &mut Criterion) {
                             client.delete_stream(&sname).await.ok();
                             client.create_stream(&scfg).await.expect("create");
                             publish_n(&client, &sname, &entries, n).await;
-
-                            // Timed: subscribe + receive + ack
                             let consumer = client.create_consumer(&ccfg).await.expect("consumer");
                             let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
+                            // Timed: receive + ack
                             let start = Instant::now();
                             receive_and_ack_n(&mut sub, n).await;
                             total += start.elapsed();
@@ -231,11 +233,13 @@ fn bench_e2e(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         rt.block_on(async {
+                            // Setup (NOT timed)
                             client.delete_stream(&sname).await.ok();
                             client.create_stream(&scfg).await.expect("create");
                             let consumer = client.create_consumer(&ccfg).await.expect("consumer");
                             let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
+                            // Timed: publish + receive
                             let start = Instant::now();
                             publish_n(&client, &sname, &entries, n).await;
                             receive_n(&mut sub, n).await;
@@ -271,11 +275,13 @@ fn bench_e2e(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
                     for _ in 0..iters {
                         rt.block_on(async {
+                            // Setup (NOT timed)
                             client.delete_stream(&sname).await.ok();
                             client.create_stream(&scfg).await.expect("create");
                             let consumer = client.create_consumer(&ccfg).await.expect("consumer");
                             let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
+                            // Timed: publish + receive + ack
                             let start = Instant::now();
                             publish_n(&client, &sname, &entries, n).await;
                             receive_and_ack_n(&mut sub, n).await;

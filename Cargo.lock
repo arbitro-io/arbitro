@@ -66,6 +66,8 @@ dependencies = [
  "arbitro-proto",
  "arbitro-store",
  "bytes",
+ "parking_lot",
+ "tokio",
  "zerocopy",
 ]
 
@@ -73,6 +75,7 @@ dependencies = [
 name = "arbitro-proto"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "zerocopy",
 ]
 

@@ -10,6 +10,7 @@
 use core::sync::atomic::Ordering::Relaxed;
 
 use arbitro_proto::error::ErrorCode;
+use arbitro_proto::event::StreamEvent;
 use arbitro_proto::ids::ConnId;
 use arbitro_proto::wire::envelope::FrameView;
 use arbitro_proto::wire::publish::BatchIter;
@@ -93,6 +94,14 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
         // Signal drain task (non-blocking, O(1)).
         // Delivery is the drain task's job, NOT publish's.
         slot.signal.release();
+
+        // Emit broadcast event (non-blocking, O(1)).
+        // Listeners (monitors, loggers, etc.) process this asynchronously.
+        let _ = slot.event_tx.send(StreamEvent::MessagePublished {
+            stream_id,
+            first_seq,
+            count: entry_count as u16,
+        });
 
         Ok((first_seq, entry_count))
     });

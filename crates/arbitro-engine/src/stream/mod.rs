@@ -8,7 +8,11 @@
 //! can append + signal under a SINGLE shard lock (R19).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::RwLock;
+use tokio::sync::broadcast;
+
+use arbitro_proto::event::StreamEvent;
 
 use arbitro_proto::config::StreamConfig;
 use arbitro_store::{MemoryStore, Store, StoreInfo};
@@ -24,15 +28,18 @@ const SHARD_MASK: u32 = (SHARD_COUNT as u32) - 1;
 /// A single stream: config + journal store + drain + signal.
 pub struct StreamSlot {
     pub config: StreamConfig,
-    pub store: Box<dyn Store>,
+    pub store: Box<dyn Store + Send + Sync>,
     pub drain: ReactiveDrain,
     pub signal: Arc<dyn DrainSignal>,
+    /// Async event emitter for this stream.
+    pub event_tx: broadcast::Sender<StreamEvent>,
 }
 
 impl StreamSlot {
     pub fn new(config: StreamConfig, signal: Arc<dyn DrainSignal>) -> Self {
         let stream_id = config.stream_id;
-        let store: Box<dyn Store> = match config.journal_kind {
+        let (event_tx, _) = broadcast::channel(1024); // 1024 event buffer per stream
+        let store: Box<dyn Store + Send + Sync> = match config.journal_kind {
             arbitro_proto::config::JournalKind::Memory => Box::new(MemoryStore::new()),
             // Disk journals provided by arbitro-server via factory
             _ => Box::new(MemoryStore::new()),
@@ -42,6 +49,7 @@ impl StreamSlot {
             store,
             drain: ReactiveDrain::new(stream_id),
             signal,
+            event_tx,
         }
     }
 
@@ -62,8 +70,9 @@ impl Shard {
 }
 
 /// Sharded stream registry. Lock one shard at a time — no global lock.
+/// Uses RwLock to allow concurrent readers (Drains) during publish/append.
 pub struct StreamMap {
-    shards: Box<[Mutex<Shard>]>,
+    shards: Box<[RwLock<Shard>]>,
 }
 
 impl Default for StreamMap {
@@ -74,8 +83,8 @@ impl Default for StreamMap {
 
 impl StreamMap {
     pub fn new() -> Self {
-        let shards: Vec<Mutex<Shard>> = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(Shard::new()))
+        let shards: Vec<RwLock<Shard>> = (0..SHARD_COUNT)
+            .map(|_| RwLock::new(Shard::new()))
             .collect();
         Self { shards: shards.into_boxed_slice() }
     }
@@ -88,7 +97,7 @@ impl StreamMap {
     /// Insert a stream with a drain signal. Returns false if already exists.
     pub fn insert(&self, config: StreamConfig, signal: Arc<dyn DrainSignal>) -> bool {
         let id = config.stream_id;
-        let mut shard = self.shards[Self::shard_idx(id)].lock().unwrap();
+        let mut shard = self.shards[Self::shard_idx(id)].write();
         if shard.streams.contains_key(&id) {
             return false;
         }
@@ -98,7 +107,7 @@ impl StreamMap {
 
     /// Remove a stream. Returns the config if it existed.
     pub fn remove(&self, stream_id: u32) -> Option<StreamConfig> {
-        let mut shard = self.shards[Self::shard_idx(stream_id)].lock().unwrap();
+        let mut shard = self.shards[Self::shard_idx(stream_id)].write();
         shard.streams.remove(&stream_id).map(|s| s.config)
     }
 
@@ -109,7 +118,7 @@ impl StreamMap {
     where
         F: FnOnce(&mut StreamSlot) -> R,
     {
-        let mut shard = self.shards[Self::shard_idx(stream_id)].lock().unwrap();
+        let mut shard = self.shards[Self::shard_idx(stream_id)].write();
         shard.streams.get_mut(&stream_id).map(f)
     }
 
@@ -119,14 +128,14 @@ impl StreamMap {
     where
         F: FnOnce(&StreamSlot) -> R,
     {
-        let shard = self.shards[Self::shard_idx(stream_id)].lock().unwrap();
+        let shard = self.shards[Self::shard_idx(stream_id)].read();
         shard.streams.get(&stream_id).map(f)
     }
 
     /// Total number of streams across all shards.
     pub fn count(&self) -> usize {
         self.shards.iter()
-            .map(|s| s.lock().unwrap().streams.len())
+            .map(|s| s.read().streams.len())
             .sum()
     }
 
@@ -134,7 +143,7 @@ impl StreamMap {
     pub fn list_configs(&self) -> Vec<StreamConfig> {
         let mut out = Vec::new();
         for shard in self.shards.iter() {
-            let s = shard.lock().unwrap();
+            let s = shard.read();
             for slot in s.streams.values() {
                 out.push(slot.config.clone());
             }
