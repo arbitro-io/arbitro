@@ -8,9 +8,9 @@ Benchmarked on a single server instance (loopback TCP, 64B payload):
 
 | Workload | 1K msgs | 1M msgs |
 |----------|---------|---------|
-| Publish | 260us (3.8M/s) | 186ms (5.4M/s) |
-| Cycle fire-forget | 486us (2.1M/s) | 305ms (3.3M/s) |
-| Cycle explicit ack | 856us (1.2M/s) | 937ms (1.1M/s) |
+| Publish | 410us (2.4M/s) | 68ms (14.6M/s) |
+| Cycle fire-forget | 311us (3.2M/s) | 64ms (15.6M/s) |
+| Cycle explicit ack | 425us (2.35M/s) | 425ms (est.) (2.3M/s) |
 
 ## Architecture
 
