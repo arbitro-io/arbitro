@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// Server configuration.
 pub struct Config {
-    /// TCP listen address (default: "0.0.0.0:4222").
+    /// TCP listen address (default: "0.0.0.0:9898").
     pub listen_addr: String,
     /// Maximum concurrent connections (default: 10_000).
     pub max_connections: u32,
@@ -21,7 +21,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            listen_addr: env_or("ARBITRO_LISTEN", "0.0.0.0:4222"),
+            listen_addr: env_or("ARBITRO_LISTEN", "0.0.0.0:9898"),
             max_connections: env_parse("ARBITRO_MAX_CONNECTIONS", 10_000),
             write_buffer_cap: env_parse("ARBITRO_WRITE_BUFFER_CAP", 8192),
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
@@ -34,7 +34,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:4222".into(),
+            listen_addr: "0.0.0.0:9898".into(),
             max_connections: 10_000,
             write_buffer_cap: 8192,
             idle_timeout: Duration::from_secs(300),
