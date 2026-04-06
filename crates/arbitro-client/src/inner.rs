@@ -13,6 +13,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::delivery::{RepErrorAction, RepOkAction, RepBatchView};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
+use arbitro_common::subject_trie::SubjectTrie;
 
 use crate::error::ClientError;
 use crate::message::{AckCmd, Message};
@@ -54,6 +55,10 @@ pub(crate) struct Inner {
     /// (send fails silently) so stale ACKs are discarded automatically.
     pub(crate) ack_tx: Mutex<mpsc::Sender<AckCmd>>,
 
+    /// Precomputed Trie for O(M) fanout distribution.
+    /// Rebuilt on each membership change (cold path).
+    pub(crate) subject_trie: Mutex<SubjectTrie>,
+
     /// Request timeout.
     pub(crate) request_timeout: std::time::Duration,
 
@@ -73,9 +78,24 @@ impl Inner {
             pending: Mutex::new(HashMap::new()),
             next_seq: AtomicU32::new(1),
             subscriptions: Mutex::new(HashMap::new()),
+            subject_trie: Mutex::new(SubjectTrie::new()),
             ack_tx: Mutex::new(ack_tx),
             request_timeout,
             addr,
+        }
+    }
+
+    /// Update the SubjectTrie from the current subscriptions (Cold Path).
+    fn rebuild_trie(&self) {
+        let subs = self.subscriptions.lock().unwrap();
+        let mut trie = self.subject_trie.lock().unwrap();
+        trie.clear();
+        for (&id, sub) in subs.iter() {
+            if let Some(ref filter) = sub.filter {
+                trie.insert(filter, id as u32);
+            } else {
+                trie.insert(b">", id as u32); // No filter = match all
+            }
         }
     }
 
@@ -192,6 +212,7 @@ impl Inner {
             Some(Action::RepError) => self.on_rep_error(env.env_seq.get(), body),
             Some(Action::Deliver) => self.on_deliver(env.stream_id.get(), env.env_seq.get(), body),
             Some(Action::RepBatch) => self.on_rep_batch(env.stream_id.get(), body),
+            Some(Action::FanoutBatch) => self.on_fanout_batch(env.stream_id.get(), body),
             Some(Action::Ping) => self.on_ping(body),
             Some(Action::Connected) => { /* handled in connect handshake */ }
             _ => {
@@ -302,5 +323,50 @@ impl Inner {
             pong_body.copy_from_slice(&body[..8]);
         }
         self.send_no_reply(Action::Pong, 0, &pong_body);
+    }
+
+    /// FanoutBatch frame: Efficient O(M) distribution using the SubjectTrie.
+    fn on_fanout_batch(&self, stream_id: u32, body: &[u8]) {
+        let view = RepBatchView::new(body);
+        let consumer_id = view.consumer_id();
+        let subs = self.subscriptions.lock().unwrap();
+        let trie = self.subject_trie.lock().unwrap();
+        let ack_tx = self.ack_tx.lock().unwrap().clone();
+
+        for entry in view.entries() {
+            trie.find_matches(entry.subject, |sub_id| {
+                if let Some(sub) = subs.get(&(sub_id as u64)) {
+                    if sub.stream_id == stream_id && sub.consumer_id == consumer_id {
+                        let msg = Message {
+                            seq: entry.seq,
+                            subject: Box::from(entry.subject),
+                            payload: Bytes::copy_from_slice(entry.payload),
+                            consumer_id,
+                            stream_id,
+                            ack_tx: ack_tx.clone(),
+                        };
+                        let _ = sub.tx.try_send(msg);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Register a new local subscription.
+    pub(crate) fn add_subscription(&self, id: u64, sub: Subscription) {
+        {
+            let mut subs = self.subscriptions.lock().unwrap();
+            subs.insert(id, sub);
+        }
+        self.rebuild_trie();
+    }
+
+    /// Remove a local subscription.
+    pub(crate) fn remove_subscription(&self, id: u64) {
+        {
+            let mut subs = self.subscriptions.lock().unwrap();
+            subs.remove(&id);
+        }
+        self.rebuild_trie();
     }
 }

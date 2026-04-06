@@ -13,6 +13,8 @@ arbitro-engine = { path = "../arbitro-engine" }
 arbitro-store  = { path = "../arbitro-store" }
 arbitro-server = { path = "../arbitro-server" }
 arbitro-client = { path = "../arbitro-client" }
+arbitro-common = { path = "../arbitro-common" }
+
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -50,4 +52,12 @@ harness = false
 
 [[bench]]
 name    = "subject_limits"
+harness = false
+
+[[bench]]
+name    = "subject_match_scaling"
+harness = false
+
+[[bench]]
+name    = "fanout_scale"
 harness = false

@@ -28,6 +28,7 @@ name = "arbitro-benches"
 version = "0.1.0"
 dependencies = [
  "arbitro-client",
+ "arbitro-common",
  "arbitro-engine",
  "arbitro-proto",
  "arbitro-server",

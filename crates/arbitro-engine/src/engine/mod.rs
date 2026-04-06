@@ -183,7 +183,7 @@ impl Engine {
                 // Fetch via shard lock — no global drains Mutex
                 let fetched = self.ctx.streams.with_mut(stream_id, |slot| {
                     let now_ts = publish::current_timestamp();
-                    slot.drain.fetch(consumer_id, max_msgs, &*slot.store, self.ctx.transport.as_ref(), now_ts)
+                    slot.drain.fetch(consumer_id, max_msgs, &*slot.store, self.ctx.transport.as_ref(), now_ts, conn_id)
                 }).unwrap_or(0);
                 reply::send_ok(self.ctx.transport.as_ref(), conn_id, stream_id, env_seq, fetched as u64);
             }

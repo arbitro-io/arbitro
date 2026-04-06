@@ -38,3 +38,18 @@ impl SubscriptionHandle {
         self.rx.recv().await
     }
 }
+
+/// Handle for callback-based subscriptions.
+/// Aborts the background task and removes the subscription on drop.
+pub struct CallbackHandle {
+    pub(crate) _handle: tokio::task::JoinHandle<()>,
+    pub(crate) inner: std::sync::Arc<crate::inner::Inner>,
+    pub(crate) sub_id: u64,
+}
+
+impl Drop for CallbackHandle {
+    fn drop(&mut self) {
+        self._handle.abort();
+        self.inner.remove_subscription(self.sub_id);
+    }
+}

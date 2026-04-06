@@ -15,6 +15,7 @@ pub enum Action {
     RepError      = 0x0204,
     RepBatch      = 0x0205,
     BatchAck      = 0x0206,
+    FanoutBatch   = 0x0207,
 
     // 0x03xx — Subscription
     Subscribe     = 0x0301,
@@ -61,6 +62,7 @@ impl Action {
             0x0204 => Some(Self::RepError),
             0x0205 => Some(Self::RepBatch),
             0x0206 => Some(Self::BatchAck),
+            0x0207 => Some(Self::FanoutBatch),
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),

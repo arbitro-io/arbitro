@@ -55,7 +55,6 @@ pub fn send_error(transport: &dyn Transport, conn_id: ConnId, stream_id: u32, en
 /// Send a RepOk envelope + variable-length body. Cold path only.
 /// Used for info/query responses (GetStream, ListStreams, etc.).
 pub fn send_data(transport: &dyn Transport, conn_id: ConnId, action: Action, stream_id: u32, env_seq: u32, body: &[u8]) {
-    use arbitro_proto::wire::envelope::ENVELOPE_SIZE;
 
     let envelope = Envelope {
         action: U16::new(action.as_u16()),

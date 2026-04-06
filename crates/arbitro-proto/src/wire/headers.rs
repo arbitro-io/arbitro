@@ -4,7 +4,7 @@
 //! memory-contiguous block, allowing for O(1) serialization and
 //! better cache locality during frame construction.
 
-use zerocopy::byteorder::little_endian::{U16, U32};
+use zerocopy::byteorder::little_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wire::envelope::Envelope;

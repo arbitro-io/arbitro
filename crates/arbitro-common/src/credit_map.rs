@@ -18,6 +18,7 @@ use crate::subject::subject_matches;
 struct InFlightRing {
     seqs:   Box<[AtomicU64]>,
     groups: Box<[AtomicU8]>,
+    conns:  Box<[AtomicU64]>, // Tracks ConnId per sequence
     mask:   usize,
 }
 
@@ -27,14 +28,16 @@ impl InFlightRing {
         Self {
             seqs:   (0..cap).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice(),
             groups: (0..cap).map(|_| AtomicU8::new(0)).collect::<Vec<_>>().into_boxed_slice(),
+            conns:  (0..cap).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice(),
             mask:   cap - 1,
         }
     }
 
     #[inline]
-    fn insert(&self, seq: u64, idx: u8) {
+    fn insert(&self, seq: u64, idx: u8, conn_id: u64) {
         let s = (seq as usize) & self.mask;
         self.groups[s].store(idx, Ordering::Relaxed);
+        self.conns[s].store(conn_id, Ordering::Relaxed);
         self.seqs[s].store(seq, Ordering::Release);
     }
 
@@ -124,11 +127,7 @@ impl CreditMap {
         }
     }
 
-    /// Acquire one credit for `subject` + record `seq` in ring.
-    /// Returns `true` on success, `false` if at limit.
-    /// Unmatched subjects always succeed (no limit applies).
-    #[inline]
-    pub fn try_acquire(&self, subject: &[u8], seq: u64) -> bool {
+    pub fn try_acquire(&self, subject: &[u8], seq: u64, conn_id: u64) -> bool {
         let Some(idx) = self.find_slot(subject) else { return true };
         let slot = &self.slots[idx];
         let ok = slot.pending
@@ -137,9 +136,28 @@ impl CreditMap {
             })
             .is_ok();
         if ok {
-            self.in_flight.insert(seq, idx as u8);
+            self.in_flight.insert(seq, idx as u8, conn_id);
         }
         ok
+    }
+
+    /// Scavenge credit for all sequences owned by `conn_id`.
+    /// Used when a client disconnects without ACKing.
+    /// Returns a list of rescued sequences (to be moved to nacked queue).
+    pub fn scavenge(&self, conn_id: u64) -> Vec<u64> {
+        let mut rescued = Vec::new();
+        for s in 0..=self.in_flight.mask {
+            let actual_conn = self.in_flight.conns[s].load(Ordering::Relaxed);
+            if actual_conn == conn_id {
+                let seq = self.in_flight.seqs[s].swap(0, Ordering::AcqRel);
+                if seq != 0 {
+                    let slot_idx = self.in_flight.groups[s].load(Ordering::Relaxed);
+                    self.slots[slot_idx as usize].pending.fetch_sub(1, Ordering::AcqRel);
+                    rescued.push(seq);
+                }
+            }
+        }
+        rescued
     }
 
     /// Release credit for `seq`. O(1): ring lookup → fetch_sub.
@@ -183,21 +201,21 @@ mod tests {
     fn acquire_blocks_at_limit() {
         let cm = CreditMap::new(&rules(), 128);
         for seq in 1..=5u64 {
-            assert!(cm.try_acquire(b"orders.created", seq));
+            assert!(cm.try_acquire(b"orders.created", seq, 42));
         }
-        assert!(!cm.try_acquire(b"orders.created", 6));
-        assert!(cm.try_acquire(b"orders.updated", 7));
+        assert!(!cm.try_acquire(b"orders.created", 6, 42));
+        assert!(cm.try_acquire(b"orders.updated", 7, 42));
     }
 
     #[test]
     fn release_restores_credit() {
         let cm = CreditMap::new(&rules(), 128);
         for seq in 1..=5u64 {
-            assert!(cm.try_acquire(b"orders.created", seq));
+            assert!(cm.try_acquire(b"orders.created", seq, 42));
         }
-        assert!(!cm.try_acquire(b"orders.created", 6));
+        assert!(!cm.try_acquire(b"orders.created", 6, 42));
         cm.release(3);
-        assert!(cm.try_acquire(b"orders.created", 7));
+        assert!(cm.try_acquire(b"orders.created", 7, 42));
     }
 
     #[test]
@@ -211,7 +229,7 @@ mod tests {
     fn ring_no_collision_within_window() {
         let ring = InFlightRing::new(64);
         for seq in 1..=64u64 {
-            ring.insert(seq, (seq % 4) as u8);
+            ring.insert(seq, (seq % 4) as u8, 42);
         }
         for seq in 1..=64u64 {
             assert_eq!(ring.remove(seq), Some((seq % 4) as u8));

@@ -60,8 +60,6 @@ impl Consumer {
         // so Deliver frames can arrive before RepOk. The subscription must already
         // exist to receive them.
         let sub_id = self.next_sub_id.fetch_add(1, Relaxed);
-        // Large buffer to avoid drops under burst. Real back-pressure (async send)
-        // requires making on_frame async — tracked as future improvement.
         let (tx, rx) = mpsc::channel(1_048_576);
 
         let subscription = Subscription {
@@ -72,10 +70,7 @@ impl Consumer {
             subscribe_body: Bytes::copy_from_slice(&body),
         };
 
-        {
-            let mut subs = self.inner.subscriptions.lock().unwrap();
-            subs.insert(sub_id, subscription);
-        }
+        self.inner.add_subscription(sub_id, subscription);
 
         // Now send Subscribe to server — backlog Deliver frames will find the local sub.
         if let Err(e) = self
@@ -84,12 +79,39 @@ impl Consumer {
             .await
         {
             // Cleanup on failure
-            let mut subs = self.inner.subscriptions.lock().unwrap();
-            subs.remove(&sub_id);
+            self.inner.remove_subscription(sub_id);
             return Err(e);
         }
 
         Ok(SubscriptionHandle { rx, _id: sub_id })
+    }
+
+    /// Push mode — subscribe with filter and a callback.
+    /// The callback runs in a background task.
+    /// Returns a CallbackHandle that manages the subscription lifetime.
+    pub async fn subscribe_callback<F>(
+        &self,
+        filter: Option<&[u8]>,
+        callback: F,
+    ) -> Result<crate::subscription::CallbackHandle, ClientError>
+    where
+        F: Fn(Message) + Send + 'static,
+    {
+        let mut handle = self.subscribe(filter).await?;
+        let sub_id = handle._id;
+        let inner = self.inner.clone();
+
+        let _handle = tokio::spawn(async move {
+            while let Some(msg) = handle.next().await {
+                callback(msg);
+            }
+        });
+
+        Ok(crate::subscription::CallbackHandle {
+            _handle,
+            inner,
+            sub_id,
+        })
     }
 
     /// Pull mode — fetch up to N messages from the server.

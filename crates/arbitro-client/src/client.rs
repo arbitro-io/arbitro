@@ -18,6 +18,7 @@ use crate::error::ClientError;
 use crate::inner::{ConnState, Inner};
 
 /// Client for the arbitro message broker.
+#[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,
 }

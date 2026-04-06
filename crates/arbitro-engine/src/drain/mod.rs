@@ -110,8 +110,17 @@ impl ReactiveDrain {
 
     /// Unbind all consumers from a given connection (disconnect cleanup).
     pub fn unbind_conn(&mut self, conn_id: ConnId) {
-        for c in self.consumers.values_mut() {
-            c.remove_conn(conn_id);
+        for consumer in self.consumers.values_mut() {
+            if let Some(ref cm) = consumer.credit_map {
+                let rescued = cm.scavenge(conn_id);
+                for seq in rescued {
+                    consumer.nacked.push_back(seq);
+                    if consumer.pending_count > 0 {
+                        consumer.pending_count -= 1;
+                    }
+                }
+            }
+            consumer.remove_conn(conn_id);
         }
     }
 
@@ -186,8 +195,9 @@ impl ReactiveDrain {
             frame_buf.extend_from_slice(&[0u8; HEADER_SIZE]);
 
             // 1. Process Nacked/Deferred first (Individual lookups)
-            // (Keeping it simple for these non-contiguous entries)
-            process_priority_entries(store, consumer, BATCH_SIZE, &mut delivered_count, frame_buf);
+            // (Pass first conn_id as representative owner for the batch)
+            let batch_conn_id = consumer.subscriptions[0].conn_id;
+            process_priority_entries(store, consumer, BATCH_SIZE, &mut delivered_count, frame_buf, batch_conn_id);
 
             // 2. Continuous Read (Single-Pass for_each)
             if delivered_count < BATCH_SIZE as u16
@@ -217,11 +227,16 @@ impl ReactiveDrain {
                         consumer.deliver_seq = entry.seq + 1;
 
                         if consumer.matches(entry.subject) {
-                            if is_none_policy || consumer.try_acquire(entry.seq, entry.subject) {
+                            // Assign ownership to current subscription in Queue mode, or first for Fanout batching.
+                            let conn_id = if is_queue && sub_count > 1 {
+                                consumer.subscriptions[*queue_idx % sub_count].conn_id
+                            } else {
+                                consumer.subscriptions[0].conn_id
+                            };
+
+                            if is_none_policy || consumer.try_acquire(entry.seq, entry.subject, conn_id) {
                                 if is_queue && sub_count > 1 {
-                                    // Queue with multiple subs: send immediately to balance load
-                                    let conn_id =
-                                        consumer.subscriptions[*queue_idx % sub_count].conn_id;
+                                    // Queue with multiple subs: already picked conn_id above
                                     *queue_idx = queue_idx.wrapping_add(1);
                                     send_entry(conn_id, entry, stream_id, transport);
                                 } else {
@@ -254,11 +269,16 @@ impl ReactiveDrain {
             };
 
             if batched_in_buf > 0 {
+                let action = match consumer.config.deliver_mode {
+                    DeliverMode::Fanout => Action::FanoutBatch,
+                    _ => Action::RepBatch,
+                };
                 finalize_batch_frame(
                     frame_buf,
                     consumer.config.consumer_id,
                     batched_in_buf,
                     stream_id,
+                    action,
                 );
                 let frame = frame_buf.split().freeze();
                 dispatch_frame(consumer, &mut self.queue_idx, frame, transport);
@@ -276,6 +296,7 @@ impl ReactiveDrain {
         store: &dyn Store,
         transport: &dyn Transport,
         now_ts: u64,
+        conn_id: u64,
     ) -> u32 {
         let consumer = match self.consumers.get_mut(&consumer_id) {
             Some(c) => c,
@@ -294,6 +315,7 @@ impl ReactiveDrain {
             now_ts,
             max_msgs as usize,
             &mut seqs,
+            conn_id,
         );
 
         let stream_id = self.stream_id;
@@ -339,6 +361,7 @@ fn process_priority_entries(
     batch_size: usize,
     delivered_count: &mut u16,
     buf: &mut BytesMut,
+    conn_id: u64,
 ) {
     let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
 
@@ -351,7 +374,7 @@ fn process_priority_entries(
         let mut delivered = false;
         let found = store
             .get(seq, &mut |entry| {
-                if is_none_policy || consumer.try_acquire(seq, entry.subject) {
+                if is_none_policy || consumer.try_acquire(seq, entry.subject, conn_id) {
                     write_entry_to_buf(entry, buf);
                     *delivered_count += 1;
                     delivered = true;
@@ -366,26 +389,26 @@ fn process_priority_entries(
     }
 
     // 2. Deferred
-    let mut i = 0;
-    while i < consumer.deferred.len() && (*delivered_count as usize) < batch_size {
-        if !consumer.has_global_credit() {
+    let num_deferred = consumer.deferred.len();
+    for _ in 0..num_deferred {
+        if (*delivered_count as usize) >= batch_size || !consumer.has_global_credit() {
             break;
         }
-        let seq = consumer.deferred[i];
+
+        let seq = consumer.deferred.pop_front().unwrap();
         let mut resolved = false;
-        let found = store
-            .get(seq, &mut |entry| {
-                if consumer.try_acquire(seq, entry.subject) {
-                    write_entry_to_buf(entry, buf);
-                    *delivered_count += 1;
-                    resolved = true;
-                }
-            })
-            .unwrap_or(false);
-        if resolved || !found {
-            consumer.deferred.remove(i);
-        } else {
-            i += 1;
+
+        let found = store.get(seq, &mut |entry| {
+            if consumer.try_acquire(seq, entry.subject, conn_id) {
+                write_entry_to_buf(entry, buf);
+                *delivered_count += 1;
+                resolved = true;
+            }
+        }).unwrap_or(false);
+
+        // Re-buffer if message exists but still blocked by subject credit
+        if !resolved && found {
+            consumer.deferred.push_back(seq);
         }
     }
 }
@@ -403,11 +426,17 @@ fn write_entry_to_buf(entry: &Entry<'_>, buf: &mut BytesMut) {
 }
 
 #[inline]
-fn finalize_batch_frame(buf: &mut BytesMut, consumer_id: u32, count: u16, stream_id: u32) {
+fn finalize_batch_frame(
+    buf: &mut BytesMut,
+    consumer_id: u32,
+    count: u16,
+    stream_id: u32,
+    action: Action,
+) {
     let msg_len = (buf.len() - ENVELOPE_SIZE) as u32;
     let header = DeliverBatchHeader {
         env: Envelope {
-            action: U16::new(Action::RepBatch.as_u16()),
+            action: U16::new(action.as_u16()),
             flags: 0,
             _rsv: 0,
             stream_id: U32::new(stream_id),
@@ -432,8 +461,25 @@ fn dispatch_frame(
 ) {
     match consumer.config.deliver_mode {
         DeliverMode::Fanout => {
+            // Deduplicate by ConnId to avoid redundant bytes on the same socket
+            let mut sent_conns = [0u64; 16];
+            let mut sent_count = 0;
+
             for sub in &consumer.subscriptions {
-                transport.send_bytes(sub.conn_id, frame.clone());
+                let mut found = false;
+                for i in 0..sent_count {
+                    if sent_conns[i] == sub.conn_id {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    transport.send_bytes(sub.conn_id, frame.clone());
+                    if sent_count < 16 {
+                        sent_conns[sent_count] = sub.conn_id;
+                        sent_count += 1;
+                    }
+                }
             }
         }
         DeliverMode::Queue => {
@@ -454,6 +500,7 @@ fn get_next_messages(
     _now_ts: u64,
     batch_size: usize,
     seqs: &mut Vec<u64>,
+    conn_id: u64,
 ) {
     let info = store.info();
     let head = info.last_seq + 1;
@@ -467,7 +514,7 @@ fn get_next_messages(
         let mut delivered = false;
         let found = store
             .get(seq, &mut |entry| {
-                if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
+                if is_none_policy || consumer.try_acquire(seq, &entry.subject, conn_id) {
                     seqs.push(seq);
                     delivered = true;
                 }
@@ -489,7 +536,7 @@ fn get_next_messages(
         let mut resolved = false;
         let found = store
             .get(seq, &mut |entry| {
-                if consumer.try_acquire(seq, &entry.subject) {
+                if consumer.try_acquire(seq, &entry.subject, conn_id) {
                     seqs.push(seq);
                     resolved = true;
                 }
@@ -513,7 +560,7 @@ fn get_next_messages(
                 if !consumer.matches(entry.subject) {
                     return;
                 }
-                if is_none_policy || consumer.try_acquire(seq, entry.subject) {
+                if is_none_policy || consumer.try_acquire(seq, entry.subject, conn_id) {
                     seqs.push(seq);
                 } else if consumer.has_global_credit() {
                     consumer.deferred.push_back(seq);
@@ -550,7 +597,7 @@ fn send_entry(conn_id: ConnId, entry: &Entry<'_>, stream_id: u32, transport: &dy
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbitro_proto::config::{AckPolicy, ConsumerConfig};
+    use arbitro_proto::config::{AckPolicy, ConsumerConfig, SubjectLimit};
     use arbitro_store::{EntryRef, MemoryStore};
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
@@ -873,7 +920,7 @@ mod tests {
             100,
         );
 
-        let fetched = drain.fetch(1, 3, &store, &transport, 0);
+        let fetched = drain.fetch(1, 3, &store, &transport, 0, 100);
         assert_eq!(fetched, 3);
         assert_eq!(transport.sent(), 3);
     }
@@ -891,7 +938,7 @@ mod tests {
             100,
         );
 
-        let fetched = drain.fetch(1, 10, &store, &transport, 0);
+        let fetched = drain.fetch(1, 10, &store, &transport, 0, 100);
         assert_eq!(fetched, 2);
     }
 
@@ -995,5 +1042,50 @@ mod tests {
         // c2 delivers its backlog (3 as one batch), c1 has nothing new
         drain.deliver_cycle(&store, &transport, 0);
         assert_eq!(transport.sent(), 2); // 1 + 1 batch sends
+    }
+
+    #[test]
+    fn unbind_recovers_credits() {
+        let transport = CountTransport::new();
+        let store = make_store_with_entries(10);
+        let mut drain = ReactiveDrain::new(1);
+        let conn_id = 12345u64;
+
+        // 1. Add consumer with strict limit (max_inflight = 2)
+        let mut cfg = consumer_cfg(b"c1", 1, DeliverMode::Queue);
+        cfg.max_inflight = 2;
+        cfg.ack_policy = AckPolicy::Explicit;
+        // MUST add a limit rule for scavenging to work (it tracks sequence -> conn_id in the Ring)
+        cfg.subject_limits = vec![SubjectLimit { pattern: b"orders.>".to_vec().into_boxed_slice(), limit: 10 }].into_boxed_slice();
+        add_and_bind(&mut drain, cfg, 0, conn_id);
+
+        // 2. First cycle delivers 2 messages (hits limit)
+        drain.deliver_cycle(&store, &transport, 0);
+        assert_eq!(transport.sent(), 1, "Should have sent 1 batch");
+        {
+            let c = drain.find_consumer(1).unwrap();
+            assert_eq!(c.pending_count, 2, "Pending count should be 2 after delivery");
+        }
+
+        // 3. Second cycle should do nothing (no credit)
+        drain.deliver_cycle(&store, &transport, 0);
+        assert_eq!(transport.sent(), 1, "Should not have sent a second batch"); 
+
+        // 4. Disconnect client
+        drain.unbind_conn(conn_id);
+        
+        {
+            let c = drain.find_consumer(1).unwrap();
+            assert_eq!(c.pending_count, 0, "Pending count should be 0 after scavenger runs");
+            assert_eq!(c.nacked.len(), 2, "Should have rescued 2 messages"); 
+        }
+
+        // 5. Re-bind the connection so messages can be delivered again
+        drain.bind(1, conn_id);
+
+        // 6. Next cycle should deliver them again (since credits were recovered)
+        let prog = drain.deliver_cycle(&store, &transport, 0);
+        assert!(prog, "Should have made progress after recovery");
+        assert_eq!(transport.sent(), 2, "Should have delivered a new batch after recovery");
     }
 }

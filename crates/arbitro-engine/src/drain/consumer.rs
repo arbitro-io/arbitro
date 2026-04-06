@@ -34,16 +34,18 @@ pub struct Consumer {
 
 impl Consumer {
     pub fn new(config: ConsumerConfig, start_seq: Sequence) -> Self {
-        let credit_map = if config.ack_policy == AckPolicy::Explicit
-            && !config.subject_limits.is_empty()
-        {
-            Some(CreditMap::from_limits(&config.subject_limits, config.max_inflight as u32))
-        } else {
-            None
-        };
+        let credit_map =
+            if config.ack_policy == AckPolicy::Explicit && !config.subject_limits.is_empty() {
+                Some(CreditMap::from_limits(
+                    &config.subject_limits,
+                    config.max_inflight as u32,
+                ))
+            } else {
+                None
+            };
 
-        let matches_all = config.filters.is_empty()
-            || config.filters.iter().any(|f| f.as_ref() == b">");
+        let matches_all =
+            config.filters.is_empty() || config.filters.iter().any(|f| f.as_ref() == b">");
 
         Self {
             config,
@@ -73,7 +75,12 @@ impl Consumer {
     /// Does this consumer's filters match the given subject?
     #[inline]
     pub fn matches(&self, subject: &[u8]) -> bool {
-        self.matches_all || self.config.filters.iter().any(|f| subject_matches(f, subject))
+        self.matches_all
+            || self
+                .config
+                .filters
+                .iter()
+                .any(|f| subject_matches(f, subject))
     }
 
     /// Is this consumer connected and ready to receive?
@@ -105,15 +112,15 @@ impl Consumer {
 
     /// Acquire credit for delivery. Returns false if no credit available.
     #[inline]
-    pub fn try_acquire(&mut self, seq: Sequence, subject: &[u8]) -> bool {
+    pub fn try_acquire(&mut self, seq: Sequence, subject: &[u8], conn_id: u64) -> bool {
         if self.config.ack_policy == AckPolicy::None {
             return true;
         }
         if self.config.max_inflight > 0 && self.pending_count >= self.config.max_inflight as u32 {
             return false;
         }
-        if let Some(ref mut cm) = self.credit_map {
-            if !cm.try_acquire(subject, seq) {
+        if let Some(ref mut mut_cm) = self.credit_map {
+            if !mut_cm.try_acquire(subject, seq, conn_id) {
                 return false;
             }
         }
@@ -197,12 +204,12 @@ mod tests {
         let mut c = explicit_consumer(b"c1", b"ORDERS");
         c.config.max_inflight = 2;
 
-        assert!(c.try_acquire(1, b"orders.created"));
-        assert!(c.try_acquire(2, b"orders.created"));
-        assert!(!c.try_acquire(3, b"orders.created")); // at limit
+        assert!(c.try_acquire(1, b"orders.created", 42));
+        assert!(c.try_acquire(2, b"orders.created", 42));
+        assert!(!c.try_acquire(3, b"orders.created", 42)); // at limit
 
         c.release(1);
-        assert!(c.try_acquire(3, b"orders.created")); // credit restored
+        assert!(c.try_acquire(3, b"orders.created", 42)); // credit restored
     }
 
     #[test]

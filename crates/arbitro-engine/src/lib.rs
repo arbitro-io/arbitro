@@ -67,7 +67,7 @@ impl EngineBuilder {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use arbitro_proto::action::Action;
     use arbitro_proto::config::StreamConfig;
