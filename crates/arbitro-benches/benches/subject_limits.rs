@@ -67,12 +67,14 @@ fn bench_subject_limits(c: &mut Criterion) {
         let sname = b"bench_limits".to_vec();
         let scfg = StreamConfig::new(&sname).build();
 
-        // Native Subject Limit Option: limits "throttle.>" to 10 in-flight messages.
+        // 3 distinct rules to validate independent credit slots per subject.
         let ccfg = ConsumerConfig::new(b"c1", &sname)
             .filter(b">")
             .ack_policy(AckPolicy::Explicit)
-            .max_inflight(10000) // Huge global credit
-            .subject_limit(b"throttle.>", 10) // Tiny subject limit!
+            .max_inflight(10000)         // Huge global credit
+            .subject_limit(b"orders.>",  5)   // Rule A: tight
+            .subject_limit(b"events.>",  10)  // Rule B: medium
+            .subject_limit(b"alerts.>",  20)  // Rule C: loose
             .build();
 
         let mut group = c.benchmark_group("subject_limits_deferred");
@@ -81,10 +83,15 @@ fn bench_subject_limits(c: &mut Criterion) {
         group.measurement_time(Duration::from_secs(5));
 
         group.bench_function(BenchmarkId::new("throttle_overhead", msg_count), |b| {
-            // Pre-create subjects to blast the deferred queue
+            // Mix of all three subject families to hit each credit slot.
             let mut entries = Vec::with_capacity(msg_count as usize);
-            for _ in 0..msg_count {
-                entries.push((b"throttle.1".as_slice(), payload.as_slice()));
+            for i in 0..msg_count {
+                let subj: &[u8] = match i % 3 {
+                    0 => b"orders.new",
+                    1 => b"events.click",
+                    _ => b"alerts.sev1",
+                };
+                entries.push((subj, payload.as_slice()));
             }
 
             b.iter_custom(|iters| {
@@ -100,21 +107,36 @@ fn bench_subject_limits(c: &mut Criterion) {
                             .expect("create consumer");
                         let mut sub = consumer.subscribe(None).await.expect("subscribe");
 
-                        // --- STRICT LIMIT VALIDATION (Runs once per iter before timing) ---
-                        // Publish 50 messages to hit the limit ceiling directly.
-                        let test_entries: Vec<_> = (0..50).map(|_| (b"throttle.1".as_slice(), payload.as_slice())).collect();
-                        client.publish_batch(&sname, &test_entries).await.expect("pub test");
-                        
-                        // We should receive EXACTLY 10 messages (the limit) without timeouts.
-                        for _ in 0..10 {
-                            let _msg = tokio::time::timeout(Duration::from_secs(1), sub.next())
-                                .await.expect("timeout waiting for allowed msgs").expect("stream closed");
-                            // DO NOT ACK YET
+                        // --- STRICT LIMIT VALIDATION per rule ---
+                        // Rule A: orders.> limit = 5
+                        let a_entries: Vec<_> = (0..30).map(|_| (b"orders.new".as_slice(), payload.as_slice())).collect();
+                        client.publish_batch(&sname, &a_entries).await.expect("pub orders");
+                        for _ in 0..5 {
+                            let _m = tokio::time::timeout(Duration::from_secs(1), sub.next()).await
+                                .expect("orders msg timeout").expect("stream closed");
                         }
-                        
-                        // The 11th message MUST timeout because the server is successfully enforcing the limit of 10.
-                        let eleventh = tokio::time::timeout(Duration::from_millis(50), sub.next()).await;
-                        assert!(eleventh.is_err(), "SECURITY/LIMIT BREACH: Received an 11th message without acking the first 10!");
+                        let over_a = tokio::time::timeout(Duration::from_millis(50), sub.next()).await;
+                        assert!(over_a.is_err(), "LIMIT BREACH orders.> (limit=5): received 6th message without ack!");
+
+                        // Rule B: events.> limit = 10
+                        let b_entries: Vec<_> = (0..30).map(|_| (b"events.click".as_slice(), payload.as_slice())).collect();
+                        client.publish_batch(&sname, &b_entries).await.expect("pub events");
+                        for _ in 0..10 {
+                            let _m = tokio::time::timeout(Duration::from_secs(1), sub.next()).await
+                                .expect("events msg timeout").expect("stream closed");
+                        }
+                        let over_b = tokio::time::timeout(Duration::from_millis(50), sub.next()).await;
+                        assert!(over_b.is_err(), "LIMIT BREACH events.> (limit=10): received 11th message without ack!");
+
+                        // Rule C: alerts.> limit = 20
+                        let c_entries: Vec<_> = (0..50).map(|_| (b"alerts.sev1".as_slice(), payload.as_slice())).collect();
+                        client.publish_batch(&sname, &c_entries).await.expect("pub alerts");
+                        for _ in 0..20 {
+                            let _m = tokio::time::timeout(Duration::from_secs(1), sub.next()).await
+                                .expect("alerts msg timeout").expect("stream closed");
+                        }
+                        let over_c = tokio::time::timeout(Duration::from_millis(50), sub.next()).await;
+                        assert!(over_c.is_err(), "LIMIT BREACH alerts.> (limit=20): received 21st message without ack!");
 
                         // Purge the queue by dropping sub/consumer
                         drop(sub);

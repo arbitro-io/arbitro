@@ -125,6 +125,14 @@ impl Client {
         body.extend_from_slice(&config.name);
         body.extend_from_slice(subject);
 
+        // Variable trailer: [2 num_limits] + per limit: [4 limit][2 pattern_len][pattern]
+        body.extend_from_slice(&(config.subject_limits.len() as u16).to_le_bytes());
+        for sl in config.subject_limits.iter() {
+            body.extend_from_slice(&sl.limit.to_le_bytes());
+            body.extend_from_slice(&(sl.pattern.len() as u16).to_le_bytes());
+            body.extend_from_slice(&sl.pattern);
+        }
+
         let consumer_id = self.inner.request(Action::CreateConsumer, stream_id, &body).await? as u32;
 
         Ok(Consumer::new(self.inner.clone(), consumer_id, stream_id))

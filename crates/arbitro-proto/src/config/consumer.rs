@@ -65,6 +65,7 @@ impl ConsumerConfig {
         deliver_mode: u8,
         ack_wait_ms: u32,
         start_seq: u64,
+        subject_limits: Box<[SubjectLimit]>,
     ) -> ConsumerConfig {
         ConsumerConfig {
             name: Box::from(name),
@@ -75,7 +76,7 @@ impl ConsumerConfig {
             } else {
                 Box::from([Box::from(subject)])
             },
-            subject_limits: Box::from([]),
+            subject_limits,
             max_inflight,
             ack_policy: AckPolicy::from_u8(ack_policy).unwrap_or(AckPolicy::None),
             deliver_policy: DeliverPolicy::from_u8(deliver_policy).unwrap_or(DeliverPolicy::All),

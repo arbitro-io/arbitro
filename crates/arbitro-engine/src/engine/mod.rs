@@ -144,6 +144,13 @@ impl Engine {
             }
             Action::CreateConsumer => {
                 let view = arbitro_proto::wire::manager::CreateConsumerView::new(frame.body());
+                let subject_limits: Vec<arbitro_proto::config::SubjectLimit> = view
+                    .limits()
+                    .map(|(pattern, limit)| arbitro_proto::config::SubjectLimit {
+                        pattern: Box::from(pattern),
+                        limit,
+                    })
+                    .collect();
                 let config = arbitro_proto::config::ConsumerConfig::from_wire(
                     view.stream_id(),
                     view.name(),
@@ -154,6 +161,7 @@ impl Engine {
                     view.deliver_mode(),
                     view.ack_wait_ms(),
                     view.start_seq(),
+                    subject_limits.into_boxed_slice(),
                 );
                 subscribe::on_create_consumer(&self.ctx, conn_id, stream_id, env_seq, config);
             }

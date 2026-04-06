@@ -111,6 +111,50 @@ impl<'a> CreateConsumerView<'a> {
         let start = CREATE_CONSUMER_FIXED_SIZE + nl;
         &self.buf[start..start + sl]
     }
+
+    /// Iterator over (pattern, limit) pairs from the variable trailer.
+    /// Trailer format: [2 num_limits] then per limit: [4 limit][2 pattern_len][pattern bytes]
+    /// Returns an empty iterator when num_limits == 0 (backward compat).
+    pub fn limits(&self) -> LimitsIter<'a> {
+        let nl = self.fixed().name_len.get() as usize;
+        let sl = self.fixed().subj_len.get() as usize;
+        let trailer_start = CREATE_CONSUMER_FIXED_SIZE + nl + sl;
+        if self.buf.len() < trailer_start + 2 {
+            return LimitsIter { buf: &[], remaining: 0, pos: 0 };
+        }
+        let num = u16::from_le_bytes([self.buf[trailer_start], self.buf[trailer_start + 1]]) as usize;
+        LimitsIter { buf: self.buf, remaining: num, pos: trailer_start + 2 }
+    }
+}
+
+/// Iterator yielding `(pattern: &[u8], limit: u32)` from the subject_limits trailer.
+pub struct LimitsIter<'a> {
+    buf:       &'a [u8],
+    remaining: usize,
+    pos:       usize,
+}
+
+impl<'a> Iterator for LimitsIter<'a> {
+    type Item = (&'a [u8], u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 { return None; }
+        // Need at least 6 bytes: [4 limit][2 pattern_len]
+        if self.buf.len() < self.pos + 6 { return None; }
+        let limit = u32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]);
+        let plen = u16::from_le_bytes([self.buf[self.pos + 4], self.buf[self.pos + 5]]) as usize;
+        self.pos += 6;
+        if self.buf.len() < self.pos + plen { return None; }
+        let pattern = &self.buf[self.pos..self.pos + plen];
+        self.pos += plen;
+        self.remaining -= 1;
+        Some((pattern, limit))
+    }
 }
 
 pub struct DeleteConsumerView<'a> {
