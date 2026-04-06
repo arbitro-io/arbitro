@@ -1,5 +1,6 @@
 //! Local subscription — client-side demux target.
 
+use bytes::Bytes;
 use arbitro_common::subject::subject_matches;
 use tokio::sync::mpsc;
 
@@ -11,6 +12,8 @@ pub(crate) struct Subscription {
     pub consumer_id: u32,
     pub filter: Option<Box<[u8]>>,
     pub tx: mpsc::Sender<Message>,
+    /// Subscribe body stored for automatic re-subscription after reconnect.
+    pub subscribe_body: Bytes,
 }
 
 impl Subscription {

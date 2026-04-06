@@ -49,9 +49,10 @@ pub(crate) struct Inner {
     /// Active subscriptions for local demux.
     pub(crate) subscriptions: Mutex<HashMap<u64, Subscription>>,
 
-    /// Channel for ack/nack commands from Message handles.
-    pub(crate) ack_tx: mpsc::Sender<AckCmd>,
-    pub(crate) ack_rx: Mutex<Option<mpsc::Receiver<AckCmd>>>,
+    /// Current ack/nack sender — replaced on each reconnect.
+    /// Messages hold a clone; after reconnect the old clone goes stale
+    /// (send fails silently) so stale ACKs are discarded automatically.
+    pub(crate) ack_tx: Mutex<mpsc::Sender<AckCmd>>,
 
     /// Request timeout.
     pub(crate) request_timeout: std::time::Duration,
@@ -63,7 +64,8 @@ pub(crate) struct Inner {
 impl Inner {
     pub(crate) fn new(addr: String, request_timeout: std::time::Duration) -> Self {
         let (state_tx, _) = watch::channel(ConnState::Disconnected);
-        let (ack_tx, ack_rx) = mpsc::channel(4096);
+        // Initial channel — replaced on each reconnect session.
+        let (ack_tx, _ack_rx) = mpsc::channel::<AckCmd>(4096);
 
         Self {
             write_tx: Mutex::new(None),
@@ -71,11 +73,19 @@ impl Inner {
             pending: Mutex::new(HashMap::new()),
             next_seq: AtomicU32::new(1),
             subscriptions: Mutex::new(HashMap::new()),
-            ack_tx,
-            ack_rx: Mutex::new(Some(ack_rx)),
+            ack_tx: Mutex::new(ack_tx),
             request_timeout,
             addr,
         }
+    }
+
+    /// Replace the ack sender with a fresh channel for a new session.
+    /// Returns the receiver for the new ack loop.
+    /// Old Message handles hold the previous sender — their ACKs fail silently (correct).
+    pub(crate) fn new_ack_channel(&self) -> mpsc::Receiver<AckCmd> {
+        let (tx, rx) = mpsc::channel(4096);
+        *self.ack_tx.lock().unwrap() = tx;
+        rx
     }
 
     /// Allocate next env_seq.
@@ -241,6 +251,7 @@ impl Inner {
         let subject = &body[2..2 + subj_len];
         let payload = &body[2 + subj_len..];
 
+        let ack_tx = self.ack_tx.lock().unwrap().clone();
         for sub in subs.values() {
             if sub.stream_id == stream_id && sub.matches(subject) {
                 let msg = Message {
@@ -249,7 +260,7 @@ impl Inner {
                     payload: Bytes::copy_from_slice(payload),
                     consumer_id: sub.consumer_id,
                     stream_id,
-                    ack_tx: self.ack_tx.clone(),
+                    ack_tx: ack_tx.clone(),
                 };
                 let _ = sub.tx.try_send(msg);
             }
@@ -262,6 +273,7 @@ impl Inner {
         let view = RepBatchView::new(body);
         let consumer_id = view.consumer_id();
         let subs = self.subscriptions.lock().unwrap();
+        let ack_tx = self.ack_tx.lock().unwrap().clone();
 
         for entry in view.entries() {
             for sub in subs.values() {
@@ -275,7 +287,7 @@ impl Inner {
                         payload: Bytes::copy_from_slice(entry.payload),
                         consumer_id,
                         stream_id,
-                        ack_tx: self.ack_tx.clone(),
+                        ack_tx: ack_tx.clone(),
                     };
                     let _ = sub.tx.try_send(msg);
                 }

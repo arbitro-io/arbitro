@@ -81,8 +81,15 @@ async fn run_session(inner: &Arc<Inner>, stream: TcpStream) -> bool {
         *guard = Some(write_tx.clone());
     }
 
+    // Fresh ack channel for this session — old Message handles go stale (correct).
+    let ack_rx = inner.new_ack_channel();
+
     // Send Connect handshake
     send_connect(&write_tx).await;
+
+    // Re-subscribe all active subscriptions (fire-and-forget, server processes in order).
+    // Done before marking Connected so subscribers are live when the user observes the state.
+    resubscribe_all(inner, &write_tx).await;
 
     // Mark connected
     inner.state_tx.send_replace(ConnState::Connected);
@@ -90,10 +97,9 @@ async fn run_session(inner: &Arc<Inner>, stream: TcpStream) -> bool {
     // Spawn write loop
     let write_handle = tokio::spawn(write_loop(writer, write_rx));
 
-    // Spawn ack processor
-    let ack_inner = inner.clone();
+    // Spawn ack processor with the fresh receiver
     let ack_write_tx = write_tx.clone();
-    let ack_handle = tokio::spawn(ack_loop(ack_inner, ack_write_tx));
+    let ack_handle = tokio::spawn(ack_loop(ack_rx, ack_write_tx));
 
     // Run read loop on this task
     read_loop(inner, reader).await;
@@ -109,6 +115,38 @@ async fn run_session(inner: &Arc<Inner>, stream: TcpStream) -> bool {
     ack_handle.abort();
 
     false // not a clean shutdown, reconnect
+}
+
+/// Re-send Subscribe frames for all active subscriptions.
+/// Called after Connect handshake on every session (first connect + reconnects).
+/// Uses env_seq=0 — server processes these fire-and-forget, no reply needed.
+async fn resubscribe_all(inner: &Arc<Inner>, write_tx: &mpsc::Sender<Bytes>) {
+    use arbitro_proto::wire::envelope::Envelope;
+    use zerocopy::byteorder::little_endian::{U16, U32};
+    use zerocopy::IntoBytes;
+
+    let frames: Vec<Bytes> = {
+        let subs = inner.subscriptions.lock().unwrap();
+        subs.values().map(|sub| {
+            let body = &sub.subscribe_body;
+            let envelope = Envelope {
+                action: U16::new(arbitro_proto::action::Action::Subscribe.as_u16()),
+                flags: 0,
+                _rsv: 0,
+                stream_id: U32::new(sub.stream_id),
+                msg_len: U32::new(body.len() as u32),
+                env_seq: U32::new(0), // no reply needed
+            };
+            let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
+            frame.extend_from_slice(envelope.as_bytes());
+            frame.extend_from_slice(body);
+            Bytes::from(frame)
+        }).collect()
+    };
+
+    for frame in frames {
+        let _ = write_tx.send(frame).await;
+    }
 }
 
 /// Send Connect frame.
@@ -247,14 +285,7 @@ const ACK_BATCH_MAX: usize = 256;
 /// Accumulates acks: recv first, drain with try_recv, group by
 /// (stream_id, consumer_id), send one BatchAck frame per group.
 /// Nacks go individually (rare, latency-sensitive).
-async fn ack_loop(inner: Arc<Inner>, write_tx: mpsc::Sender<Bytes>) {
-    let mut rx = {
-        let mut guard = inner.ack_rx.lock().unwrap();
-        match guard.take() {
-            Some(rx) => rx,
-            None => return,
-        }
-    };
+async fn ack_loop(mut rx: mpsc::Receiver<AckCmd>, write_tx: mpsc::Sender<Bytes>) {
 
     // Scratch buffers — reused across iterations, capacity grows monotonically.
     let mut pending_acks: Vec<(u32, u32, u64)> = Vec::with_capacity(ACK_BATCH_MAX);

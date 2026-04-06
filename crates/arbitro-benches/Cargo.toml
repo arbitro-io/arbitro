@@ -29,10 +29,6 @@ name    = "action_dispatch"
 harness = false
 
 [[bench]]
-name    = "publish_throughput"
-harness = false
-
-[[bench]]
 name    = "e2e_throughput"
 harness = false
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::U32;
@@ -67,6 +68,7 @@ impl Consumer {
             consumer_id: self.consumer_id,
             filter: filter.map(Box::from),
             tx,
+            subscribe_body: Bytes::copy_from_slice(&body),
         };
 
         {
