@@ -35,8 +35,6 @@ const BATCH_SIZE: usize = 256;
 
 /// Scratch buffers reused across delivery cycles. Capacity grows monotonically.
 struct DrainScratch {
-    /// Collected seq numbers to deliver.
-    seqs: Vec<u64>,
     /// Reusable buffer for building batch frames. BytesMut so we can freeze → Bytes zero-copy.
     frame_buf: BytesMut,
 }
@@ -44,7 +42,6 @@ struct DrainScratch {
 impl DrainScratch {
     fn new() -> Self {
         Self {
-            seqs: Vec::with_capacity(BATCH_SIZE),
             frame_buf: BytesMut::with_capacity(16 * 1024), // 16KB initial, grows monotonically
         }
     }
@@ -164,65 +161,86 @@ impl ReactiveDrain {
         &mut self,
         store: &dyn Store,
         transport: &dyn Transport,
-        now_ts: u64,
+        _now_ts: u64,
     ) -> bool {
-        let stream_id = self.stream_id;
         let mut any_progress = false;
+        let stream_id = self.stream_id;
 
         for ci in 0..self.consumers.len() {
-            if self.consumers[ci].subscriptions.is_empty() { continue; }
-            if !self.consumers[ci].has_global_credit() { continue; }
+            let consumer = &mut self.consumers[ci];
+            if consumer.subscriptions.is_empty() { continue; }
+            if !consumer.has_global_credit() { continue; }
 
-            // Collect deliverable seq numbers into scratch buffer
-            self.scratch.seqs.clear();
-            get_next_messages(
-                store,
-                &mut self.consumers[ci],
-                now_ts,
-                BATCH_SIZE,
-                &mut self.scratch.seqs,
-            );
+            // Single-pass building: Start building the frame immediately
+            let mut delivered_count = 0u16;
+            let frame_buf = &mut self.scratch.frame_buf;
+            frame_buf.clear();
 
-            if self.scratch.seqs.is_empty() { continue; }
+            // Reserve space for envelope [16B]
+            frame_buf.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+
+            // Placeholder for RepBatchFixed [8B]
+            let fixed_pos = frame_buf.len();
+            frame_buf.extend_from_slice(&[0u8; 8]);
+
+            // 1. Process Nacked/Deferred first (Individual lookups)
+            // (Keeping it simple for these non-contiguous entries)
+            process_priority_entries(store, consumer, BATCH_SIZE, &mut delivered_count, frame_buf);
+
+            // 2. Continuous Read (Single-Pass for_each)
+            if delivered_count < BATCH_SIZE as u16 && consumer.deliver_seq < store.info().last_seq + 1 {
+                let remaining = BATCH_SIZE - delivered_count as usize;
+                let scan_end = (consumer.deliver_seq + (remaining * 2) as u64).min(store.info().last_seq + 1);
+                
+                let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
+                let is_queue = consumer.config.deliver_mode == DeliverMode::Queue;
+                let sub_count = consumer.subscriptions.len();
+                
+                let mut current_delivered = delivered_count;
+                let queue_idx = &mut self.queue_idx;
+
+                store.for_each(consumer.deliver_seq, scan_end, &mut |entry| {
+                    if current_delivered >= BATCH_SIZE as u16 { return; }
+                    if !is_none_policy && !consumer.has_global_credit() { return; }
+
+                    // Advance cursor
+                    consumer.deliver_seq = entry.seq + 1;
+
+                    if consumer.matches(&entry.subject) {
+                        if is_none_policy || consumer.try_acquire(entry.seq, &entry.subject) {
+                            if is_queue && sub_count > 1 {
+                                // Queue with multiple subs: send immediately to balance load
+                                let conn_id = consumer.subscriptions[*queue_idx % sub_count].conn_id;
+                                *queue_idx = queue_idx.wrapping_add(1);
+                                send_entry(conn_id, entry, stream_id, transport);
+                            } else {
+                                // Fanout or Single-sub Queue: write to batch frame
+                                write_entry_to_buf(entry, frame_buf);
+                            }
+                            current_delivered += 1;
+                        } else if consumer.has_global_credit() {
+                            consumer.deferred.push_back(entry.seq);
+                        }
+                    }
+                }).ok();
+                delivered_count = current_delivered;
+            }
+
+            if delivered_count == 0 { continue; }
             any_progress = true;
 
-            let consumer_id = self.consumers[ci].config.consumer_id;
-            let is_queue = self.consumers[ci].config.deliver_mode == DeliverMode::Queue;
-
-            if is_queue {
-                // Queue: round-robin — each msg goes to one subscription.
-                let sub_count = self.consumers[ci].subscriptions.len();
-                if sub_count == 0 { continue; }
-
-                // Single sub optimization: all entries go to same conn
-                if sub_count == 1 {
-                    let conn_id = self.consumers[ci].subscriptions[0].conn_id;
-                    send_batch(store, &self.scratch.seqs, consumer_id, stream_id, conn_id, transport, &mut self.scratch.frame_buf);
-                } else {
-                    // Multiple subs: round-robin assignment, send per-entry (rare case).
-                    for si in 0..self.scratch.seqs.len() {
-                        let seq = self.scratch.seqs[si];
-                        let conn_id = self.consumers[ci].subscriptions[self.queue_idx % sub_count].conn_id;
-                        self.queue_idx = self.queue_idx.wrapping_add(1);
-                        store.get(seq, &mut |entry| {
-                            send_entry(conn_id, entry, stream_id, transport);
-                        }).ok();
-                    }
-                }
+            // Finalize and Dispatch Batch Frame if any entries were batched
+            // (In Queue mode with sub_count > 1, delivered_count messages were sent but 0 were batched)
+            let batched_in_buf = if consumer.config.deliver_mode == DeliverMode::Queue && consumer.subscriptions.len() > 1 {
+                0
             } else {
-                // Fanout: every subscription gets the full batch.
-                let subs = &self.consumers[ci].subscriptions;
-                if subs.len() == 1 {
-                    let conn_id = subs[0].conn_id;
-                    send_batch(store, &self.scratch.seqs, consumer_id, stream_id, conn_id, transport, &mut self.scratch.frame_buf);
-                } else {
-                    // Build batch frame once, freeze to Bytes, clone (Arc bump) per sub
-                    build_batch_frame(store, &self.scratch.seqs, consumer_id, stream_id, &mut self.scratch.frame_buf);
-                    let frame = self.scratch.frame_buf.split().freeze();
-                    for sub in subs {
-                        transport.send_bytes(sub.conn_id, frame.clone());
-                    }
-                }
+                delivered_count
+            };
+
+            if batched_in_buf > 0 {
+                finalize_batch_frame(frame_buf, fixed_pos, consumer.config.consumer_id, batched_in_buf, stream_id);
+                let frame = frame_buf.split().freeze();
+                dispatch_frame(consumer, &mut self.queue_idx, frame, transport);
             }
         }
 
@@ -247,21 +265,22 @@ impl ReactiveDrain {
             return 0;
         }
 
-        self.scratch.seqs.clear();
+        // Note: fetch logic remains separate as it is pull-based
+        let mut seqs = Vec::with_capacity(max_msgs as usize);
         get_next_messages(
             store,
             &mut self.consumers[ci],
             now_ts,
             max_msgs as usize,
-            &mut self.scratch.seqs,
+            &mut seqs,
         );
 
         let stream_id = self.stream_id;
-        let num_seqs = self.scratch.seqs.len();
+        let num_seqs = seqs.len();
         let mut delivered = 0u32;
 
         for si in 0..num_seqs {
-            let seq = self.scratch.seqs[si];
+            let seq = seqs[si];
             // Fetch sends to the first subscription
             let conn_id = self.consumers[ci].subscriptions[0].conn_id;
             store.get(seq, &mut |entry| {
@@ -291,10 +310,86 @@ impl ReactiveDrain {
 
 // ── Free functions (hot path) ───────────────────────────────────────────
 
+fn process_priority_entries(
+    store: &dyn Store,
+    consumer: &mut Consumer,
+    batch_size: usize,
+    delivered_count: &mut u16,
+    buf: &mut BytesMut,
+) {
+    let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
+
+    // 1. Nacked
+    while !consumer.nacked.is_empty() && (*delivered_count as usize) < batch_size {
+        if !is_none_policy && !consumer.has_global_credit() { break; }
+        let seq = *consumer.nacked.front().unwrap();
+        let mut delivered = false;
+        let found = store.get(seq, &mut |entry| {
+            if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
+                write_entry_to_buf(entry, buf);
+                *delivered_count += 1;
+                delivered = true;
+            }
+        }).unwrap_or(false);
+        if delivered || !found { consumer.nacked.pop_front(); } else { break; }
+    }
+
+    // 2. Deferred
+    let mut i = 0;
+    while i < consumer.deferred.len() && (*delivered_count as usize) < batch_size {
+        if !consumer.has_global_credit() { break; }
+        let seq = consumer.deferred[i];
+        let mut resolved = false;
+        let found = store.get(seq, &mut |entry| {
+            if consumer.try_acquire(seq, &entry.subject) {
+                write_entry_to_buf(entry, buf);
+                *delivered_count += 1;
+                resolved = true;
+            }
+        }).unwrap_or(false);
+        if resolved || !found { consumer.deferred.remove(i); } else { i += 1; }
+    }
+}
+
+#[inline]
+fn write_entry_to_buf(entry: &Entry, buf: &mut BytesMut) {
+    let subj_len = entry.subject.len() as u16;
+    let data_len = (entry.subject.len() + entry.payload.len()) as u32;
+    let hdr = build_entry_header(entry.seq, subj_len, data_len);
+    buf.extend_from_slice(&hdr);
+    buf.extend_from_slice(&entry.subject);
+    buf.extend_from_slice(&entry.payload);
+}
+
+#[inline]
+fn finalize_batch_frame(buf: &mut BytesMut, fixed_pos: usize, consumer_id: u32, count: u16, stream_id: u32) {
+    let fixed = build_rep_batch_fixed(consumer_id, count);
+    buf[fixed_pos..fixed_pos + 8].copy_from_slice(&fixed);
+    let msg_len = (buf.len() - ENVELOPE_SIZE) as u32;
+    let env = build_rep_batch_envelope(stream_id, msg_len);
+    buf[..ENVELOPE_SIZE].copy_from_slice(&env);
+}
+
+#[inline]
+fn dispatch_frame(consumer: &mut Consumer, queue_idx: &mut usize, frame: bytes::Bytes, transport: &dyn Transport) {
+    match consumer.config.deliver_mode {
+        DeliverMode::Fanout => {
+            for sub in &consumer.subscriptions {
+                transport.send_bytes(sub.conn_id, frame.clone());
+            }
+        }
+        DeliverMode::Queue => {
+            if !consumer.subscriptions.is_empty() {
+                let idx = *queue_idx % consumer.subscriptions.len();
+                transport.send_bytes(consumer.subscriptions[idx].conn_id, frame);
+                *queue_idx += 1;
+            }
+        }
+    }
+}
+
 /// Collect up to `batch_size` deliverable seq numbers for this consumer.
 /// Priority: (1) nacked, (2) deferred, (3) new from journal cursor.
-///
-/// Zero-alloc: seqs is a pre-allocated scratch buffer, cleared by caller.
 fn get_next_messages(
     store: &dyn Store,
     consumer: &mut Consumer,
@@ -303,14 +398,12 @@ fn get_next_messages(
     seqs: &mut Vec<u64>,
 ) {
     let info = store.info();
-    let head = info.last_seq + 1; // next_seq (one past last)
+    let head = info.last_seq + 1;
     let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
 
-    // 1. Nacked first (redeliveries have priority)
     while !consumer.nacked.is_empty() && seqs.len() < batch_size {
         if !is_none_policy && !consumer.has_global_credit() { break; }
         let seq = *consumer.nacked.front().unwrap();
-
         let mut delivered = false;
         let found = store.get(seq, &mut |entry| {
             if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
@@ -318,20 +411,13 @@ fn get_next_messages(
                 delivered = true;
             }
         }).unwrap_or(false);
-
-        if delivered || !found {
-            consumer.nacked.pop_front();
-        } else {
-            break; // credit blocked, stop nacked processing
-        }
+        if delivered || !found { consumer.nacked.pop_front(); } else { break; }
     }
 
-    // 2. Deferred (previously subject-blocked, retry now)
     let mut i = 0;
     while i < consumer.deferred.len() && seqs.len() < batch_size {
         if !consumer.has_global_credit() { break; }
         let seq = consumer.deferred[i];
-
         let mut resolved = false;
         let found = store.get(seq, &mut |entry| {
             if consumer.try_acquire(seq, &entry.subject) {
@@ -339,89 +425,22 @@ fn get_next_messages(
                 resolved = true;
             }
         }).unwrap_or(false);
-
-        if resolved || !found {
-            consumer.deferred.remove(i);
-        } else {
-            i += 1; // still blocked, skip
-        }
+        if resolved || !found { consumer.deferred.remove(i); } else { i += 1; }
     }
 
-    // 3. New messages from journal cursor
     while consumer.deliver_seq < head && seqs.len() < batch_size {
         if !is_none_policy && !consumer.has_global_credit() { break; }
         let seq = consumer.deliver_seq;
-        consumer.deliver_seq += 1; // always advance — never re-read same seq
-
+        consumer.deliver_seq += 1;
         store.get(seq, &mut |entry| {
             if !consumer.matches(&entry.subject) { return; }
-
             if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
                 seqs.push(seq);
             } else if consumer.has_global_credit() {
-                // Subject blocked but global credit available → defer
                 consumer.deferred.push_back(seq);
             }
         }).ok();
     }
-}
-
-/// Build a batch RepBatch frame into `buf` from store entries.
-/// Layout: [16B envelope][8B RepBatchFixed][N × (14B entry_header + subject + payload)]
-///
-/// Uses BytesMut so caller can freeze → Bytes for zero-copy send.
-#[inline]
-fn build_batch_frame(
-    store: &dyn Store,
-    seqs: &[u64],
-    consumer_id: u32,
-    stream_id: u32,
-    buf: &mut BytesMut,
-) {
-    buf.clear();
-    let count = seqs.len() as u16;
-
-    // Reserve space for envelope (will fill msg_len after building body)
-    buf.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-
-    // RepBatchFixed header
-    let fixed = build_rep_batch_fixed(consumer_id, count);
-    buf.extend_from_slice(&fixed);
-
-    // Entries: [14B header][subject][payload] per entry
-    for &seq in seqs {
-        store.get(seq, &mut |entry| {
-            let subj_len = entry.subject.len() as u16;
-            let data_len = (entry.subject.len() + entry.payload.len()) as u32;
-            let hdr = build_entry_header(entry.seq, subj_len, data_len);
-            buf.extend_from_slice(&hdr);
-            buf.extend_from_slice(&entry.subject);
-            buf.extend_from_slice(&entry.payload);
-        }).ok();
-    }
-
-    // Fill envelope now that we know msg_len
-    let msg_len = (buf.len() - ENVELOPE_SIZE) as u32;
-    let env = build_rep_batch_envelope(stream_id, msg_len);
-    buf[..ENVELOPE_SIZE].copy_from_slice(&env);
-}
-
-/// Build and send a batch RepBatch frame to a single connection.
-/// Builds into BytesMut, freezes to Bytes, sends via send_bytes (zero-copy).
-#[inline]
-fn send_batch(
-    store: &dyn Store,
-    seqs: &[u64],
-    consumer_id: u32,
-    stream_id: u32,
-    conn_id: ConnId,
-    transport: &dyn Transport,
-    buf: &mut BytesMut,
-) {
-    build_batch_frame(store, seqs, consumer_id, stream_id, buf);
-    // split() returns the current content as BytesMut and leaves buf empty but with capacity.
-    // freeze() converts to Bytes (Arc-backed, zero-copy).
-    transport.send_bytes(conn_id, buf.split().freeze());
 }
 
 /// Send a single entry to a connection. Stack envelope + scatter write.
