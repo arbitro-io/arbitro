@@ -27,7 +27,7 @@ name    = "throughput"
 harness = false
 
 [[bench]]
-name    = "subject_limits"
+name    = "limits"
 harness = false
 
 [[bench]]
