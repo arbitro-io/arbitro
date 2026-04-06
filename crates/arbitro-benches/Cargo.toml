@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name    = "protocol_compare"
 harness = false
+
+[[bench]]
+name    = "subject_limits"
+harness = false

@@ -1,12 +1,13 @@
 //! Consumer — push (subscribe) and pull (fetch) modes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 
+use arbitro_proto::wire::DeleteConsumerAction;
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::U32;
+use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
 use arbitro_proto::wire::subscribe::FetchFixed;
@@ -77,7 +78,11 @@ impl Consumer {
         }
 
         // Now send Subscribe to server — backlog Deliver frames will find the local sub.
-        if let Err(e) = self.inner.request(Action::Subscribe, self.stream_id, &body).await {
+        if let Err(e) = self
+            .inner
+            .request(Action::Subscribe, self.stream_id, &body)
+            .await
+        {
             // Cleanup on failure
             let mut subs = self.inner.subscriptions.lock().unwrap();
             subs.remove(&sub_id);
@@ -94,7 +99,9 @@ impl Consumer {
             max_msgs: U32::new(max_msgs),
         };
 
-        self.inner.request(Action::Fetch, self.stream_id, body.as_bytes()).await?;
+        self.inner
+            .request(Action::Fetch, self.stream_id, body.as_bytes())
+            .await?;
 
         // After fetch request, messages arrive as Deliver frames.
         // For now, we return empty — the messages will come via subscription.
@@ -110,5 +117,18 @@ impl Consumer {
     /// Get the stream ID.
     pub fn stream_id(&self) -> u32 {
         self.stream_id
+    }
+
+    /// Delete the consumer.
+    pub async fn delete(&self) -> Result<(), ClientError> {
+        let body = DeleteConsumerAction {
+            consumer_id: U32::new(self.consumer_id),
+            _pad: U32::new(0),
+        };
+
+        self.inner
+            .request(Action::DeleteConsumer, self.stream_id, body.as_bytes())
+            .await?;
+        Ok(())
     }
 }

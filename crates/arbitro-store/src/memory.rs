@@ -43,10 +43,7 @@ impl MemoryStore {
 
     #[inline]
     fn seq_to_idx(&self, seq: u64) -> Option<usize> {
-        if seq < self.first_seq || seq >= self.next_seq {
-            return None;
-        }
-        Some((seq - self.first_seq) as usize)
+        self.index.binary_search_by_key(&seq, |meta| meta.seq).ok()
     }
 
     #[inline]
@@ -116,10 +113,8 @@ impl Store for MemoryStore {
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
-        let s = self.seq_to_idx(start).unwrap_or(0);
-        let e = self.seq_to_idx(end.saturating_sub(1))
-            .map(|i| i + 1)
-            .unwrap_or(self.index.len());
+        let s = self.index.binary_search_by_key(&start, |m| m.seq).unwrap_or_else(|i| i);
+        let e = self.index.binary_search_by_key(&end, |m| m.seq).unwrap_or_else(|i| i);
         
         let mut out = Vec::with_capacity(e - s);
         for i in s..e {
@@ -141,10 +136,8 @@ impl Store for MemoryStore {
     }
 
     fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
-        let s = self.seq_to_idx(start).unwrap_or(0);
-        let e = self.seq_to_idx(end.saturating_sub(1))
-            .map(|i| i + 1)
-            .unwrap_or(self.index.len());
+        let s = self.index.binary_search_by_key(&start, |m| m.seq).unwrap_or_else(|i| i);
+        let e = self.index.binary_search_by_key(&end, |m| m.seq).unwrap_or_else(|i| i);
         for i in s..e {
             let entry = self.get_entry_view(i);
             f(&entry);

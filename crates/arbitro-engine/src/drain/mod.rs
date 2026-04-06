@@ -16,16 +16,21 @@ pub mod subscription;
 use consumer::Consumer;
 use subscription::Subscription;
 
+use std::collections::HashMap;
+
 use bytes::BytesMut;
 
+use arbitro_proto::action::Action;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode};
 use arbitro_proto::ids::ConnId;
+use arbitro_proto::wire::delivery::RepBatchFixed;
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::wire::headers::{DeliverBatchHeader, DeliveryEntryHeader};
-use arbitro_proto::wire::delivery::RepBatchFixed;
-use arbitro_proto::action::Action;
 use arbitro_store::{Entry, Store};
-use zerocopy::{IntoBytes, byteorder::little_endian::{U16, U32, U64}};
+use zerocopy::{
+    byteorder::little_endian::{U16, U32, U64},
+    IntoBytes,
+};
 
 use crate::transport::Transport;
 
@@ -53,7 +58,7 @@ impl DrainScratch {
 /// the stream's DrainSignal (Gate/Notify).
 pub struct ReactiveDrain {
     stream_id: u32,
-    consumers: Vec<Consumer>,
+    consumers: HashMap<u32, Consumer>,
     /// Round-robin index for Queue mode delivery.
     queue_idx: usize,
     /// Reusable scratch buffers — zero alloc after warmup.
@@ -64,7 +69,7 @@ impl ReactiveDrain {
     pub fn new(stream_id: u32) -> Self {
         Self {
             stream_id,
-            consumers: Vec::new(),
+            consumers: HashMap::new(),
             queue_idx: 0,
             scratch: DrainScratch::new(),
         }
@@ -75,20 +80,18 @@ impl ReactiveDrain {
     /// Register a consumer. Returns consumer_id.
     pub fn add_consumer(&mut self, config: ConsumerConfig, start_seq: u64) -> u32 {
         let id = config.consumer_id;
-        self.consumers.push(Consumer::new(config, start_seq));
+        self.consumers.insert(id, Consumer::new(config, start_seq));
         id
     }
 
     /// Remove a consumer by id.
     pub fn remove_consumer(&mut self, consumer_id: u32) -> bool {
-        let before = self.consumers.len();
-        self.consumers.retain(|c| c.config.consumer_id != consumer_id);
-        self.consumers.len() < before
+        self.consumers.remove(&consumer_id).is_some()
     }
 
     /// Bind a consumer to a connection (add subscription).
     pub fn bind(&mut self, consumer_id: u32, conn_id: ConnId) -> bool {
-        if let Some(c) = self.consumers.iter_mut().find(|c| c.config.consumer_id == consumer_id) {
+        if let Some(c) = self.consumers.get_mut(&consumer_id) {
             c.add_subscription(Subscription::new(conn_id));
             true
         } else {
@@ -98,7 +101,7 @@ impl ReactiveDrain {
 
     /// Unbind a consumer from a specific connection.
     pub fn unbind(&mut self, consumer_id: u32, conn_id: ConnId) -> bool {
-        if let Some(c) = self.consumers.iter_mut().find(|c| c.config.consumer_id == consumer_id) {
+        if let Some(c) = self.consumers.get_mut(&consumer_id) {
             c.remove_conn(conn_id)
         } else {
             false
@@ -107,14 +110,14 @@ impl ReactiveDrain {
 
     /// Unbind all consumers from a given connection (disconnect cleanup).
     pub fn unbind_conn(&mut self, conn_id: ConnId) {
-        for c in &mut self.consumers {
+        for c in self.consumers.values_mut() {
             c.remove_conn(conn_id);
         }
     }
 
     /// Release credit on ack. Returns true if consumer found.
     pub fn on_ack(&mut self, consumer_id: u32, seq: u64) -> bool {
-        if let Some(c) = self.consumers.iter_mut().find(|c| c.config.consumer_id == consumer_id) {
+        if let Some(c) = self.consumers.get_mut(&consumer_id) {
             c.release(seq);
             true
         } else {
@@ -124,7 +127,7 @@ impl ReactiveDrain {
 
     /// Release credit for a batch of acked sequences. Returns number of acks processed.
     pub fn on_batch_ack(&mut self, consumer_id: u32, seqs: &[u64]) -> u32 {
-        if let Some(c) = self.consumers.iter_mut().find(|c| c.config.consumer_id == consumer_id) {
+        if let Some(c) = self.consumers.get_mut(&consumer_id) {
             let mut count = 0u32;
             for &seq in seqs {
                 c.release(seq);
@@ -138,7 +141,7 @@ impl ReactiveDrain {
 
     /// Release credit on nack, queue for redelivery. Returns true if consumer found.
     pub fn on_nack(&mut self, consumer_id: u32, seq: u64) -> bool {
-        if let Some(c) = self.consumers.iter_mut().find(|c| c.config.consumer_id == consumer_id) {
+        if let Some(c) = self.consumers.get_mut(&consumer_id) {
             c.release(seq);
             c.nacked.push_back(seq);
             true
@@ -165,10 +168,13 @@ impl ReactiveDrain {
         let mut any_progress = false;
         let stream_id = self.stream_id;
 
-        for ci in 0..self.consumers.len() {
-            let consumer = &mut self.consumers[ci];
-            if consumer.subscriptions.is_empty() { continue; }
-            if !consumer.has_global_credit() { continue; }
+        for consumer in self.consumers.values_mut() {
+            if consumer.subscriptions.is_empty() {
+                continue;
+            }
+            if !consumer.has_global_credit() {
+                continue;
+            }
 
             // Single-pass building using DeliverBatchHeader (24 bytes)
             let mut delivered_count = 0u16;
@@ -184,57 +190,76 @@ impl ReactiveDrain {
             process_priority_entries(store, consumer, BATCH_SIZE, &mut delivered_count, frame_buf);
 
             // 2. Continuous Read (Single-Pass for_each)
-            if delivered_count < BATCH_SIZE as u16 && consumer.deliver_seq < store.info().last_seq + 1 {
+            if delivered_count < BATCH_SIZE as u16
+                && consumer.deliver_seq < store.info().last_seq + 1
+            {
                 let remaining = BATCH_SIZE - delivered_count as usize;
-                let scan_end = (consumer.deliver_seq + (remaining * 2) as u64).min(store.info().last_seq + 1);
-                
+                let scan_end =
+                    (consumer.deliver_seq + (remaining * 2) as u64).min(store.info().last_seq + 1);
+
                 let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
                 let is_queue = consumer.config.deliver_mode == DeliverMode::Queue;
                 let sub_count = consumer.subscriptions.len();
-                
+
                 let mut current_delivered = delivered_count;
                 let queue_idx = &mut self.queue_idx;
 
-                store.for_each(consumer.deliver_seq, scan_end, &mut |entry| {
-                    if current_delivered >= BATCH_SIZE as u16 { return; }
-                    if !is_none_policy && !consumer.has_global_credit() { return; }
-
-                    // Advance cursor
-                    consumer.deliver_seq = entry.seq + 1;
-
-                    if consumer.matches(entry.subject) {
-                        if is_none_policy || consumer.try_acquire(entry.seq, entry.subject) {
-                            if is_queue && sub_count > 1 {
-                                // Queue with multiple subs: send immediately to balance load
-                                let conn_id = consumer.subscriptions[*queue_idx % sub_count].conn_id;
-                                *queue_idx = queue_idx.wrapping_add(1);
-                                send_entry(conn_id, entry, stream_id, transport);
-                            } else {
-                                // Fanout or Single-sub Queue: write to batch frame
-                                write_entry_to_buf(entry, frame_buf);
-                            }
-                            current_delivered += 1;
-                        } else if consumer.has_global_credit() {
-                            consumer.deferred.push_back(entry.seq);
+                store
+                    .for_each(consumer.deliver_seq, scan_end, &mut |entry| {
+                        if current_delivered >= BATCH_SIZE as u16 {
+                            return;
                         }
-                    }
-                }).ok();
+                        if !is_none_policy && !consumer.has_global_credit() {
+                            return;
+                        }
+
+                        // Advance cursor
+                        consumer.deliver_seq = entry.seq + 1;
+
+                        if consumer.matches(entry.subject) {
+                            if is_none_policy || consumer.try_acquire(entry.seq, entry.subject) {
+                                if is_queue && sub_count > 1 {
+                                    // Queue with multiple subs: send immediately to balance load
+                                    let conn_id =
+                                        consumer.subscriptions[*queue_idx % sub_count].conn_id;
+                                    *queue_idx = queue_idx.wrapping_add(1);
+                                    send_entry(conn_id, entry, stream_id, transport);
+                                } else {
+                                    // Fanout or Single-sub Queue: write to batch frame
+                                    write_entry_to_buf(entry, frame_buf);
+                                }
+                                current_delivered += 1;
+                            } else if consumer.has_global_credit() {
+                                consumer.deferred.push_back(entry.seq);
+                            }
+                        }
+                    })
+                    .ok();
                 delivered_count = current_delivered;
             }
 
-            if delivered_count == 0 { continue; }
+            if delivered_count == 0 {
+                continue;
+            }
             any_progress = true;
 
             // Finalize and Dispatch Batch Frame if any entries were batched
             // (In Queue mode with sub_count > 1, delivered_count messages were sent but 0 were batched)
-            let batched_in_buf = if consumer.config.deliver_mode == DeliverMode::Queue && consumer.subscriptions.len() > 1 {
+            let batched_in_buf = if consumer.config.deliver_mode == DeliverMode::Queue
+                && consumer.subscriptions.len() > 1
+            {
                 0
             } else {
                 delivered_count
             };
 
             if batched_in_buf > 0 {
-                finalize_batch_frame(frame_buf, consumer.config.consumer_id, batched_in_buf, stream_id);
+                finalize_batch_frame(
+                    frame_buf,
+                    consumer.config.consumer_id,
+                    batched_in_buf,
+                    stream_id,
+                );
                 let frame = frame_buf.split().freeze();
                 dispatch_frame(consumer, &mut self.queue_idx, frame, transport);
             }
@@ -252,12 +277,12 @@ impl ReactiveDrain {
         transport: &dyn Transport,
         now_ts: u64,
     ) -> u32 {
-        let ci = match self.consumers.iter().position(|c| c.config.consumer_id == consumer_id) {
-            Some(i) => i,
+        let consumer = match self.consumers.get_mut(&consumer_id) {
+            Some(c) => c,
             None => return 0,
         };
 
-        if self.consumers[ci].subscriptions.is_empty() {
+        if consumer.subscriptions.is_empty() {
             return 0;
         }
 
@@ -265,7 +290,7 @@ impl ReactiveDrain {
         let mut seqs = Vec::with_capacity(max_msgs as usize);
         get_next_messages(
             store,
-            &mut self.consumers[ci],
+            consumer,
             now_ts,
             max_msgs as usize,
             &mut seqs,
@@ -278,10 +303,12 @@ impl ReactiveDrain {
         for si in 0..num_seqs {
             let seq = seqs[si];
             // Fetch sends to the first subscription
-            let conn_id = self.consumers[ci].subscriptions[0].conn_id;
-            store.get(seq, &mut |entry| {
-                send_entry(conn_id, entry, stream_id, transport);
-            }).ok();
+            let conn_id = consumer.subscriptions[0].conn_id;
+            store
+                .get(seq, &mut |entry| {
+                    send_entry(conn_id, entry, stream_id, transport);
+                })
+                .ok();
             delivered += 1;
         }
 
@@ -295,12 +322,12 @@ impl ReactiveDrain {
     }
 
     pub fn find_consumer(&self, consumer_id: u32) -> Option<&Consumer> {
-        self.consumers.iter().find(|c| c.config.consumer_id == consumer_id)
+        self.consumers.get(&consumer_id)
     }
 
     /// Iterate all consumers — used for overlap checks (cold path).
     pub fn iter_consumers(&self) -> impl Iterator<Item = &Consumer> {
-        self.consumers.iter()
+        self.consumers.values()
     }
 }
 
@@ -317,33 +344,49 @@ fn process_priority_entries(
 
     // 1. Nacked
     while !consumer.nacked.is_empty() && (*delivered_count as usize) < batch_size {
-        if !is_none_policy && !consumer.has_global_credit() { break; }
+        if !is_none_policy && !consumer.has_global_credit() {
+            break;
+        }
         let seq = *consumer.nacked.front().unwrap();
         let mut delivered = false;
-        let found = store.get(seq, &mut |entry| {
-            if is_none_policy || consumer.try_acquire(seq, entry.subject) {
-                write_entry_to_buf(entry, buf);
-                *delivered_count += 1;
-                delivered = true;
-            }
-        }).unwrap_or(false);
-        if delivered || !found { consumer.nacked.pop_front(); } else { break; }
+        let found = store
+            .get(seq, &mut |entry| {
+                if is_none_policy || consumer.try_acquire(seq, entry.subject) {
+                    write_entry_to_buf(entry, buf);
+                    *delivered_count += 1;
+                    delivered = true;
+                }
+            })
+            .unwrap_or(false);
+        if delivered || !found {
+            consumer.nacked.pop_front();
+        } else {
+            break;
+        }
     }
 
     // 2. Deferred
     let mut i = 0;
     while i < consumer.deferred.len() && (*delivered_count as usize) < batch_size {
-        if !consumer.has_global_credit() { break; }
+        if !consumer.has_global_credit() {
+            break;
+        }
         let seq = consumer.deferred[i];
         let mut resolved = false;
-        let found = store.get(seq, &mut |entry| {
-            if consumer.try_acquire(seq, entry.subject) {
-                write_entry_to_buf(entry, buf);
-                *delivered_count += 1;
-                resolved = true;
-            }
-        }).unwrap_or(false);
-        if resolved || !found { consumer.deferred.remove(i); } else { i += 1; }
+        let found = store
+            .get(seq, &mut |entry| {
+                if consumer.try_acquire(seq, entry.subject) {
+                    write_entry_to_buf(entry, buf);
+                    *delivered_count += 1;
+                    resolved = true;
+                }
+            })
+            .unwrap_or(false);
+        if resolved || !found {
+            consumer.deferred.remove(i);
+        } else {
+            i += 1;
+        }
     }
 }
 
@@ -381,7 +424,12 @@ fn finalize_batch_frame(buf: &mut BytesMut, consumer_id: u32, count: u16, stream
 }
 
 #[inline]
-fn dispatch_frame(consumer: &mut Consumer, queue_idx: &mut usize, frame: bytes::Bytes, transport: &dyn Transport) {
+fn dispatch_frame(
+    consumer: &mut Consumer,
+    queue_idx: &mut usize,
+    frame: bytes::Bytes,
+    transport: &dyn Transport,
+) {
     match consumer.config.deliver_mode {
         DeliverMode::Fanout => {
             for sub in &consumer.subscriptions {
@@ -412,44 +460,66 @@ fn get_next_messages(
     let is_none_policy = consumer.config.ack_policy == AckPolicy::None;
 
     while !consumer.nacked.is_empty() && seqs.len() < batch_size {
-        if !is_none_policy && !consumer.has_global_credit() { break; }
+        if !is_none_policy && !consumer.has_global_credit() {
+            break;
+        }
         let seq = *consumer.nacked.front().unwrap();
         let mut delivered = false;
-        let found = store.get(seq, &mut |entry| {
-            if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
-                seqs.push(seq);
-                delivered = true;
-            }
-        }).unwrap_or(false);
-        if delivered || !found { consumer.nacked.pop_front(); } else { break; }
+        let found = store
+            .get(seq, &mut |entry| {
+                if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
+                    seqs.push(seq);
+                    delivered = true;
+                }
+            })
+            .unwrap_or(false);
+        if delivered || !found {
+            consumer.nacked.pop_front();
+        } else {
+            break;
+        }
     }
 
     let mut i = 0;
     while i < consumer.deferred.len() && seqs.len() < batch_size {
-        if !consumer.has_global_credit() { break; }
+        if !consumer.has_global_credit() {
+            break;
+        }
         let seq = consumer.deferred[i];
         let mut resolved = false;
-        let found = store.get(seq, &mut |entry| {
-            if consumer.try_acquire(seq, &entry.subject) {
-                seqs.push(seq);
-                resolved = true;
-            }
-        }).unwrap_or(false);
-        if resolved || !found { consumer.deferred.remove(i); } else { i += 1; }
+        let found = store
+            .get(seq, &mut |entry| {
+                if consumer.try_acquire(seq, &entry.subject) {
+                    seqs.push(seq);
+                    resolved = true;
+                }
+            })
+            .unwrap_or(false);
+        if resolved || !found {
+            consumer.deferred.remove(i);
+        } else {
+            i += 1;
+        }
     }
 
     while consumer.deliver_seq < head && seqs.len() < batch_size {
-        if !is_none_policy && !consumer.has_global_credit() { break; }
+        if !is_none_policy && !consumer.has_global_credit() {
+            break;
+        }
         let seq = consumer.deliver_seq;
         consumer.deliver_seq += 1;
-        store.get(seq, &mut |entry| {
-            if !consumer.matches(entry.subject) { return; }
-            if is_none_policy || consumer.try_acquire(seq, entry.subject) {
-                seqs.push(seq);
-            } else if consumer.has_global_credit() {
-                consumer.deferred.push_back(seq);
-            }
-        }).ok();
+        store
+            .get(seq, &mut |entry| {
+                if !consumer.matches(entry.subject) {
+                    return;
+                }
+                if is_none_policy || consumer.try_acquire(seq, entry.subject) {
+                    seqs.push(seq);
+                } else if consumer.has_global_credit() {
+                    consumer.deferred.push_back(seq);
+                }
+            })
+            .ok();
     }
 }
 
@@ -466,19 +536,22 @@ fn send_entry(conn_id: ConnId, entry: &Entry<'_>, stream_id: u32, transport: &dy
     };
     let subj_len_bytes = (entry.subject.len() as u16).to_le_bytes();
 
-    transport.send_parts(conn_id, &[
-        env.as_bytes(),
-        &subj_len_bytes,
-        entry.subject,
-        entry.payload,
-    ]);
+    transport.send_parts(
+        conn_id,
+        &[
+            env.as_bytes(),
+            &subj_len_bytes,
+            entry.subject,
+            entry.payload,
+        ],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arbitro_proto::config::{AckPolicy, ConsumerConfig};
-    use arbitro_store::{MemoryStore, EntryRef};
+    use arbitro_store::{EntryRef, MemoryStore};
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
     /// Counting transport — tracks how many sends happened.
@@ -487,8 +560,14 @@ mod tests {
     }
 
     impl CountTransport {
-        fn new() -> Self { Self { count: AtomicU32::new(0) } }
-        fn sent(&self) -> u32 { self.count.load(Relaxed) }
+        fn new() -> Self {
+            Self {
+                count: AtomicU32::new(0),
+            }
+        }
+        fn sent(&self) -> u32 {
+            self.count.load(Relaxed)
+        }
     }
 
     impl Transport for CountTransport {
@@ -512,16 +591,26 @@ mod tests {
     fn make_store_with_entries(count: u64) -> MemoryStore {
         let mut store = MemoryStore::new();
         for i in 0..count {
-            store.append(
-                EntryRef { subject: b"orders.created", payload: b"{}" },
-                1000 + i,
-            ).unwrap();
+            store
+                .append(
+                    EntryRef {
+                        subject: b"orders.created",
+                        payload: b"{}",
+                    },
+                    1000 + i,
+                )
+                .unwrap();
         }
         store
     }
 
     /// Helper: add consumer and bind to conn_id.
-    fn add_and_bind(drain: &mut ReactiveDrain, cfg: ConsumerConfig, start_seq: u64, conn_id: ConnId) {
+    fn add_and_bind(
+        drain: &mut ReactiveDrain,
+        cfg: ConsumerConfig,
+        start_seq: u64,
+        conn_id: ConnId,
+    ) {
         let id = cfg.consumer_id;
         drain.add_consumer(cfg, start_seq);
         drain.bind(id, conn_id);
@@ -533,13 +622,28 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
-        add_and_bind(&mut drain, consumer_cfg(b"c2", 2, DeliverMode::Fanout), 1, 200);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c2", 2, DeliverMode::Fanout),
+            1,
+            200,
+        );
 
-        store.append(
-            EntryRef { subject: b"orders.created", payload: b"{}" },
-            1000,
-        ).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                },
+                1000,
+            )
+            .unwrap();
 
         let progress = drain.deliver_cycle(&store, &transport, 0);
         assert!(progress);
@@ -559,10 +663,15 @@ mod tests {
         drain.bind(1, 200);
 
         for i in 0..4u64 {
-            store.append(
-                EntryRef { subject: b"orders.created", payload: b"{}" },
-                1000 + i,
-            ).unwrap();
+            store
+                .append(
+                    EntryRef {
+                        subject: b"orders.created",
+                        payload: b"{}",
+                    },
+                    1000 + i,
+                )
+                .unwrap();
         }
 
         drain.deliver_cycle(&store, &transport, 0);
@@ -579,10 +688,15 @@ mod tests {
         // Consumer without subscription = inactive
         drain.add_consumer(consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1);
 
-        store.append(
-            EntryRef { subject: b"orders.created", payload: b"{}" },
-            1000,
-        ).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                },
+                1000,
+            )
+            .unwrap();
 
         let progress = drain.deliver_cycle(&store, &transport, 0);
         assert!(!progress);
@@ -595,12 +709,22 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
-        store.append(
-            EntryRef { subject: b"payments.done", payload: b"{}" },
-            1000,
-        ).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"payments.done",
+                    payload: b"{}",
+                },
+                1000,
+            )
+            .unwrap();
 
         let progress = drain.deliver_cycle(&store, &transport, 0);
         assert!(!progress);
@@ -612,15 +736,30 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
-        add_and_bind(&mut drain, consumer_cfg(b"c2", 2, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c2", 2, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
         drain.unbind_conn(100);
 
-        store.append(
-            EntryRef { subject: b"orders.created", payload: b"{}" },
-            1000,
-        ).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                },
+                1000,
+            )
+            .unwrap();
 
         assert!(!drain.deliver_cycle(&store, &transport, 0));
     }
@@ -652,8 +791,24 @@ mod tests {
         drain.bind(1, 100);
 
         // Append 2 entries
-        store.append(EntryRef { subject: b"orders.created", payload: b"1" }, 1000).unwrap();
-        store.append(EntryRef { subject: b"orders.created", payload: b"2" }, 1001).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"1",
+                },
+                1000,
+            )
+            .unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"2",
+                },
+                1001,
+            )
+            .unwrap();
 
         // First cycle delivers 1 (inflight = 1, limit = 1)
         drain.deliver_cycle(&store, &transport, 0);
@@ -683,7 +838,15 @@ mod tests {
         drain.add_consumer(cfg, 1);
         drain.bind(1, 100);
 
-        store.append(EntryRef { subject: b"orders.created", payload: b"1" }, 1000).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"1",
+                },
+                1000,
+            )
+            .unwrap();
 
         // Deliver first entry
         drain.deliver_cycle(&store, &transport, 0);
@@ -703,7 +866,12 @@ mod tests {
         let store = make_store_with_entries(5);
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
         let fetched = drain.fetch(1, 3, &store, &transport, 0);
         assert_eq!(fetched, 3);
@@ -716,7 +884,12 @@ mod tests {
         let store = make_store_with_entries(2);
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
         let fetched = drain.fetch(1, 10, &store, &transport, 0);
         assert_eq!(fetched, 2);
@@ -728,11 +901,24 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut drain = ReactiveDrain::new(1);
 
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
         // Append 3 entries
         for i in 0..3u64 {
-            store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 1000 + i).unwrap();
+            store
+                .append(
+                    EntryRef {
+                        subject: b"orders.created",
+                        payload: b"{}",
+                    },
+                    1000 + i,
+                )
+                .unwrap();
         }
 
         // First cycle delivers all 3 as one batch
@@ -743,8 +929,24 @@ mod tests {
         assert!(!drain.deliver_cycle(&store, &transport, 0));
 
         // Append 2 more
-        store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 2000).unwrap();
-        store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 2001).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                },
+                2000,
+            )
+            .unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                },
+                2001,
+            )
+            .unwrap();
 
         // Third cycle delivers the 2 new ones as one batch
         assert!(drain.deliver_cycle(&store, &transport, 0));
@@ -758,11 +960,24 @@ mod tests {
         let mut drain = ReactiveDrain::new(1);
 
         // Two consumers starting at different positions
-        add_and_bind(&mut drain, consumer_cfg(b"c1", 1, DeliverMode::Fanout), 1, 100);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c1", 1, DeliverMode::Fanout),
+            1,
+            100,
+        );
 
         // Append 3 entries
         for i in 0..3u64 {
-            store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 1000 + i).unwrap();
+            store
+                .append(
+                    EntryRef {
+                        subject: b"orders.created",
+                        payload: b"{}",
+                    },
+                    1000 + i,
+                )
+                .unwrap();
         }
 
         // c1 delivers 3 as one batch
@@ -770,7 +985,12 @@ mod tests {
         assert_eq!(transport.sent(), 1); // 1 batch send
 
         // Now add c2 starting from seq 1 — it has backlog
-        add_and_bind(&mut drain, consumer_cfg(b"c2", 2, DeliverMode::Fanout), 1, 200);
+        add_and_bind(
+            &mut drain,
+            consumer_cfg(b"c2", 2, DeliverMode::Fanout),
+            1,
+            200,
+        );
 
         // c2 delivers its backlog (3 as one batch), c1 has nothing new
         drain.deliver_cycle(&store, &transport, 0);
