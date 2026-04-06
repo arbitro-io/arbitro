@@ -17,14 +17,14 @@ Built in Rust with a **Zero-Allocation, Zero-Copy** architecture, Arbitro follow
 > [!IMPORTANT]
 > **WSL / Native Linux Mandatory**: To achieve these numbers, Arbitro **must** be compiled and run inside WSL or Native Linux. Running from `/mnt/` (9P Windows Bridge) is 2-10x slower.
 
-Benchmarked on a single server instance (loopback, 64B payload):
+Benchmarked on a single server instance (WSL, 64B payload, Local Memory Persistence):
 
 | Workload | 1K msgs | 1M msgs |
 |----------|---------|---------|
-| Publish (Ingest) | 410us (2.4M/s) | 68ms (**14.6M/s**) |
-| Cycle Fire-and-Forget | 311us (3.2M/s) | 64ms (**15.6M/s**) |
-| Fanout (60 Subs) | 1.4ms (700k/s) | 1.4s (**6.6M/s**) |
-| Cycle Explicit Ack | 425us (2.35M/s) | 425ms (est.) (2.3M/s) |
+| Publish (Ingest) | 3.4M/s | **14.2M/s** |
+| Cycle Fire-and-Forget | 3.3M/s | **15.1M/s** |
+| Fanout (60 Subs) | 700k/s | **2.88M/s** |
+| Cycle Explicit Ack | 2.3M/s | **2.1M/s** |
 
 ## Quick Start
 
