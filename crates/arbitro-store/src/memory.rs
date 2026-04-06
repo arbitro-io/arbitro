@@ -6,10 +6,22 @@
 use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
 
 pub struct MemoryStore {
-    entries: Vec<Entry>,
+    /// Contiguous arena for all subjects and payloads.
+    data: Vec<u8>,
+    /// Metadata for each entry to allow O(1) access.
+    index: Vec<LogMetadata>,
     next_seq: u64,
     first_seq: u64,
     total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogMetadata {
+    pub seq: u64,
+    pub ts: u64,
+    pub subj_len: u16,
+    pub payload_len: u32,
+    pub offset: usize,
 }
 
 impl Default for MemoryStore {
@@ -21,7 +33,8 @@ impl Default for MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            data: Vec::with_capacity(65536), // Initial 64KB
+            index: Vec::with_capacity(1024),
             next_seq: 1,
             first_seq: 1,
             total_bytes: 0,
@@ -37,22 +50,44 @@ impl MemoryStore {
     }
 
     #[inline]
-    fn entry_bytes(subject: &[u8], payload: &[u8]) -> u64 {
-        (subject.len() + payload.len()) as u64
-    }
-
-    #[inline]
     fn push_entry(&mut self, entry: &EntryRef<'_>, timestamp: u64) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.total_bytes += Self::entry_bytes(entry.subject, entry.payload);
-        self.entries.push(Entry {
+        
+        let subj_len = entry.subject.len() as u16;
+        let payload_len = entry.payload.len() as u32;
+        let offset = self.data.len();
+
+        // 1. Append data to arena
+        self.data.extend_from_slice(entry.subject);
+        self.data.extend_from_slice(entry.payload);
+        
+        // 2. Register in index
+        self.index.push(LogMetadata {
             seq,
-            timestamp,
-            subject: Box::from(entry.subject),
-            payload: Box::from(entry.payload),
+            ts: timestamp,
+            subj_len,
+            payload_len,
+            offset,
         });
+
+        self.total_bytes += (subj_len as u64) + (payload_len as u64);
         seq
+    }
+
+    #[inline]
+    fn get_entry_view(&self, idx: usize) -> Entry<'_> {
+        let meta = &self.index[idx];
+        let subj_start = meta.offset;
+        let payload_start = subj_start + (meta.subj_len as usize);
+        let payload_end = payload_start + (meta.payload_len as usize);
+
+        Entry {
+            seq: meta.seq,
+            timestamp: meta.ts,
+            subject: &self.data[subj_start..payload_start],
+            payload: &self.data[payload_start..payload_end],
+        }
     }
 }
 
@@ -67,7 +102,7 @@ impl Store for MemoryStore {
         if entries.is_empty() {
             return Ok(self.next_seq);
         }
-        self.entries.reserve(entries.len());
+        self.index.reserve(entries.len());
         let first = self.next_seq;
         for entry in entries {
             self.push_entry(entry, timestamp);
@@ -76,58 +111,85 @@ impl Store for MemoryStore {
     }
 
     #[inline]
-    fn read(&self, seq: u64) -> Result<Option<Entry>, StoreError> {
-        Ok(self.seq_to_idx(seq).map(|idx| self.entries[idx].clone()))
+    fn read(&self, seq: u64) -> Result<Option<Entry<'_>>, StoreError> {
+        Ok(self.seq_to_idx(seq).map(|idx| self.get_entry_view(idx)))
     }
 
-    fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry>, StoreError> {
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
         let s = self.seq_to_idx(start).unwrap_or(0);
         let e = self.seq_to_idx(end.saturating_sub(1))
             .map(|i| i + 1)
-            .unwrap_or(self.entries.len());
-        Ok(self.entries[s..e].to_vec())
+            .unwrap_or(self.index.len());
+        
+        let mut out = Vec::with_capacity(e - s);
+        for i in s..e {
+            out.push(self.get_entry_view(i));
+        }
+        Ok(out)
     }
 
     #[inline]
-    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry)) -> Result<bool, StoreError> {
+    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
         match self.seq_to_idx(seq) {
             Some(idx) => {
-                f(&self.entries[idx]);
+                let entry = self.get_entry_view(idx);
+                f(&entry);
                 Ok(true)
             }
             None => Ok(false),
         }
     }
 
-    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry)) -> Result<(), StoreError> {
+    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
         let s = self.seq_to_idx(start).unwrap_or(0);
         let e = self.seq_to_idx(end.saturating_sub(1))
             .map(|i| i + 1)
-            .unwrap_or(self.entries.len());
-        for entry in &self.entries[s..e] {
-            f(entry);
+            .unwrap_or(self.index.len());
+        for i in s..e {
+            let entry = self.get_entry_view(i);
+            f(&entry);
         }
         Ok(())
     }
 
     fn purge(&mut self) -> u64 {
-        let count = self.entries.len() as u64;
-        self.entries.clear();
+        let count = self.index.len() as u64;
+        self.data.clear();
+        self.index.clear();
         self.first_seq = self.next_seq;
         self.total_bytes = 0;
         count
     }
 
     fn drain(&mut self, subject: &[u8]) -> u64 {
-        let before = self.entries.len();
-        self.entries.retain(|e| !entry_matches(e, subject));
-        let removed = (before - self.entries.len()) as u64;
+        let mut new_data = Vec::with_capacity(self.data.len());
+        let mut new_index = Vec::with_capacity(self.index.len());
+        let mut removed = 0;
+        let mut bytes = 0;
 
-        // Recalculate bytes and first_seq
-        self.total_bytes = self.entries.iter()
-            .map(|e| (e.subject.len() + e.payload.len()) as u64)
-            .sum();
-        if let Some(first) = self.entries.first() {
+        for i in 0..self.index.len() {
+            let entry = self.get_entry_view(i);
+            if !entry_matches(&entry, subject) {
+                let offset = new_data.len();
+                new_data.extend_from_slice(entry.subject);
+                new_data.extend_from_slice(entry.payload);
+                
+                let meta = self.index[i];
+                new_index.push(LogMetadata {
+                    offset,
+                    ..meta
+                });
+                bytes += (meta.subj_len as u64) + (meta.payload_len as u64);
+            } else {
+                removed += 1;
+            }
+        }
+
+        self.data = new_data;
+        self.index = new_index;
+        self.total_bytes = bytes;
+
+        if let Some(first) = self.index.first() {
             self.first_seq = first.seq;
         } else {
             self.first_seq = self.next_seq;
@@ -138,7 +200,7 @@ impl Store for MemoryStore {
 
     fn info(&self) -> StoreInfo {
         StoreInfo {
-            messages: self.entries.len() as u64,
+            messages: self.index.len() as u64,
             bytes: self.total_bytes,
             first_seq: self.first_seq,
             last_seq: self.next_seq.saturating_sub(1),
@@ -228,6 +290,8 @@ mod tests {
         // Remaining: orders.updated (seq 2), payments.done (seq 4)
         assert!(s.read(1).unwrap().is_none());
         assert!(s.read(2).unwrap().is_some());
+        assert!(s.read(3).unwrap().is_none());
+        assert!(s.read(4).unwrap().is_some());
     }
 
     #[test]

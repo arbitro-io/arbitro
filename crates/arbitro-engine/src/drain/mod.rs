@@ -10,23 +10,22 @@
 //! For Queue: round-robin across subscriptions within the consumer.
 
 pub mod consumer;
-pub mod frame_builder;
 pub mod signal;
 pub mod subscription;
 
 use consumer::Consumer;
-use frame_builder::{
-    build_rep_batch_envelope, build_rep_batch_fixed, build_entry_header,
-    build_delivery_envelope,
-};
 use subscription::Subscription;
 
 use bytes::BytesMut;
 
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode};
 use arbitro_proto::ids::ConnId;
-use arbitro_proto::wire::envelope::ENVELOPE_SIZE;
+use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
+use arbitro_proto::wire::headers::{DeliverBatchHeader, DeliveryEntryHeader};
+use arbitro_proto::wire::delivery::RepBatchFixed;
+use arbitro_proto::action::Action;
 use arbitro_store::{Entry, Store};
+use zerocopy::{IntoBytes, byteorder::little_endian::{U16, U32, U64}};
 
 use crate::transport::Transport;
 
@@ -171,17 +170,14 @@ impl ReactiveDrain {
             if consumer.subscriptions.is_empty() { continue; }
             if !consumer.has_global_credit() { continue; }
 
-            // Single-pass building: Start building the frame immediately
+            // Single-pass building using DeliverBatchHeader (24 bytes)
             let mut delivered_count = 0u16;
             let frame_buf = &mut self.scratch.frame_buf;
             frame_buf.clear();
 
-            // Reserve space for envelope [16B]
-            frame_buf.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-
-            // Placeholder for RepBatchFixed [8B]
-            let fixed_pos = frame_buf.len();
-            frame_buf.extend_from_slice(&[0u8; 8]);
+            // Reserve space for the composite header [24B]
+            const HEADER_SIZE: usize = core::mem::size_of::<DeliverBatchHeader>();
+            frame_buf.extend_from_slice(&[0u8; HEADER_SIZE]);
 
             // 1. Process Nacked/Deferred first (Individual lookups)
             // (Keeping it simple for these non-contiguous entries)
@@ -206,8 +202,8 @@ impl ReactiveDrain {
                     // Advance cursor
                     consumer.deliver_seq = entry.seq + 1;
 
-                    if consumer.matches(&entry.subject) {
-                        if is_none_policy || consumer.try_acquire(entry.seq, &entry.subject) {
+                    if consumer.matches(entry.subject) {
+                        if is_none_policy || consumer.try_acquire(entry.seq, entry.subject) {
                             if is_queue && sub_count > 1 {
                                 // Queue with multiple subs: send immediately to balance load
                                 let conn_id = consumer.subscriptions[*queue_idx % sub_count].conn_id;
@@ -238,7 +234,7 @@ impl ReactiveDrain {
             };
 
             if batched_in_buf > 0 {
-                finalize_batch_frame(frame_buf, fixed_pos, consumer.config.consumer_id, batched_in_buf, stream_id);
+                finalize_batch_frame(frame_buf, consumer.config.consumer_id, batched_in_buf, stream_id);
                 let frame = frame_buf.split().freeze();
                 dispatch_frame(consumer, &mut self.queue_idx, frame, transport);
             }
@@ -325,7 +321,7 @@ fn process_priority_entries(
         let seq = *consumer.nacked.front().unwrap();
         let mut delivered = false;
         let found = store.get(seq, &mut |entry| {
-            if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
+            if is_none_policy || consumer.try_acquire(seq, entry.subject) {
                 write_entry_to_buf(entry, buf);
                 *delivered_count += 1;
                 delivered = true;
@@ -341,7 +337,7 @@ fn process_priority_entries(
         let seq = consumer.deferred[i];
         let mut resolved = false;
         let found = store.get(seq, &mut |entry| {
-            if consumer.try_acquire(seq, &entry.subject) {
+            if consumer.try_acquire(seq, entry.subject) {
                 write_entry_to_buf(entry, buf);
                 *delivered_count += 1;
                 resolved = true;
@@ -352,22 +348,36 @@ fn process_priority_entries(
 }
 
 #[inline]
-fn write_entry_to_buf(entry: &Entry, buf: &mut BytesMut) {
-    let subj_len = entry.subject.len() as u16;
-    let data_len = (entry.subject.len() + entry.payload.len()) as u32;
-    let hdr = build_entry_header(entry.seq, subj_len, data_len);
-    buf.extend_from_slice(&hdr);
-    buf.extend_from_slice(&entry.subject);
-    buf.extend_from_slice(&entry.payload);
+fn write_entry_to_buf(entry: &Entry<'_>, buf: &mut BytesMut) {
+    let hdr = DeliveryEntryHeader {
+        seq: U64::new(entry.seq),
+        subj_len: U16::new(entry.subject.len() as u16),
+        data_len: U32::new((entry.subject.len() + entry.payload.len()) as u32),
+    };
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(entry.subject);
+    buf.extend_from_slice(entry.payload);
 }
 
 #[inline]
-fn finalize_batch_frame(buf: &mut BytesMut, fixed_pos: usize, consumer_id: u32, count: u16, stream_id: u32) {
-    let fixed = build_rep_batch_fixed(consumer_id, count);
-    buf[fixed_pos..fixed_pos + 8].copy_from_slice(&fixed);
+fn finalize_batch_frame(buf: &mut BytesMut, consumer_id: u32, count: u16, stream_id: u32) {
     let msg_len = (buf.len() - ENVELOPE_SIZE) as u32;
-    let env = build_rep_batch_envelope(stream_id, msg_len);
-    buf[..ENVELOPE_SIZE].copy_from_slice(&env);
+    let header = DeliverBatchHeader {
+        env: Envelope {
+            action: U16::new(Action::RepBatch.as_u16()),
+            flags: 0,
+            _rsv: 0,
+            stream_id: U32::new(stream_id),
+            msg_len: U32::new(msg_len),
+            env_seq: U32::new(0),
+        },
+        batch: RepBatchFixed {
+            consumer_id: U32::new(consumer_id),
+            count: U16::new(count),
+            _pad: U16::new(0),
+        },
+    };
+    buf[..core::mem::size_of::<DeliverBatchHeader>()].copy_from_slice(header.as_bytes());
 }
 
 #[inline]
@@ -433,8 +443,8 @@ fn get_next_messages(
         let seq = consumer.deliver_seq;
         consumer.deliver_seq += 1;
         store.get(seq, &mut |entry| {
-            if !consumer.matches(&entry.subject) { return; }
-            if is_none_policy || consumer.try_acquire(seq, &entry.subject) {
+            if !consumer.matches(entry.subject) { return; }
+            if is_none_policy || consumer.try_acquire(seq, entry.subject) {
                 seqs.push(seq);
             } else if consumer.has_global_credit() {
                 consumer.deferred.push_back(seq);
@@ -443,19 +453,24 @@ fn get_next_messages(
     }
 }
 
-/// Send a single entry to a connection. Stack envelope + scatter write.
-/// Used as fallback for Queue mode with multiple subscriptions.
 #[inline]
-fn send_entry(conn_id: ConnId, entry: &Entry, stream_id: u32, transport: &dyn Transport) {
+fn send_entry(conn_id: ConnId, entry: &Entry<'_>, stream_id: u32, transport: &dyn Transport) {
     let body_len = 2 + entry.subject.len() + entry.payload.len();
-    let env = build_delivery_envelope(stream_id, body_len as u32, entry.seq as u32);
+    let env = Envelope {
+        action: U16::new(Action::Deliver.as_u16()),
+        flags: 0,
+        _rsv: 0,
+        stream_id: U32::new(stream_id),
+        msg_len: U32::new(body_len as u32),
+        env_seq: U32::new(entry.seq as u32),
+    };
     let subj_len_bytes = (entry.subject.len() as u16).to_le_bytes();
 
     transport.send_parts(conn_id, &[
-        &env,
+        env.as_bytes(),
         &subj_len_bytes,
-        &entry.subject,
-        &entry.payload,
+        entry.subject,
+        entry.payload,
     ]);
 }
 

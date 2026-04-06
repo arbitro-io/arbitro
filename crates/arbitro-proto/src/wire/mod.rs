@@ -4,6 +4,7 @@ pub mod delivery;
 pub mod subscribe;
 pub mod stream;
 pub mod system;
+pub mod headers;
 pub mod metrics;
 pub mod manager;
 

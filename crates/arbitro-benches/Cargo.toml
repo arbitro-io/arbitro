@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name    = "parallel_dispatch"
 harness = false
+
+[[bench]]
+name    = "protocol_compare"
+harness = false

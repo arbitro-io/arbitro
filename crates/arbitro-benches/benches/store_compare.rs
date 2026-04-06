@@ -13,6 +13,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use arbitro_store::{MemoryStore, EntryRef as ArbitroEntryRef, Store};
 
 // ── Common types ────────────────────────────────────────────────
 
@@ -609,6 +610,16 @@ fn bench_stores(c: &mut Criterion) {
             });
         });
 
+        group.bench_function("real_memory_store", |b| {
+            b.iter(|| {
+                let mut stores = HashMap::new();
+                for (sid, subj, pay) in &data {
+                    let store = stores.entry(*sid).or_insert_with(MemoryStore::new);
+                    store.append(ArbitroEntryRef { subject: subj.as_slice(), payload: pay.as_slice() }, 1000).unwrap();
+                }
+            });
+        });
+
         group.finish();
     }
 
@@ -617,11 +628,14 @@ fn bench_stores(c: &mut Criterion) {
     let mut trie = TrieStore::new();
     let mut ring = RingStore::new();
     let mut indexed = IndexedVecStore::new();
+    let mut real_stores = HashMap::new();
     for (sid, subj, pay) in &data {
         flat.append(EntryRef { stream_id: *sid, subject: subj, payload: pay });
         trie.append(EntryRef { stream_id: *sid, subject: subj, payload: pay });
         ring.append(EntryRef { stream_id: *sid, subject: subj, payload: pay });
         indexed.append(EntryRef { stream_id: *sid, subject: subj, payload: pay });
+        let store = real_stores.entry(*sid).or_insert_with(MemoryStore::new);
+        store.append(ArbitroEntryRef { subject: subj, payload: pay }, 1000).unwrap();
     }
 
     // ── Drain stream (all 200 msgs from stream 0) ──────────────
@@ -659,6 +673,17 @@ fn bench_stores(c: &mut Criterion) {
             b.iter(|| {
                 let mut count = 0u64;
                 indexed.drain_stream(TARGET_STREAM, |_| count += black_box(1));
+                assert_eq!(count, STREAM_MSGS as u64);
+            });
+        });
+
+        group.bench_function("real_memory_store", |b| {
+            let real = real_stores.get(&TARGET_STREAM).unwrap();
+            b.iter(|| {
+                let mut count = 0u64;
+                real.for_each(1, 1001, &mut |_entry| {
+                    count += black_box(1);
+                }).ok();
                 assert_eq!(count, STREAM_MSGS as u64);
             });
         });

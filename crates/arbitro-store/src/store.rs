@@ -5,13 +5,14 @@
 
 use arbitro_common::subject::subject_matches;
 
-/// A single stored message.
-#[derive(Debug, Clone)]
-pub struct Entry {
+/// A single stored message view.
+/// Borrows data from the store arena — zero allocations.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry<'a> {
     pub seq: u64,
     pub timestamp: u64,
-    pub subject: Box<[u8]>,
-    pub payload: Box<[u8]>,
+    pub subject: &'a [u8],
+    pub payload: &'a [u8],
 }
 
 /// Message reference for appending — borrows data, no allocation.
@@ -63,20 +64,20 @@ pub trait Store: Send + Sync {
     fn append_batch(&mut self, entries: &[EntryRef<'_>], timestamp: u64) -> Result<u64, StoreError>;
 
     /// Read a single entry by sequence.
-    #[deprecated(note = "use get() for zero-alloc callback-based read")]
-    fn read(&self, seq: u64) -> Result<Option<Entry>, StoreError>;
+    /// Deprecated: users should prefer get() or for_each() for better performance.
+    fn read(&self, seq: u64) -> Result<Option<Entry<'_>>, StoreError>;
 
     /// Read a range [start, end) of entries.
-    #[deprecated(note = "use for_each() for zero-alloc callback-based read")]
-    fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry>, StoreError>;
+    /// Deprecated: users should prefer get() or for_each() for better performance.
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError>;
 
     /// Zero-alloc: calls `f` with a borrowed entry at `seq`.
     /// Returns `Ok(true)` if found, `Ok(false)` if not found.
-    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry)) -> Result<bool, StoreError>;
+    fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError>;
 
     /// Zero-alloc: calls `f` for each entry in `[start..end)`.
     /// Borrows directly from internal storage — no cloning.
-    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry)) -> Result<(), StoreError>;
+    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError>;
 
     // ── Management ──────────────────────────────────────────────────
 
@@ -93,6 +94,6 @@ pub trait Store: Send + Sync {
 /// Helper: check if an entry's subject matches a pattern.
 /// Used by drain implementations.
 #[inline]
-pub fn entry_matches(entry: &Entry, pattern: &[u8]) -> bool {
+pub fn entry_matches(entry: &Entry<'_>, pattern: &[u8]) -> bool {
     subject_matches(pattern, &entry.subject)
 }
