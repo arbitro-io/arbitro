@@ -6,10 +6,11 @@ Built in Rust with a **Zero-Allocation, Zero-Copy** architecture, Arbitro follow
 
 ## Key Features
 
-- **Subject-Based Flow Control**: Fine-grained `subject_limits` to prevent noisy neighbors and manage heterogeneous consumer speeds.
+- **Fanout Optimization**: `FanoutBatch` (0x0207) protocol for connection-level deduplication and $O(M)$ client-side `SubjectTrie` filtering.
+- **High-Density Callback API**: Non-blocking closure-based subscriptions with RAII `CallbackHandle` for automatic lifecycle management.
 - **Zero-Copy Engine**: Wire protocol and internal delivery path use `repr(C)` composite headers for O(1) frame construction.
 - **Linear Byte Log**: Arena-based `MemoryStore` for contiguous, cache-friendly message ingestion and draining.
-- **High Concurrency**: Sharded stream architecture with sub-nanosecond synchronization primitives.
+- **Subject-Based Flow Control**: Fine-grained `subject_limits` to prevent noisy neighbors and manage heterogeneous consumer speeds.
 
 ## Performance
 
@@ -22,6 +23,7 @@ Benchmarked on a single server instance (loopback, 64B payload):
 |----------|---------|---------|
 | Publish (Ingest) | 410us (2.4M/s) | 68ms (**14.6M/s**) |
 | Cycle Fire-and-Forget | 311us (3.2M/s) | 64ms (**15.6M/s**) |
+| Fanout (60 Subs) | 1.4ms (700k/s) | 1.4s (**6.6M/s**) |
 | Cycle Explicit Ack | 425us (2.35M/s) | 425ms (est.) (2.3M/s) |
 
 ## Quick Start
@@ -66,6 +68,11 @@ let consumer_cfg = ConsumerConfig::new(b"gateway", b"ORDERS")
     .build();
 
 let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+
+// Callback Mode: Non-blocking, closure-based message handling
+let _handle = consumer.subscribe_callback(Some(b"orders.>"), move |msg| {
+    println!("Received order: {:?}", msg.subject);
+}).await.unwrap();
 ```
 
 ## Environment Variables
@@ -84,8 +91,9 @@ See `.agent/rules/performance.md` for the full list. Key principles:
 
 - **Zero-copy hot path**: `zerocopy` overlays, one copy max (into Arena).
 - **No allocations on critical path**: Pre-allocated scratch buffers, reused across cycles.
-- **O(1) Dispatch**: Match-based jump tables for protocol frame routing.
-- **No channels on hot path**: `Gate` (tokio::Notify) replaces MPSC for drain signaling.
+- **Fanout Deduplication**: `FanoutBatch` ensures only ONE frame per socket is sent, even with hundreds of local subscribers.
+- **O(1) Dispatch**: Match-based jump tables for protocol frame routing and client-side `SubjectTrie`.
+- **No channels on hot path**: `Gate` (tokio::Notify) replaces MPSC for drain signaling in the engine.
 
 ## License
 
