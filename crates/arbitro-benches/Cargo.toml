@@ -23,31 +23,7 @@ criterion = { workspace = true }
 tokio-uring = { workspace = true }
 
 [[bench]]
-name    = "decode_cost"
-harness = false
-
-[[bench]]
-name    = "action_dispatch"
-harness = false
-
-[[bench]]
-name    = "e2e_throughput"
-harness = false
-
-[[bench]]
-name    = "store_compare"
-harness = false
-
-[[bench]]
-name    = "drain_steps"
-harness = false
-
-[[bench]]
-name    = "parallel_dispatch"
-harness = false
-
-[[bench]]
-name    = "protocol_compare"
+name    = "throughput"
 harness = false
 
 [[bench]]
@@ -55,9 +31,13 @@ name    = "subject_limits"
 harness = false
 
 [[bench]]
-name    = "subject_match_scaling"
+name    = "fanout"
 harness = false
 
 [[bench]]
-name    = "fanout_scale"
+name    = "chaos"
+harness = false
+
+[[bench]]
+name    = "endurance"
 harness = false
