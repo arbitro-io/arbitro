@@ -28,6 +28,8 @@ pub struct Consumer {
     /// Sequences deferred due to per-subject credit limits.
     /// Retry when credit frees (ack releases subject slot).
     pub deferred: VecDeque<u64>,
+    /// Fast-path: true if filter is ">" or empty, matching every subject.
+    pub matches_all: bool,
 }
 
 impl Consumer {
@@ -40,6 +42,9 @@ impl Consumer {
             None
         };
 
+        let matches_all = config.filters.is_empty()
+            || config.filters.iter().any(|f| f.as_ref() == b">");
+
         Self {
             config,
             subscriptions: Vec::new(),
@@ -48,6 +53,7 @@ impl Consumer {
             pending_count: 0,
             nacked: VecDeque::new(),
             deferred: VecDeque::new(),
+            matches_all,
         }
     }
 
@@ -67,10 +73,7 @@ impl Consumer {
     /// Does this consumer's filters match the given subject?
     #[inline]
     pub fn matches(&self, subject: &[u8]) -> bool {
-        if self.config.filters.is_empty() {
-            return true;
-        }
-        self.config.filters.iter().any(|f| subject_matches(f, subject))
+        self.matches_all || self.config.filters.iter().any(|f| subject_matches(f, subject))
     }
 
     /// Is this consumer connected and ready to receive?
