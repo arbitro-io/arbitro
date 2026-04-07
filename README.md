@@ -12,7 +12,7 @@ Built in Rust with a **Zero-Allocation, Zero-Copy** architecture, Arbitro follow
 - **Massive Subject Partitioning**: Independently control flow for millions of unique subjects with zero configuration.
 - **Ultra-High Throughput**: 14.2M+ messages per second ingestion on commodity hardware.
 - **Predictable Latency**: Sub-microsecond internal dispatch with deterministic performance.
-- **Unified Flow Control**: Hierarchical subject limits to prevent "noisy neighbor" congestion and ensure fair usage.
+- **Crash-Safe Persistence**: Zero-Copy indexing with **Magic Byte (0xAF)** validation to guarantee recovery after abrupt process failure (`SIGKILL`).
 - **Reactive Model**: Efficient non-blocking delivery for both callback-based and pull-based consumers.
 
 ## Performance (E2E Throughput)
@@ -32,9 +32,9 @@ Arbitro isn't just fast in bursts; it's designed for **Thermal and Memory Stabil
 
 | Scenario | Throughput (Avg) | CPU Load | RAM (RSS) | Stability |
 | :--- | :--- | :--- | :--- | :--- |
-| **Memory Hot-Path** | **478,800 msg/s** | **~10.8%** | **~2.99 GB** | **Rock Solid** |
-| **Disk Persistence (Tolerant)** | **8,944 msg/s** | **~1.4%** | **~71 MB** | **Zero-Alloc Index** |
-| **Chaos Resilience** | **10s Flicker** | **Insignificant** | **Stable** | **Immediate Recovery** |
+| **Memory Hot-Path** | **~2.8M msg/s** | **~10.8%** | **~2.99 GB** | **O(1) Hybrid Index** |
+| **Disk Persistence (Tolerant)** | **~35,400 msg/s** | **~3.2%** | **~120 MB** | **Crash-Safe (AF)** |
+| **Chaos Resilience** | **10s Stress** | **Isolated PIDs** | **Stable** | **100% Recovery Proof** |
 
 > [!TIP]
 > **Zero-Allocation Telemetry**: The internal metrics radar reads directly from the kernel interface, ensuring that monitoring the engine doesn't pollute the engine's own Performance Profile.
@@ -173,6 +173,8 @@ client.publish_batch(b"ORDERS", &[
 
 ### Phase 2: Persistence & Connectivity (Validated)
 - [x] **Disk Persistence**: High-performance AEP/NVMe storage backend (**TolerantStore**).
+- [x] **Crash-Safe Journaling**: **Magic Byte (0xAF)** validation for recovery after `SIGKILL`.
+- [x] **Sync Acks**: Guaranteed delivery points with explicit `AckSync` protocol.
 - [ ] **Subject Scavenging**: Automatic expiration of inactive subject slots.
 - [ ] **Multi-Language Clients**: Official TypeScript (`arbitro-ts`) and Go (`arbitro-go`) support.
 

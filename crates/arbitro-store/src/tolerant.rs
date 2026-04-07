@@ -31,6 +31,9 @@ pub struct TolerantStore {
     current_segment_offset: u32,
 }
 
+const MAGIC: u8 = 0xAF;
+const HEADER_SIZE: usize = 23;
+
 impl TolerantStore {
     pub fn new(base_path: PathBuf) -> Self {
         Self {
@@ -87,7 +90,7 @@ impl TolerantStore {
     fn load_segment(&mut self, path: &std::path::Path) -> Result<(), StoreError> {
         let file = fs::File::open(path).map_err(|_| StoreError::NotFound)?;
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if len < 22 { return Ok(()); }
+        if len < HEADER_SIZE as u64 { return Ok(()); }
 
         let mmap = unsafe { Mmap::map(&file).map_err(|_| StoreError::NotFound)? };
         let segment_idx = self.sealed_segments.len() as u32;
@@ -95,18 +98,24 @@ impl TolerantStore {
         let mut first = 0;
         let mut last = 0;
 
-        while offset + 22 <= mmap.len() {
-            let h = &mmap[offset..offset+22];
-            let subj_len = u16::from_le_bytes([h[0], h[1]]);
-            let payload_len = u32::from_le_bytes([h[2], h[3], h[4], h[5]]);
-            let ts = u64::from_le_bytes([h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13]]);
-            let seq = u64::from_le_bytes([h[14], h[15], h[16], h[17], h[18], h[19], h[20], h[21]]);
+        while offset + HEADER_SIZE <= mmap.len() {
+            let h = &mmap[offset..offset+HEADER_SIZE];
+            
+            // CRASH CONSISTENCY: Stop if Magic is missing (end of valid data in pre-allocated segment)
+            if h[0] != MAGIC {
+                break;
+            }
+
+            let subj_len = u16::from_le_bytes([h[1], h[2]]);
+            let payload_len = u32::from_le_bytes([h[3], h[4], h[5], h[6]]);
+            let ts = u64::from_le_bytes([h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14]]);
+            let seq = u64::from_le_bytes([h[15], h[16], h[17], h[18], h[19], h[20], h[21], h[22]]);
 
             if first == 0 { first = seq; }
             last = seq;
-            self.index.push(LogMetadata { seq, ts, subj_len, payload_len, offset: (offset + 22) as u32, segment_idx });
+            self.index.push(LogMetadata { seq, ts, subj_len, payload_len, offset: (offset + HEADER_SIZE) as u32, segment_idx });
             
-            offset += 22 + (subj_len as usize) + (payload_len as usize);
+            offset += HEADER_SIZE + (subj_len as usize) + (payload_len as usize);
             self.next_seq = seq + 1;
             self.total_bytes += (subj_len as u64) + (payload_len as u64);
         }
@@ -132,7 +141,7 @@ impl Store for TolerantStore {
 
     fn append(&mut self, entry: EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError> {
         let entry_total = (entry.subject.len() + entry.payload.len()) as u64;
-        let total_needed = 22 + entry_total;
+        let total_needed = (HEADER_SIZE as u64) + entry_total;
 
         if (self.current_segment_offset as u64) + total_needed >= MAX_SEGMENT_BYTES {
             self.rotate()?;
@@ -145,12 +154,13 @@ impl Store for TolerantStore {
         let slen = entry.subject.len() as u16;
         let plen = entry.payload.len() as u32;
 
-        mmap[start..start + 2].copy_from_slice(&slen.to_le_bytes());
-        mmap[start + 2..start + 6].copy_from_slice(&plen.to_le_bytes());
-        mmap[start + 6..start + 14].copy_from_slice(&timestamp.to_le_bytes());
-        mmap[start + 14..start + 22].copy_from_slice(&seq.to_le_bytes());
+        mmap[start] = MAGIC;
+        mmap[start + 1..start + 3].copy_from_slice(&slen.to_le_bytes());
+        mmap[start + 3..start + 7].copy_from_slice(&plen.to_le_bytes());
+        mmap[start + 7..start + 15].copy_from_slice(&timestamp.to_le_bytes());
+        mmap[start + 15..start + 23].copy_from_slice(&seq.to_le_bytes());
 
-        let data_off = start + 22;
+        let data_off = start + HEADER_SIZE;
         mmap[data_off..data_off + entry.subject.len()].copy_from_slice(entry.subject);
         mmap[data_off + entry.subject.len()..data_off + entry.subject.len() + entry.payload.len()]
             .copy_from_slice(entry.payload);
