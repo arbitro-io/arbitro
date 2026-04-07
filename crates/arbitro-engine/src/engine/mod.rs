@@ -108,11 +108,17 @@ impl Engine {
             Action::Ack => {
                 system::on_ack(&self.ctx, conn_id, &frame);
             }
+            Action::AckSync => {
+                system::on_ack_sync(&self.ctx, conn_id, &frame);
+            }
             Action::Nack => {
                 system::on_nack(&self.ctx, conn_id, &frame);
             }
             Action::BatchAck => {
                 system::on_batch_ack(&self.ctx, conn_id, &frame);
+            }
+            Action::BatchAckSync => {
+                system::on_batch_ack_sync(&self.ctx, conn_id, &frame);
             }
             // Everything else is cold path
             _ => self.dispatch_cold(action, conn_id, &frame),

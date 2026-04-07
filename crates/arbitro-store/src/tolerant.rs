@@ -165,10 +165,9 @@ impl Store for TolerantStore {
     }
 
     fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
-        let idx = match self.index.binary_search_by_key(&seq, |m| m.seq) {
-            Ok(i) => i,
-            Err(_) => return Ok(false),
-        };
+        if seq < self.first_seq { return Ok(false); }
+        let idx = (seq - self.first_seq) as usize;
+        if idx >= self.index.len() { return Ok(false); }
         let m = &self.index[idx];
         let data = if m.segment_idx == self.sealed_segments.len() as u32 {
             self.active_mmap.as_ref().map(|m| &m[..]).ok_or(StoreError::NotFound)?
@@ -183,7 +182,9 @@ impl Store for TolerantStore {
 
     fn truncate_front(&mut self, target: u64) -> u64 {
         if self.index.is_empty() || target <= self.first_seq { return 0; }
-        let idx = self.index.binary_search_by_key(&target, |m| m.seq).unwrap_or_else(|i| i);
+        
+        let idx = (target - self.first_seq) as usize;
+        let idx = idx.min(self.index.len());
         if idx == 0 { return 0; }
 
         let mut dropped = 0;
@@ -239,7 +240,10 @@ impl Store for TolerantStore {
     fn read_range(&self, _: u64, _: u64) -> Result<Vec<Entry<'_>>, StoreError> { Err(StoreError::NotFound) }
     fn drain(&mut self, _: &[u8]) -> u64 { 0 }
     fn for_each(&self, s: u64, e: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
-        let (start, end) = (self.index.binary_search_by_key(&s, |m| m.seq).unwrap_or_else(|i| i), self.index.binary_search_by_key(&e, |m| m.seq).unwrap_or_else(|i| i));
+        let start = if s < self.first_seq { 0 } else { (s - self.first_seq) as usize };
+        let end = if e < self.first_seq { 0 } else { (e - self.first_seq) as usize };
+        let end = end.min(self.index.len());
+        let start = start.min(end);
         for i in start..end { self.get(self.index[i].seq, f)?; }
         Ok(())
     }

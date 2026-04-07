@@ -69,12 +69,60 @@ pub fn on_ack(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
         let result = slot.drain.on_ack(consumer_id, seq);
         if result {
             slot.signal.release();
+            
+            // WorkQueue Lazy Scavenging: Truncate in chunks to respect Hardware Sympathy
+            use arbitro_proto::config::RetentionPolicy;
+            if slot.config.retention == RetentionPolicy::WorkQueue {
+                let low_water = slot.drain.lowest_unacked_seq();
+                let store_first = slot.store.info().first_seq;
+                
+                // Truncate only in batches of 1,000 to avoid O(N) memory shifting penalties
+                if low_water.saturating_sub(store_first) >= 1000 {
+                    slot.store.truncate_front(low_water);
+                }
+            }
         }
         result
     }).unwrap_or(false);
 
     if !acked {
         let env_seq = frame.envelope().env_seq.get();
+        reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, seq, ErrorCode::ConsumerNotFound);
+    }
+
+    ctx.metrics.msgs_out.fetch_add(1, Relaxed);
+}
+
+/// Handle a guaranteed AckSync frame — same logic as Ack but strictly replies with RepOk on success.
+#[inline]
+pub fn on_ack_sync(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
+    let stream_id = frame.stream_id();
+    let body = frame.body();
+    let view = AckView::new(body);
+    let consumer_id = view.consumer_id();
+    let seq = view.sequence();
+
+    let acked = ctx.streams.with_mut(stream_id, |slot| {
+        let result = slot.drain.on_ack(consumer_id, seq);
+        if result {
+            slot.signal.release();
+            
+            use arbitro_proto::config::RetentionPolicy;
+            if slot.config.retention == RetentionPolicy::WorkQueue {
+                let low_water = slot.drain.lowest_unacked_seq();
+                let store_first = slot.store.info().first_seq;
+                if low_water.saturating_sub(store_first) >= 1000 {
+                    slot.store.truncate_front(low_water);
+                }
+            }
+        }
+        result
+    }).unwrap_or(false);
+
+    let env_seq = frame.envelope().env_seq.get();
+    if acked {
+        reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, seq);
+    } else {
         reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, seq, ErrorCode::ConsumerNotFound);
     }
 
@@ -96,8 +144,55 @@ pub fn on_batch_ack(ctx: &Context, _conn_id: ConnId, frame: &FrameView<'_>) {
         let count = slot.drain.on_batch_ack(consumer_id, &seqs);
         if count > 0 {
             slot.signal.release();
+            
+            // WorkQueue Lazy Scavenging
+            use arbitro_proto::config::RetentionPolicy;
+            if slot.config.retention == RetentionPolicy::WorkQueue {
+                let low_water = slot.drain.lowest_unacked_seq();
+                let store_first = slot.store.info().first_seq;
+                
+                if low_water.saturating_sub(store_first) >= 1000 {
+                    slot.store.truncate_front(low_water);
+                }
+            }
         }
     });
+
+    ctx.metrics.msgs_out.fetch_add(seqs.len() as u64, Relaxed);
+}
+
+/// Handle a guaranteed BatchAckSync frame — same logic as BatchAck but replies with RepOk.
+#[inline]
+pub fn on_batch_ack_sync(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>) {
+    let stream_id = frame.stream_id();
+    let body = frame.body();
+    let view = BatchAckView::new(body);
+    let consumer_id = view.consumer_id();
+    let seqs: Vec<u64> = view.sequences().collect();
+
+    let count = ctx.streams.with_mut(stream_id, |slot| {
+        let count = slot.drain.on_batch_ack(consumer_id, &seqs);
+        if count > 0 {
+            slot.signal.release();
+            
+            use arbitro_proto::config::RetentionPolicy;
+            if slot.config.retention == RetentionPolicy::WorkQueue {
+                let low_water = slot.drain.lowest_unacked_seq();
+                let store_first = slot.store.info().first_seq;
+                if low_water.saturating_sub(store_first) >= 1000 {
+                    slot.store.truncate_front(low_water);
+                }
+            }
+        }
+        count as u64
+    }).unwrap_or(0);
+
+    let env_seq = frame.envelope().env_seq.get();
+    if count > 0 {
+        reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, count);
+    } else {
+        reply::send_error(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0, ErrorCode::ConsumerNotFound);
+    }
 
     ctx.metrics.msgs_out.fetch_add(seqs.len() as u64, Relaxed);
 }

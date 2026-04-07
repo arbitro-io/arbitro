@@ -142,6 +142,26 @@ impl Consumer {
         }
     }
 
+    /// Calculate the lowest sequence number that has NOT been reliably acknowledged.
+    /// Used for O(1) low-water mark lazy scavenging across WorkQueue streams.
+    #[inline]
+    pub fn lowest_unacked_seq(&self) -> Sequence {
+        if self.config.ack_policy == AckPolicy::None {
+            return self.deliver_seq;
+        }
+        
+        // Base is the lowest sequence we are currently tracking to deliver or redeliver
+        let min_nacked = self.nacked.front().copied().unwrap_or(self.deliver_seq);
+        let min_deferred = self.deferred.front().copied().unwrap_or(self.deliver_seq);
+        
+        let base = min_nacked.min(min_deferred).min(self.deliver_seq);
+
+        // Account for messages currently checked out (in-flight).
+        // Since we strictly pull from the base upwards, the lowest unacked message 
+        // cannot be more than `pending_count` units behind the base in the worst contiguous case.
+        base.saturating_sub(self.pending_count as u64)
+    }
+
     #[inline]
     pub fn is_queue(&self) -> bool {
         self.config.deliver_mode == DeliverMode::Queue

@@ -43,7 +43,27 @@ impl MemoryStore {
 
     #[inline]
     fn seq_to_idx(&self, seq: u64) -> Option<usize> {
-        self.index.binary_search_by_key(&seq, |meta| meta.seq).ok()
+        if seq < self.first_seq {
+            return None;
+        }
+        let est_idx = (seq - self.first_seq) as usize;
+        if est_idx < self.index.len() && self.index[est_idx].seq == seq {
+            Some(est_idx)
+        } else {
+            // Fallback for sparse indices (e.g. after subject drain)
+            self.index.binary_search_by_key(&seq, |meta| meta.seq).ok()
+        }
+    }
+
+    #[inline]
+    fn find_lower_bound(&self, seq: u64) -> usize {
+        if seq <= self.first_seq { return 0; }
+        let est_idx = (seq - self.first_seq) as usize;
+        if est_idx < self.index.len() && self.index[est_idx].seq == seq {
+            est_idx
+        } else {
+            self.index.binary_search_by_key(&seq, |m| m.seq).unwrap_or_else(|i| i)
+        }
     }
 
     #[inline]
@@ -113,8 +133,10 @@ impl Store for MemoryStore {
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
-        let s = self.index.binary_search_by_key(&start, |m| m.seq).unwrap_or_else(|i| i);
-        let e = self.index.binary_search_by_key(&end, |m| m.seq).unwrap_or_else(|i| i);
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end);
+        let e = e.min(self.index.len());
+        let s = s.min(e);
         
         let mut out = Vec::with_capacity(e - s);
         for i in s..e {
@@ -136,8 +158,11 @@ impl Store for MemoryStore {
     }
 
     fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
-        let s = self.index.binary_search_by_key(&start, |m| m.seq).unwrap_or_else(|i| i);
-        let e = self.index.binary_search_by_key(&end, |m| m.seq).unwrap_or_else(|i| i);
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end);
+        let e = e.min(self.index.len());
+        let s = s.min(e);
+        
         for i in s..e {
             let entry = self.get_entry_view(i);
             f(&entry);
@@ -146,10 +171,10 @@ impl Store for MemoryStore {
     }
 
     fn truncate_front(&mut self, first_seq: u64) -> u64 {
-        let idx = match self.index.binary_search_by_key(&first_seq, |m| m.seq) {
-            Ok(i) => i,
-            Err(i) => i,
-        };
+        if first_seq <= self.first_seq || self.index.is_empty() { return 0; }
+        
+        let idx = (first_seq - self.first_seq) as usize;
+        let idx = idx.min(self.index.len());
 
         if idx == 0 {
             return 0;

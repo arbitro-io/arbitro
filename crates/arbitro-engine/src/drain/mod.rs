@@ -351,6 +351,19 @@ impl ReactiveDrain {
     pub fn iter_consumers(&self) -> impl Iterator<Item = &Consumer> {
         self.consumers.values()
     }
+
+    /// Calculate the global low water mark across all registered consumers.
+    /// Used for WorkQueue and Interest lazy scavenging.
+    pub fn lowest_unacked_seq(&self) -> u64 {
+        if self.consumers.is_empty() {
+            return 0; // No consumers means we keep data until someone connects
+        }
+        let mut min_seq = u64::MAX;
+        for c in self.consumers.values() {
+            min_seq = min_seq.min(c.lowest_unacked_seq());
+        }
+        if min_seq == u64::MAX { 0 } else { min_seq }
+    }
 }
 
 // ── Free functions (hot path) ───────────────────────────────────────────

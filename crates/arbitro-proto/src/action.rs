@@ -16,6 +16,8 @@ pub enum Action {
     RepBatch      = 0x0205,
     BatchAck      = 0x0206,
     FanoutBatch   = 0x0207,
+    AckSync       = 0x0208,
+    BatchAckSync  = 0x0209,
 
     // 0x03xx — Subscription
     Subscribe     = 0x0301,
@@ -63,6 +65,8 @@ impl Action {
             0x0205 => Some(Self::RepBatch),
             0x0206 => Some(Self::BatchAck),
             0x0207 => Some(Self::FanoutBatch),
+            0x0208 => Some(Self::AckSync),
+            0x0209 => Some(Self::BatchAckSync),
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
@@ -101,7 +105,7 @@ impl Action {
     /// Hot-path actions: publish, ack, nack.
     #[inline(always)]
     pub const fn is_hot(self) -> bool {
-        matches!(self, Self::Publish | Self::Ack | Self::Nack | Self::BatchAck)
+        matches!(self, Self::Publish | Self::Ack | Self::Nack | Self::BatchAck | Self::AckSync | Self::BatchAckSync)
     }
 
     /// Actions that carry a subject for routing.
