@@ -5,21 +5,23 @@ pub mod metrics;
 pub mod stream;
 pub mod transport;
 
-// Re-exports for ergonomic API
-pub use engine::Engine;
-pub use engine::context::Context;
-pub use auth::{Auth, AllowAll};
-pub use transport::{Transport, NoopTransport};
-pub use metrics::{Metrics, MetricsSnapshot};
-pub use drain::signal::{DrainSignal, NullSignal};
-pub use drain::ReactiveDrain;
-pub use engine::context::SignalFactory;
+use std::sync::Arc;
+use arbitro_metadata::MetadataLog;
+pub use crate::engine::Engine;
+pub use crate::engine::context::Context;
+pub use crate::engine::context::SignalFactory;
+pub use crate::auth::Auth;
+pub use crate::transport::Transport;
+pub use crate::drain::signal::DrainSignal;
+use crate::auth::AllowAll;
+use crate::transport::NoopTransport;
 
 /// Builder for constructing an Engine with custom transport and auth.
 pub struct EngineBuilder {
     transport: Option<Box<dyn Transport>>,
     auth: Option<Box<dyn Auth>>,
     signal_factory: Option<SignalFactory>,
+    metadata: Option<Arc<MetadataLog>>,
 }
 
 impl Default for EngineBuilder {
@@ -34,6 +36,7 @@ impl EngineBuilder {
             transport: None,
             auth: None,
             signal_factory: None,
+            metadata: None,
         }
     }
 
@@ -52,12 +55,20 @@ impl EngineBuilder {
         self
     }
 
+    pub fn metadata(mut self, m: Arc<MetadataLog>) -> Self {
+        self.metadata = Some(m);
+        self
+    }
+
     pub fn build(self) -> Engine {
         let transport = self.transport.unwrap_or_else(|| Box::new(NoopTransport));
         let auth = self.auth.unwrap_or_else(|| Box::new(AllowAll));
         let mut ctx = Context::new(transport, auth);
         if let Some(f) = self.signal_factory {
             ctx.signal_factory = f;
+        }
+        if let Some(m) = self.metadata {
+            *ctx.metadata.write() = Some(m);
         }
         Engine::new(ctx)
     }

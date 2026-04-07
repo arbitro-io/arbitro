@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use arbitro_proto::config::ConsumerConfig;
 use arbitro_proto::ids::ConnId;
 
+use arbitro_metadata::MetadataLog;
 use crate::auth::Auth;
 use crate::drain::signal::{DrainSignal, NullSignal};
 use crate::metrics::Metrics;
@@ -37,6 +38,8 @@ pub struct Context {
     pub next_consumer_id: Mutex<u32>,
     /// Track which connections are active.
     pub connections: Mutex<HashMap<ConnId, ConnState>>,
+    /// Persistent log for metadata. Interior mutability allows enabling it after replay.
+    pub metadata: parking_lot::RwLock<Option<Arc<MetadataLog>>>,
 }
 
 /// Per-connection state.
@@ -58,6 +61,7 @@ impl Context {
             consumers: Mutex::new(HashMap::new()),
             next_consumer_id: Mutex::new(1),
             connections: Mutex::new(HashMap::new()),
+            metadata: parking_lot::RwLock::new(None),
         }
     }
 

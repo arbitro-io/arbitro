@@ -28,7 +28,7 @@ pub struct ArbitroServer {
 }
 
 impl ArbitroServer {
-    pub fn new(config: Config, transport: Arc<TokioTransport>) -> Self {
+    pub fn new(config: Config, transport: Arc<TokioTransport>, metadata: Option<Arc<arbitro_metadata::MetadataLog>>) -> Self {
         let streams_for_factory = Arc::new(std::sync::Mutex::new(None::<std::sync::Arc<arbitro_engine::stream::StreamMap>>));
         let transport_for_factory: Arc<dyn Transport> = transport.clone();
         let streams_clone = streams_for_factory.clone();
@@ -41,15 +41,24 @@ impl ArbitroServer {
             gate
         });
 
-        let engine = EngineBuilder::new()
+        let mut engine_builder = EngineBuilder::new()
             .transport(transport.clone())
-            .signal_factory(signal_factory)
-            .build();
+            .signal_factory(signal_factory);
+
+        if let Some(m) = metadata {
+            engine_builder = engine_builder.metadata(m);
+        }
+
+        let engine = engine_builder.build();
 
         // Set the streams Arc so the factory can use it
         *streams_for_factory.lock().unwrap() = Some(engine.streams().clone());
 
         Self { config, engine, transport }
+    }
+
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Run the server — blocks until shutdown.

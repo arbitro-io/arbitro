@@ -14,8 +14,33 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::ids::ConnId;
 use arbitro_proto::wire::envelope::FrameView;
+use arbitro_proto::metadata::MetadataCommand;
+use arbitro_metadata::MetadataApplier;
 
 use context::Context;
+
+impl MetadataApplier for Engine {
+    fn apply_command(&self, command: MetadataCommand) {
+        let dummy_conn = ConnId::MAX;
+        let dummy_seq = 0;
+
+        match command {
+            MetadataCommand::CreateStream(cfg) => {
+                management::on_create_stream(&self.ctx, dummy_conn, dummy_seq, cfg);
+            }
+            MetadataCommand::DeleteStream(id) => {
+                management::on_delete_stream(&self.ctx, dummy_conn, id, dummy_seq);
+            }
+            MetadataCommand::CreateConsumer(cfg) => {
+                let stream_id = cfg.stream_id;
+                subscribe::on_create_consumer(&self.ctx, dummy_conn, stream_id, dummy_seq, cfg);
+            }
+            MetadataCommand::DeleteConsumer { stream_id, consumer_id } => {
+                subscribe::on_delete_consumer(&self.ctx, dummy_conn, stream_id, dummy_seq, consumer_id);
+            }
+        }
+    }
+}
 
 /// The engine — owns context and scratch buffers.
 pub struct Engine {

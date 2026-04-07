@@ -64,6 +64,7 @@ name = "arbitro-engine"
 version = "0.1.0"
 dependencies = [
  "arbitro-common",
+ "arbitro-metadata",
  "arbitro-proto",
  "arbitro-store",
  "bytes",
@@ -73,10 +74,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitro-metadata"
+version = "0.1.0"
+dependencies = [
+ "arbitro-proto",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "arbitro-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "serde",
  "zerocopy",
 ]
 
@@ -86,6 +98,7 @@ version = "0.1.0"
 dependencies = [
  "arbitro-client",
  "arbitro-engine",
+ "arbitro-metadata",
  "arbitro-proto",
  "arbitro-store",
  "bytes",

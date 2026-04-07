@@ -8,6 +8,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::config::StreamConfig;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::ids::ConnId;
+use arbitro_proto::metadata::MetadataCommand;
 
 use super::context::Context;
 use super::reply;
@@ -17,7 +18,15 @@ pub fn on_create_stream(ctx: &Context, conn_id: ConnId, env_seq: u32, config: St
     let stream_id = config.stream_id;
     let signal = (ctx.signal_factory)(stream_id);
 
+    // Capture config for recording if insert succeeds
+    let config_to_record = config.clone();
+
     if ctx.streams.insert(config, signal) {
+        // Record to persistent log if present
+        if let Some(log) = ctx.metadata.read().as_ref() {
+            let _ = log.record(&MetadataCommand::CreateStream(config_to_record));
+        }
+
         ctx.metrics.streams.fetch_add(1, Relaxed);
         reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, 0);
     } else {
@@ -28,6 +37,11 @@ pub fn on_create_stream(ctx: &Context, conn_id: ConnId, env_seq: u32, config: St
 /// Delete a stream. Cold path.
 pub fn on_delete_stream(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32) {
     if ctx.streams.remove(stream_id).is_some() {
+        // Record to persistent log if present
+        if let Some(log) = ctx.metadata.read().as_ref() {
+            let _ = log.record(&MetadataCommand::DeleteStream(stream_id));
+        }
+
         // Drain + store removed with the StreamSlot
         // Remove consumer configs for this stream
         let mut consumers = ctx.consumers.lock().unwrap();

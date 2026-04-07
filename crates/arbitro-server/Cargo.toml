@@ -15,6 +15,7 @@ path = "src/lib.rs"
 arbitro-proto  = { path = "../arbitro-proto" }
 arbitro-engine = { path = "../arbitro-engine" }
 arbitro-store  = { path = "../arbitro-store" }
+arbitro-metadata = { path = "../arbitro-metadata" }
 tokio          = { workspace = true }
 tracing        = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -16,6 +16,8 @@ pub struct Config {
     pub keepalive_interval: Duration,
     /// Shutdown timeout — max wait for graceful drain (default: 10s).
     pub shutdown_timeout: Duration,
+    /// Data directory for persistence (None = in-memory only).
+    pub data_dir: Option<String>,
 }
 
 impl Config {
@@ -27,6 +29,7 @@ impl Config {
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
             keepalive_interval: Duration::from_secs(env_parse("ARBITRO_KEEPALIVE_INTERVAL", 30)),
             shutdown_timeout: Duration::from_secs(env_parse("ARBITRO_SHUTDOWN_TIMEOUT", 10)),
+            data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
         }
     }
 }
@@ -40,6 +43,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
+            data_dir: None,
         }
     }
 }

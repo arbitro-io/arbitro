@@ -7,6 +7,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::config::{ConsumerConfig, DeliverMode, DeliverPolicy};
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::ids::ConnId;
+use arbitro_proto::metadata::MetadataCommand;
 
 use arbitro_common::subject::patterns_overlap;
 
@@ -75,7 +76,12 @@ pub fn on_create_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
     // Store consumer config
     {
         let mut consumers = ctx.consumers.lock().unwrap();
-        consumers.insert((stream_id, consumer_id), config);
+        consumers.insert((stream_id, consumer_id), config.clone());
+    }
+
+    // Record to persistent log if present
+    if let Some(log) = ctx.metadata.read().as_ref() {
+        let _ = log.record(&MetadataCommand::CreateConsumer(config));
     }
 
     ctx.metrics.consumers.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -89,6 +95,11 @@ pub fn on_delete_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_se
     }).unwrap_or(false);
 
     if removed {
+        // Record to persistent log if present
+        if let Some(log) = ctx.metadata.read().as_ref() {
+            let _ = log.record(&MetadataCommand::DeleteConsumer { stream_id, consumer_id });
+        }
+
         let mut consumers = ctx.consumers.lock().unwrap();
         consumers.remove(&(stream_id, consumer_id));
         ctx.metrics.consumers.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);

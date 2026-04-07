@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use super::stream::fnv1a_32;
 
 /// Consumer configuration — cold path, created once.
@@ -6,7 +7,7 @@ use super::stream::fnv1a_32;
 /// - Filters must not overlap each other.
 /// - `subject_limits`, `max_inflight`, `ack_wait_ms` only apply
 ///   when `ack_policy` is `Explicit`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerConfig {
     pub name: Box<[u8]>,
     pub consumer_id: u32,
@@ -126,14 +127,15 @@ impl ConsumerConfigBuilder {
 }
 
 /// Per-subject flow control — prevents noisy neighbor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubjectLimit {
     pub pattern: Box<[u8]>,
     pub limit: u32,
 }
 
 /// Ack policy — determines if the broker tracks in-flight messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum AckPolicy {
     /// Fire-and-forget. No ack tracking, no redelivery.
@@ -152,7 +154,8 @@ impl AckPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum DeliverPolicy {
     /// All messages from the beginning.
@@ -174,7 +177,8 @@ impl DeliverPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum DeliverMode {
     /// All consumers receive every message.

@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// Stream configuration — cold path, created once.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub name: Box<[u8]>,
     pub stream_id: u32,
@@ -60,7 +62,8 @@ impl StreamConfigBuilder {
 }
 
 /// What happens when stream limits (max_msgs, max_bytes, max_age) are reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum RetentionPolicy {
     /// Discard oldest messages to make room — ring buffer behavior. Default.
@@ -84,7 +87,8 @@ impl RetentionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum JournalKind {
     Memory = 0,

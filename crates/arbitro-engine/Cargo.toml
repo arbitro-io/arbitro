@@ -8,6 +8,7 @@ license.workspace = true
 arbitro-proto  = { path = "../arbitro-proto" }
 arbitro-common = { path = "../arbitro-common" }
 arbitro-store  = { path = "../arbitro-store" }
+arbitro-metadata = { path = "../arbitro-metadata" }
 zerocopy       = { workspace = true }
 bytes          = { workspace = true }
 parking_lot    = { workspace = true }
