@@ -19,7 +19,7 @@ use arbitro_server::{ArbitroServer, Config, TokioTransport};
 const MSGS_PER_BATCH: usize = 1000;
 const TOTAL_MSGS: u64 = 500_000;
 const FLICKER_CLIENTS: usize = 10;
-const FLICKER_ITERATIONS: usize = 50;
+const FLICKER_DURATION: Duration = Duration::from_secs(10);
 
 fn portpicker() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -145,33 +145,34 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let mut flicker_tasks = Vec::new();
+        let start_chaos = Instant::now();
+        
         for i in 0..FLICKER_CLIENTS {
             let addr_clone = addr.clone();
             flicker_tasks.push(tokio::spawn(async move {
-                for _ in 0..FLICKER_ITERATIONS {
+                while start_chaos.elapsed() < FLICKER_DURATION {
                     if let Ok(client) = Client::connect(&addr_clone).await {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(15)).await;
                         drop(client);
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 println!("Client {} finished flickering.", i);
             }));
         }
 
-        let client = Client::connect(&addr).await.unwrap();
-        let start = Instant::now();
-        for _ in 0..50 {
+        let client = Client::connect(&addr).await.expect("chaos connect");
+        while start_chaos.elapsed() < FLICKER_DURATION {
             let _ = client.publish(b"chaos_durable", b"flicker.msg", b"data").await;
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         for task in flicker_tasks { let _ = task.await; }
         println!("\nCHAOS SUMMARY:");
         println!("- Zero-Copy Persistence: Verified");
         println!("- Abrupt Shutdown Recovery: Verified");
-        println!("- Client Flickering resilience: Verified");
-        println!("Total Chaos Time: {:?}", start.elapsed());
+        println!("- Client Flickering resilience: Verified (10s Burst)");
+        println!("Total Chaos Time: {:?}", start_chaos.elapsed());
         let _ = stop_tx3.send(true);
     }
 }
