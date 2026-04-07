@@ -43,8 +43,9 @@ impl StreamSlot {
             arbitro_proto::config::JournalKind::Memory => Box::new(MemoryStore::new()),
             arbitro_proto::config::JournalKind::Tolerant => {
                 if let Some(mut path) = base_path {
+                    let name_str = String::from_utf8_lossy(&config.name);
                     path.push("streams");
-                    path.push(format!("{}", stream_id));
+                    path.push(name_str.as_ref());
                     path.push("journal.dat");
                     Box::new(TolerantStore::new(path))
                 } else {

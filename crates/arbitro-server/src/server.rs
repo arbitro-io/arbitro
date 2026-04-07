@@ -66,12 +66,20 @@ impl ArbitroServer {
     }
 
     /// Run the server — blocks until shutdown.
-    pub async fn run(mut self) -> std::io::Result<()> {
+    pub async fn run(self) -> std::io::Result<()> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.run_with_shutdown(rx).await
+    }
+
+    /// Run the server with an external shutdown signal.
+    pub async fn run_with_shutdown(mut self, mut stop_rx: watch::Receiver<bool>) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         tracing::info!(addr = %self.config.listen_addr, "listening");
 
-        // Shutdown signal
+        // Internal shutdown signal (triggered by CTRL+C or stop_rx)
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        
+        // ... (rest of the logic)
         // Keepalive + idle timeout task
         let keepalive_transport = self.transport.clone();
         let idle_timeout = self.config.idle_timeout;
