@@ -145,6 +145,40 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn truncate_front(&mut self, first_seq: u64) -> u64 {
+        let idx = match self.index.binary_search_by_key(&first_seq, |m| m.seq) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+
+        if idx == 0 {
+            return 0;
+        }
+
+        let removed = idx as u64;
+        let data_cut = self.index[idx - 1].offset + (self.index[idx - 1].subj_len as usize) + (self.index[idx - 1].payload_len as usize);
+
+        // 1. Drain data arena (Hardware Sympathy: this is a memory move, O(N))
+        self.data.drain(0..data_cut);
+
+        // 2. Drain index
+        self.index.drain(0..idx);
+
+        // 3. Update offsets in remaining index entries
+        for meta in &mut self.index {
+            meta.offset -= data_cut;
+        }
+
+        self.first_seq = first_seq;
+        
+        // Recalculate total bytes
+        self.total_bytes = self.index.iter()
+            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
+            .sum();
+
+        removed
+    }
+
     fn purge(&mut self) -> u64 {
         let count = self.index.len() as u64;
         self.data.clear();

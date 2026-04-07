@@ -75,15 +75,50 @@ pub fn on_publish(ctx: &Context, conn_id: ConnId, frame: &FrameView<'_>, scratch
         let info = slot.store.info();
         let cfg = &slot.config;
 
-        if cfg.max_msgs > 0 && info.messages + entry_count as u64 > cfg.max_msgs {
-            return Err(ErrorCode::StreamFull);
-        }
-        if cfg.max_bytes > 0 {
-            let new_bytes: u64 = scratch.entries.iter()
+        use arbitro_proto::config::RetentionPolicy;
+
+        if cfg.retention == RetentionPolicy::Limits {
+            let current_info = info;
+            let overflow_msgs = (current_info.messages + entry_count as u64).saturating_sub(cfg.max_msgs);
+            
+            // Calculate bytes added by this batch
+            let added_bytes: u64 = scratch.entries.iter()
                 .map(|e| (e.subject.len() + e.payload.len()) as u64)
                 .sum();
-            if info.bytes + new_bytes > cfg.max_bytes {
+            
+            let overflow_bytes = if cfg.max_bytes > 0 {
+                (current_info.bytes + added_bytes).saturating_sub(cfg.max_bytes)
+            } else {
+                0
+            };
+
+            if (cfg.max_msgs > 0 && overflow_msgs > 0) || (cfg.max_bytes > 0 && overflow_bytes > 0) {
+                 // Discard old until we fit. For efficiency, we tell the store 
+                 // the exact first_seq it should have now.
+                 // This is much faster than one-by-one.
+                 let mut target_first = current_info.first_seq;
+                 
+                 // If we have msgs limit, we need to jump ahead at least overflow_msgs
+                 if cfg.max_msgs > 0 && overflow_msgs > 0 {
+                    target_first += overflow_msgs;
+                 }
+                 
+                 // Note: for bytes, truncate_front is less precise as it operates on segments/offsets.
+                 // But once we truncate msgs, bytes will drop too.
+                 slot.store.truncate_front(target_first);
+            }
+        } else {
+            // Strict Limits Policy
+            if cfg.max_msgs > 0 && info.messages + entry_count as u64 > cfg.max_msgs {
                 return Err(ErrorCode::StreamFull);
+            }
+            if cfg.max_bytes > 0 {
+                let new_bytes: u64 = scratch.entries.iter()
+                    .map(|e| (e.subject.len() + e.payload.len()) as u64)
+                    .sum();
+                if info.bytes + new_bytes > cfg.max_bytes {
+                    return Err(ErrorCode::StreamFull);
+                }
             }
         }
 

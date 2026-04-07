@@ -93,6 +93,7 @@ impl RetentionPolicy {
 pub enum JournalKind {
     Memory = 0,
     Disk   = 1,
+    Tolerant = 2,
 }
 
 impl JournalKind {
@@ -100,6 +101,7 @@ impl JournalKind {
         match v {
             0 => Some(Self::Memory),
             1 => Some(Self::Disk),
+            2 => Some(Self::Tolerant),
             _ => None,
         }
     }

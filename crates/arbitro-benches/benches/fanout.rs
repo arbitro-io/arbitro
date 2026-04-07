@@ -32,16 +32,12 @@ fn portpicker() -> u16 {
 async fn create_test_server() -> String {
     let port = portpicker();
     let addr = format!("127.0.0.1:{port}");
-    let config = Config {
-        listen_addr: addr.clone(),
-        max_connections: 100,
-        write_buffer_cap: 1024 * 1024,
-        idle_timeout: Duration::from_secs(60),
-        keepalive_interval: Duration::from_secs(30),
-        shutdown_timeout: Duration::from_secs(2),
-    };
+    let config = Config::default()
+        .listen_addr(addr.clone())
+        .max_connections(100)
+        .write_buffer_cap(1024 * 1024);
     let write_cap = config.write_buffer_cap;
-    let server = ArbitroServer::new(config, Arc::new(TokioTransport::new(write_cap)));
+    let server = ArbitroServer::new(config, Arc::new(TokioTransport::new(write_cap)), None);
     tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(100)).await;
     addr

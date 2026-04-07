@@ -16,6 +16,7 @@ pub struct Entry<'a> {
 }
 
 /// Message reference for appending — borrows data, no allocation.
+#[derive(Debug, Clone, Copy)]
 pub struct EntryRef<'a> {
     pub subject: &'a [u8],
     pub payload: &'a [u8],
@@ -83,6 +84,10 @@ pub trait Store: Send + Sync {
 
     /// Delete all messages. Stream survives. Returns deleted count.
     fn purge(&mut self) -> u64;
+
+    /// Delete messages before the given sequence. Stream survives.
+    /// Returns number of deleted messages.
+    fn truncate_front(&mut self, first_seq: u64) -> u64;
 
     /// Delete all messages matching a subject pattern. Returns deleted count.
     fn drain(&mut self, subject: &[u8]) -> u64;

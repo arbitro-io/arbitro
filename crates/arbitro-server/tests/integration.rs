@@ -12,17 +12,16 @@ async fn start_server() -> String {
     let port = portpicker();
     let addr = format!("127.0.0.1:{port}");
 
-    let config = Config {
-        listen_addr: addr.clone(),
-        max_connections: 100,
-        write_buffer_cap: 1024,
-        idle_timeout: Duration::from_secs(60),
-        keepalive_interval: Duration::from_secs(10),
-        shutdown_timeout: Duration::from_secs(2),
-    };
+    let config = Config::default()
+        .listen_addr(addr.clone())
+        .max_connections(100)
+        .write_buffer_cap(1024)
+        .idle_timeout(Duration::from_secs(60))
+        .keepalive_interval(Duration::from_secs(10))
+        .shutdown_timeout(Duration::from_secs(2));
 
     let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
-    let server = ArbitroServer::new(config, transport);
+    let server = ArbitroServer::new(config, transport, None);
 
     tokio::spawn(async move {
         let _ = server.run().await;

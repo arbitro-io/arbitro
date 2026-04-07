@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 arbitro-proto = { path = "../arbitro-proto" }
 arbitro-common = { path = "../arbitro-common" }
+memmap2 = "0.9"

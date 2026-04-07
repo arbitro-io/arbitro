@@ -45,6 +45,10 @@ impl ArbitroServer {
             .transport(transport.clone())
             .signal_factory(signal_factory);
 
+        if let Some(d) = &config.data_dir {
+            engine_builder = engine_builder.data_dir(d);
+        }
+
         if let Some(m) = metadata {
             engine_builder = engine_builder.metadata(m);
         }

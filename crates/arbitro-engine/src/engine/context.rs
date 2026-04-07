@@ -40,6 +40,8 @@ pub struct Context {
     pub connections: Mutex<HashMap<ConnId, ConnState>>,
     /// Persistent log for metadata. Interior mutability allows enabling it after replay.
     pub metadata: parking_lot::RwLock<Option<Arc<MetadataLog>>>,
+    /// Base directory for persistent stream data.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 /// Per-connection state.
@@ -62,6 +64,7 @@ impl Context {
             next_consumer_id: Mutex::new(1),
             connections: Mutex::new(HashMap::new()),
             metadata: parking_lot::RwLock::new(None),
+            data_dir: None,
         }
     }
 

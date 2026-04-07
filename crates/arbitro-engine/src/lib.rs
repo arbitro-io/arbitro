@@ -22,6 +22,7 @@ pub struct EngineBuilder {
     auth: Option<Box<dyn Auth>>,
     signal_factory: Option<SignalFactory>,
     metadata: Option<Arc<MetadataLog>>,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for EngineBuilder {
@@ -37,6 +38,7 @@ impl EngineBuilder {
             auth: None,
             signal_factory: None,
             metadata: None,
+            data_dir: None,
         }
     }
 
@@ -60,10 +62,16 @@ impl EngineBuilder {
         self
     }
 
+    pub fn data_dir(mut self, d: impl Into<std::path::PathBuf>) -> Self {
+        self.data_dir = Some(d.into());
+        self
+    }
+
     pub fn build(self) -> Engine {
         let transport = self.transport.unwrap_or_else(|| Box::new(NoopTransport));
         let auth = self.auth.unwrap_or_else(|| Box::new(AllowAll));
         let mut ctx = Context::new(transport, auth);
+        ctx.data_dir = self.data_dir;
         if let Some(f) = self.signal_factory {
             ctx.signal_factory = f;
         }

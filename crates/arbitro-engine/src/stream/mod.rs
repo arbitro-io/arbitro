@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use arbitro_proto::event::StreamEvent;
 
 use arbitro_proto::config::StreamConfig;
-use arbitro_store::{MemoryStore, Store, StoreInfo};
+use arbitro_store::{MemoryStore, Store, StoreInfo, TolerantStore};
 
 use crate::drain::ReactiveDrain;
 use crate::drain::signal::DrainSignal;
@@ -36,14 +36,28 @@ pub struct StreamSlot {
 }
 
 impl StreamSlot {
-    pub fn new(config: StreamConfig, signal: Arc<dyn DrainSignal>) -> Self {
+    pub fn new(config: StreamConfig, signal: Arc<dyn DrainSignal>, base_path: Option<std::path::PathBuf>) -> Self {
         let stream_id = config.stream_id;
         let (event_tx, _) = broadcast::channel(1024); // 1024 event buffer per stream
-        let store: Box<dyn Store + Send + Sync> = match config.journal_kind {
+        let mut store: Box<dyn Store + Send + Sync> = match config.journal_kind {
             arbitro_proto::config::JournalKind::Memory => Box::new(MemoryStore::new()),
-            // Disk journals provided by arbitro-server via factory
+            arbitro_proto::config::JournalKind::Tolerant => {
+                if let Some(mut path) = base_path {
+                    path.push("streams");
+                    path.push(format!("{}", stream_id));
+                    path.push("journal.dat");
+                    Box::new(TolerantStore::new(path))
+                } else {
+                    // Fallback to memory if no data_dir provided
+                    Box::new(MemoryStore::new())
+                }
+            }
             _ => Box::new(MemoryStore::new()),
         };
+
+        // Initialize store (rebuild index if disk-based)
+        let _ = store.init();
+
         Self {
             config,
             store,
@@ -51,6 +65,11 @@ impl StreamSlot {
             signal,
             event_tx,
         }
+    }
+
+    #[inline]
+    pub fn shutdown(&mut self) {
+        let _ = self.store.shutdown();
     }
 
     #[inline]
@@ -95,20 +114,20 @@ impl StreamMap {
     }
 
     /// Insert a stream with a drain signal. Returns false if already exists.
-    pub fn insert(&self, config: StreamConfig, signal: Arc<dyn DrainSignal>) -> bool {
+    pub fn insert(&self, config: StreamConfig, signal: Arc<dyn DrainSignal>, base_path: Option<std::path::PathBuf>) -> bool {
         let id = config.stream_id;
         let mut shard = self.shards[Self::shard_idx(id)].write();
         if shard.streams.contains_key(&id) {
             return false;
         }
-        shard.streams.insert(id, StreamSlot::new(config, signal));
+        shard.streams.insert(id, StreamSlot::new(config, signal, base_path));
         true
     }
 
-    /// Remove a stream. Returns the config if it existed.
-    pub fn remove(&self, stream_id: u32) -> Option<StreamConfig> {
+    /// Remove a stream and return the full slot. Returns None if it didn't exist.
+    pub fn remove_slot(&self, stream_id: u32) -> Option<StreamSlot> {
         let mut shard = self.shards[Self::shard_idx(stream_id)].write();
-        shard.streams.remove(&stream_id).map(|s| s.config)
+        shard.streams.remove(&stream_id)
     }
 
     /// Execute a closure with mutable access to a stream slot.
@@ -172,7 +191,7 @@ mod tests {
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
 
-        assert!(map.insert(cfg, null_signal()));
+        assert!(map.insert(cfg, null_signal(), None));
         assert!(map.with(id, |s| s.config.stream_id).is_some());
     }
 
@@ -182,8 +201,8 @@ mod tests {
         let cfg1 = test_config(b"ORDERS");
         let cfg2 = test_config(b"ORDERS");
 
-        assert!(map.insert(cfg1, null_signal()));
-        assert!(!map.insert(cfg2, null_signal()));
+        assert!(map.insert(cfg1, null_signal(), None));
+        assert!(!map.insert(cfg2, null_signal(), None));
     }
 
     #[test]
@@ -192,8 +211,8 @@ mod tests {
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
 
-        map.insert(cfg, null_signal());
-        assert!(map.remove(id).is_some());
+        map.insert(cfg, null_signal(), None);
+        assert!(map.remove_slot(id).is_some());
         assert!(map.with(id, |_| ()).is_none());
     }
 
@@ -202,7 +221,7 @@ mod tests {
         let map = StreamMap::new();
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
-        map.insert(cfg, null_signal());
+        map.insert(cfg, null_signal(), None);
 
         let seq = map.with_mut(id, |slot| {
             slot.store.append(EntryRef { subject: b"orders.created", payload: b"{}" }, 1000)
@@ -216,9 +235,9 @@ mod tests {
     #[test]
     fn count_and_list() {
         let map = StreamMap::new();
-        map.insert(test_config(b"A"), null_signal());
-        map.insert(test_config(b"B"), null_signal());
-        map.insert(test_config(b"C"), null_signal());
+        map.insert(test_config(b"A"), null_signal(), None);
+        map.insert(test_config(b"B"), null_signal(), None);
+        map.insert(test_config(b"C"), null_signal(), None);
 
         assert_eq!(map.count(), 3);
         assert_eq!(map.list_configs().len(), 3);
@@ -229,7 +248,7 @@ mod tests {
         let map = StreamMap::new();
         for i in 0u32..128 {
             let name = format!("STREAM_{}", i);
-            map.insert(test_config(name.as_bytes()), null_signal());
+            map.insert(test_config(name.as_bytes()), null_signal(), None);
         }
         assert_eq!(map.count(), 128);
     }
@@ -239,7 +258,7 @@ mod tests {
         let map = StreamMap::new();
         let cfg = test_config(b"ORDERS");
         let id = cfg.stream_id;
-        map.insert(cfg, null_signal());
+        map.insert(cfg, null_signal(), None);
 
         // Drain is accessible via StreamSlot
         map.with_mut(id, |slot| {

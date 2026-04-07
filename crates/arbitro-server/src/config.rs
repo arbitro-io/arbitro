@@ -32,6 +32,41 @@ impl Config {
             data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
         }
     }
+
+    pub fn listen_addr(mut self, addr: impl Into<String>) -> Self {
+        self.listen_addr = addr.into();
+        self
+    }
+
+    pub fn max_connections(mut self, max: u32) -> Self {
+        self.max_connections = max;
+        self
+    }
+
+    pub fn write_buffer_cap(mut self, cap: usize) -> Self {
+        self.write_buffer_cap = cap;
+        self
+    }
+
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    pub fn keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = interval;
+        self
+    }
+
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    pub fn data_dir(mut self, dir: impl Into<String>) -> Self {
+        self.data_dir = Some(dir.into());
+        self
+    }
 }
 
 impl Default for Config {

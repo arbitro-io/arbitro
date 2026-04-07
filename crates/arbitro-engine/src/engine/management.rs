@@ -21,7 +21,7 @@ pub fn on_create_stream(ctx: &Context, conn_id: ConnId, env_seq: u32, config: St
     // Capture config for recording if insert succeeds
     let config_to_record = config.clone();
 
-    if ctx.streams.insert(config, signal) {
+    if ctx.streams.insert(config, signal, ctx.data_dir.clone()) {
         // Record to persistent log if present
         if let Some(log) = ctx.metadata.read().as_ref() {
             let _ = log.record(&MetadataCommand::CreateStream(config_to_record));
@@ -36,7 +36,10 @@ pub fn on_create_stream(ctx: &Context, conn_id: ConnId, env_seq: u32, config: St
 
 /// Delete a stream. Cold path.
 pub fn on_delete_stream(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32) {
-    if ctx.streams.remove(stream_id).is_some() {
+    if let Some(mut slot) = ctx.streams.remove_slot(stream_id) {
+        // Physical cleanup
+        slot.store.purge();
+
         // Record to persistent log if present
         if let Some(log) = ctx.metadata.read().as_ref() {
             let _ = log.record(&MetadataCommand::DeleteStream(stream_id));
