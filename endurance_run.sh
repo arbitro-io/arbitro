@@ -1,57 +1,62 @@
 #!/bin/bash
+# 1-MINUTE ULTRA-ENDURANCE STRESS TEST (O(1) Memory + Scavenging Verification)
 
-# Configuration
-DURATION=30
-CONCURRENCY=2  # Total clients = 2 processes * 2 internal tasks = 4
-LISTEN_ADDR="127.0.0.1:9899"
+set -e
+trap 'kill $(jobs -p)' EXIT
+
+SERVER_BIN="./arbitro-server"
+CLIENT_BIN="./endurance_client"
 DATA_DIR="/tmp/arbitro_endurance_data"
+LOG_FILE="/tmp/endurance_stress.log"
+DURATION=60
+CONCURRENCY=4
 
-echo "--- ORCHESTRATED ENDURANCE TEST (PROCESOS SEPARADOS) ---"
+echo "--- STARTING EXTRA-REDUCIDO 1-MINUTE STRESS TEST ---"
+echo "Target: 200k-300k msg/s | Duration: ${DURATION}s"
 
-# Step 1: Build binaries
-echo "Compilando servidor y cliente..."
-cargo build --release --bin arbitro-server --bin endurance_client
-
-# Step 2: Cleanup and Trap
-cleanup() {
-    echo -e "\nLimpiando procesos..."
-    pkill -9 -f arbitro-server
-    pkill -9 -f endurance_client
-    rm -rf "$DATA_DIR"
-    echo "Hecho."
-}
-
-# Trap to ensure cleanup on exit or error
-trap cleanup EXIT
-
-# Step 3: Setup environment
+# 1. CLEANUP
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
-# Step 4: Start Server
-echo "Iniciando Servidor en $LISTEN_ADDR..."
-export ARBITRO_LISTEN="$LISTEN_ADDR"
+# 2. START SERVER (Isolated)
 export ARBITRO_DATA_DIR="$DATA_DIR"
-./target/release/arbitro-server > /tmp/server.log 2>&1 &
+export ARBITRO_LISTEN="127.0.0.1:9898"
+$SERVER_BIN > /tmp/server_chaos.log 2>&1 &
 SERVER_PID=$!
-
 sleep 2
 
-# Step 5: Start Clients
-echo "Lanzando $CONCURRENCY procesos de cliente..."
-for i in $(seq 1 $CONCURRENCY); do
-    export ARBITRO_ADDR="$LISTEN_ADDR"
-    export ARBITRO_DURATION="$DURATION"
-    export ARBITRO_CONCURRENCY=2 # each client process spawns 2 tasks
-    ./target/release/endurance_client > "/tmp/client_$i.log" 2>&1 &
-done
+echo "Server Started (PID: $SERVER_PID)"
 
-# Step 6: Monitor
-echo "Monitoreando durante ${DURATION}s..."
-for i in $(seq 1 6); do
+# 3. START DUAL CLIENT (PRODUCER + CONSUMER/SCAVENGER)
+echo "Launching DUAL client (Prod+Cons)..."
+export ARBITRO_ROLE="dual"
+export ARBITRO_DURATION=$DURATION
+export ARBITRO_CONCURRENCY=$CONCURRENCY
+export ARBITRO_KIND="memory" # Verification of RAM scavenging
+$CLIENT_BIN > /tmp/endurance_telemetry.log 2>&1 &
+CLIENT_PID=$!
+
+# 4. MONITORING LOOP (RSS + Telemetry)
+echo "Monitoring RSS (RAM) Stability for 60s..."
+T=0
+while [ $T -lt $DURATION ]; do
+    RSS=$(ps -o rss= -p $SERVER_PID | xargs)
+    RSS_MB=$((RSS / 1024))
+    echo "[T+${T}s] Server RAM: ${RSS_MB}MB | Telemetry:"
+    tail -n 1 /tmp/endurance_telemetry.log | grep "Telemetry" || echo "  (Initializing...)"
+    
     sleep 5
-    echo "--- T+$(expr $i \* 5)s Telemetry Snapshot ---"
-    grep "Local Msgs" /tmp/client_*.log | tail -n $CONCURRENCY
+    T=$((T + 5))
 done
 
-echo "Test Completado."
+echo "--- TEST COMPLETE ---"
+echo "Final Server RAM RSS: $(ps -o rss= -p $SERVER_PID | xargs) KB"
+echo "Cleaning up..."
+
+# Verification of cleanup success in the logs
+grep "Final Report" /tmp/endurance_telemetry.log
+
+# Physical proof: check remaining messages in MemoryStore (if possible via telemetry)
+# In reality, we look at the 'Acked' vs 'Published' ratio.
+
+echo "Done."

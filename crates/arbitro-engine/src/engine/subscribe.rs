@@ -16,7 +16,22 @@ use super::reply;
 
 /// Create a consumer on a stream. Cold path.
 pub fn on_create_consumer(ctx: &Context, conn_id: ConnId, stream_id: u32, env_seq: u32, mut config: ConsumerConfig) {
-    // Assign consumer_id
+    // 1. Check if a consumer with this name already exists for this stream
+    let existing_id = {
+        let consumers = ctx.consumers.lock().unwrap();
+        consumers.iter()
+            .find(|(&(sid, _), cfg)| sid == stream_id && cfg.name == config.name)
+            .map(|(&( _, cid), _)| cid)
+    };
+
+    if let Some(id) = existing_id {
+        // Reuse existing consumer ID
+        ctx.metrics.consumers.fetch_add(0, core::sync::atomic::Ordering::Relaxed); // No increment
+        reply::send_ok(ctx.transport.as_ref(), conn_id, stream_id, env_seq, id as u64);
+        return;
+    }
+
+    // 2. Not found: Assign new consumer_id
     let consumer_id = ctx.alloc_consumer_id();
     config.consumer_id = consumer_id;
     config.stream_id = stream_id;
