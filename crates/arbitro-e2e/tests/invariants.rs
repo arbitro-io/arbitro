@@ -1,0 +1,704 @@
+//! End-to-end invariant tests — real TCP client ↔ server.
+//!
+//! Each test starts a server on a random port, connects a client,
+//! and verifies correctness through the public client API only.
+
+use std::time::Duration;
+
+use arbitro_client::Client;
+use arbitro_proto::config::{ConsumerConfig, StreamConfig};
+use arbitro_proto::config::AckPolicy;
+use arbitro_server::{ArbitroServer, Config};
+use tokio::sync::watch;
+
+/// Start a server on a random port, return (shutdown_tx, addr).
+async fn start_server() -> (watch::Sender<bool>, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener); // free the port for the server
+
+    let (tx, rx) = watch::channel(false);
+    let config = Config::default()
+        .listen_addr(&addr)
+        .shard_count(2)
+        .channel_capacity(1024);
+
+    let server = ArbitroServer::new(config);
+    tokio::spawn(async move {
+        let _ = server.run_with_shutdown(rx).await;
+    });
+
+    // Give server a moment to bind
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (tx, addr)
+}
+
+/// Connect a client to the given address.
+async fn connect(addr: &str) -> Client {
+    Client::connect_with_timeout(addr, Duration::from_secs(2))
+        .await
+        .expect("client should connect")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stream CRUD
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 1. Create stream → appears in list_streams.
+#[tokio::test]
+async fn stream_create_then_list() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let config = StreamConfig::new(b"orders", b">").build();
+    client.create_stream(&config).await.unwrap();
+
+    let streams = client.list_streams().await.unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].name, b"orders");
+}
+
+/// 2. Create duplicate stream → idempotent (no error).
+#[tokio::test]
+async fn stream_create_idempotent() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let config = StreamConfig::new(b"orders", b">").build();
+    client.create_stream(&config).await.unwrap();
+    // Second create should not fail
+    client.create_stream(&config).await.unwrap();
+
+    let streams = client.list_streams().await.unwrap();
+    assert_eq!(streams.len(), 1);
+}
+
+/// 3. Delete stream → disappears from list_streams.
+#[tokio::test]
+async fn stream_delete_then_list() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let config = StreamConfig::new(b"events", b">").build();
+    client.create_stream(&config).await.unwrap();
+    assert_eq!(client.list_streams().await.unwrap().len(), 1);
+
+    client.delete_stream(b"events").await.unwrap();
+    assert_eq!(client.list_streams().await.unwrap().len(), 0);
+}
+
+/// 4. Publish to non-existent stream → error.
+#[tokio::test]
+async fn publish_to_missing_stream_errors() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let result = client.publish(b"ghost", b"ghost_event", b"data").await;
+    assert!(
+        result.is_err(),
+        "publish to non-existent stream should fail"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Consumer CRUD
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 5. Create consumer → returns valid ID.
+#[tokio::test]
+async fn consumer_create_returns_id() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"orders", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    assert!(consumer.id() > 0, "consumer ID should be non-zero");
+}
+
+/// 6. Delete consumer → clean removal.
+#[tokio::test]
+async fn consumer_delete() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"orders", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let cid = consumer.id();
+
+    consumer.delete().await.unwrap();
+
+    // Deleting again should error (or be no-op)
+    let result = client.delete_consumer(b"orders", cid).await;
+    // Either error or idempotent — just shouldn't panic
+    let _ = result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Publish + Deliver
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 7. Publish single → subscriber receives correct subject + payload.
+#[tokio::test]
+async fn publish_single_delivers_correctly() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"chat", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"reader", b"chat").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    let seq = client
+        .publish(b"chat", b"chat_hello", b"world")
+        .await
+        .unwrap();
+    assert!(seq > 0, "sequence should be positive");
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .expect("should receive within timeout")
+        .expect("subscription open");
+
+    assert_eq!(&*msg.subject, b"chat_hello");
+    assert_eq!(&msg.payload[..], b"world");
+    msg.ack();
+}
+
+/// 8. Publish batch → all messages delivered.
+#[tokio::test]
+async fn publish_batch_delivers_all() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"logs", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"sink", b"logs").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    let entries: Vec<(&[u8], &[u8])> = (0..50).map(|_| (&b"logs_line"[..], &b"data"[..])).collect();
+    client.publish_batch(b"logs", &entries).await.unwrap();
+
+    let mut count = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+            Ok(Some(msg)) => {
+                msg.ack();
+                count += 1;
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(count, 50, "all 50 messages should be delivered");
+}
+
+/// 9. Publish returns monotonic sequences.
+#[tokio::test]
+async fn publish_sequences_monotonic() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"counter", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let seq1 = client
+        .publish(b"counter", b"counter_inc", b"1")
+        .await
+        .unwrap();
+    let seq2 = client
+        .publish(b"counter", b"counter_inc", b"2")
+        .await
+        .unwrap();
+    let seq3 = client
+        .publish(b"counter", b"counter_inc", b"3")
+        .await
+        .unwrap();
+
+    assert!(seq2 > seq1, "seq2 ({seq2}) > seq1 ({seq1})");
+    assert!(seq3 > seq2, "seq3 ({seq3}) > seq2 ({seq2})");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Ack / Nack
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 10. Ack → message not redelivered.
+#[tokio::test]
+async fn ack_prevents_redelivery() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"acktest", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"acker", b"acktest").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    client
+        .publish(b"acktest", b"acktest_msg", b"data")
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    msg.ack();
+
+    // No more messages should arrive
+    let extra = tokio::time::timeout(Duration::from_millis(200), sub.next()).await;
+    assert!(extra.is_err(), "after ack, no redelivery should happen");
+}
+
+/// 11. Nack → message redelivered.
+#[tokio::test]
+async fn nack_causes_redelivery() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"nacktest", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"nacker", b"nacktest").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    client
+        .publish(b"nacktest", b"nacktest_msg", b"data")
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    msg.nack();
+
+    // Should get redelivered
+    let redelivered = tokio::time::timeout(Duration::from_secs(2), sub.next()).await;
+    assert!(
+        redelivered.is_ok(),
+        "after nack, message should be redelivered"
+    );
+    if let Ok(Some(msg)) = redelivered {
+        assert_eq!(&msg.payload[..], b"data");
+        msg.ack();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Ordering
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 12. Messages arrive in sequence order.
+#[tokio::test]
+async fn delivery_preserves_order() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"ordered", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"reader", b"ordered").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    for i in 0..20u32 {
+        let payload = i.to_le_bytes();
+        client
+            .publish(b"ordered", b"ordered_seq", &payload)
+            .await
+            .unwrap();
+    }
+
+    let mut prev_seq = 0u64;
+    for _ in 0..20 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            msg.seq > prev_seq,
+            "seq {} should be > prev {}",
+            msg.seq,
+            prev_seq
+        );
+        prev_seq = msg.seq;
+        msg.ack();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fan-out & Queue groups (overlapping consumers)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 13. Fan-out — two consumers with DIFFERENT groups both receive every message.
+#[tokio::test]
+async fn fanout_two_consumers_each_receive_all() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"events", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    // Two consumers with DIFFERENT groups → separate queues → fan-out
+    let c1_cfg = ConsumerConfig::new(b"svc_a", b"events")
+        .group(b"group_a")
+        .build();
+
+    let c2_cfg = ConsumerConfig::new(b"svc_b", b"events")
+        .group(b"group_b")
+        .build();
+
+    let c1 = client.create_consumer(&c1_cfg).await.unwrap();
+    let c2 = client.create_consumer(&c2_cfg).await.unwrap();
+
+    let mut sub1 = c1.subscribe(None).await.unwrap();
+    let mut sub2 = c2.subscribe(None).await.unwrap();
+
+    // Publish 5 messages
+    for i in 0..5u32 {
+        client
+            .publish(b"events", b"events_tick", &i.to_le_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Both subscribers should receive all 5
+    for (name, sub) in [("sub1", &mut sub1), ("sub2", &mut sub2)] {
+        let mut count = 0u32;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+                Ok(Some(msg)) => {
+                    msg.ack();
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(count, 5, "{name} should receive all 5 messages");
+    }
+}
+
+/// 14. Queue group — two consumers with the SAME group share messages (each delivered once).
+#[tokio::test]
+async fn queue_group_distributes_messages() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"tasks", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    // Two consumers with the SAME default group → same queue → round-robin
+    let c1_cfg = ConsumerConfig::new(b"worker1", b"tasks").build();
+    let c2_cfg = ConsumerConfig::new(b"worker2", b"tasks").build();
+
+    let c1 = client.create_consumer(&c1_cfg).await.unwrap();
+    let c2 = client.create_consumer(&c2_cfg).await.unwrap();
+
+    let mut sub1 = c1.subscribe(None).await.unwrap();
+    let mut sub2 = c2.subscribe(None).await.unwrap();
+
+    // Publish 10 messages
+    for i in 0..10u32 {
+        client
+            .publish(b"tasks", b"tasks_job", &i.to_le_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Drain both subscribers
+    let mut count1 = 0u32;
+    let mut count2 = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub1.next()).await {
+            Ok(Some(msg)) => {
+                msg.ack();
+                count1 += 1;
+            }
+            _ => break,
+        }
+    }
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub2.next()).await {
+            Ok(Some(msg)) => {
+                msg.ack();
+                count2 += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let total = count1 + count2;
+    assert_eq!(
+        total, 10,
+        "total delivered should be 10, got {count1}+{count2}={total}"
+    );
+}
+
+/// 15. Consumers on different streams — publishing to one doesn't deliver to the other.
+#[tokio::test]
+async fn consumers_on_different_streams_isolated() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let s1 = StreamConfig::new(b"logs", b">").build();
+    let s2 = StreamConfig::new(b"metrics", b">").build();
+    client.create_stream(&s1).await.unwrap();
+    client.create_stream(&s2).await.unwrap();
+
+    // Unique consumer names (consumer_id = fnv1a of name, must be distinct)
+    let c1 = ConsumerConfig::new(b"log_sink", b"logs").build();
+    let c2 = ConsumerConfig::new(b"metric_sink", b"metrics").build();
+
+    let consumer1 = client.create_consumer(&c1).await.unwrap();
+    let consumer2 = client.create_consumer(&c2).await.unwrap();
+
+    let mut sub1 = consumer1.subscribe(None).await.unwrap();
+    let mut sub2 = consumer2.subscribe(None).await.unwrap();
+
+    // Publish to logs only
+    client
+        .publish(b"logs", b"logs_line", b"hello")
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), sub1.next())
+        .await
+        .expect("sub1 should receive")
+        .expect("channel open");
+    assert_eq!(&msg.payload[..], b"hello");
+    msg.ack();
+
+    // metrics subscriber should not receive anything
+    let leaked = tokio::time::timeout(Duration::from_millis(300), sub2.next()).await;
+    assert!(
+        leaked.is_err(),
+        "metrics sub should not receive logs messages"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Isolation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 16. Streams are independent — publish to one doesn't leak to another.
+#[tokio::test]
+async fn streams_are_isolated() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream_a = StreamConfig::new(b"alpha", b">").build();
+    let stream_b = StreamConfig::new(b"beta", b">").build();
+    client.create_stream(&stream_a).await.unwrap();
+    client.create_stream(&stream_b).await.unwrap();
+
+    let consumer_b_cfg = ConsumerConfig::new(b"beta_reader", b"beta").build();
+    let consumer_b = client.create_consumer(&consumer_b_cfg).await.unwrap();
+    let mut sub_b = consumer_b.subscribe(None).await.unwrap();
+
+    // Publish to stream alpha only
+    client
+        .publish(b"alpha", b"alpha_event", b"data")
+        .await
+        .unwrap();
+
+    // Stream beta subscriber should receive nothing
+    let leaked = tokio::time::timeout(Duration::from_millis(300), sub_b.next()).await;
+    assert!(leaked.is_err(), "messages in alpha must not leak to beta");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AckSync
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 17. ack_sync waits for broker confirmation and returns Ok.
+#[tokio::test]
+async fn ack_sync_returns_ok() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"acksync", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"syncer", b"acksync").build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    client
+        .publish(b"acksync", b"acksync_ev", b"payload")
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&msg.payload[..], b"payload");
+
+    // ack_sync must return Ok — broker confirmed
+    msg.ack_sync().await.expect("ack_sync should succeed");
+
+    // No redelivery after confirmed ack
+    let extra = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
+    assert!(extra.is_err(), "after ack_sync, no redelivery should happen");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Inflight limits
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 18. max_inflight caps the number of unacked messages delivered.
+///
+/// With max_inflight=2 and 5 published messages, only 2 should arrive
+/// before we ack. After acking one, a third arrives.
+#[tokio::test]
+async fn max_inflight_caps_delivery() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"inf_stream", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"inf_consumer", b"inf_stream")
+        .ack_policy(AckPolicy::Explicit)
+        .max_inflight(2)
+        .build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    // Publish 5 messages
+    for i in 0..5u8 {
+        client.publish(b"inf_stream", b"inf_subj", &[i]).await.unwrap();
+    }
+
+    // Should receive exactly 2 (the inflight cap)
+    let m1 = tokio::time::timeout(Duration::from_secs(2), sub.next()).await.unwrap().unwrap();
+    let m2 = tokio::time::timeout(Duration::from_secs(2), sub.next()).await.unwrap().unwrap();
+
+    // Third should NOT arrive — we're at the cap
+    let blocked = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
+    assert!(blocked.is_err(), "3rd message should be blocked by max_inflight=2");
+
+    // Ack one → frees a slot → third arrives
+    m1.ack_sync().await.unwrap();
+
+    let m3 = tokio::time::timeout(Duration::from_secs(2), sub.next()).await;
+    assert!(m3.is_ok(), "after ack, 3rd message should arrive");
+
+    // Cleanup
+    m2.ack();
+    if let Ok(Some(msg)) = m3 {
+        msg.ack();
+    }
+}
+
+/// 19. Multiple max_subject_inflight patterns with different limits.
+///
+/// Three tiers:
+///   - `message.premium.>` → limit 3
+///   - `message.freemium.>` → limit 1
+///   - `other.*` → no limit (uncapped)
+///
+/// Publish 5× premium, 3× freemium, 3× other.
+/// Initial delivery: 3 premium + 1 freemium + 3 other = 7.
+/// After acking 1 premium → 4th premium arrives.
+/// After acking 1 freemium → 2nd freemium arrives.
+#[tokio::test]
+async fn max_subject_inflight_multiple_patterns() {
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"msi", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    let consumer_cfg = ConsumerConfig::new(b"msi_c", b"msi")
+        .ack_policy(AckPolicy::Explicit)
+        .max_inflight(100)
+        .max_subject_inflight(b"message.premium.>", 3)
+        .max_subject_inflight(b"message.freemium.>", 1)
+        .build();
+    let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    // Single batch publish — all 11 land in one shard command, one drain sees all.
+    let entries: Vec<(&[u8], &[u8])> = vec![
+        (b"other.x", b"O0"),
+        (b"other.x", b"O1"),
+        (b"other.x", b"O2"),
+        (b"message.freemium.events", b"F0"),
+        (b"message.freemium.events", b"F1"),
+        (b"message.freemium.events", b"F2"),
+        (b"message.premium.orders", b"P0"),
+        (b"message.premium.orders", b"P1"),
+        (b"message.premium.orders", b"P2"),
+        (b"message.premium.orders", b"P3"),
+        (b"message.premium.orders", b"P4"),
+    ];
+    client.publish_batch(b"msi", &entries).await.unwrap();
+
+    // Let all publishes and drain cycles settle
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Collect initial burst
+    let mut received = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+            Ok(Some(msg)) => received.push(msg),
+            _ => break,
+        }
+    }
+
+    let premium_count = received.iter()
+        .filter(|m| m.subject.starts_with(b"message.premium.")).count();
+    let freemium_count = received.iter()
+        .filter(|m| m.subject.starts_with(b"message.freemium.")).count();
+    let other_count = received.iter()
+        .filter(|m| m.subject.starts_with(b"other.")).count();
+
+    assert_eq!(premium_count, 3, "premium should be capped at 3, got {premium_count}");
+    assert_eq!(freemium_count, 1, "freemium should be capped at 1, got {freemium_count}");
+    assert_eq!(other_count, 3, "other has no cap, all 3 should arrive, got {other_count}");
+    assert_eq!(received.len(), 7, "total initial should be 7, got {}", received.len());
+
+    // ── Ack one premium → 4th premium should arrive ──
+    let first_premium = received.iter()
+        .find(|m| m.subject.starts_with(b"message.premium."))
+        .unwrap();
+    first_premium.ack_sync().await.unwrap();
+
+    let next = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await.expect("4th premium should arrive after ack");
+    let msg = next.unwrap();
+    assert!(msg.subject.starts_with(b"message.premium."),
+        "expected premium, got {:?}", String::from_utf8_lossy(&msg.subject));
+
+    // ── Ack one freemium → 2nd freemium should arrive ──
+    let first_freemium = received.iter()
+        .find(|m| m.subject.starts_with(b"message.freemium."))
+        .unwrap();
+    first_freemium.ack_sync().await.unwrap();
+
+    let next = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await.expect("2nd freemium should arrive after ack");
+    let msg = next.unwrap();
+    assert!(msg.subject.starts_with(b"message.freemium."),
+        "expected freemium, got {:?}", String::from_utf8_lossy(&msg.subject));
+
+    // Cleanup
+    for msg in &received {
+        msg.ack();
+    }
+}

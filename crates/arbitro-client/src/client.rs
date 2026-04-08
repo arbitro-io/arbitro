@@ -8,7 +8,7 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_proto::action::Action;
 use arbitro_proto::config::{ConsumerConfig, StreamConfig, fnv1a_32};
-use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction};
+use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction, ListStreamsAction};
 use arbitro_proto::wire::publish::PublishEntry;
 use arbitro_proto::wire::stream::{CreateStreamFixed, DeleteStreamFixed};
 
@@ -65,22 +65,34 @@ impl Client {
     pub async fn create_stream(&self, config: &StreamConfig) -> Result<(), ClientError> {
         let fixed = CreateStreamFixed {
             name_len: U16::new(config.name.len() as u16),
-            _pad: U16::new(0),
+            filter_len: U16::new(config.filter.len() as u16),
             max_msgs: U64::new(config.max_msgs),
             max_bytes: U64::new(config.max_bytes),
             max_age_secs: U64::new(config.max_age_secs),
             replicas: config.replicas,
             journal_kind: config.journal_kind as u8,
             retention: config.retention as u8,
-            _pad2: 0,
+            _pad: 0,
         };
 
-        let mut body = Vec::with_capacity(32 + config.name.len());
+        let mut body = Vec::with_capacity(32 + config.name.len() + config.filter.len());
         body.extend_from_slice(fixed.as_bytes());
         body.extend_from_slice(&config.name);
+        body.extend_from_slice(&config.filter);
 
         self.inner.request(Action::CreateStream, 0, &body).await?;
         Ok(())
+    }
+
+    /// List all streams. Returns stream info entries.
+    pub async fn list_streams(&self) -> Result<Vec<StreamInfo>, ClientError> {
+        let body = ListStreamsAction {
+            offset: U32::new(0),
+            limit: U32::new(u32::MAX),
+        };
+
+        let raw = self.inner.request_body(Action::ListStreams, 0, body.as_bytes()).await?;
+        Ok(parse_list_streams(&raw))
     }
 
     /// Delete a stream by name.
@@ -116,19 +128,21 @@ impl Client {
             ack_policy: config.ack_policy as u8,
             deliver_policy: config.deliver_policy as u8,
             deliver_mode: config.deliver_mode as u8,
-            _pad: [0u8; 3],
+            _pad: 0,
+            group_len: U16::new(config.group.len() as u16),
             ack_wait_ms: U32::new(config.ack_wait_ms),
             start_seq: U64::new(config.start_seq),
         };
 
-        let mut body = Vec::with_capacity(28 + config.name.len() + subject.len());
+        let mut body = Vec::with_capacity(28 + config.name.len() + config.group.len() + subject.len());
         body.extend_from_slice(fixed.as_bytes());
         body.extend_from_slice(&config.name);
+        body.extend_from_slice(&config.group);
         body.extend_from_slice(subject);
 
         // Variable trailer: [2 num_limits] + per limit: [4 limit][2 pattern_len][pattern]
-        body.extend_from_slice(&(config.subject_limits.len() as u16).to_le_bytes());
-        for sl in config.subject_limits.iter() {
+        body.extend_from_slice(&(config.max_subject_inflights.len() as u16).to_le_bytes());
+        for sl in config.max_subject_inflights.iter() {
             body.extend_from_slice(&sl.limit.to_le_bytes());
             body.extend_from_slice(&(sl.pattern.len() as u16).to_le_bytes());
             body.extend_from_slice(&sl.pattern);
@@ -228,4 +242,40 @@ impl Client {
     pub fn is_connected(&self) -> bool {
         *self.inner.state_tx.borrow() == ConnState::Connected
     }
+}
+
+/// Stream info returned by `list_streams()`.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub stream_id: u32,
+    pub name: Vec<u8>,
+}
+
+/// Parse ListStreams response body: [4B count][N × (4B stream_id, 2B name_len, name)]
+fn parse_list_streams(body: &[u8]) -> Vec<StreamInfo> {
+    if body.len() < 4 {
+        return vec![];
+    }
+    let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 4;
+
+    for _ in 0..count {
+        if pos + 6 > body.len() {
+            break;
+        }
+        let stream_id = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        let name_len = u16::from_le_bytes([body[pos + 4], body[pos + 5]]) as usize;
+        pos += 6;
+
+        if pos + name_len > body.len() {
+            break;
+        }
+        let name = body[pos..pos + name_len].to_vec();
+        pos += name_len;
+
+        out.push(StreamInfo { stream_id, name });
+    }
+
+    out
 }

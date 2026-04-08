@@ -1,23 +1,26 @@
 use zerocopy::byteorder::little_endian::{U16, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// 32B fixed — Create a stream. Variable name follows.
+/// 32B fixed — Create a stream. Variable name + filter follow.
 ///
 /// ```text
-/// [2 name_len][2 pad][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 pad]
+/// [2 name_len][2 filter_len][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 pad]
 /// ```
+///
+/// Variable data layout: `[name (name_len)][filter (filter_len)]`
+/// `filter` is the subject pattern this stream captures (e.g. `"orders.>"`).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct CreateStreamFixed {
     pub name_len: U16,
-    pub _pad: U16,
+    pub filter_len: U16,
     pub max_msgs: U64,
     pub max_bytes: U64,
     pub max_age_secs: U64,
     pub replicas: u8,
     pub journal_kind: u8,
     pub retention: u8,
-    pub _pad2: u8,
+    pub _pad: u8,
 }
 
 pub const CREATE_STREAM_FIXED_SIZE: usize = core::mem::size_of::<CreateStreamFixed>();
@@ -85,6 +88,14 @@ impl<'a> CreateStreamView<'a> {
     pub fn name(&self) -> &'a [u8] {
         let nl = self.fixed().name_len.get() as usize;
         &self.buf[CREATE_STREAM_FIXED_SIZE..CREATE_STREAM_FIXED_SIZE + nl]
+    }
+
+    #[inline(always)]
+    pub fn filter(&self) -> &'a [u8] {
+        let nl = self.fixed().name_len.get() as usize;
+        let fl = self.fixed().filter_len.get() as usize;
+        let start = CREATE_STREAM_FIXED_SIZE + nl;
+        &self.buf[start..start + fl]
     }
 
     #[inline(always)]

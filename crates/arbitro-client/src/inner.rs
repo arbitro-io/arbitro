@@ -1,8 +1,8 @@
 //! Inner — shared state for connection, request correlation, subscriber demux.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -13,7 +13,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::delivery::{RepErrorAction, RepOkAction, RepBatchView};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
-use arbitro_common::subject_trie::SubjectTrie;
+use arbitro_engine_v2::common::SubjectTrie;
 
 use crate::error::ClientError;
 use crate::message::{AckCmd, Message};
@@ -30,6 +30,8 @@ pub enum ConnState {
 /// Result of a request to the broker.
 pub(crate) enum RequestResult {
     Ok(u64),
+    /// Variable-length reply: the raw body bytes (for ListStreams etc).
+    OkBody(Bytes),
     Error(ErrorCode),
 }
 
@@ -59,6 +61,9 @@ pub(crate) struct Inner {
     /// Rebuilt on each membership change (cold path).
     pub(crate) subject_trie: Mutex<SubjectTrie>,
 
+    /// Monotonic subscription ID — shared across all Consumer objects.
+    pub(crate) next_sub_id: AtomicU64,
+
     /// Request timeout.
     pub(crate) request_timeout: std::time::Duration,
 
@@ -80,6 +85,7 @@ impl Inner {
             subscriptions: Mutex::new(HashMap::new()),
             subject_trie: Mutex::new(SubjectTrie::new()),
             ack_tx: Mutex::new(ack_tx),
+            next_sub_id: AtomicU64::new(1),
             request_timeout,
             addr,
         }
@@ -163,10 +169,58 @@ impl Inner {
         // Wait for response with timeout
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(RequestResult::Ok(ref_seq))) => Ok(ref_seq),
+            Ok(Ok(RequestResult::OkBody(_))) => Ok(0), // unexpected body reply for scalar request
             Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
             Ok(Err(_)) => Err(ClientError::Disconnected), // oneshot dropped
             Err(_) => {
                 // Timeout — cleanup pending
+                let mut pending = self.pending.lock().unwrap();
+                pending.remove(&seq);
+                Err(ClientError::Timeout)
+            }
+        }
+    }
+
+    /// Send a request and wait for a variable-length body reply (with timeout).
+    pub(crate) async fn request_body(
+        &self,
+        action: Action,
+        stream_id: u32,
+        body: &[u8],
+    ) -> Result<Bytes, ClientError> {
+        let seq = self.alloc_seq();
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.insert(seq, tx);
+        }
+
+        let envelope = Envelope {
+            action: U16::new(action.as_u16()),
+            flags: 0,
+            _rsv: 0,
+            stream_id: U32::new(stream_id),
+            msg_len: U32::new(body.len() as u32),
+            env_seq: U32::new(seq),
+        };
+
+        let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
+        frame.extend_from_slice(envelope.as_bytes());
+        frame.extend_from_slice(body);
+
+        if !self.send_frame(Bytes::from(frame)) {
+            let mut pending = self.pending.lock().unwrap();
+            pending.remove(&seq);
+            return Err(ClientError::Disconnected);
+        }
+
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(RequestResult::OkBody(data))) => Ok(data),
+            Ok(Ok(RequestResult::Ok(_))) => Ok(Bytes::new()),
+            Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
+            Ok(Err(_)) => Err(ClientError::Disconnected),
+            Err(_) => {
                 let mut pending = self.pending.lock().unwrap();
                 pending.remove(&seq);
                 Err(ClientError::Timeout)
@@ -197,7 +251,7 @@ impl Inner {
     }
 
     /// Process an incoming frame from the server.
-    pub(crate) fn on_frame(&self, buf: &[u8]) {
+    pub(crate) fn on_frame(self: &Arc<Self>, buf: &[u8]) {
         if buf.len() < ENVELOPE_SIZE {
             return;
         }
@@ -213,6 +267,7 @@ impl Inner {
             Some(Action::Deliver) => self.on_deliver(env.stream_id.get(), env.env_seq.get(), body),
             Some(Action::RepBatch) => self.on_rep_batch(env.stream_id.get(), body),
             Some(Action::FanoutBatch) => self.on_fanout_batch(env.stream_id.get(), body),
+            Some(Action::ListStreams) => self.on_list_streams(env.env_seq.get(), body),
             Some(Action::Ping) => self.on_ping(body),
             Some(Action::Connected) => { /* handled in connect handshake */ }
             _ => {
@@ -254,43 +309,46 @@ impl Inner {
     }
 
     /// Deliver frame: demux to local subscribers.
-    /// Server body format: [2 subj_len][subject][payload]
+    /// Server body format: [4 consumer_id][2 subj_len][subject][payload]
     /// Sequence comes from envelope env_seq (u32).
-    fn on_deliver(&self, stream_id: u32, env_seq: u32, body: &[u8]) {
+    fn on_deliver(self: &Arc<Self>, stream_id: u32, env_seq: u32, body: &[u8]) {
         let subs = self.subscriptions.lock().unwrap();
 
-        if body.len() < 2 {
+        if body.len() < 6 {
             return;
         }
 
         let seq = env_seq as u64;
-        let subj_len = u16::from_le_bytes([body[0], body[1]]) as usize;
+        let consumer_id = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let subj_len = u16::from_le_bytes([body[4], body[5]]) as usize;
 
-        if 2 + subj_len > body.len() {
+        if 6 + subj_len > body.len() {
             return;
         }
-        let subject = &body[2..2 + subj_len];
-        let payload = &body[2 + subj_len..];
+        let subject = &body[6..6 + subj_len];
+        let payload = &body[6 + subj_len..];
 
         let ack_tx = self.ack_tx.lock().unwrap().clone();
         for sub in subs.values() {
-            if sub.stream_id == stream_id && sub.matches(subject) {
+            if sub.consumer_id == consumer_id && sub.stream_id == stream_id {
                 let msg = Message {
                     seq,
                     subject: Box::from(subject),
                     payload: Bytes::copy_from_slice(payload),
-                    consumer_id: sub.consumer_id,
+                    consumer_id,
                     stream_id,
                     ack_tx: ack_tx.clone(),
+                    inner: Arc::clone(self),
                 };
                 let _ = sub.tx.try_send(msg);
+                break; // one consumer_id → one subscription
             }
         }
     }
 
     /// RepBatch frame: batch of delivered entries for a consumer.
     /// Body format: [8B RepBatchFixed][N × (14B entry_header + subject + payload)]
-    fn on_rep_batch(&self, stream_id: u32, body: &[u8]) {
+    fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
         let consumer_id = view.consumer_id();
         let subs = self.subscriptions.lock().unwrap();
@@ -309,10 +367,18 @@ impl Inner {
                         consumer_id,
                         stream_id,
                         ack_tx: ack_tx.clone(),
+                        inner: Arc::clone(self),
                     };
                     let _ = sub.tx.try_send(msg);
                 }
             }
+        }
+    }
+
+    fn on_list_streams(&self, env_seq: u32, body: &[u8]) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(tx) = pending.remove(&env_seq) {
+            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
         }
     }
 
@@ -326,7 +392,7 @@ impl Inner {
     }
 
     /// FanoutBatch frame: Efficient O(M) distribution using the SubjectTrie.
-    fn on_fanout_batch(&self, stream_id: u32, body: &[u8]) {
+    fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
         let consumer_id = view.consumer_id();
         let subs = self.subscriptions.lock().unwrap();
@@ -344,6 +410,7 @@ impl Inner {
                             consumer_id,
                             stream_id,
                             ack_tx: ack_tx.clone(),
+                            inner: Arc::clone(self),
                         };
                         let _ = sub.tx.try_send(msg);
                     }

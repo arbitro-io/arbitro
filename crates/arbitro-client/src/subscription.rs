@@ -1,7 +1,7 @@
 //! Local subscription — client-side demux target.
 
 use bytes::Bytes;
-use arbitro_common::subject::subject_matches;
+use arbitro_engine_v2::common::subject_matches;
 use tokio::sync::mpsc;
 
 use crate::message::Message;

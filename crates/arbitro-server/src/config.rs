@@ -6,6 +6,10 @@ use std::time::Duration;
 pub struct Config {
     /// TCP listen address (default: "0.0.0.0:9898").
     pub listen_addr: String,
+    /// Number of engine shards (default: CPU count).
+    pub shard_count: usize,
+    /// mpsc channel capacity per shard (default: 4096).
+    pub channel_capacity: usize,
     /// Maximum concurrent connections (default: 10_000).
     pub max_connections: u32,
     /// Write channel capacity per connection in frames (default: 8192).
@@ -24,6 +28,11 @@ impl Config {
     pub fn from_env() -> Self {
         Self {
             listen_addr: env_or("ARBITRO_LISTEN", "0.0.0.0:9898"),
+            shard_count: env_parse(
+                "ARBITRO_SHARDS",
+                std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+            ),
+            channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
             max_connections: env_parse("ARBITRO_MAX_CONNECTIONS", 10_000),
             write_buffer_cap: env_parse("ARBITRO_WRITE_BUFFER_CAP", 8192),
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
@@ -31,6 +40,16 @@ impl Config {
             shutdown_timeout: Duration::from_secs(env_parse("ARBITRO_SHUTDOWN_TIMEOUT", 10)),
             data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
         }
+    }
+
+    pub fn shard_count(mut self, count: usize) -> Self {
+        self.shard_count = count;
+        self
+    }
+
+    pub fn channel_capacity(mut self, cap: usize) -> Self {
+        self.channel_capacity = cap;
+        self
     }
 
     pub fn listen_addr(mut self, addr: impl Into<String>) -> Self {
@@ -73,6 +92,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:9898".into(),
+            shard_count: std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+            channel_capacity: 4096,
             max_connections: 10_000,
             write_buffer_cap: 8192,
             idle_timeout: Duration::from_secs(300),

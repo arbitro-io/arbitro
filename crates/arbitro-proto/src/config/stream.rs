@@ -1,10 +1,19 @@
 use serde::{Deserialize, Serialize};
 
 /// Stream configuration — cold path, created once.
+///
+/// Invariants:
+///   - `name` is an identifier: `[a-zA-Z0-9_-]`, max 255 bytes.
+///   - `filter` is a subject pattern that defines what this stream captures.
+///     No two streams may have overlapping filters.
+///   - `stream_id` is always `fnv1a_32(name)`, computed server-side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub name: Box<[u8]>,
     pub stream_id: u32,
+    /// Subject pattern this stream captures. Required.
+    /// Example: `"orders.>"` captures all subjects starting with `orders.`.
+    pub filter: Box<[u8]>,
     pub max_msgs: u64,
     pub max_bytes: u64,
     pub max_age_secs: u64,
@@ -15,6 +24,7 @@ pub struct StreamConfig {
 
 pub struct StreamConfigBuilder {
     name: Box<[u8]>,
+    filter: Box<[u8]>,
     max_msgs: u64,
     max_bytes: u64,
     max_age_secs: u64,
@@ -24,10 +34,12 @@ pub struct StreamConfigBuilder {
 }
 
 impl StreamConfig {
+    /// Start building. `filter` is the subject pattern this stream captures.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(name: &[u8]) -> StreamConfigBuilder {
+    pub fn new(name: &[u8], filter: &[u8]) -> StreamConfigBuilder {
         StreamConfigBuilder {
             name: Box::from(name),
+            filter: Box::from(filter),
             max_msgs: 0,
             max_bytes: 0,
             max_age_secs: 0,
@@ -51,6 +63,7 @@ impl StreamConfigBuilder {
         StreamConfig {
             name: self.name,
             stream_id,
+            filter: self.filter,
             max_msgs: self.max_msgs,
             max_bytes: self.max_bytes,
             max_age_secs: self.max_age_secs,

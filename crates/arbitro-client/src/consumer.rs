@@ -1,6 +1,6 @@
 //! Consumer — push (subscribe) and pull (fetch) modes.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use arbitro_proto::wire::DeleteConsumerAction;
@@ -22,7 +22,6 @@ pub struct Consumer {
     pub(crate) inner: Arc<Inner>,
     pub(crate) consumer_id: u32,
     pub(crate) stream_id: u32,
-    next_sub_id: AtomicU64,
 }
 
 impl Consumer {
@@ -31,7 +30,6 @@ impl Consumer {
             inner,
             consumer_id,
             stream_id,
-            next_sub_id: AtomicU64::new(1),
         }
     }
 
@@ -59,7 +57,7 @@ impl Consumer {
         // The server delivers backlog during on_bind (inside the Subscribe handling),
         // so Deliver frames can arrive before RepOk. The subscription must already
         // exist to receive them.
-        let sub_id = self.next_sub_id.fetch_add(1, Relaxed);
+        let sub_id = self.inner.next_sub_id.fetch_add(1, Relaxed);
         let (tx, rx) = mpsc::channel(1_048_576);
 
         let subscription = Subscription {

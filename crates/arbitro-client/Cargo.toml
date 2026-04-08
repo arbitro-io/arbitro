@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-arbitro-proto  = { path = "../arbitro-proto" }
-arbitro-common = { path = "../arbitro-common" }
+arbitro-proto      = { path = "../arbitro-proto" }
+arbitro-engine-v2  = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
 bytes         = { workspace = true }

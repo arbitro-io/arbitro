@@ -44,3 +44,12 @@ Every design decision must respect the hardware. No exceptions.
 19. **Single lock per stream** — one `Mutex` per drain. Append under shard lock, release fast, signal drain.
 20. **No lock contention across streams** — sharded `StreamMap` (64-way). Streams never share locks.
 21. **Batch delivery** — drain collects entries per consumer, sends one frame per batch via `write_vectored`. Never one send per message.
+
+## Engine Integration (arbitro-engine v2)
+
+22. **Engine types as bytes** — `FanoutEntry`, `ClaimedEntry`, `AckEntry`, `RepPublish` have `IntoBytes+FromBytes+#[repr(C)]`. Use `as_bytes()` pointer cast, not field-by-field copy.
+23. **No owned mirror types** — never define `FanoutEntryOwned` or `ClaimedEntryOwned`. Engine types ARE the wire types. The only owned types are in `command.rs` for channel crossing (`Vec<FanoutEntry>`, not `Vec<FanoutEntryOwned>`).
+24. **send_parts for wire replies** — build envelope header on the stack, send body as `as_bytes()` slice reference. Zero heap allocation for building wire frames.
+25. **Scratch buffers in shard** — pre-allocated `Vec<AckEntry>`, `Vec<NackEntry>`. `.clear()` per batch, capacity grows monotonically, never shrinks. No allocation on steady-state hot path.
+26. **Ack reply is zero-alloc** — `AckReply { accepted: u32, rejected: u32 }` is 8 bytes, inline in oneshot. No Vec, no Box, no Bytes.
+27. **Publish fanout is one-alloc** — `Vec<FanoutEntry>` from `drain.entries().to_vec()`. Single allocation, amortized over batch. Acceptable because publish is not the tightest hot path (ack is).

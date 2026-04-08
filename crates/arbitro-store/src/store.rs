@@ -3,7 +3,7 @@
 //! Sync only. No tokio, no async. If a backend needs async I/O,
 //! the server wraps it in spawn_blocking.
 
-use arbitro_common::subject::subject_matches;
+use arbitro_engine_v2::common::subject_matches;
 
 /// A single stored message view.
 /// Borrows data from the store arena — zero allocations.

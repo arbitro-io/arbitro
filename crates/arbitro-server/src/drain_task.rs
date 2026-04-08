@@ -1,48 +1,40 @@
-//! Drain task — async loop that delivers messages for a single stream.
+//! Drain task — async loop that delivers messages for a shard's pull consumers.
 //!
-//! One task per stream. Waits on Gate (Notify), takes shard lock,
-//! calls deliver_cycle, releases lock. Repeat.
+//! One task per shard. Waits on Gate (Notify), sends DrainDeliver commands to
+//! the shard via ShardHandle. The shard does the actual claim + store.get +
+//! deliver via ConnectionRegistry — all on the shard thread (no async I/O).
 //!
-//! The engine never calls deliver_cycle — only signal.release().
-//! This task is the ONLY caller of deliver_cycle in production.
+//! The shard signals `gate.release()` after publish queues messages.
 
-use std::sync::Arc;
-
-use arbitro_engine::transport::Transport;
-use arbitro_engine::stream::StreamMap;
+use tokio::sync::watch;
 
 use crate::gate::Gate;
+use crate::handle::ShardHandle;
 
-/// Spawn a drain task for a stream. Returns a JoinHandle.
+/// Spawn a drain task for a shard. Returns a JoinHandle.
 pub fn spawn_drain_task(
-    stream_id: u32,
-    gate: Arc<Gate>,
-    streams: Arc<StreamMap>,
-    transport: Arc<dyn Transport>,
+    shard: ShardHandle,
+    gate: Gate,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            gate.wait().await;
+    tokio::spawn(drain_loop(shard, gate, shutdown_rx))
+}
 
-            let transport_ref = transport.as_ref();
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            // Drain until no progress. Release lock between cycles
-            // so publish can append concurrently.
-            loop {
-                let progress = streams.with_mut(stream_id, |slot| {
-                    slot.drain.deliver_cycle(&*slot.store, transport_ref, now_ts)
-                });
-
-                match progress {
-                    None => return,        // Stream deleted, exit task
-                    Some(false) => break,  // No more work
-                    Some(true) => {}       // More work, loop
+/// The drain loop — waits for gate signals, triggers delivery on the shard.
+async fn drain_loop(
+    shard: ShardHandle,
+    gate: Gate,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = gate.wait() => {
+                // Fire & forget — shard handles claim + store read + deliver
+                if shard.drain_deliver().await.is_err() {
+                    break; // shard worker exited
                 }
             }
+            _ = shutdown_rx.changed() => break,
         }
-    })
+    }
 }

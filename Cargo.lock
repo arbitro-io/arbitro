@@ -3,6 +3,19 @@
 version = 4
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -30,11 +43,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "arbitro-benches"
+name = "arbitro-client"
+version = "0.1.0"
+dependencies = [
+ "arbitro-engine",
+ "arbitro-proto",
+ "bytes",
+ "tokio",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
+name = "arbitro-e2e"
 version = "0.1.0"
 dependencies = [
  "arbitro-client",
- "arbitro-common",
  "arbitro-engine",
  "arbitro-proto",
  "arbitro-server",
@@ -48,46 +72,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitro-client"
-version = "0.1.0"
-dependencies = [
- "arbitro-common",
- "arbitro-proto",
- "bytes",
- "tokio",
- "tracing",
- "zerocopy",
-]
-
-[[package]]
-name = "arbitro-common"
-version = "0.1.0"
-dependencies = [
- "arbitro-proto",
-]
-
-[[package]]
 name = "arbitro-engine"
 version = "0.1.0"
 dependencies = [
- "arbitro-common",
- "arbitro-metadata",
- "arbitro-proto",
- "arbitro-store",
+ "ahash",
  "bytes",
- "parking_lot",
- "tokio",
  "zerocopy",
-]
-
-[[package]]
-name = "arbitro-metadata"
-version = "0.1.0"
-dependencies = [
- "arbitro-proto",
- "serde",
- "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -105,7 +95,6 @@ version = "0.1.0"
 dependencies = [
  "arbitro-client",
  "arbitro-engine",
- "arbitro-metadata",
  "arbitro-proto",
  "arbitro-store",
  "bytes",
@@ -119,7 +108,7 @@ dependencies = [
 name = "arbitro-store"
 version = "0.1.0"
 dependencies = [
- "arbitro-common",
+ "arbitro-engine",
  "arbitro-proto",
  "memmap2",
 ]
@@ -345,13 +334,25 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi 5.3.0",
+ "wasip2",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de51e6874e94e7bf76d726fc5d13ba782deca734ff60d5bb2fb2607c7406555"
 dependencies = [
  "cfg-if",
  "libc",
- "r-efi",
+ "r-efi 6.0.0",
  "wasip2",
  "wasip3",
 ]
@@ -649,6 +650,12 @@ dependencies = [
 
 [[package]]
 name = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+
+[[package]]
+name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
@@ -863,7 +870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys",
@@ -1008,6 +1015,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walkdir"

@@ -1,4 +1,7 @@
-//! Session — per-connection state on the server side.
+//! Session — per-connection transport handle.
+//!
+//! The engine owns connection lifecycle (open/drain/bindings/pending).
+//! Session is ONLY the TCP transport layer: write channel + keepalive timer.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
@@ -6,30 +9,12 @@ use std::time::Instant;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use arbitro_proto::ids::ConnId;
-
-/// Per-connection session on the server.
+/// Per-connection transport handle. NOT lifecycle — engine owns that.
 pub struct Session {
-    pub conn_id: ConnId,
     /// Bounded write channel — backpressure on slow consumers.
     pub tx: mpsc::Sender<Bytes>,
-    /// Last activity timestamp — for idle timeout.
+    /// Last activity timestamp — for idle timeout / keepalive.
     pub last_activity: Instant,
-    /// Connection state.
-    pub state: SessionState,
-}
-
-/// Connection lifecycle states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionState {
-    /// Waiting for Connect frame.
-    Connecting,
-    /// Authenticated and active.
-    Active,
-    /// Server is shutting down, draining write buffer.
-    Draining,
-    /// Closed — about to be removed.
-    Closed,
 }
 
 /// Atomic connection ID generator.
@@ -47,7 +32,7 @@ impl ConnIdGen {
     }
 
     #[inline]
-    pub fn next(&self) -> ConnId {
+    pub fn next(&self) -> u64 {
         self.next.fetch_add(1, Relaxed)
     }
 }
