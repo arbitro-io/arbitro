@@ -420,8 +420,10 @@ impl ShardWorker {
 
     fn handle_unsubscribe(&mut self, cmd: UnsubscribeCmd) {
         let report = self.engine.drain_subscription(cmd.subscription_id, cmd.mode);
+        // Remove subscription from catalog/graph/edges/match_table
+        let _ = self.engine.remove_subscription(cmd.subscription_id);
 
-        // Remove bindings for this subscription
+        // Remove server-side bindings for this subscription's consumer
         // SubscriptionId == ConsumerId in current design
         let consumer_id = ConsumerId(cmd.subscription_id.0);
         self.bindings.retain(|b| b.consumer_id != consumer_id);
@@ -459,8 +461,9 @@ impl ShardWorker {
     }
 
     fn handle_delete_stream(&mut self, cmd: DeleteStreamCmd) {
-        let report = self.engine.drain_queue(QueueId(cmd.stream_id.raw()), cmd.mode);
-        let _ = self.engine.remove_stream(cmd.stream_id);
+        // Full cascade: drain + remove all consumers, subscriptions, queues,
+        // ready state, idempotency window, and finally the stream itself.
+        let report = self.engine.remove_stream_full(cmd.stream_id, cmd.mode);
 
         // Remove store. Only purge on-disk data for live deletions.
         // During recovery replay, purge_disk=false — the store files reflect
@@ -480,7 +483,7 @@ impl ShardWorker {
         // Clear seeded flag so a recreated stream can re-seed from store.
         self.seeded_streams.remove(&cmd.stream_id);
 
-        // Remove orphan bindings for this stream.
+        // Remove server-side bindings for this stream.
         self.bindings.retain(|b| b.stream_id != cmd.stream_id);
 
         let _ = cmd.reply.send(report);
@@ -515,7 +518,7 @@ impl ShardWorker {
     }
 
     fn handle_drain_connection(&mut self, cmd: DrainConnectionCmd) {
-        // Remove bindings for this connection
+        // Remove server-side bindings for this connection
         self.bindings.retain(|b| b.connection_id != cmd.connection_id);
 
         let report = self.engine.drain_connection(&DrainConnectionReq {
@@ -523,6 +526,9 @@ impl ShardWorker {
             mode: cmd.mode,
             now: cmd.now,
         });
+        // Remove ConnectionNode from graph + ConnectionsByNode edge. O(1).
+        self.engine.remove_connection(cmd.connection_id);
+
         let _ = cmd.reply.send(report);
     }
 
