@@ -52,6 +52,8 @@ pub struct ShardWorker {
     data_dir: Option<String>,
     /// Streams that have been seeded from store (avoid double-seeding).
     seeded_streams: HashSet<StreamId>,
+    /// Last seq published to engine per stream — drain_deliver reads from here.
+    last_engine_seq: HashMap<StreamId, u64>,
     // Scratch buffers — allocated once, reused
     scratch_ack: Vec<AckEntry>,
     scratch_nack: Vec<NackEntry>,
@@ -75,6 +77,7 @@ impl ShardWorker {
             bindings: Vec::new(),
             data_dir,
             seeded_streams: HashSet::new(),
+            last_engine_seq: HashMap::new(),
             scratch_ack: Vec::with_capacity(64),
             scratch_nack: Vec::with_capacity(64),
         }
@@ -164,7 +167,7 @@ impl ShardWorker {
     // ── Hot path handlers ───────────────────────────────────────────────
 
     fn handle_publish(&mut self, cmd: PublishCmd) {
-        // 1. Stream exists? (only real validation on publish)
+        // 1. Stream exists?
         let store = match self.stores.get_mut(&cmd.stream_id) {
             Some(s) => s,
             None => {
@@ -173,7 +176,7 @@ impl ShardWorker {
             }
         };
 
-        // 2. Store — persist first (source of truth)
+        // 2. Store — persist (source of truth)
         let store_entries: Vec<EntryRef<'_>> = cmd.entries.iter().map(|e| {
             EntryRef {
                 subject: &e.subject,
@@ -194,29 +197,7 @@ impl ShardWorker {
             }
         };
 
-        // 3. Register in engine queues (makes messages claimable)
-        let now = Timestamp::new(now_ms);
-        let publish_entries: Vec<PublishEntry<'_>> = cmd.entries.iter().map(|e| {
-            PublishEntry {
-                subject_hash: arbitro_engine_v2::catalog::fnv1a_32(&e.subject),
-                subject: &e.subject,
-                payload: PayloadRef::Borrowed(&e.payload),
-                idempotency_key: 0,
-                credits_cost: 1,
-            }
-        }).collect();
-
-        let _rep = self.engine.publish(&PublishBatch {
-            stream_id: cmd.stream_id,
-            entries: &publish_entries,
-            now,
-        });
-
-        // 4. Engine contract: ALWAYS drain_fanout after publish
-        let drain = self.engine.drain_fanout();
-        drop(drain); // RAII — resets fanout queue
-
-        // 5. Both fire & forget, O(1), no dependency between them
+        // 3. Reply + signal — engine processing happens in drain_deliver
         self.send_rep_ok(cmd.conn_id, cmd.env_seq, first_seq);
         self.gate.release();
     }
@@ -279,6 +260,43 @@ impl ShardWorker {
 
     // ── Delivery handler ───────────────────────────────────────────────
 
+    /// Feed pending journal entries into the engine so they become claimable.
+    fn publish_pending_to_engine(&mut self, now: Timestamp) {
+        let stream_ids: Vec<StreamId> = self.stores.keys().copied().collect();
+
+        for stream_id in stream_ids {
+            let last = self.last_engine_seq.get(&stream_id).copied().unwrap_or(0);
+            let info = self.stores[&stream_id].info();
+            if info.last_seq <= last { continue; }
+
+            let start = last + 1;
+            let end = info.last_seq + 1;
+
+            // Temporarily remove store to avoid borrow conflict with self.engine
+            let store = self.stores.remove(&stream_id).unwrap();
+
+            store.for_each(start, end, &mut |entry| {
+                let publish_entry = PublishEntry {
+                    subject_hash: arbitro_engine_v2::catalog::fnv1a_32(entry.subject),
+                    subject: entry.subject,
+                    payload: PayloadRef::Borrowed(entry.payload),
+                    idempotency_key: 0,
+                    credits_cost: 1,
+                };
+                self.engine.publish(&PublishBatch {
+                    stream_id,
+                    entries: &[publish_entry],
+                    now,
+                });
+                let drain = self.engine.drain_fanout();
+                drop(drain);
+            }).ok();
+
+            self.stores.insert(stream_id, store);
+            self.last_engine_seq.insert(stream_id, info.last_seq);
+        }
+    }
+
     /// Iterate all active bindings, claim from engine, read store, deliver.
     /// Loops per binding until the queue is drained or max_inflight is hit.
     fn handle_drain_deliver(&mut self) {
@@ -287,6 +305,9 @@ impl ShardWorker {
             .unwrap_or_default()
             .as_millis() as u64;
         let now = Timestamp::new(now_ms);
+
+        // 1. Feed new journal entries into engine
+        self.publish_pending_to_engine(now);
 
         let mut any_delivered = false;
 
@@ -640,9 +661,10 @@ impl ShardWorker {
             seeded += 1;
         }).ok();
 
-        // Put store back
+        // Put store back + mark engine seq as caught up
         self.stores.insert(stream_id, store);
         self.seeded_streams.insert(stream_id);
+        self.last_engine_seq.insert(stream_id, info.last_seq);
 
         if seeded > 0 {
             tracing::info!(

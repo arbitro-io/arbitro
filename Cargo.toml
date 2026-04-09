@@ -19,3 +19,10 @@ tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile    = "3.10"
 tokio-uring = "0.5"
+
+[profile.release]
+opt-level = 3
+strip = true
+debug = false
+codegen-units = 1
+lto = true

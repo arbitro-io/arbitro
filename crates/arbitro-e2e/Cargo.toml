@@ -18,6 +18,9 @@ tempfile       = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+crossbeam-channel = "0.5"
+flume = "0.11"
+atomic-wait = "1"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-uring = { workspace = true }
@@ -44,4 +47,20 @@ harness = false
 
 [[bench]]
 name    = "queue_balance"
+harness = false
+
+[[bench]]
+name    = "tcp_wire"
+harness = false
+
+[[bench]]
+name    = "gate"
+harness = false
+
+[[bench]]
+name    = "gate_cpu"
+harness = false
+
+[[bench]]
+name    = "shard_loop"
 harness = false

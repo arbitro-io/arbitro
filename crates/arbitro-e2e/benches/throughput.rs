@@ -1,22 +1,20 @@
-//! Benchmark: end-to-end throughput.
+//! Benchmark: in-memory publish (ingestion) throughput.
 //!
-//! Three measurements per mode:
-//!   1. Publish throughput — time to publish N messages (batch)
-//!   2. Delivery throughput — publish backlog, then measure subscribe + receive only
-//!   3. Full cycle — publish + subscribe + receive (+ ack) measured together
+//! Measures publish throughput scaling:
+//!   - publish_single: 1 msg per RTT, across N connections
+//!   - publish_batch:  1K msgs per RTT, across N connections
 //!
-//! Modes: fire_forget (AckPolicy::None) vs explicit_ack (AckPolicy::Explicit).
-//! Single server instance. Streams recreated between iterations.
+//! Each connection publishes to its own stream → different shards → real parallelism.
+//! Concurrency levels: 1, 4, 8.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput, BenchmarkId};
 use tokio::runtime::Runtime;
 
 use arbitro_client::Client;
-use arbitro_proto::config::{AckPolicy, ConsumerConfig, StreamConfig};
-use arbitro_server::{ArbitroServer, Config, TokioTransport};
+use arbitro_proto::config::StreamConfig;
+use arbitro_server::{ArbitroServer, Config};
 
 // ── Infrastructure ───────────────────────────────────────────────
 
@@ -34,264 +32,142 @@ async fn start_server() -> String {
         .max_connections(100)
         .write_buffer_cap(8192);
 
-    let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
-    let server = ArbitroServer::new(config, transport, None);
-
-    tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-
+    let server = ArbitroServer::new(config);
+    tokio::spawn(async move { let _ = server.run().await; });
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect_with_timeout(addr, Duration::from_secs(30))
+    Client::connect_with_timeout(addr, Duration::from_secs(5))
         .await
         .expect("client must connect")
 }
 
-const CHUNK: usize = 50_000;
-
-async fn publish_n(client: &Client, stream: &[u8], entries: &[(&[u8], &[u8])], n: u32) {
-    let mut remaining = n as usize;
-    while remaining > 0 {
-        let batch_size = remaining.min(entries.len());
-        client.publish_batch(stream, &entries[..batch_size]).await.expect("publish");
-        remaining -= batch_size;
-    }
-}
-
-async fn receive_n(sub: &mut arbitro_client::SubscriptionHandle, n: u32) {
-    let mut received = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while received < n {
-        match tokio::time::timeout_at(deadline, sub.next()).await {
-            Ok(Some(_)) => received += 1,
-            _ => panic!("timeout after {received}/{n} msgs"),
-        }
-    }
-}
-
-async fn receive_and_ack_n(sub: &mut arbitro_client::SubscriptionHandle, n: u32) {
-    let mut received = 0u32;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while received < n {
-        match tokio::time::timeout_at(deadline, sub.next()).await {
-            Ok(Some(msg)) => { msg.ack(); received += 1; }
-            _ => panic!("timeout after {received}/{n} msgs"),
-        }
-    }
-}
+const MSGS_PER_CLIENT: u32 = 1_000;
+const BATCH_SIZE: usize = 1_000;
+const CONCURRENCY: &[usize] = &[1, 4, 8];
 
 // ── Benchmarks ───────────────────────────────────────────────────
 
-fn bench_e2e(c: &mut Criterion) {
+fn bench_publish(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let addr = rt.block_on(start_server());
-    let client = rt.block_on(connect(&addr));
 
-    let payload = vec![0u8; 64];
+    // Create 8 streams — each client publishes to its own stream
+    let stream_names: Vec<Vec<u8>> = (0..8)
+        .map(|i| format!("ingest_{i}").into_bytes())
+        .collect();
 
-    for &n in &[1_000u32, 1_000_000] {
-        let chunk_size = (n as usize).min(CHUNK);
-        let entries: Vec<(&[u8], &[u8])> = (0..chunk_size)
-            .map(|_| (b"bench.msg".as_slice(), payload.as_slice()))
-            .collect();
+    let setup_client = rt.block_on(connect(&addr));
+    rt.block_on(async {
+        for name in &stream_names {
+            setup_client.create_stream(&StreamConfig::new(name, b">").build())
+                .await.expect("create stream");
+        }
+    });
 
-        let mtime = if n >= 1_000_000 { Duration::from_secs(30) } else { Duration::from_secs(5) };
-        let samples = if n >= 1_000_000 { 10 } else { 100 };
+    // ── 1. Single publish (1 msg per RTT) ───────────────────────
+    {
+        let mut group = c.benchmark_group("publish_single");
+        group.measurement_time(Duration::from_secs(5));
+        group.sample_size(20);
 
-        // ── 1. Publish throughput ──────────────────────────────────
-        {
-            let sname = format!("pub_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname, b">").build();
+        for &n_clients in CONCURRENCY {
+            let total_msgs = MSGS_PER_CLIENT as u64 * n_clients as u64;
+            group.throughput(Throughput::Elements(total_msgs));
 
-            let mut group = c.benchmark_group("publish");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
+            let clients: Vec<Client> = rt.block_on(async {
+                let mut v = Vec::with_capacity(n_clients);
+                for _ in 0..n_clients { v.push(connect(&addr).await); }
+                v
+            });
 
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                // Setup (OUTSIDE timing): fresh stream
-                rt.block_on(async {
-                    client.delete_stream(&sname).await.ok();
-                    client.create_stream(&scfg).await.expect("create");
-                });
-
-                b.iter(|| {
-                    rt.block_on(async {
-                        publish_n(&client, &sname, &entries, n).await;
+            group.bench_with_input(
+                BenchmarkId::new(format!("{n_clients}conn_{n_clients}stream"), total_msgs),
+                &n_clients,
+                |b, _| {
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let elapsed = rt.block_on(async {
+                                let start = Instant::now();
+                                let mut handles = Vec::with_capacity(n_clients);
+                                for (i, client) in clients.iter().enumerate() {
+                                    let c = client.clone();
+                                    let stream = stream_names[i % stream_names.len()].clone();
+                                    handles.push(tokio::spawn(async move {
+                                        let payload = vec![0u8; 64];
+                                        for _ in 0..MSGS_PER_CLIENT {
+                                            c.publish(&stream, b"bench.msg", &payload)
+                                                .await.expect("publish");
+                                        }
+                                    }));
+                                }
+                                for h in handles { h.await.unwrap(); }
+                                start.elapsed()
+                            });
+                            total += elapsed;
+                        }
+                        total
                     });
-                });
-            });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
+                },
+            );
         }
+        group.finish();
+    }
 
-        // ── 2. Delivery fire-forget (backlog → subscribe → measure receive) ──
-        {
-            let sname = format!("ff_d_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname, b">").build();
-            let ccfg = ConsumerConfig::new(b"ff_c", &sname)
-                .filter(b">")
-                .ack_policy(AckPolicy::None)
-                .build();
+    // ── 2. Batch publish (1K msgs per RTT) ──────────────────────
+    {
+        let mut group = c.benchmark_group("publish_batch");
+        group.measurement_time(Duration::from_secs(5));
+        group.sample_size(20);
 
-            let mut group = c.benchmark_group("deliver_fire_forget");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
+        for &n_clients in CONCURRENCY {
+            let total_msgs = BATCH_SIZE as u64 * n_clients as u64;
+            group.throughput(Throughput::Elements(total_msgs));
 
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        rt.block_on(async {
-                            // Setup (NOT timed): fresh stream + publish backlog + consumer
-                            client.delete_stream(&sname).await.ok();
-                            client.create_stream(&scfg).await.expect("create");
-                            publish_n(&client, &sname, &entries, n).await;
-                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
-
-                            // Timed: receive only
-                            let start = Instant::now();
-                            receive_n(&mut sub, n).await;
-                            total += start.elapsed();
-                        });
-                    }
-                    total
-                });
+            let clients: Vec<Client> = rt.block_on(async {
+                let mut v = Vec::with_capacity(n_clients);
+                for _ in 0..n_clients { v.push(connect(&addr).await); }
+                v
             });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("{n_clients}conn_{n_clients}stream"), total_msgs),
+                &n_clients,
+                |b, _| {
+                    b.iter_custom(|iters| {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            let elapsed = rt.block_on(async {
+                                let start = Instant::now();
+                                let mut handles = Vec::with_capacity(n_clients);
+                                for (i, client) in clients.iter().enumerate() {
+                                    let c = client.clone();
+                                    let stream = stream_names[i % stream_names.len()].clone();
+                                    handles.push(tokio::spawn(async move {
+                                        let payload = vec![0u8; 64];
+                                        let entries: Vec<(&[u8], &[u8])> = (0..BATCH_SIZE)
+                                            .map(|_| (b"bench.msg".as_slice(), payload.as_slice()))
+                                            .collect();
+                                        c.publish_batch(&stream, &entries)
+                                            .await.expect("publish_batch");
+                                    }));
+                                }
+                                for h in handles { h.await.unwrap(); }
+                                start.elapsed()
+                            });
+                            total += elapsed;
+                        }
+                        total
+                    });
+                },
+            );
         }
-
-        // ── 3. Delivery explicit ack (backlog → subscribe → measure receive + ack) ──
-        {
-            let sname = format!("ack_d_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname, b">").build();
-            let max_inflight: u16 = if n >= 1_000_000 { 60_000 } else { 1000 };
-            let ccfg = ConsumerConfig::new(b"ack_c", &sname)
-                .filter(b">")
-                .ack_policy(AckPolicy::Explicit)
-                .max_inflight(max_inflight)
-                .ack_wait_ms(60_000)
-                .build();
-
-            let mut group = c.benchmark_group("deliver_explicit_ack");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
-
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        rt.block_on(async {
-                            // Setup (NOT timed)
-                            client.delete_stream(&sname).await.ok();
-                            client.create_stream(&scfg).await.expect("create");
-                            publish_n(&client, &sname, &entries, n).await;
-                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
-
-                            // Timed: receive + ack
-                            let start = Instant::now();
-                            receive_and_ack_n(&mut sub, n).await;
-                            total += start.elapsed();
-                        });
-                    }
-                    total
-                });
-            });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
-        }
-
-        // ── 4. Full cycle fire-forget (publish + receive measured together) ──
-        {
-            let sname = format!("ff_f_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname, b">").build();
-            let ccfg = ConsumerConfig::new(b"ff_fc", &sname)
-                .filter(b">")
-                .ack_policy(AckPolicy::None)
-                .build();
-
-            let mut group = c.benchmark_group("full_cycle_fire_forget");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
-
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        rt.block_on(async {
-                            // Setup (NOT timed)
-                            client.delete_stream(&sname).await.ok();
-                            client.create_stream(&scfg).await.expect("create");
-                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
-
-                            // Timed: publish + receive
-                            let start = Instant::now();
-                            publish_n(&client, &sname, &entries, n).await;
-                            receive_n(&mut sub, n).await;
-                            total += start.elapsed();
-                        });
-                    }
-                    total
-                });
-            });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
-        }
-
-        // ── 5. Full cycle explicit ack (publish + receive + ack measured together) ──
-        {
-            let sname = format!("ack_f_{n}").into_bytes();
-            let scfg = StreamConfig::new(&sname, b">").build();
-            let max_inflight: u16 = if n >= 1_000_000 { 60_000 } else { 1000 };
-            let ccfg = ConsumerConfig::new(b"ack_fc", &sname)
-                .filter(b">")
-                .ack_policy(AckPolicy::Explicit)
-                .max_inflight(max_inflight)
-                .ack_wait_ms(60_000)
-                .build();
-
-            let mut group = c.benchmark_group("full_cycle_explicit_ack");
-            group.throughput(Throughput::Elements(n as u64));
-            group.measurement_time(mtime);
-            group.sample_size(samples);
-
-            group.bench_function(format!("{n}msg_64B"), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
-                    for _ in 0..iters {
-                        rt.block_on(async {
-                            // Setup (NOT timed)
-                            client.delete_stream(&sname).await.ok();
-                            client.create_stream(&scfg).await.expect("create");
-                            let consumer = client.create_consumer(&ccfg).await.expect("consumer");
-                            let mut sub = consumer.subscribe(None).await.expect("subscribe");
-
-                            // Timed: publish + receive + ack
-                            let start = Instant::now();
-                            publish_n(&client, &sname, &entries, n).await;
-                            receive_and_ack_n(&mut sub, n).await;
-                            total += start.elapsed();
-                        });
-                    }
-                    total
-                });
-            });
-            group.finish();
-            rt.block_on(client.delete_stream(&sname)).ok();
-        }
+        group.finish();
     }
 }
 
-criterion_group!(benches, bench_e2e);
+criterion_group!(benches, bench_publish);
 criterion_main!(benches);
