@@ -10,7 +10,7 @@
 //! Delivery path: drain task sends DrainDeliver → shard iterates active
 //!   bindings → engine.claim per binding → store.get per entry → deliver frame.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arbitro_engine_v2::batch::*;
 use arbitro_engine_v2::types::*;
@@ -19,7 +19,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::delivery::RepOkAction;
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use arbitro_store::{EntryRef, MemoryStore, Store};
+use arbitro_store::{EntryRef, MemoryStore, Store, TolerantStore};
 use bytes::BytesMut;
 use tokio::sync::mpsc;
 use zerocopy::IntoBytes;
@@ -48,6 +48,10 @@ pub struct ShardWorker {
     registry: ConnectionRegistry,
     /// Active bindings — iterated on DrainDeliver to claim + deliver.
     bindings: Vec<ActiveBinding>,
+    /// Data directory for disk-backed stores. None = memory only.
+    data_dir: Option<String>,
+    /// Streams that have been seeded from store (avoid double-seeding).
+    seeded_streams: HashSet<StreamId>,
     // Scratch buffers — allocated once, reused
     scratch_ack: Vec<AckEntry>,
     scratch_nack: Vec<NackEntry>,
@@ -60,6 +64,7 @@ impl ShardWorker {
         rx: mpsc::Receiver<ShardCommand>,
         gate: Gate,
         registry: ConnectionRegistry,
+        data_dir: Option<String>,
     ) -> Self {
         Self {
             engine,
@@ -68,6 +73,8 @@ impl ShardWorker {
             gate,
             registry,
             bindings: Vec::new(),
+            data_dir,
+            seeded_streams: HashSet::new(),
             scratch_ack: Vec::with_capacity(64),
             scratch_nack: Vec::with_capacity(64),
         }
@@ -75,6 +82,13 @@ impl ShardWorker {
 
     /// Run the shard loop. Blocks until Shutdown or channel close.
     pub fn run(mut self) {
+        // ── Store init ─────────────────────────────────────────────────
+        for (id, store) in &mut self.stores {
+            if let Err(e) = store.init() {
+                tracing::error!(stream_id = id.raw(), error = ?e, "store init failed");
+            }
+        }
+
         while let Some(cmd) = self.rx.blocking_recv() {
             match cmd {
                 ShardCommand::Publish(cmd) => self.handle_publish(cmd),
@@ -93,9 +107,18 @@ impl ShardWorker {
                 ShardCommand::DrainDeliver => self.handle_drain_deliver(),
                 ShardCommand::ListStreams(cmd) => self.handle_list_streams(cmd),
                 ShardCommand::ListConsumers(cmd) => self.handle_list_consumers(cmd),
+                ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
                 ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
                 ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
+                ShardCommand::SeedStores(cmd) => self.handle_seed_stores(cmd),
                 ShardCommand::Shutdown => break,
+            }
+        }
+
+        // ── Store shutdown ─────────────────────────────────────────────
+        for (id, store) in &mut self.stores {
+            if let Err(e) = store.shutdown() {
+                tracing::error!(stream_id = id.raw(), error = ?e, "store shutdown failed");
             }
         }
     }
@@ -175,7 +198,7 @@ impl ShardWorker {
         let now = Timestamp::new(now_ms);
         let publish_entries: Vec<PublishEntry<'_>> = cmd.entries.iter().map(|e| {
             PublishEntry {
-                subject_hash: arbitro_proto::config::fnv1a_32(&e.subject),
+                subject_hash: arbitro_engine_v2::catalog::fnv1a_32(&e.subject),
                 subject: &e.subject,
                 payload: PayloadRef::Borrowed(&e.payload),
                 idempotency_key: 0,
@@ -352,6 +375,18 @@ impl ShardWorker {
         let sub_ok = self.engine.ensure_subscription(cmd.subscription_config).is_ok();
 
         if stream_ok && consumer_ok && sub_ok {
+            // Seed engine from store if this stream has persisted messages
+            // that haven't been loaded into the engine yet (recovery path).
+            if !self.seeded_streams.contains(&stream_id) {
+                if let Some(store) = self.stores.get(&stream_id) {
+                    let info = store.info();
+                    if info.messages > 0 {
+                        self.seed_from_store(stream_id, &info);
+                    }
+                }
+                self.seeded_streams.insert(stream_id);
+            }
+
             // Resolve the consumer's real queue_id from the engine (may differ
             // from what the subscribe frame sent if the consumer was created
             // with a custom group via create_consumer).
@@ -375,6 +410,9 @@ impl ShardWorker {
                 consumer_id,
                 stream_id,
             });
+
+            // Wake drain task — there may be pending messages (e.g. after recovery)
+            self.gate.release();
         }
 
         let _ = cmd.reply.send(stream_ok && consumer_ok && sub_ok);
@@ -399,11 +437,21 @@ impl ShardWorker {
 
         // Create store if stream is new
         if ok && !self.stores.contains_key(&stream_id) {
-            let store: Box<dyn Store> = match journal_kind {
-                0 => Box::new(MemoryStore::new()),
-                // TODO: TolerantStore needs a path — wire through from config
-                _ => Box::new(MemoryStore::new()),
+            let mut store: Box<dyn Store> = match (journal_kind, &self.data_dir) {
+                (0, _) => Box::new(MemoryStore::new()),
+                (_, Some(dir)) => {
+                    let path = std::path::Path::new(dir)
+                        .join("streams")
+                        .join(stream_id.raw().to_string());
+                    Box::new(TolerantStore::new(path))
+                }
+                // No data_dir — fallback to memory
+                (_, None) => Box::new(MemoryStore::new()),
             };
+            if let Err(e) = store.init() {
+                tracing::error!(stream_id = stream_id.raw(), error = ?e, "store init failed");
+            }
+
             self.stores.insert(stream_id, store);
         }
 
@@ -413,7 +461,28 @@ impl ShardWorker {
     fn handle_delete_stream(&mut self, cmd: DeleteStreamCmd) {
         let report = self.engine.drain_queue(QueueId(cmd.stream_id.raw()), cmd.mode);
         let _ = self.engine.remove_stream(cmd.stream_id);
-        self.stores.remove(&cmd.stream_id);
+
+        // Remove store. Only purge on-disk data for live deletions.
+        // During recovery replay, purge_disk=false — the store files reflect
+        // the final persisted state and must not be destroyed.
+        if let Some(mut store) = self.stores.remove(&cmd.stream_id) {
+            if cmd.purge_disk {
+                let _ = store.purge();
+                if let Some(ref dir) = self.data_dir {
+                    let path = std::path::Path::new(dir)
+                        .join("streams")
+                        .join(cmd.stream_id.raw().to_string());
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+
+        // Clear seeded flag so a recreated stream can re-seed from store.
+        self.seeded_streams.remove(&cmd.stream_id);
+
+        // Remove orphan bindings for this stream.
+        self.bindings.retain(|b| b.stream_id != cmd.stream_id);
+
         let _ = cmd.reply.send(report);
     }
 
@@ -431,6 +500,8 @@ impl ShardWorker {
     fn handle_delete_consumer(&mut self, cmd: DeleteConsumerCmd) {
         self.bindings.retain(|b| b.consumer_id != cmd.consumer_id);
         let report = self.engine.drain_consumer(cmd.consumer_id, cmd.mode);
+        // Remove consumer from catalog/graph after draining
+        let _ = self.engine.remove_consumer(cmd.consumer_id);
         let _ = cmd.reply.send(report);
     }
 
@@ -483,6 +554,17 @@ impl ShardWorker {
         let _ = cmd.reply.send(ListConsumersReply { consumers });
     }
 
+    fn handle_store_info(&self, cmd: StoreInfoCmd) {
+        let reply = match self.stores.get(&cmd.stream_id) {
+            Some(store) => {
+                let info = store.info();
+                StoreInfoReply { messages: info.messages, bytes: info.bytes }
+            }
+            None => StoreInfoReply { messages: 0, bytes: 0 },
+        };
+        let _ = cmd.reply.send(reply);
+    }
+
     fn handle_pause_consumer(&mut self, cmd: PauseConsumerCmd) {
         let ok = self.engine.pause_consumer(cmd.consumer_id);
         let _ = cmd.reply.send(ok);
@@ -491,5 +573,80 @@ impl ShardWorker {
     fn handle_resume_consumer(&mut self, cmd: ResumeConsumerCmd) {
         let ok = self.engine.resume_consumer(cmd.consumer_id);
         let _ = cmd.reply.send(ok);
+    }
+
+    // ── Recovery ────────────────────────────────────────────────────────
+
+    /// Seed engine from a specific stream's store. Temporarily removes the
+    /// store from the map to avoid borrow conflicts with the engine.
+    fn seed_from_store(&mut self, stream_id: StreamId, info: &arbitro_store::StoreInfo) -> u64 {
+        let now = Timestamp::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+
+        let first = info.first_seq;
+        let end = info.last_seq + 1;
+        let mut seeded = 0u64;
+
+        // Temporarily take store out to avoid borrow conflict with self.engine
+        let store = match self.stores.remove(&stream_id) {
+            Some(s) => s,
+            None => return 0,
+        };
+
+        store.for_each(first, end, &mut |entry| {
+            let publish_entry = PublishEntry {
+                subject_hash: arbitro_engine_v2::catalog::fnv1a_32(entry.subject),
+                subject: entry.subject,
+                payload: PayloadRef::Borrowed(entry.payload),
+                idempotency_key: 0,
+                credits_cost: 1,
+            };
+            let _rep = self.engine.publish(&PublishBatch {
+                stream_id,
+                entries: &[publish_entry],
+                now,
+            });
+            let drain = self.engine.drain_fanout();
+            drop(drain);
+            seeded += 1;
+        }).ok();
+
+        // Put store back
+        self.stores.insert(stream_id, store);
+        self.seeded_streams.insert(stream_id);
+
+        if seeded > 0 {
+            tracing::info!(
+                stream_id = stream_id.raw(),
+                messages = seeded,
+                "seeded engine from store"
+            );
+        }
+
+        seeded
+    }
+
+    /// Handle SeedStores command — seed engine from all non-empty stores.
+    /// Called after ALL recovery commands (streams + consumers) are replayed.
+    fn handle_seed_stores(&mut self, cmd: SeedStoresCmd) {
+        let mut total_seeded = 0u64;
+
+        let stream_ids: Vec<StreamId> = self.stores.keys().copied().collect();
+        for stream_id in stream_ids {
+            if self.seeded_streams.contains(&stream_id) {
+                continue;
+            }
+            let info = self.stores[&stream_id].info();
+            if info.messages == 0 {
+                continue;
+            }
+            total_seeded += self.seed_from_store(stream_id, &info);
+        }
+
+        let _ = cmd.reply.send(total_seeded);
     }
 }

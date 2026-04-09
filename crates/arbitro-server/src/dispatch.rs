@@ -30,6 +30,7 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use crate::command::PublishEntryOwned;
+use crate::command_log::SharedCommandLog;
 use crate::router::Server;
 use crate::transport::ConnectionRegistry;
 
@@ -39,6 +40,7 @@ pub async fn dispatch_frame(
     frame: Bytes,
     server: &Server,
     registry: &ConnectionRegistry,
+    command_log: Option<&SharedCommandLog>,
 ) {
     let view = FrameView::new(&frame);
     let action = match view.action() {
@@ -68,15 +70,15 @@ pub async fn dispatch_frame(
         Action::Fetch => dispatch_fetch(conn_id, stream_id, body, server, registry).await,
 
         // ── Stream management ───────────────────────────────────────
-        Action::CreateStream => dispatch_create_stream(conn_id, env_seq, body, server, registry).await,
-        Action::DeleteStream => dispatch_delete_stream(conn_id, env_seq, body, server, registry).await,
+        Action::CreateStream => dispatch_create_stream(conn_id, env_seq, body, server, registry, command_log).await,
+        Action::DeleteStream => dispatch_delete_stream(conn_id, env_seq, body, server, registry, command_log).await,
         Action::ListStreams => dispatch_list_streams(conn_id, env_seq, server, registry).await,
 
         Action::ListConsumers => dispatch_list_consumers(conn_id, env_seq, server, registry).await,
 
         // ── Consumer management ─────────────────────────────────────
-        Action::CreateConsumer => dispatch_create_consumer(conn_id, env_seq, body, server, registry).await,
-        Action::DeleteConsumer => dispatch_delete_consumer(conn_id, stream_id, env_seq, body, server, registry).await,
+        Action::CreateConsumer => dispatch_create_consumer(conn_id, env_seq, body, server, registry, command_log).await,
+        Action::DeleteConsumer => dispatch_delete_consumer(conn_id, stream_id, env_seq, body, server, registry, command_log).await,
 
         // ── System ──────────────────────────────────────────────────
         Action::Connect => dispatch_connect(conn_id, body, server, registry).await,
@@ -204,7 +206,7 @@ async fn dispatch_subscribe(
     let queue_id = if group.is_empty() {
         QueueId(stream_id)
     } else {
-        QueueId(arbitro_proto::config::fnv1a_32(group))
+        QueueId(arbitro_engine_v2::catalog::fnv1a_32(group))
     };
 
     let reply = shard
@@ -311,10 +313,11 @@ async fn dispatch_create_stream(
     body: &[u8],
     server: &Server,
     registry: &ConnectionRegistry,
+    command_log: Option<&SharedCommandLog>,
 ) {
     let view = CreateStreamView::new(body);
     let name = view.name();
-    let stream_id = arbitro_proto::config::fnv1a_32(name);
+    let stream_id = arbitro_engine_v2::catalog::fnv1a_32(name);
     let shard = server.shard_for(StreamId(stream_id));
 
     match shard
@@ -327,7 +330,15 @@ async fn dispatch_create_stream(
         )
         .await
     {
-        Ok(true) => send_rep_ok(registry, conn_id, env_seq, stream_id as u64),
+        Ok(true) => {
+            if let Some(log) = command_log {
+                let cmd = arbitro_proto::metadata::build_create_stream(body);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::error!(error = %e, "failed to record CreateStream to command log");
+                }
+            }
+            send_rep_ok(registry, conn_id, env_seq, stream_id as u64);
+        }
         Ok(_) => send_error(registry, conn_id, env_seq, ErrorCode::StreamAlreadyExists),
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
     }
@@ -339,17 +350,26 @@ async fn dispatch_delete_stream(
     body: &[u8],
     server: &Server,
     registry: &ConnectionRegistry,
+    command_log: Option<&SharedCommandLog>,
 ) {
     let view = DeleteStreamView::new(body);
     let name = view.name();
-    let stream_id = arbitro_proto::config::fnv1a_32(name);
+    let stream_id = arbitro_engine_v2::catalog::fnv1a_32(name);
     let shard = server.shard_for(StreamId(stream_id));
 
     match shard
-        .delete_stream(StreamId(stream_id), DrainMode::ReleaseAndRequeue)
+        .delete_stream(StreamId(stream_id), DrainMode::ReleaseAndRequeue, true)
         .await
     {
-        Ok(_) => send_rep_ok(registry, conn_id, env_seq, env_seq as u64),
+        Ok(_) => {
+            if let Some(log) = command_log {
+                let cmd = arbitro_proto::metadata::build_delete_stream(body);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::error!(error = %e, "failed to record DeleteStream to command log");
+                }
+            }
+            send_rep_ok(registry, conn_id, env_seq, env_seq as u64);
+        }
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
     }
 }
@@ -444,18 +464,19 @@ async fn dispatch_create_consumer(
     body: &[u8],
     server: &Server,
     registry: &ConnectionRegistry,
+    command_log: Option<&SharedCommandLog>,
 ) {
     let view = CreateConsumerView::new(body);
     let stream_id = view.stream_id();
     let consumer_name = view.name();
-    let consumer_id = arbitro_proto::config::fnv1a_32(consumer_name);
+    let consumer_id = arbitro_engine_v2::catalog::fnv1a_32(consumer_name);
     let shard = server.shard_for(StreamId(stream_id));
 
     let group = view.group();
     let queue_id = if group.is_empty() {
         QueueId(stream_id)
     } else {
-        QueueId(arbitro_proto::config::fnv1a_32(group))
+        QueueId(arbitro_engine_v2::catalog::fnv1a_32(group))
     };
 
     let ack_policy = match view.ack_policy() {
@@ -483,7 +504,15 @@ async fn dispatch_create_consumer(
         )
         .await
     {
-        Ok(true) => send_rep_ok(registry, conn_id, env_seq, consumer_id as u64),
+        Ok(true) => {
+            if let Some(log) = command_log {
+                let cmd = arbitro_proto::metadata::build_create_consumer(body);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::error!(error = %e, "failed to record CreateConsumer to command log");
+                }
+            }
+            send_rep_ok(registry, conn_id, env_seq, consumer_id as u64);
+        }
         Ok(_) => send_error(registry, conn_id, env_seq, ErrorCode::ConsumerAlreadyExists),
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
     }
@@ -496,6 +525,7 @@ async fn dispatch_delete_consumer(
     body: &[u8],
     server: &Server,
     registry: &ConnectionRegistry,
+    command_log: Option<&SharedCommandLog>,
 ) {
     let view = DeleteConsumerView::new(body);
     let shard = server.shard_for(StreamId(stream_id));
@@ -504,7 +534,15 @@ async fn dispatch_delete_consumer(
         .delete_consumer(ConsumerId(view.consumer_id()), DrainMode::ReleaseAndRequeue)
         .await
     {
-        Ok(_) => send_rep_ok(registry, conn_id, env_seq, env_seq as u64),
+        Ok(_) => {
+            if let Some(log) = command_log {
+                let cmd = arbitro_proto::metadata::build_delete_consumer(body);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::error!(error = %e, "failed to record DeleteConsumer to command log");
+                }
+            }
+            send_rep_ok(registry, conn_id, env_seq, env_seq as u64);
+        }
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
     }
 }

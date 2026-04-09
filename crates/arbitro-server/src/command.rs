@@ -49,6 +49,10 @@ pub enum ShardCommand {
     // Query
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),
+    StoreInfo(StoreInfoCmd),
+
+    // Recovery
+    SeedStores(SeedStoresCmd),
 
     // System
     Shutdown,
@@ -139,6 +143,9 @@ pub struct CreateStreamCmd {
 pub struct DeleteStreamCmd {
     pub stream_id: StreamId,
     pub mode: DrainMode,
+    /// When true, delete on-disk store data (segment files).
+    /// False during recovery replay — the store reflects the final state.
+    pub purge_disk: bool,
     pub reply: oneshot::Sender<DrainReport>,
 }
 
@@ -170,6 +177,16 @@ pub struct ListStreamsReply {
 
 pub struct ListConsumersCmd {
     pub reply: oneshot::Sender<ListConsumersReply>,
+}
+
+pub struct StoreInfoCmd {
+    pub stream_id: StreamId,
+    pub reply: oneshot::Sender<StoreInfoReply>,
+}
+
+pub struct StoreInfoReply {
+    pub messages: u64,
+    pub bytes: u64,
 }
 
 /// Each entry is (consumer_id, stream_id, queue_id, paused).
@@ -212,4 +229,11 @@ pub struct PauseConsumerCmd {
 pub struct ResumeConsumerCmd {
     pub consumer_id: ConsumerId,
     pub reply: oneshot::Sender<bool>,
+}
+
+// ── Recovery ───────────────────────────────────────────────────────────────────
+
+/// Seed engine queues from stores that have existing messages (recovery).
+pub struct SeedStoresCmd {
+    pub reply: oneshot::Sender<u64>,
 }

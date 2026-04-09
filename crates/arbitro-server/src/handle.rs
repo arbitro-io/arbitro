@@ -156,11 +156,13 @@ impl ShardHandle {
         &self,
         stream_id: StreamId,
         mode: DrainMode,
+        purge_disk: bool,
     ) -> Result<DrainReport, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DeleteStream(DeleteStreamCmd {
             stream_id,
             mode,
+            purge_disk,
             reply: tx,
         })).await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
@@ -209,6 +211,15 @@ impl ShardHandle {
     pub async fn list_consumers(&self) -> Result<ListConsumersReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::ListConsumers(ListConsumersCmd {
+            reply: tx,
+        })).await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    pub async fn store_info(&self, stream_id: StreamId) -> Result<StoreInfoReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::StoreInfo(StoreInfoCmd {
+            stream_id,
             reply: tx,
         })).await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
@@ -289,6 +300,18 @@ impl ShardHandle {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::ResumeConsumer(ResumeConsumerCmd {
             consumer_id,
+            reply: tx,
+        })).await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    // ── Recovery ────────────────────────────────────────────────────────
+
+    /// Seed engine queues from stores with existing data (recovery path).
+    /// Returns total number of messages seeded.
+    pub async fn seed_stores(&self) -> Result<u64, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::SeedStores(SeedStoresCmd {
             reply: tx,
         })).await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
