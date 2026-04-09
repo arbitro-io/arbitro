@@ -173,12 +173,12 @@ impl ShardHandle {
     pub async fn create_consumer(
         &self,
         config: ConsumerConfig,
-        subject_limits: Vec<(Vec<u8>, u32)>,
+        max_subject_inflights: Vec<(Vec<u8>, u32)>,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::CreateConsumer(CreateConsumerCmd {
             config,
-            subject_limits,
+            max_subject_inflights,
             reply: tx,
         })).await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)

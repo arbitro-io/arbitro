@@ -28,7 +28,7 @@ enum ReplayCommand {
     CreateConsumer {
         stream_id: StreamId,
         config: ConsumerConfig,
-        subject_limits: Vec<(Vec<u8>, u32)>,
+        max_subject_inflights: Vec<(Vec<u8>, u32)>,
     },
     DeleteConsumer {
         stream_id: StreamId,
@@ -77,10 +77,10 @@ impl ReplayApplier {
                         Err(e) => tracing::error!(?stream_id, error = %e, "replay DeleteStream failed"),
                     }
                 }
-                ReplayCommand::CreateConsumer { stream_id, config, subject_limits } => {
+                ReplayCommand::CreateConsumer { stream_id, config, max_subject_inflights } => {
                     let consumer_id = config.id;
                     let shard = self.server.shard_for(stream_id);
-                    match shard.create_consumer(config, subject_limits).await {
+                    match shard.create_consumer(config, max_subject_inflights).await {
                         Ok(true) => {
                             consumers_recovered += 1;
                             tracing::debug!(?consumer_id, "replayed CreateConsumer");
@@ -175,7 +175,7 @@ impl MetadataApplier for ReplayApplier {
                     _ => AckPolicy::Explicit,
                 };
 
-                let subject_limits: Vec<(Vec<u8>, u32)> = cv
+                let max_subject_inflights: Vec<(Vec<u8>, u32)> = cv
                     .subject_limits()
                     .map(|e| (e.pattern.to_vec(), e.limit))
                     .collect();
@@ -188,9 +188,9 @@ impl MetadataApplier for ReplayApplier {
                         stream_id,
                         durable: true,
                         ack_policy,
-                        max_ack_pending: if cv.max_inflight() == 0 { u32::MAX } else { cv.max_inflight() as u32 },
+                        max_inflight: if cv.max_inflight() == 0 { u32::MAX } else { cv.max_inflight() as u32 },
                     },
-                    subject_limits,
+                    max_subject_inflights,
                 });
             }
             CMD_DELETE_CONSUMER => {

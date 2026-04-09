@@ -5,6 +5,7 @@ pub mod dispatch;
 pub mod drain_task;
 pub mod gate;
 pub mod handle;
+pub mod recovery;
 pub mod router;
 pub mod server;
 pub mod session;

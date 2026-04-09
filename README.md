@@ -93,11 +93,11 @@ let consumer_cfg = ConsumerConfig::new(b"gateway", b"ORDERS")
     .ack_policy(AckPolicy::Explicit)
     .max_inflight(10000)
     // 30 credits for EACH unique premium user
-    .subject_limit(b"orders.premium.>", 30)
+    .max_subject_inflight(b"orders.premium.>", 30)
     // 10 credits for EACH unique basic user
-    .subject_limit(b"orders.basic.>", 10)
+    .max_subject_inflight(b"orders.basic.>", 10)
     // ONLY 1 credit for EACH unique freemium user (1 at a time)
-    .subject_limit(b"orders.freemium.>", 1)
+    .max_subject_inflight(b"orders.freemium.>", 1)
     .build();
 ```
 

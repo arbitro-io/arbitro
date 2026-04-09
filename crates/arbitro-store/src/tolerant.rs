@@ -52,11 +52,13 @@ impl TolerantStore {
 
     fn rotate(&mut self) -> Result<(), StoreError> {
         if let Some(mmap) = self.active_mmap.take() {
+            let _ = mmap.flush();
+            // Drop mmap BEFORE seal_segment reopens the file (Windows file locking).
+            drop(mmap);
             let path = segment::segment_path(&self.base_path, self.active_segment_id);
             let sealed = segment::seal_segment(&path, self.current_segment_offset)
                 .map_err(|_| StoreError::Full)?;
             self.sealed_segments.push(sealed);
-            drop(mmap);
         }
 
         self.active_segment_id = self.next_seq;
@@ -218,6 +220,9 @@ impl Store for TolerantStore {
     fn shutdown(&mut self) -> Result<(), StoreError> {
         if let Some(mmap) = self.active_mmap.take() {
             let _ = mmap.flush();
+            // Drop mmap BEFORE seal_segment reopens the file.
+            // On Windows, mmap holds an exclusive file handle.
+            drop(mmap);
             let path = segment::segment_path(&self.base_path, self.active_segment_id);
             let _ = segment::seal_segment(&path, self.current_segment_offset);
         }
@@ -230,6 +235,8 @@ impl Store for TolerantStore {
         self.sealed_segments.clear();
         self.segments.clear();
         self.active_mmap = None;
+        self.total_bytes = 0;
+        self.current_segment_offset = 0;
         let _ = fs::remove_dir_all(&self.base_path);
         let _ = fs::create_dir_all(&self.base_path);
         count
@@ -256,5 +263,299 @@ impl Store for TolerantStore {
         let start = start.min(end);
         for i in start..end { self.get(self.index[i].seq, f)?; }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{EntryRef, Store};
+
+    fn make_entry<'a>(subject: &'a [u8], payload: &'a [u8]) -> EntryRef<'a> {
+        EntryRef { subject, payload }
+    }
+
+    #[test]
+    fn append_and_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        let seq = store.append(make_entry(b"orders.created", b"{\"id\":1}"), 1000).unwrap();
+        assert_eq!(seq, 1);
+
+        let mut found = false;
+        let ok = store.get(1, &mut |entry| {
+            assert_eq!(entry.seq, 1);
+            assert_eq!(entry.subject, b"orders.created");
+            assert_eq!(entry.payload, b"{\"id\":1}");
+            assert_eq!(entry.timestamp, 1000);
+            found = true;
+        }).unwrap();
+        assert!(ok);
+        assert!(found);
+
+        // Not found returns false
+        let ok = store.get(999, &mut |_| panic!("should not be called")).unwrap();
+        assert!(!ok);
+    }
+
+    #[test]
+    fn append_batch_and_for_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        let entries = [
+            make_entry(b"a", b"1"),
+            make_entry(b"b", b"2"),
+            make_entry(b"c", b"3"),
+            make_entry(b"d", b"4"),
+            make_entry(b"e", b"5"),
+        ];
+        let first = store.append_batch(&entries, 100).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(store.info().messages, 5);
+
+        let mut count = 0u32;
+        let mut seqs = Vec::new();
+        store.for_each(1, 6, &mut |entry| {
+            seqs.push(entry.seq);
+            count += 1;
+        }).unwrap();
+        assert_eq!(count, 5);
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn info_tracks_messages_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        // "ab" + "cd" = 4 bytes
+        store.append(make_entry(b"ab", b"cd"), 0).unwrap();
+        // "ef" + "ghij" = 6 bytes
+        store.append(make_entry(b"ef", b"ghij"), 0).unwrap();
+        // "x" + "y" = 2 bytes
+        store.append(make_entry(b"x", b"y"), 0).unwrap();
+
+        let info = store.info();
+        assert_eq!(info.messages, 3);
+        assert_eq!(info.bytes, 12); // 4 + 6 + 2
+        assert_eq!(info.first_seq, 1);
+        assert_eq!(info.last_seq, 3);
+    }
+
+    #[test]
+    fn shutdown_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+
+        // Write 3 entries and shut down
+        {
+            let mut store = TolerantStore::new(path.clone());
+            store.init().unwrap();
+            store.append(make_entry(b"subj.a", b"payload1"), 10).unwrap();
+            store.append(make_entry(b"subj.b", b"payload2"), 20).unwrap();
+            store.append(make_entry(b"subj.c", b"payload3"), 30).unwrap();
+            store.shutdown().unwrap();
+        }
+
+        // Reopen and verify recovery
+        {
+            let mut store = TolerantStore::new(path);
+            store.init().unwrap();
+
+            let info = store.info();
+            assert_eq!(info.messages, 3);
+
+            let mut found_subjects = Vec::new();
+            store.for_each(1, 4, &mut |entry| {
+                found_subjects.push(entry.subject.to_vec());
+            }).unwrap();
+            assert_eq!(found_subjects.len(), 3);
+            assert_eq!(found_subjects[0], b"subj.a");
+            assert_eq!(found_subjects[1], b"subj.b");
+            assert_eq!(found_subjects[2], b"subj.c");
+
+            // Verify individual get works
+            let mut ok = false;
+            store.get(2, &mut |entry| {
+                assert_eq!(entry.subject, b"subj.b");
+                assert_eq!(entry.payload, b"payload2");
+                assert_eq!(entry.timestamp, 20);
+                ok = true;
+            }).unwrap();
+            assert!(ok);
+        }
+    }
+
+    #[test]
+    fn many_appends_info_and_for_each() {
+        // Verifies correctness with many small appends (not large enough to
+        // trigger 64MB rotation, but exercises the hot path thoroughly).
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        let count = 1000u64;
+        let mut expected_bytes = 0u64;
+        for i in 0..count {
+            let payload = format!("payload-{}", i);
+            store.append(make_entry(b"test.subject", payload.as_bytes()), i).unwrap();
+            expected_bytes += b"test.subject".len() as u64 + payload.len() as u64;
+        }
+
+        let info = store.info();
+        assert_eq!(info.messages, count);
+        assert_eq!(info.bytes, expected_bytes);
+        assert_eq!(info.first_seq, 1);
+        assert_eq!(info.last_seq, count);
+
+        // Verify for_each over the full range
+        let mut seen = 0u64;
+        store.for_each(1, count + 1, &mut |entry| {
+            assert_eq!(entry.subject, b"test.subject");
+            seen += 1;
+        }).unwrap();
+        assert_eq!(seen, count);
+    }
+
+    #[test]
+    fn purge_clears_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        for i in 0..5u8 {
+            store.append(make_entry(b"x", &[i]), 0).unwrap();
+        }
+        assert_eq!(store.info().messages, 5);
+
+        let deleted = store.purge();
+        assert_eq!(deleted, 5);
+        assert_eq!(store.info().messages, 0);
+        assert_eq!(store.info().bytes, 0);
+    }
+
+    #[test]
+    fn truncate_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        for i in 0..10u8 {
+            store.append(make_entry(b"x", &[i]), i as u64).unwrap();
+        }
+        assert_eq!(store.info().messages, 10);
+
+        // Truncate front up to seq 6 (removes seqs 1..6, keeps 6..10)
+        let removed = store.truncate_front(6);
+        assert_eq!(removed, 5);
+        assert_eq!(store.info().messages, 5);
+        assert_eq!(store.info().first_seq, 6);
+
+        // First 5 entries should be gone
+        for seq in 1..=5 {
+            let ok = store.get(seq, &mut |_| panic!("should not be found")).unwrap();
+            assert!(!ok);
+        }
+
+        // Last 5 entries should be readable
+        for seq in 6..=10 {
+            let mut found = false;
+            let ok = store.get(seq, &mut |entry| {
+                assert_eq!(entry.seq, seq);
+                // payload is (seq - 1) as u8
+                assert_eq!(entry.payload, &[(seq - 1) as u8]);
+                found = true;
+            }).unwrap();
+            assert!(ok);
+            assert!(found);
+        }
+    }
+
+    #[test]
+    fn crash_recovery_truncated_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        std::fs::create_dir_all(&store_path).unwrap();
+
+        // Manually write a segment file with 2 valid entries + garbage at the end
+        let seg_path = segment::segment_path(&store_path, 1);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&seg_path).unwrap();
+
+            // Entry 1: subject="a", payload="bb", seq=1, ts=100
+            let subj = b"a";
+            let payload = b"bb";
+            let mut header = [0u8; HEADER_SIZE];
+            header[0] = MAGIC;
+            header[1..3].copy_from_slice(&(subj.len() as u16).to_le_bytes());
+            header[3..7].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            header[7..15].copy_from_slice(&100u64.to_le_bytes());
+            header[15..23].copy_from_slice(&1u64.to_le_bytes());
+            file.write_all(&header).unwrap();
+            file.write_all(subj).unwrap();
+            file.write_all(payload).unwrap();
+
+            // Entry 2: subject="c", payload="dd", seq=2, ts=200
+            let subj2 = b"c";
+            let payload2 = b"dd";
+            header[0] = MAGIC;
+            header[1..3].copy_from_slice(&(subj2.len() as u16).to_le_bytes());
+            header[3..7].copy_from_slice(&(payload2.len() as u32).to_le_bytes());
+            header[7..15].copy_from_slice(&200u64.to_le_bytes());
+            header[15..23].copy_from_slice(&2u64.to_le_bytes());
+            file.write_all(&header).unwrap();
+            file.write_all(subj2).unwrap();
+            file.write_all(payload2).unwrap();
+
+            // Garbage bytes (no MAGIC prefix) simulating crash mid-write
+            file.write_all(&[0x00, 0x01, 0x02, 0xFF, 0xFE]).unwrap();
+        }
+
+        // Open the store — it should recover only the 2 valid entries
+        let mut store = TolerantStore::new(store_path);
+        store.init().unwrap();
+
+        let info = store.info();
+        assert_eq!(info.messages, 2);
+
+        let mut found = false;
+        store.get(1, &mut |entry| {
+            assert_eq!(entry.subject, b"a");
+            assert_eq!(entry.payload, b"bb");
+            assert_eq!(entry.timestamp, 100);
+            found = true;
+        }).unwrap();
+        assert!(found);
+
+        found = false;
+        store.get(2, &mut |entry| {
+            assert_eq!(entry.subject, b"c");
+            assert_eq!(entry.payload, b"dd");
+            assert_eq!(entry.timestamp, 200);
+            found = true;
+        }).unwrap();
+        assert!(found);
+    }
+
+    #[test]
+    fn empty_store_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("empty_store"));
+        store.init().unwrap();
+
+        let info = store.info();
+        assert_eq!(info.messages, 0);
+        assert_eq!(info.bytes, 0);
+        assert_eq!(info.first_seq, 1);
+
+        // get on empty store returns false
+        let ok = store.get(1, &mut |_| panic!("should not be called")).unwrap();
+        assert!(!ok);
     }
 }

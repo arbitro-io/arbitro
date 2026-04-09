@@ -268,6 +268,7 @@ impl Inner {
             Some(Action::RepBatch) => self.on_rep_batch(env.stream_id.get(), body),
             Some(Action::FanoutBatch) => self.on_fanout_batch(env.stream_id.get(), body),
             Some(Action::ListStreams) => self.on_list_streams(env.env_seq.get(), body),
+            Some(Action::ListConsumers) => self.on_list_consumers(env.env_seq.get(), body),
             Some(Action::Ping) => self.on_ping(body),
             Some(Action::Connected) => { /* handled in connect handshake */ }
             _ => {
@@ -376,6 +377,13 @@ impl Inner {
     }
 
     fn on_list_streams(&self, env_seq: u32, body: &[u8]) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(tx) = pending.remove(&env_seq) {
+            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+        }
+    }
+
+    fn on_list_consumers(&self, env_seq: u32, body: &[u8]) {
         let mut pending = self.pending.lock().unwrap();
         if let Some(tx) = pending.remove(&env_seq) {
             let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));

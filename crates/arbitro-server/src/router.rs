@@ -35,7 +35,7 @@ impl Server {
             let gate = Gate::new();
             let gate_clone = gate.clone();
 
-            let worker = ShardWorker::new(engine, rx, gate_clone, registry.clone());
+            let worker = ShardWorker::new(engine, rx, gate_clone, registry.clone(), config.data_dir.clone());
 
             // Named thread — mandatory per concurrency.md
             std::thread::Builder::new()

@@ -1,6 +1,7 @@
 //! arbitro-server — TCP message broker.
 
 use arbitro_server::{ArbitroServer, Config};
+use arbitro_server::command_log::{CommandLog, SharedCommandLog};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -12,6 +13,14 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let config = Config::from_env();
-    let server = ArbitroServer::new(config);
+    let mut server = ArbitroServer::new(config);
+
+    // Wire command log if data_dir is configured
+    if let Some(ref dir) = server.config().data_dir {
+        let path = std::path::Path::new(dir).join("metadata.log");
+        let log = CommandLog::open(path)?;
+        server.set_command_log(SharedCommandLog::new(log));
+    }
+
     server.run().await
 }

@@ -19,6 +19,8 @@ use std::time::Instant;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
+use arbitro_proto::lifecycle::LifeCycle;
+
 use crate::session::{ConnIdGen, Session};
 
 /// TCP transport backed by per-connection bounded channels.
@@ -143,5 +145,18 @@ impl ConnectionRegistry {
         } else {
             false
         }
+    }
+}
+
+impl LifeCycle for ConnectionRegistry {
+    fn on_init(&mut self) {
+        tracing::info!("ConnectionRegistry: init (write_buffer_cap={})", self.inner.write_buffer_cap);
+    }
+
+    fn on_shutdown(&mut self) {
+        let mut sessions = self.inner.sessions.lock().unwrap();
+        let count = sessions.len();
+        sessions.clear();
+        tracing::info!("ConnectionRegistry: shutdown, closed {} sessions", count);
     }
 }

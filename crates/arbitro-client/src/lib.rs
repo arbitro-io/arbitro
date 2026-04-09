@@ -6,7 +6,7 @@ pub mod inner;
 pub mod message;
 pub mod subscription;
 
-pub use client::{Client, StreamInfo};
+pub use client::{Client, ConsumerInfo, StreamInfo};
 pub use consumer::Consumer;
 pub use error::ClientError;
 pub use inner::ConnState;

@@ -280,12 +280,15 @@ impl ShardWorker {
     // ── Delivery handler ───────────────────────────────────────────────
 
     /// Iterate all active bindings, claim from engine, read store, deliver.
+    /// Loops per binding until the queue is drained or max_inflight is hit.
     fn handle_drain_deliver(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let now = Timestamp::new(now_ms);
+
+        let mut any_delivered = false;
 
         for i in 0..self.bindings.len() {
             let binding = &self.bindings[i];
@@ -294,36 +297,52 @@ impl ShardWorker {
             let consumer_id = binding.consumer_id;
             let stream_id = binding.stream_id;
 
-            let claimed = self.engine.claim(&ClaimBatch {
-                queue_id,
-                connection_id,
-                consumer_id,
-                max_items: 64,
-                now,
-            });
-
-            let entries = claimed.entries().to_vec();
-            if entries.is_empty() {
-                continue;
-            }
-
             let store = match self.stores.get(&stream_id) {
                 Some(s) => s,
                 None => continue,
             };
 
-            for entry in &entries {
-                store.get(entry.seq, &mut |store_entry| {
-                    self.send_deliver_frame(
-                        connection_id.0,
-                        stream_id.raw(),
-                        consumer_id.0,
-                        entry.seq,
-                        store_entry.subject,
-                        store_entry.payload,
-                    );
-                }).ok();
+            // Loop: claim batches until queue empty or inflight limit hit
+            loop {
+                let claimed = self.engine.claim(&ClaimBatch {
+                    queue_id,
+                    connection_id,
+                    consumer_id,
+                    max_items: 64,
+                    now,
+                });
+
+                let entries = claimed.entries().to_vec();
+                if entries.is_empty() {
+                    break;
+                }
+
+                any_delivered = true;
+
+                for entry in &entries {
+                    store.get(entry.seq, &mut |store_entry| {
+                        self.send_deliver_frame(
+                            connection_id.0,
+                            stream_id.raw(),
+                            consumer_id.0,
+                            entry.seq,
+                            store_entry.subject,
+                            store_entry.payload,
+                        );
+                    }).ok();
+                }
+
+                // If claim returned fewer than max_items, queue is drained
+                if entries.len() < 64 {
+                    break;
+                }
             }
+        }
+
+        // If we delivered anything, re-signal the gate so the drain task
+        // wakes again (acks may have freed inflight slots for more delivery).
+        if any_delivered {
+            self.gate.release();
         }
     }
 
@@ -493,8 +512,8 @@ impl ShardWorker {
         let stream_id = cmd.config.stream_id;
         let ok = self.engine.ensure_consumer(cmd.config).is_ok();
         if ok {
-            for (pattern, limit) in &cmd.subject_limits {
-                let _ = self.engine.set_subject_limit(stream_id, pattern, *limit);
+            for (pattern, limit) in &cmd.max_subject_inflights {
+                let _ = self.engine.set_max_subject_inflight(stream_id, pattern, *limit);
             }
         }
         let _ = cmd.reply.send(ok);

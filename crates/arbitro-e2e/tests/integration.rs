@@ -76,7 +76,7 @@ async fn test_create_consumer() {
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
-            max_ack_pending: 1000,
+            max_inflight: 1000,
         }, vec![])
         .await
         .unwrap();
@@ -120,7 +120,7 @@ async fn test_subscribe_bind() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 1000,
+                max_inflight: 1000,
             },
             SubscriptionConfig {
                 id: SubscriptionId(1),
@@ -168,7 +168,7 @@ async fn test_publish_ack_cycle() {
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
-            max_ack_pending: 1000,
+            max_inflight: 1000,
         }, vec![])
         .await
         .unwrap();
@@ -190,7 +190,7 @@ async fn test_publish_ack_cycle() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 1000,
+                max_inflight: 1000,
             },
             SubscriptionConfig {
                 id: SubscriptionId(1),
@@ -288,7 +288,7 @@ async fn test_fanout_delivery() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 100,
+                max_inflight: 100,
             }, vec![])
             .await
             .unwrap();
@@ -310,7 +310,7 @@ async fn test_fanout_delivery() {
                     stream_id: StreamId(1),
                     durable: true,
                     ack_policy: AckPolicy::Explicit,
-                    max_ack_pending: 100,
+                    max_inflight: 100,
                 },
                 SubscriptionConfig {
                     id: SubscriptionId(i),
@@ -357,7 +357,7 @@ async fn test_nack_redelivery() {
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
-            max_ack_pending: 100,
+            max_inflight: 100,
         }, vec![])
         .await
         .unwrap();
@@ -379,7 +379,7 @@ async fn test_nack_redelivery() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 100,
+                max_inflight: 100,
             },
             SubscriptionConfig {
                 id: SubscriptionId(1),
@@ -452,7 +452,7 @@ async fn test_disconnect_releases_pending() {
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
-            max_ack_pending: 100,
+            max_inflight: 100,
         }, vec![])
         .await
         .unwrap();
@@ -474,7 +474,7 @@ async fn test_disconnect_releases_pending() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 100,
+                max_inflight: 100,
             },
             SubscriptionConfig {
                 id: SubscriptionId(1),
@@ -561,7 +561,7 @@ async fn test_pause_resume_consumer() {
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
-            max_ack_pending: 100,
+            max_inflight: 100,
         }, vec![])
         .await
         .unwrap();
@@ -719,7 +719,7 @@ async fn test_end_to_end_publish_deliver_ack() {
                 stream_id: StreamId(1),
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
-                max_ack_pending: 100,
+                max_inflight: 100,
             },
             SubscriptionConfig {
                 id: SubscriptionId(1),

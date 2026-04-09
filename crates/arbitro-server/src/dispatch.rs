@@ -225,7 +225,7 @@ async fn dispatch_subscribe(
                 } else {
                     AckPolicy::Explicit
                 },
-                max_ack_pending: if view.max_inflight() == 0 { u32::MAX } else { view.max_inflight() as u32 },
+                max_inflight: if view.max_inflight() == 0 { u32::MAX } else { view.max_inflight() as u32 },
             },
             SubscriptionConfig {
                 id: SubscriptionId(consumer_id),
@@ -485,7 +485,7 @@ async fn dispatch_create_consumer(
     };
 
     // Collect per-subject inflight limits from wire trailer.
-    let subject_limits: Vec<(Vec<u8>, u32)> = view
+    let max_subject_inflights: Vec<(Vec<u8>, u32)> = view
         .subject_limits()
         .map(|e| (e.pattern.to_vec(), e.limit))
         .collect();
@@ -498,9 +498,9 @@ async fn dispatch_create_consumer(
                 stream_id: StreamId(stream_id),
                 durable: true,
                 ack_policy,
-                max_ack_pending: if view.max_inflight() == 0 { u32::MAX } else { view.max_inflight() as u32 },
+                max_inflight: if view.max_inflight() == 0 { u32::MAX } else { view.max_inflight() as u32 },
             },
-            subject_limits,
+            max_subject_inflights,
         )
         .await
     {

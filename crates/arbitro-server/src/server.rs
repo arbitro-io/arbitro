@@ -4,25 +4,30 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::wire::delivery::RepErrorAction;
+use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 
+use arbitro_proto::lifecycle::LifeCycle;
+
+use crate::command_log::SharedCommandLog;
 use crate::config::Config;
 use crate::dispatch;
 use crate::drain_task;
 use crate::router::Server;
 use crate::transport::ConnectionRegistry;
 
-/// The running server — owns the shard router and connection registry.
+/// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
     config: Config,
     server: Server,
     registry: ConnectionRegistry,
+    services: Vec<Box<dyn LifeCycle>>,
+    command_log: Option<SharedCommandLog>,
 }
 
 impl ArbitroServer {
@@ -30,7 +35,33 @@ impl ArbitroServer {
         let registry = ConnectionRegistry::new(config.write_buffer_cap);
         let server = Server::spawn(&config, &registry);
 
-        Self { config, server, registry }
+        let mut services: Vec<Box<dyn LifeCycle>> = Vec::new();
+        services.push(Box::new(registry.clone()));
+
+        Self {
+            config,
+            server,
+            registry,
+            services,
+            command_log: None,
+        }
+    }
+
+    /// Register a lifecycle service. Called before `run()`.
+    pub fn register(&mut self, service: Box<dyn LifeCycle>) {
+        self.services.push(service);
+    }
+
+    /// Set the shared command log for metadata persistence.
+    /// Also registers it as a lifecycle service.
+    pub fn set_command_log(&mut self, log: SharedCommandLog) {
+        self.services.push(Box::new(log.clone()));
+        self.command_log = Some(log);
+    }
+
+    /// Access the server configuration.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Access the shard router.
@@ -50,7 +81,28 @@ impl ArbitroServer {
     }
 
     /// Run the server with an external shutdown signal.
-    pub async fn run_with_shutdown(self, mut _stop_rx: watch::Receiver<bool>) -> std::io::Result<()> {
+    pub async fn run_with_shutdown(
+        mut self,
+        mut _stop_rx: watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
+        // ── LifeCycle: on_init ──────────────────────────────────────────
+        for service in &mut self.services {
+            service.on_init();
+        }
+
+        // ── Replay command log → re-create streams/consumers ───────────
+        if let Some(ref log) = self.command_log {
+            let server = self.server.clone();
+            let mut applier = crate::recovery::ReplayApplier::new(server);
+            match log.replay(&mut applier) {
+                Ok(n) if n > 0 => tracing::info!(count = n, "metadata replay complete"),
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "metadata replay failed"),
+            }
+            // Flush any pending async commands from replay
+            applier.flush().await;
+        }
+
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         tracing::info!(addr = %self.config.listen_addr, "listening");
 
@@ -118,6 +170,13 @@ impl ArbitroServer {
             }
         });
 
+        // Bridge external shutdown → internal shutdown
+        let bridge_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let _ = _stop_rx.changed().await;
+            let _ = bridge_tx.send(true);
+        });
+
         // Frame processing loop
         let mut shutdown_process = shutdown_rx.clone();
         loop {
@@ -127,6 +186,7 @@ impl ArbitroServer {
                         Some((conn_id, frame)) => {
                             dispatch::dispatch_frame(
                                 conn_id, frame, &self.server, &self.registry,
+                                self.command_log.as_ref(),
                             ).await;
                         }
                         None => break,
@@ -175,6 +235,11 @@ impl ArbitroServer {
 
         while frame_rx.try_recv().is_ok() {}
 
+        // ── LifeCycle: on_shutdown ──────────────────────────────────────
+        for service in &mut self.services {
+            service.on_shutdown();
+        }
+
         tracing::info!("shutdown complete");
         Ok(())
     }
@@ -203,9 +268,9 @@ async fn read_loop(
         }
 
         // Parse msg_len from envelope (bytes 8..12, little-endian u32)
-        let msg_len = u32::from_le_bytes([
-            header_buf[8], header_buf[9], header_buf[10], header_buf[11],
-        ]) as usize;
+        let msg_len =
+            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]])
+                as usize;
 
         let total = ENVELOPE_SIZE + msg_len;
         let mut buf = BytesMut::with_capacity(total);
@@ -279,7 +344,10 @@ async fn write_all_vectored(
     while written < total {
         let n = writer.write_vectored(&slices).await?;
         if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write_vectored returned 0"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored returned 0",
+            ));
         }
         written += n;
 
@@ -291,7 +359,9 @@ async fn write_all_vectored(
         }
         if skip > 0 && !slices.is_empty() {
             let remaining_frame_idx = frames.len() - slices.len();
-            writer.write_all(&frames[remaining_frame_idx][skip..]).await?;
+            writer
+                .write_all(&frames[remaining_frame_idx][skip..])
+                .await?;
             for frame in &frames[remaining_frame_idx + 1..] {
                 writer.write_all(frame).await?;
             }

@@ -95,6 +95,17 @@ impl Client {
         Ok(parse_list_streams(&raw))
     }
 
+    /// List all consumers. Returns consumer info entries.
+    pub async fn list_consumers(&self) -> Result<Vec<ConsumerInfo>, ClientError> {
+        let body = ListStreamsAction {
+            offset: U32::new(0),
+            limit: U32::new(u32::MAX),
+        };
+
+        let raw = self.inner.request_body(Action::ListConsumers, 0, body.as_bytes()).await?;
+        Ok(parse_list_consumers(&raw))
+    }
+
     /// Delete a stream by name.
     pub async fn delete_stream(&self, name: &[u8]) -> Result<(), ClientError> {
         let fixed = DeleteStreamFixed {
@@ -275,6 +286,40 @@ fn parse_list_streams(body: &[u8]) -> Vec<StreamInfo> {
         pos += name_len;
 
         out.push(StreamInfo { stream_id, name });
+    }
+
+    out
+}
+
+/// Consumer info returned by `list_consumers()`.
+#[derive(Debug, Clone)]
+pub struct ConsumerInfo {
+    pub consumer_id: u32,
+    pub stream_id: u32,
+    pub queue_id: u32,
+    pub paused: bool,
+}
+
+/// Parse ListConsumers response body: [4B count][N × (4B consumer_id, 4B stream_id, 4B queue_id, 1B paused)]
+fn parse_list_consumers(body: &[u8]) -> Vec<ConsumerInfo> {
+    if body.len() < 4 {
+        return vec![];
+    }
+    let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 4;
+
+    for _ in 0..count {
+        if pos + 13 > body.len() {
+            break;
+        }
+        let consumer_id = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        let stream_id = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]);
+        let queue_id = u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]);
+        let paused = body[pos + 12] != 0;
+        pos += 13;
+
+        out.push(ConsumerInfo { consumer_id, stream_id, queue_id, paused });
     }
 
     out

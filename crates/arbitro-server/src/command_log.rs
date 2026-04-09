@@ -19,7 +19,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
+use arbitro_proto::lifecycle::LifeCycle;
 use arbitro_proto::metadata::{MetadataApplier, MetadataCommandView};
 use tracing::{info, warn};
 
@@ -115,6 +117,61 @@ impl CommandLog {
 
         info!("Successfully replayed {} metadata commands", count);
         Ok(count)
+    }
+}
+
+// ── Shared handle ──────────────────────────────────────────────────────────
+
+/// Thread-safe, clone-friendly handle to a CommandLog.
+///
+/// Wraps `Arc<Mutex<CommandLog>>`. The Mutex is uncontended in practice —
+/// metadata ops are cold path and serialized through the dispatch layer.
+#[derive(Clone)]
+pub struct SharedCommandLog {
+    inner: Arc<Mutex<CommandLog>>,
+}
+
+impl SharedCommandLog {
+    pub fn new(log: CommandLog) -> Self {
+        Self { inner: Arc::new(Mutex::new(log)) }
+    }
+
+    /// Record a raw metadata command. Cold path — Mutex is fine.
+    pub fn record(&self, command: &[u8]) -> std::io::Result<()> {
+        self.inner.lock().unwrap().record(command)
+    }
+
+    /// Replay all commands into the applier.
+    pub fn replay(&self, applier: &mut dyn MetadataApplier) -> std::io::Result<u32> {
+        self.inner.lock().unwrap().replay(applier)
+    }
+}
+
+impl LifeCycle for SharedCommandLog {
+    fn on_init(&mut self) {
+        let log = self.inner.lock().unwrap();
+        info!("CommandLog: init (log at {:?})", log.path);
+    }
+
+    fn on_shutdown(&mut self) {
+        let mut log = self.inner.lock().unwrap();
+        if let Err(e) = log.file.flush() {
+            warn!("CommandLog: flush on shutdown failed: {}", e);
+        }
+        info!("CommandLog: shutdown complete");
+    }
+}
+
+impl LifeCycle for CommandLog {
+    fn on_init(&mut self) {
+        info!("CommandLog: init (log at {:?})", self.path);
+    }
+
+    fn on_shutdown(&mut self) {
+        if let Err(e) = self.file.flush() {
+            warn!("CommandLog: flush on shutdown failed: {}", e);
+        }
+        info!("CommandLog: shutdown complete");
     }
 }
 

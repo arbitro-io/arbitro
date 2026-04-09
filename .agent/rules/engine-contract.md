@@ -34,7 +34,7 @@ The server is a **caller** of `ArbitroEngine`. It must respect the engine's API:
 | `engine.drain_node(id, mode, now)` | — | `DrainReport` | Admin |
 | `engine.pause_consumer(id)` | — | `bool` | Admin |
 | `engine.resume_consumer(id)` | — | `bool` | Admin |
-| `engine.set_subject_limit(stream, pattern, limit)` | — | `Result<()>` | Admin |
+| `engine.set_max_subject_inflight(stream, pattern, limit)` | — | `Result<()>` | Admin |
 | `engine.tick(now_ms, &mut expired)` | — | fills vec | Scheduler tick |
 | `engine.drain_events()` | — | `Vec<EngineEvent>` | Event bus drain |
 

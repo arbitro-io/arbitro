@@ -154,7 +154,7 @@ pub struct DeleteStreamCmd {
 pub struct CreateConsumerCmd {
     pub config: ConsumerConfig,
     /// Per-subject inflight limits: (pattern, limit). Applied after consumer creation.
-    pub subject_limits: Vec<(Vec<u8>, u32)>,
+    pub max_subject_inflights: Vec<(Vec<u8>, u32)>,
     pub reply: oneshot::Sender<bool>,
 }
 

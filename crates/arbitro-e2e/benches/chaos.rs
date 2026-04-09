@@ -63,11 +63,22 @@ async fn run_manager() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = "127.0.0.1:9911";
     let current_exe = env::current_exe()?;
-    let server_path = current_exe.parent().unwrap().join("arbitro-server");
-    
-    if !server_path.exists() {
-        panic!("Server binary NOT FOUND at {:?}.", server_path);
-    }
+    let deps_dir = current_exe.parent().unwrap();
+    // Binary lives in target/release/, bench binary in target/release/deps/
+    let server_path = deps_dir.join("arbitro-server");
+    let server_path = if server_path.exists() {
+        server_path
+    } else {
+        let parent = deps_dir.parent().unwrap().join("arbitro-server");
+        if parent.exists() {
+            parent
+        } else {
+            panic!(
+                "Server binary NOT FOUND. Looked in {:?} and {:?}. Build with: cargo build --release --bin arbitro-server",
+                server_path, parent,
+            );
+        }
+    };
 
     println!("\n--- STAGE 1: DURABILITY BURST (KILL SERVER) ---");
     {
