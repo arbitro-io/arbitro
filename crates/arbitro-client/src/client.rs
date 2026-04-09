@@ -183,13 +183,13 @@ impl Client {
 
     // ── Publish ──────────────────────────────────────────────────
 
-    /// Publish a single message. Returns the assigned sequence number.
+    /// Publish a single message (fire-and-forget — no round-trip wait).
     pub async fn publish(
         &self,
         stream_name: &[u8],
         subject: &[u8],
         payload: &[u8],
-    ) -> Result<u64, ClientError> {
+    ) -> Result<(), ClientError> {
         let stream_id = fnv1a_32(stream_name);
 
         // Build batch body: [2 count][entry_header][subject][payload]
@@ -208,11 +208,71 @@ impl Client {
         body.extend_from_slice(subject);
         body.extend_from_slice(payload);
 
+        self.inner.fire_and_forget(Action::Publish, stream_id, &body).await
+    }
+
+    /// Publish a batch of (subject, payload) pairs (fire-and-forget).
+    pub async fn publish_batch(
+        &self,
+        stream_name: &[u8],
+        entries: &[(&[u8], &[u8])],
+    ) -> Result<(), ClientError> {
+        let stream_id = fnv1a_32(stream_name);
+
+        let total_body: usize = 2 + entries.iter()
+            .map(|(s, p)| 12 + s.len() + p.len())
+            .sum::<usize>();
+
+        let mut body = Vec::with_capacity(total_body);
+        body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+
+        for (subject, payload) in entries {
+            let entry = PublishEntry {
+                data_len: U32::new(payload.len() as u32),
+                subj_len: U16::new(subject.len() as u16),
+                reply_len: U16::new(0),
+                flags: 0,
+                _pad: [0u8; 3],
+            };
+            body.extend_from_slice(entry.as_bytes());
+            body.extend_from_slice(subject);
+            body.extend_from_slice(payload);
+        }
+
+        self.inner.fire_and_forget(Action::Publish, stream_id, &body).await
+    }
+
+    /// Publish a single message and wait for server confirmation.
+    /// Returns the assigned sequence number.
+    pub async fn publish_sync(
+        &self,
+        stream_name: &[u8],
+        subject: &[u8],
+        payload: &[u8],
+    ) -> Result<u64, ClientError> {
+        let stream_id = fnv1a_32(stream_name);
+
+        let entry = PublishEntry {
+            data_len: U32::new(payload.len() as u32),
+            subj_len: U16::new(subject.len() as u16),
+            reply_len: U16::new(0),
+            flags: 0,
+            _pad: [0u8; 3],
+        };
+
+        let body_len = 2 + 12 + subject.len() + payload.len();
+        let mut body = Vec::with_capacity(body_len);
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(entry.as_bytes());
+        body.extend_from_slice(subject);
+        body.extend_from_slice(payload);
+
         self.inner.request(Action::Publish, stream_id, &body).await
     }
 
-    /// Publish a batch of (subject, payload) pairs. Returns first sequence.
-    pub async fn publish_batch(
+    /// Publish a batch and wait for server confirmation.
+    /// Returns the first assigned sequence number.
+    pub async fn publish_batch_sync(
         &self,
         stream_name: &[u8],
         entries: &[(&[u8], &[u8])],

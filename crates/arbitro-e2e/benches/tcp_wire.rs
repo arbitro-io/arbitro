@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+extern crate libc;
+
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::IntoBytes;
 
@@ -34,7 +35,7 @@ use arbitro_store::{EntryRef, MemoryStore, Store};
 const MSGS_PER_BATCH: u16 = 256;
 const SUBJECT: &[u8] = b"bench.msg";
 const PAYLOAD_LEN: usize = 64;
-const ITERATIONS: u32 = 5_000;
+const ITERATIONS: u32 = 1000;
 
 // ── Wire helpers ─────────────────────────────────────────────────
 
@@ -156,78 +157,6 @@ async fn server_l1(listener: TcpListener, store_entries: &'static [EntryRef<'sta
     }
 }
 
-// ── Level 2: TCP + Channel hop only (no store) ──────────────────
-//
-// Measures pure channel cost: tokio → mpsc → shard thread → mpsc back → reply
-
-async fn server_l2_channel(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, mut shard_rx) = mpsc::channel::<()>(65536);
-    let (done_tx, mut done_rx) = mpsc::channel::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            while shard_rx.blocking_recv().is_some() {
-                let _ = done_tx.blocking_send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).await.is_err() { break; }
-        if done_rx.recv().await.is_none() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 3: TCP + Store + Channel hop (real publish path) ───────
-//
-// tokio read loop → mpsc → shard OS thread (store only) → mpsc back → reply
-// This is the actual publish pipeline: store + signal, no engine.
-
-async fn server_l3(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, mut shard_rx) = mpsc::channel::<()>(65536);
-    let (done_tx, mut done_rx) = mpsc::channel::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            let mut store = MemoryStore::new();
-
-            while shard_rx.blocking_recv().is_some() {
-                store.purge();
-                let _ = store.append_batch(store_entries, 0);
-                let _ = done_tx.blocking_send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).await.is_err() { break; }
-        if done_rx.recv().await.is_none() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
 // ── Level 2x: crossbeam channel hop only (no store) ─────────────
 
 async fn server_l2_crossbeam(listener: TcpListener) {
@@ -295,73 +224,6 @@ async fn server_l3_crossbeam(
     }
 }
 
-// ── Level 2f: flume channel hop only (no store) ─────────────────
-
-async fn server_l2_flume(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, shard_rx) = flume::bounded::<()>(65536);
-    let (done_tx, done_rx) = flume::bounded::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            while shard_rx.recv().is_ok() {
-                let _ = done_tx.send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).is_err() { break; }
-        if done_rx.recv().is_err() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 3f: flume + Store (real publish with flume) ────────────
-
-async fn server_l3_flume(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, shard_rx) = flume::bounded::<()>(65536);
-    let (done_tx, done_rx) = flume::bounded::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            let mut store = MemoryStore::new();
-
-            while shard_rx.recv().is_ok() {
-                store.purge();
-                let _ = store.append_batch(store_entries, 0);
-                let _ = done_tx.send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).is_err() { break; }
-        if done_rx.recv().is_err() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
 // ── Level 2s: spin channel hop (no store) ───────────────────────
 //
 // Pure atomic spin — no kernel syscall, no parking.
@@ -372,14 +234,15 @@ async fn server_l2_spin(listener: TcpListener) {
 
     let ready = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let ready2 = ready.clone();
-    let done2 = done.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready2 = ready.clone(); let done2 = done.clone(); let stop2 = stop.clone();
 
-    std::thread::Builder::new()
+    let jh = std::thread::Builder::new()
         .name("shard-bench".into())
         .spawn(move || {
             loop {
                 while !ready2.load(Ordering::Acquire) {
+                    if stop2.load(Ordering::Relaxed) { return; }
                     std::hint::spin_loop();
                 }
                 ready2.store(false, Ordering::Release);
@@ -395,12 +258,12 @@ async fn server_l2_spin(listener: TcpListener) {
     loop {
         if !read_frame(&mut stream, &mut header, &mut body).await { break; }
         ready.store(true, Ordering::Release);
-        while !done.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
+        while !done.load(Ordering::Acquire) { std::hint::spin_loop(); }
         done.store(false, Ordering::Release);
         stream.write_all(&reply).await.ok();
     }
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
 }
 
 // ── Level 3s: spin + Store ──────────────────────────────────────
@@ -414,15 +277,16 @@ async fn server_l3_spin(
 
     let ready = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let ready2 = ready.clone();
-    let done2 = done.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready2 = ready.clone(); let done2 = done.clone(); let stop2 = stop.clone();
 
-    std::thread::Builder::new()
+    let jh = std::thread::Builder::new()
         .name("shard-bench".into())
         .spawn(move || {
             let mut store = MemoryStore::new();
             loop {
                 while !ready2.load(Ordering::Acquire) {
+                    if stop2.load(Ordering::Relaxed) { return; }
                     std::hint::spin_loop();
                 }
                 ready2.store(false, Ordering::Release);
@@ -440,15 +304,15 @@ async fn server_l3_spin(
     loop {
         if !read_frame(&mut stream, &mut header, &mut body).await { break; }
         ready.store(true, Ordering::Release);
-        while !done.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
+        while !done.load(Ordering::Acquire) { std::hint::spin_loop(); }
         done.store(false, Ordering::Release);
         stream.write_all(&reply).await.ok();
     }
+    stop.store(true, Ordering::Relaxed);
+    let _ = jh.join();
 }
 
-// ── Gate ────────────────────────────────────────────────────────
+// ── Gate (matches server: spin 512 → park, same as production) ──
 
 #[repr(align(64))]
 struct Gate {
@@ -478,6 +342,10 @@ impl Gate {
     #[inline] fn lock(&self) {
         self.locked.store(true, Ordering::Relaxed);
     }
+    #[inline] fn is_open(&self) -> bool {
+        !self.locked.load(Ordering::Relaxed)
+    }
+    /// Spin 512× then park once. Returns on any unpark.
     #[inline] fn acquire(&self) {
         if !self.locked.load(Ordering::Relaxed) { return; }
         for _ in 0..512 {
@@ -485,11 +353,8 @@ impl Gate {
             std::hint::spin_loop();
         }
         self.parked.store(true, Ordering::Relaxed);
-        loop {
-            if !self.locked.load(Ordering::Relaxed) { self.parked.store(false, Ordering::Relaxed); return; }
-            std::thread::park();
-            if !self.locked.load(Ordering::Relaxed) { self.parked.store(false, Ordering::Relaxed); return; }
-        }
+        std::thread::park();
+        self.parked.store(false, Ordering::Relaxed);
     }
 }
 
@@ -501,19 +366,26 @@ async fn server_l2_gate(listener: TcpListener) {
 
     let gate = Arc::new(Gate::new());
     let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let gate2 = gate.clone();
     let done2 = done.clone();
+    let stop2 = stop.clone();
     let main_thread = std::thread::current();
 
-    std::thread::Builder::new()
+    let jh = std::thread::Builder::new()
         .name("shard-bench".into())
         .spawn(move || {
             gate2.set_worker(std::thread::current());
             loop {
-                gate2.acquire();
-                done2.store(true, Ordering::Relaxed);
-                main_thread.unpark();
-                gate2.lock();
+                if stop2.load(Ordering::Relaxed) { return; }
+                if gate2.is_open() {
+                    done2.store(true, Ordering::Relaxed);
+                    main_thread.unpark();
+                    gate2.lock();
+                }
+                if !gate2.is_open() {
+                    gate2.acquire(); // spin 512 → park
+                }
             }
         })
         .unwrap();
@@ -529,6 +401,9 @@ async fn server_l2_gate(listener: TcpListener) {
         done.store(false, Ordering::Relaxed);
         stream.write_all(&reply).await.ok();
     }
+    stop.store(true, Ordering::Relaxed);
+    gate.release();
+    let _ = jh.join();
 }
 
 // ── Level 3g: Gate + Store ──────────────────────────────────────
@@ -542,22 +417,29 @@ async fn server_l3_gate(
 
     let gate = Arc::new(Gate::new());
     let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let gate2 = gate.clone();
     let done2 = done.clone();
+    let stop2 = stop.clone();
     let main_thread = std::thread::current();
 
-    std::thread::Builder::new()
+    let jh = std::thread::Builder::new()
         .name("shard-bench".into())
         .spawn(move || {
             gate2.set_worker(std::thread::current());
             let mut store = MemoryStore::new();
             loop {
-                gate2.acquire();
-                store.purge();
-                let _ = store.append_batch(store_entries, 0);
-                done2.store(true, Ordering::Relaxed);
-                main_thread.unpark();
-                gate2.lock();
+                if stop2.load(Ordering::Relaxed) { return; }
+                if gate2.is_open() {
+                    store.purge();
+                    let _ = store.append_batch(store_entries, 0);
+                    done2.store(true, Ordering::Relaxed);
+                    main_thread.unpark();
+                    gate2.lock();
+                }
+                if !gate2.is_open() {
+                    gate2.acquire(); // spin 512 → park
+                }
             }
         })
         .unwrap();
@@ -573,6 +455,118 @@ async fn server_l3_gate(
         done.store(false, Ordering::Relaxed);
         stream.write_all(&reply).await.ok();
     }
+    stop.store(true, Ordering::Relaxed);
+    gate.release();
+    let _ = jh.join();
+}
+
+// ── Level 2gx: crossbeam cmd + Gate signal (no store) ──────────
+
+async fn server_l2_crossbeam_gate(listener: TcpListener) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let _ = stream.set_nodelay(true);
+
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<()>(65536);
+    let gate = Arc::new(Gate::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let gate2 = gate.clone();
+    let done2 = done.clone();
+    let stop2 = stop.clone();
+    let main_thread = std::thread::current();
+
+    let jh = std::thread::Builder::new()
+        .name("shard-bench".into())
+        .spawn(move || {
+            gate2.set_worker(std::thread::current());
+            loop {
+                if stop2.load(Ordering::Relaxed) { return; }
+                if gate2.is_open() {
+                    while cmd_rx.try_recv().is_ok() {}
+                    done2.store(true, Ordering::Relaxed);
+                    main_thread.unpark();
+                    gate2.lock();
+                }
+                if !gate2.is_open() {
+                    gate2.acquire(); // spin 512 → park
+                }
+            }
+        })
+        .unwrap();
+
+    let mut header = [0u8; ENVELOPE_SIZE];
+    let mut body = BytesMut::with_capacity(128 * 1024);
+    let reply = rep_ok_bytes();
+
+    loop {
+        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
+        let _ = cmd_tx.send(());
+        gate.release();
+        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
+        done.store(false, Ordering::Relaxed);
+        stream.write_all(&reply).await.ok();
+    }
+    stop.store(true, Ordering::Relaxed);
+    gate.release();
+    let _ = jh.join();
+}
+
+// ── Level 3gx: crossbeam cmd + Gate + Store ────────────────────
+
+async fn server_l3_crossbeam_gate(
+    listener: TcpListener,
+    store_entries: &'static [EntryRef<'static>],
+) {
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let _ = stream.set_nodelay(true);
+
+    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<()>(65536);
+    let gate = Arc::new(Gate::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let gate2 = gate.clone();
+    let done2 = done.clone();
+    let stop2 = stop.clone();
+    let main_thread = std::thread::current();
+
+    let jh = std::thread::Builder::new()
+        .name("shard-bench".into())
+        .spawn(move || {
+            gate2.set_worker(std::thread::current());
+            let mut store = MemoryStore::new();
+            loop {
+                if stop2.load(Ordering::Relaxed) { return; }
+                if gate2.is_open() {
+                    while cmd_rx.try_recv().is_ok() {
+                        store.purge();
+                        let _ = store.append_batch(store_entries, 0);
+                    }
+                    done2.store(true, Ordering::Relaxed);
+                    main_thread.unpark();
+                    gate2.lock();
+                }
+                if !gate2.is_open() {
+                    gate2.acquire(); // spin 512 → park
+                }
+            }
+        })
+        .unwrap();
+
+    let mut header = [0u8; ENVELOPE_SIZE];
+    let mut body = BytesMut::with_capacity(128 * 1024);
+    let reply = rep_ok_bytes();
+
+    loop {
+        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
+        let _ = cmd_tx.send(());
+        gate.release();
+        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
+        done.store(false, Ordering::Relaxed);
+        stream.write_all(&reply).await.ok();
+    }
+    stop.store(true, Ordering::Relaxed);
+    gate.release();
+    let _ = jh.join();
 }
 
 // ── Runner ───────────────────────────────────────────────────────
@@ -580,6 +574,23 @@ async fn server_l3_gate(
 fn portpicker() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
+}
+
+/// Read RSS (resident set size) in KB from /proc/self/statm.
+fn rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4) // page size = 4KB on Linux
+        .unwrap_or(0)
+}
+
+/// Process CPU time (user + system) in nanoseconds via clock_gettime.
+/// Nanosecond resolution — works for sub-millisecond measurements.
+fn cpu_time_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts); }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 fn run_level<F, Fut>(rt: &tokio::runtime::Runtime, label: &str, frame: &[u8], msgs_per_batch: u16, server_fn: F)
@@ -596,16 +607,34 @@ where
         tokio::spawn(server_fn(listener));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
         let start = Instant::now();
-        run_client(&addr, frame, ITERATIONS).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_client(&addr, frame, ITERATIONS),
+        ).await;
+
         let elapsed = start.elapsed();
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+
+        if result.is_err() {
+            println!("  {label:40} | TIMEOUT (10s) — level hung");
+            return;
+        }
 
         let throughput = total_msgs as f64 / elapsed.as_secs_f64();
         let data_mb = (frame.len() as f64 * ITERATIONS as f64) / 1_000_000.0;
         let rate = data_mb / elapsed.as_secs_f64();
+        let rss_delta = rss_after.saturating_sub(rss_before);
+        let cpu_ns = cpu_after.saturating_sub(cpu_before);
+        let wall_ns = elapsed.as_nanos() as u64;
+        let cpu_pct = if wall_ns > 0 { (cpu_ns as f64 / wall_ns as f64) * 100.0 } else { 0.0 };
 
         println!(
-            "  {label:45} | {elapsed:>9.2?} | {throughput:>12.0} msg/s | {rate:>8.1} MB/s",
+            "  {label:40} | {elapsed:>9.2?} | {throughput:>10.0} msg/s | {rate:>6.1} MB/s | {rss_after:>6} KB | +{rss_delta:<4} KB | cpu {cpu_pct:>5.1}%",
         );
     });
 }
@@ -627,31 +656,29 @@ fn precompute_batch(batch_size: u16) -> BatchPrecomputed {
 
 fn run_suite(rt: &tokio::runtime::Runtime, suite_label: &str, b: &BatchPrecomputed) {
     println!("\n[ {suite_label} — batch={} ]", b.batch_size);
-    println!("  {:45} | {:>9} | {:>12} | {:>8}", "Level", "Time", "Throughput", "Data");
-    println!("  {}", "-".repeat(90));
+    println!("  {:40} | {:>9} | {:>10} | {:>6} | {:>9} | {:>8} | {:>7}", "Level", "Time", "Throughput", "Data", "RSS", "Δ RSS", "CPU");
+    println!("  {}", "-".repeat(105));
 
     let se = b.store_entries;
 
-    run_level(rt, "L0  TCP only (recv → decode → reply)", &b.frame, b.batch_size, server_l0);
-    run_level(rt, "L1  + MemoryStore.append_batch", &b.frame, b.batch_size, move |l| server_l1(l, se));
-    run_level(rt, "L2  tokio::mpsc channel hop (no store)", &b.frame, b.batch_size, server_l2_channel);
-    run_level(rt, "L2x crossbeam channel hop (no store)", &b.frame, b.batch_size, server_l2_crossbeam);
-    run_level(rt, "L2f flume channel hop (no store)", &b.frame, b.batch_size, server_l2_flume);
-    run_level(rt, "L2s spin atomic (no store)", &b.frame, b.batch_size, server_l2_spin);
-    run_level(rt, "L2g Gate (no store)", &b.frame, b.batch_size, server_l2_gate);
-    run_level(rt, "L3  tokio::mpsc + Store (real publish)", &b.frame, b.batch_size, move |l| server_l3(l, se));
-    run_level(rt, "L3x crossbeam + Store (real publish)", &b.frame, b.batch_size, move |l| server_l3_crossbeam(l, se));
-    run_level(rt, "L3f flume + Store (real publish)", &b.frame, b.batch_size, move |l| server_l3_flume(l, se));
-    run_level(rt, "L3s spin + Store (real publish)", &b.frame, b.batch_size, move |l| server_l3_spin(l, se));
-    run_level(rt, "L3g Gate + Store (real publish)", &b.frame, b.batch_size, move |l| server_l3_gate(l, se));
+    run_level(rt, "L0  TCP baseline", &b.frame, b.batch_size, server_l0);
+    run_level(rt, "L1  + Store", &b.frame, b.batch_size, move |l| server_l1(l, se));
+    run_level(rt, "L2x crossbeam (no store)", &b.frame, b.batch_size, server_l2_crossbeam);
+    run_level(rt, "L2s spin (no store)", &b.frame, b.batch_size, server_l2_spin);
+    run_level(rt, "L2g Gate only (no store)", &b.frame, b.batch_size, server_l2_gate);
+    run_level(rt, "L3x crossbeam + Store", &b.frame, b.batch_size, move |l| server_l3_crossbeam(l, se));
+    run_level(rt, "L3s spin + Store", &b.frame, b.batch_size, move |l| server_l3_spin(l, se));
+    run_level(rt, "L3g Gate + Store", &b.frame, b.batch_size, move |l| server_l3_gate(l, se));
+    run_level(rt, "L2gx crossbeam + Gate (no store)", &b.frame, b.batch_size, server_l2_crossbeam_gate);
+    run_level(rt, "L3gx crossbeam + Gate + Store ★", &b.frame, b.batch_size, move |l| server_l3_crossbeam_gate(l, se));
 }
 
 fn main() {
     let batches = [1u16, 256, 1000];
     let precomputed: Vec<_> = batches.iter().map(|&b| precompute_batch(b)).collect();
 
-    println!("\nPipeline Profiling: {PAYLOAD_LEN}B payload, {ITERATIONS} iterations, 1 connection");
-    println!("{}", "=".repeat(100));
+    println!("\nPipeline Profiling: {PAYLOAD_LEN}B payload, {ITERATIONS} iterations");
+    println!("{}", "=".repeat(115));
 
     for b in &precomputed {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -659,11 +686,5 @@ fn main() {
         run_suite(&rt, "current_thread — 1 core", b);
     }
 
-    for b in &precomputed {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all().build().unwrap();
-        run_suite(&rt, "multi_thread — all cores", b);
-    }
-
-    println!("\n{}", "=".repeat(100));
+    println!("\n{}", "=".repeat(115));
 }

@@ -658,8 +658,8 @@ fn send_error(registry: &ConnectionRegistry, conn_id: u64, env_seq: u32, code: E
     registry.send_parts(conn_id, &[envelope.as_bytes(), body.as_bytes()]);
 }
 
-/// Deliver notification (push mode). Minimal frame until drain_task
-/// provides full payload via Store.
+/// Deliver notification (push mode). Minimal frame — full payload
+/// delivered by shard thread drain loop via Store.
 #[inline]
 fn send_deliver(
     registry: &ConnectionRegistry,

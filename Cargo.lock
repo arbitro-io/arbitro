@@ -68,6 +68,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "flume",
+ "libc",
  "tempfile",
  "tokio",
  "tokio-uring",

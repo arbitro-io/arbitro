@@ -1,11 +1,14 @@
 //! Benchmark: Gate final design.
 //!
 //! Scenario: worker loop { acquire → work → lock } until jobs done.
-//! Compares old (UnsafeCell) vs final (AtomicBool Relaxed + parked flag).
+//! Compares: spin, old gate, new gate, crossbeam, crossbeam + gate.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+extern crate crossbeam_channel;
+extern crate libc;
 
 const ITERATIONS: u32 = 50_000;
 
@@ -179,27 +182,108 @@ fn bench_new() -> Duration {
     elapsed
 }
 
+// ── Bench crossbeam ─────────────────────────────────────────────
+
+fn bench_crossbeam() -> Duration {
+    let (tx, rx) = crossbeam_channel::bounded::<()>(65536);
+    let count = Arc::new(AtomicU32::new(0));
+    let c = count.clone();
+    let w = std::thread::Builder::new().name("crossbeam".into()).spawn(move || {
+        loop {
+            if c.load(Ordering::Relaxed) >= ITERATIONS { break; }
+            if rx.recv().is_err() { break; }
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let start = Instant::now();
+    while count.load(Ordering::Relaxed) < ITERATIONS { let _ = tx.send(()); std::hint::spin_loop(); }
+    let elapsed = start.elapsed();
+    drop(tx);
+    w.join().unwrap();
+    elapsed
+}
+
+// ── Bench crossbeam + Gate ──────────────────────────────────────
+
+fn bench_crossbeam_gate() -> Duration {
+    let (tx, rx) = crossbeam_channel::bounded::<()>(65536);
+    let gate = Arc::new(Gate::new());
+    let count = Arc::new(AtomicU32::new(0));
+    let g = gate.clone(); let c = count.clone();
+    let w = std::thread::Builder::new().name("cb+gate".into()).spawn(move || {
+        g.set_worker(std::thread::current());
+        loop {
+            if c.load(Ordering::Relaxed) >= ITERATIONS { break; }
+            g.acquire();
+            while rx.try_recv().is_ok() {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            g.lock();
+        }
+    }).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let start = Instant::now();
+    while count.load(Ordering::Relaxed) < ITERATIONS {
+        let _ = tx.send(());
+        gate.release();
+        std::hint::spin_loop();
+    }
+    let elapsed = start.elapsed();
+    drop(tx);
+    w.join().unwrap();
+    elapsed
+}
+
 // ── Main ────────────────────────────────────────────────────────
 
-fn print_result(label: &str, elapsed: Duration) {
+fn rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|pages| pages * 4)
+        .unwrap_or(0)
+}
+
+fn cpu_time_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts); }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+fn print_result(label: &str, elapsed: Duration, cpu_ns: u64, rss_delta: i64) {
     let ops = ITERATIONS as f64 / elapsed.as_secs_f64();
     let latency_ns = elapsed.as_nanos() as f64 / ITERATIONS as f64;
-    println!("  {label:45} | {elapsed:>9.2?} | {ops:>12.0} ops/s | {latency_ns:>6.0} ns/op");
+    let wall_ns = elapsed.as_nanos() as u64;
+    let cpu_pct = if wall_ns > 0 { (cpu_ns as f64 / wall_ns as f64) * 100.0 } else { 0.0 };
+    println!(
+        "  {label:40} | {elapsed:>9.2?} | {ops:>10.0} ops/s | {latency_ns:>5.0} ns | cpu {cpu_pct:>5.1}% | rss {rss_delta:>+5} KB",
+    );
+}
+
+fn run_bench<F: FnOnce() -> Duration>(label: &str, f: F) {
+    let rss_before = rss_kb() as i64;
+    let cpu_before = cpu_time_ns();
+    let elapsed = f();
+    let cpu_after = cpu_time_ns();
+    let rss_after = rss_kb() as i64;
+    print_result(label, elapsed, cpu_after - cpu_before, rss_after - rss_before);
 }
 
 fn main() {
     println!("\nGate Final: {ITERATIONS} jobs (acquire → work → lock)");
-    println!("{}", "=".repeat(90));
+    println!("{}", "=".repeat(100));
     println!(
-        "  {:45} | {:>9} | {:>12} | {:>9}",
-        "Variant", "Time", "Ops/s", "Latency"
+        "  {:40} | {:>9} | {:>10} | {:>5} | {:>9} | {:>9}",
+        "Variant", "Time", "Ops/s", "Lat", "CPU", "RSS"
     );
-    println!("  {}", "-".repeat(82));
+    println!("  {}", "-".repeat(95));
 
-    print_result("spin atomic (baseline)", bench_spin());
-    print_result("OLD: volatile + unpark always", bench_old());
-    print_result("NEW: AtomicBool Relaxed + parked flag", bench_new());
+    run_bench("spin atomic (baseline)", bench_spin);
+    run_bench("OLD: volatile + unpark always", bench_old);
+    run_bench("NEW: AtomicBool Relaxed + parked", bench_new);
+    run_bench("crossbeam only", bench_crossbeam);
+    run_bench("crossbeam + Gate (target arch)", bench_crossbeam_gate);
 
-    println!("\n{}", "=".repeat(90));
-    println!("  NEW: no UB, no unnecessary syscalls, 0% CPU idle");
+    println!("\n{}", "=".repeat(100));
 }

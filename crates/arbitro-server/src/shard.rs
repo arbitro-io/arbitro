@@ -1,14 +1,12 @@
 //! Shard worker — owns an ArbitroEngine + stores on a dedicated OS thread.
 //!
-//! The worker runs a blocking loop: recv() command → process → send reply.
+//! Dual-source loop: try_recv commands + gate.is_open drain delivery.
 //! No async, no locks — pure &mut engine on its own thread.
 //!
-//! Publish path: validate stream → store.append → engine.publish →
-//!   drain_fanout → RepOk + gate.release (fire & forget).
-//! The shard sends RepOk directly via ConnectionRegistry — no oneshot roundtrip.
-//!
-//! Delivery path: drain task sends DrainDeliver → shard iterates active
-//!   bindings → engine.claim per binding → store.get per entry → deliver frame.
+//! Publish path: validate stream → store.append → RepOk + gate.release.
+//! Delivery path: gate opens → publish_pending_to_engine → iterate bindings →
+//!   engine.claim per binding → store.get per entry → deliver frame.
+//!   Gate locks when nothing to deliver. Ack/nack/publish reopen it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -46,7 +44,7 @@ pub struct ShardWorker {
     rx: mpsc::Receiver<ShardCommand>,
     gate: Gate,
     registry: ConnectionRegistry,
-    /// Active bindings — iterated on DrainDeliver to claim + deliver.
+    /// Active bindings — iterated when gate is open to claim + deliver.
     bindings: Vec<ActiveBinding>,
     /// Data directory for disk-backed stores. None = memory only.
     data_dir: Option<String>,
@@ -83,8 +81,11 @@ impl ShardWorker {
         }
     }
 
-    /// Run the shard loop. Blocks until Shutdown or channel close.
+    /// Run the shard loop. Dual-source: try_recv commands + gate drain.
+    /// Parks when both are idle. Wakes via unpark (command send or gate release).
     pub fn run(mut self) {
+        self.gate.set_worker(std::thread::current());
+
         // ── Store init ─────────────────────────────────────────────────
         for (id, store) in &mut self.stores {
             if let Err(e) = store.init() {
@@ -92,29 +93,27 @@ impl ShardWorker {
             }
         }
 
-        while let Some(cmd) = self.rx.blocking_recv() {
-            match cmd {
-                ShardCommand::Publish(cmd) => self.handle_publish(cmd),
-                ShardCommand::Claim(cmd) => self.handle_claim(cmd),
-                ShardCommand::Ack(cmd) => self.handle_ack(cmd),
-                ShardCommand::Nack(cmd) => self.handle_nack(cmd),
-                ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),
-                ShardCommand::Unsubscribe(cmd) => self.handle_unsubscribe(cmd),
-                ShardCommand::CreateStream(cmd) => self.handle_create_stream(cmd),
-                ShardCommand::DeleteStream(cmd) => self.handle_delete_stream(cmd),
-                ShardCommand::CreateConsumer(cmd) => self.handle_create_consumer(cmd),
-                ShardCommand::DeleteConsumer(cmd) => self.handle_delete_consumer(cmd),
-                ShardCommand::OpenConnection(cmd) => self.handle_open_connection(cmd),
-                ShardCommand::DrainConnection(cmd) => self.handle_drain_connection(cmd),
-                ShardCommand::Bind(cmd) => self.handle_bind(cmd),
-                ShardCommand::DrainDeliver => self.handle_drain_deliver(),
-                ShardCommand::ListStreams(cmd) => self.handle_list_streams(cmd),
-                ShardCommand::ListConsumers(cmd) => self.handle_list_consumers(cmd),
-                ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
-                ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
-                ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
-                ShardCommand::SeedStores(cmd) => self.handle_seed_stores(cmd),
-                ShardCommand::Shutdown => break,
+        loop {
+            // 1. Drain all pending commands (non-blocking)
+            let mut got_shutdown = false;
+            while let Ok(cmd) = self.rx.try_recv() {
+                match cmd {
+                    ShardCommand::Shutdown => { got_shutdown = true; break; }
+                    cmd => self.dispatch_command(cmd),
+                }
+            }
+            if got_shutdown { break; }
+
+            // 2. If gate is open → run delivery
+            if self.gate.is_open() {
+                self.handle_drain_deliver();
+            }
+
+            // 3. Spin-wait then park if nothing to do (both mpsc empty AND gate locked)
+            //    acquire: spin 512× (~1µs) then park once. Returns on any unpark
+            //    (gate.release or ShardHandle.unpark). Avoids park syscall under load.
+            if self.rx.is_empty() && !self.gate.is_open() {
+                self.gate.acquire();
             }
         }
 
@@ -123,6 +122,32 @@ impl ShardWorker {
             if let Err(e) = store.shutdown() {
                 tracing::error!(stream_id = id.raw(), error = ?e, "store shutdown failed");
             }
+        }
+    }
+
+    /// Dispatch a single command to its handler.
+    fn dispatch_command(&mut self, cmd: ShardCommand) {
+        match cmd {
+            ShardCommand::Publish(cmd) => self.handle_publish(cmd),
+            ShardCommand::Claim(cmd) => self.handle_claim(cmd),
+            ShardCommand::Ack(cmd) => self.handle_ack(cmd),
+            ShardCommand::Nack(cmd) => self.handle_nack(cmd),
+            ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),
+            ShardCommand::Unsubscribe(cmd) => self.handle_unsubscribe(cmd),
+            ShardCommand::CreateStream(cmd) => self.handle_create_stream(cmd),
+            ShardCommand::DeleteStream(cmd) => self.handle_delete_stream(cmd),
+            ShardCommand::CreateConsumer(cmd) => self.handle_create_consumer(cmd),
+            ShardCommand::DeleteConsumer(cmd) => self.handle_delete_consumer(cmd),
+            ShardCommand::OpenConnection(cmd) => self.handle_open_connection(cmd),
+            ShardCommand::DrainConnection(cmd) => self.handle_drain_connection(cmd),
+            ShardCommand::Bind(cmd) => self.handle_bind(cmd),
+            ShardCommand::ListStreams(cmd) => self.handle_list_streams(cmd),
+            ShardCommand::ListConsumers(cmd) => self.handle_list_consumers(cmd),
+            ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
+            ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
+            ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
+            ShardCommand::SeedStores(cmd) => self.handle_seed_stores(cmd),
+            ShardCommand::Shutdown => {} // handled in run loop
         }
     }
 
@@ -360,10 +385,12 @@ impl ShardWorker {
             }
         }
 
-        // If we delivered anything, re-signal the gate so the drain task
-        // wakes again (acks may have freed inflight slots for more delivery).
         if any_delivered {
+            // Re-signal: there may be more messages ready
             self.gate.release();
+        } else {
+            // Nothing to deliver — lock gate until next publish/ack/nack
+            self.gate.lock();
         }
     }
 

@@ -92,7 +92,7 @@ fn bench_limits_e2e(c: &mut Criterion) {
                         .collect();
                     
                     client.publish_batch(stream_name, &basic_entries).await.unwrap();
-                    
+
                     // Drain the 100 basic messages (but don't ACK them to keep credits occupied)
                     for _ in 0..100 {
                         let _msg = sub.next().await.unwrap();

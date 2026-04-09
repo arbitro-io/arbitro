@@ -17,7 +17,6 @@ use crate::transport::ConnectionRegistry;
 #[derive(Clone)]
 pub struct Server {
     shards: Arc<[ShardHandle]>,
-    gates: Arc<[Gate]>,
 }
 
 impl Server {
@@ -27,29 +26,26 @@ impl Server {
         let channel_capacity = config.channel_capacity;
 
         let mut handles = Vec::with_capacity(shard_count);
-        let mut gates = Vec::with_capacity(shard_count);
 
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
             let engine = ArbitroEngine::new();
             let gate = Gate::new();
-            let gate_clone = gate.clone();
 
-            let worker = ShardWorker::new(engine, rx, gate_clone, registry.clone(), config.data_dir.clone());
+            let worker = ShardWorker::new(engine, rx, gate, registry.clone(), config.data_dir.clone());
 
             // Named thread — mandatory per concurrency.md
-            std::thread::Builder::new()
+            let join_handle = std::thread::Builder::new()
                 .name(format!("shard-{id}"))
                 .spawn(move || worker.run())
                 .expect("failed to spawn shard thread");
 
-            handles.push(ShardHandle::new(id as u32, tx));
-            gates.push(gate);
+            let shard_thread = join_handle.thread().clone();
+            handles.push(ShardHandle::new(id as u32, tx, shard_thread));
         }
 
         Self {
             shards: handles.into(),
-            gates: gates.into(),
         }
     }
 
@@ -65,12 +61,6 @@ impl Server {
     #[inline]
     pub fn shard(&self, index: usize) -> &ShardHandle {
         &self.shards[index]
-    }
-
-    /// Get gate for a shard (for drain task).
-    #[inline]
-    pub fn gate(&self, index: usize) -> &Gate {
-        &self.gates[index]
     }
 
     /// Number of shards.

@@ -17,11 +17,12 @@ use crate::command::*;
 pub struct ShardHandle {
     shard_id: u32,
     tx: mpsc::Sender<ShardCommand>,
+    shard_thread: std::thread::Thread,
 }
 
 impl ShardHandle {
-    pub fn new(shard_id: u32, tx: mpsc::Sender<ShardCommand>) -> Self {
-        Self { shard_id, tx }
+    pub fn new(shard_id: u32, tx: mpsc::Sender<ShardCommand>, shard_thread: std::thread::Thread) -> Self {
+        Self { shard_id, tx, shard_thread }
     }
 
     pub fn shard_id(&self) -> u32 {
@@ -277,14 +278,6 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    // ── Delivery ────────────────────────────────────────────────────────
-
-    /// Trigger delivery: shard iterates bindings, claims, reads store, delivers.
-    /// Fire & forget — no reply needed.
-    pub async fn drain_deliver(&self) -> Result<(), SendError> {
-        self.send(ShardCommand::DrainDeliver).await
-    }
-
     // ── Admin ───────────────────────────────────────────────────────────
 
     pub async fn pause_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
@@ -320,11 +313,14 @@ impl ShardHandle {
     // ── Internal ────────────────────────────────────────────────────────
 
     pub async fn send(&self, cmd: ShardCommand) -> Result<(), SendError> {
-        self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)
+        self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)?;
+        self.shard_thread.unpark();
+        Ok(())
     }
 
     pub fn send_shutdown(&self) {
         let _ = self.tx.try_send(ShardCommand::Shutdown);
+        self.shard_thread.unpark();
     }
 }
 

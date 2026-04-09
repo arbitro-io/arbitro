@@ -337,7 +337,7 @@ async fn test_nack_redelivery() {
     let shard = server.shard(0);
     let ts = now();
 
-    let (conn_id, _rx) = registry.register();
+    let (conn_id, mut rx) = registry.register();
 
     shard
         .create_stream(
@@ -399,27 +399,38 @@ async fn test_nack_redelivery() {
     }];
     shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
 
-    // Give shard a moment to process
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Claim
-    let claim1 = shard
-        .claim(QueueId(1), ConnectionId(conn_id), ConsumerId(1), 10, ts)
-        .await
-        .unwrap();
-    assert_eq!(claim1.len(), 1);
+    // Drain the auto-delivered frames from connection rx to get the seq
+    // Frames: RepOk (publish reply) + Deliver (auto-delivered)
+    let mut delivered_seq = None;
+    while let Ok(frame) = rx.try_recv() {
+        let action = u16::from_le_bytes([frame[0], frame[1]]);
+        if action == Action::Deliver.as_u16() {
+            let seq = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]) as u64;
+            delivered_seq = Some(seq);
+        }
+    }
+    let seq = delivered_seq.expect("should have received auto-delivered message");
 
-    // Nack — should requeue
-    let nack_entries: Vec<NackEntry> = claim1.iter().map(|e| NackEntry { seq: e.seq, retry_at: None }).collect();
+    // Nack — should requeue the auto-delivered message
+    let nack_entries = vec![NackEntry { seq, retry_at: None }];
     let nack = shard.nack(ConsumerId(1), nack_entries, ts).await.unwrap();
     assert_eq!(nack.requeued, 1);
 
-    // Re-claim — should get the same message back
-    let claim2 = shard
-        .claim(QueueId(1), ConnectionId(conn_id), ConsumerId(1), 10, ts)
-        .await
-        .unwrap();
-    assert_eq!(claim2.len(), 1);
+    // Wait for re-delivery via Gate (nack → gate.release → drain_deliver)
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Verify re-delivery arrived on the connection (auto-delivered by Gate)
+    let mut redelivered = false;
+    while let Ok(frame) = rx.try_recv() {
+        let action = u16::from_le_bytes([frame[0], frame[1]]);
+        if action == Action::Deliver.as_u16() {
+            redelivered = true;
+        }
+    }
+    assert!(redelivered, "nacked message should be re-delivered via Gate");
 
     server.shutdown();
 }
@@ -497,17 +508,11 @@ async fn test_disconnect_releases_pending() {
         .collect();
     shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
 
-    // Give shard a moment to process
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
+    // Messages become inflight automatically — no explicit claim needed
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Claim all 50
-    let claimed = shard
-        .claim(QueueId(1), ConnectionId(conn_id), ConsumerId(1), 256, ts)
-        .await
-        .unwrap();
-    assert!(!claimed.is_empty());
-
-    // Disconnect — all pending should be requeued
+    // Disconnect — all inflight (auto-delivered) should be requeued
     let drain = shard
         .drain_connection(ConnectionId(conn_id), DrainMode::ReleaseAndRequeue, ts)
         .await
@@ -759,8 +764,8 @@ async fn test_end_to_end_publish_deliver_ack() {
     let action_bytes = u16::from_le_bytes([rep_ok_frame[0], rep_ok_frame[1]]);
     assert_eq!(action_bytes, Action::RepOk.as_u16(), "first frame should be RepOk");
 
-    // 6. Trigger delivery via DrainDeliver
-    shard.drain_deliver().await.unwrap();
+    // 6. Wait for shard thread to drain-deliver (gate auto-releases on publish)
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 7. Receive deliver frames — one per message
     let mut delivered_count = 0u32;
@@ -810,4 +815,75 @@ async fn test_end_to_end_publish_deliver_ack() {
     );
 
     server.shutdown();
+}
+
+// ── Gate smoke test ───────────────────────────────────────────────────────
+
+/// Verify Gate-driven auto-delivery works end-to-end:
+/// publish → gate.release → shard drains → Deliver frames arrive on connection.
+/// 3 iterations, 2-second global timeout — must not hang.
+#[tokio::test]
+async fn test_gate_auto_delivery_smoke() {
+    let overall = tokio::time::timeout(Duration::from_secs(2), async {
+        let (server, registry) = test_server();
+        let shard = server.shard(0);
+        let ts = now();
+
+        let (conn_id, mut rx) = registry.register();
+
+        shard.open_connection(ConnectionId(conn_id), NodeId(1), ts).await.unwrap();
+
+        shard.create_stream(
+            StreamConfig { id: StreamId(1), name: b"gate_smoke".to_vec() }, 0,
+        ).await.unwrap();
+
+        shard.subscribe(
+            StreamConfig { id: StreamId(1), name: b"gate_smoke".to_vec() },
+            ConsumerConfig {
+                id: ConsumerId(1), queue_id: QueueId(1), stream_id: StreamId(1),
+                durable: true, ack_policy: AckPolicy::Explicit, max_inflight: 100,
+            },
+            SubscriptionConfig {
+                id: SubscriptionId(1), stream_id: StreamId(1),
+                consumer_id: ConsumerId(1), filters: vec![],
+            },
+            ConnectionId(conn_id), ts,
+        ).await.unwrap();
+
+        // 3 rounds — publish 5 msgs each, verify auto-delivery
+        for round in 0..3u32 {
+            let entries: Vec<_> = (0..5).map(|i| {
+                arbitro_server::command::PublishEntryOwned {
+                    subject: bytes::Bytes::from_static(b"gate.smoke"),
+                    payload: bytes::Bytes::from(format!("r{round}-{i}").into_bytes()),
+                }
+            }).collect();
+
+            shard.publish(StreamId(1), conn_id, round + 1, entries).await.unwrap();
+
+            // Wait for shard to auto-deliver
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Drain rx — count Deliver frames
+            let mut delivers = 0u32;
+            while let Ok(frame) = rx.try_recv() {
+                let action = u16::from_le_bytes([frame[0], frame[1]]);
+                if action == Action::Deliver.as_u16() {
+                    delivers += 1;
+                }
+            }
+
+            assert_eq!(delivers, 5, "round {round}: expected 5 auto-delivered messages");
+
+            // Ack all so inflight is freed for next round
+            let ack_entries: Vec<AckEntry> = (1..=5u64)
+                .map(|i| AckEntry { seq: round as u64 * 5 + i })
+                .collect();
+            shard.ack(ConsumerId(1), ack_entries, ts).await.unwrap();
+        }
+
+        server.shutdown();
+    });
+
+    overall.await.expect("test_gate_auto_delivery_smoke hung — Gate is blocked");
 }

@@ -43,9 +43,6 @@ pub enum ShardCommand {
     PauseConsumer(PauseConsumerCmd),
     ResumeConsumer(ResumeConsumerCmd),
 
-    // Delivery
-    DrainDeliver,
-
     // Query
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),

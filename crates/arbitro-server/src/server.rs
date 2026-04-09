@@ -17,7 +17,6 @@ use arbitro_proto::lifecycle::LifeCycle;
 use crate::command_log::SharedCommandLog;
 use crate::config::Config;
 use crate::dispatch;
-use crate::drain_task;
 use crate::router::Server;
 use crate::transport::ConnectionRegistry;
 
@@ -108,15 +107,6 @@ impl ArbitroServer {
 
         // Internal shutdown signal
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        // Spawn drain tasks — one per shard
-        let mut drain_handles = Vec::with_capacity(self.server.shard_count());
-        for i in 0..self.server.shard_count() {
-            let shard = self.server.shard(i).clone();
-            let gate = self.server.gate(i).clone();
-            let handle = drain_task::spawn_drain_task(shard, gate, shutdown_rx.clone());
-            drain_handles.push(handle);
-        }
 
         // Keepalive + idle timeout task
         let keepalive_registry = self.registry.clone();
@@ -226,11 +216,6 @@ impl ArbitroServer {
         // Force close remaining
         for conn_id in &all_conns {
             self.registry.remove(*conn_id);
-        }
-
-        // Abort drain tasks
-        for handle in drain_handles {
-            handle.abort();
         }
 
         while frame_rx.try_recv().is_ok() {}

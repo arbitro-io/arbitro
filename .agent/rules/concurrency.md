@@ -28,7 +28,8 @@ Thread "shard-N" → owns Engine N + Store N → &mut self calls only
 
 ### Shard channel: `mpsc::channel<ShardCommand>`
 - **Sender** (async side): held by `ShardHandle`, cloneable, shared across tokio tasks
-- **Receiver** (sync side): held by `ShardWorker`, `blocking_recv()` in dedicated thread
+- **Receiver** (sync side): held by `ShardWorker`, `try_recv()` in dual-source loop + `thread::park()`
+- **Wake**: `ShardHandle.send()` calls `shard_thread.unpark()` after `tx.send()`
 - **Capacity**: configurable (default 4096). Backpressure if full — `.await` blocks sender
 - **Direction**: always transport → shard. Never shard → shard.
 
@@ -100,13 +101,42 @@ std::thread::Builder::new()
 
 Never use unnamed threads (`std::thread::spawn`).
 
-## DRAIN TASK — ASYNC, NOT ON SHARD THREAD
+## DRAIN DELIVERY — ON SHARD THREAD VIA GATE
 
-The drain task (reactive delivery loop) runs as a tokio task, NOT on the shard thread. It communicates with the shard via `ShardHandle` (mpsc + oneshot), same as transport.
+Delivery runs **directly on the shard thread** — no async drain task, no middleman.
+
+The shard thread serves **two wakeup sources** in a unified loop:
+1. **mpsc commands** — publish, ack, nack, subscribe, etc. (`try_recv`)
+2. **Gate signal** — "drain work available, deliver now" (`gate.is_open()`)
+
+The shard parks when **both** are idle. Either source wakes it:
+- `ShardHandle.send()` sends command + calls `shard_thread.unpark()`
+- `gate.release()` sets locked=false + calls `shard_thread.unpark()`
 
 ```
-Shard thread: engine.publish() → gate.release()
-Drain task:   gate.wait() → shard.claim() → build Deliver → send to connection
+Shard loop:  try_recv commands → gate.is_open? → handle_drain_deliver → park
+Gate opens:  publish (new messages), ack (freed inflight), nack (requeued), subscribe/bind
+Gate closes: handle_drain_deliver found nothing to deliver
 ```
 
-The Gate (`arbitro-common::Gate`) is the bridge between sync (shard thread) and async (drain task).
+### Gate (`crate::gate::Gate`)
+
+```rust
+#[repr(align(64))]
+pub struct Gate {
+    locked: AtomicBool,     // true = no work pending
+    parked: AtomicBool,     // true = shard thread is parked
+    worker: UnsafeCell<Option<std::thread::Thread>>,
+}
+```
+
+- Lives inside `ShardWorker` — one per shard thread. **Not Clone, not Arc.**
+- External callers (ShardHandle) wake the shard via `shard_thread.unpark()`, not gate.
+- Gate is internal to the shard thread's own delivery scheduling.
+
+### Rules
+
+1. **No async drain task.** Delivery runs on the shard thread via Gate.
+2. **`try_recv` is not spinning.** Shard parks when both mpsc and gate are idle.
+3. **Spurious unpark is safe.** Extra loop iteration (~5ns), no harm.
+4. **Gate.release() from shard handlers only.** Called after publish/ack/nack/subscribe/bind.

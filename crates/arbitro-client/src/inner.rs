@@ -228,6 +228,40 @@ impl Inner {
         }
     }
 
+    /// Fire-and-forget: send frame with backpressure, no oneshot, no pending map.
+    /// Server will send RepOk back via TCP but on_rep_ok ignores unknown env_seq.
+    pub(crate) async fn fire_and_forget(
+        &self,
+        action: Action,
+        stream_id: u32,
+        body: &[u8],
+    ) -> Result<(), ClientError> {
+        let seq = self.alloc_seq();
+        let envelope = Envelope {
+            action: U16::new(action.as_u16()),
+            flags: 0,
+            _rsv: 0,
+            stream_id: U32::new(stream_id),
+            msg_len: U32::new(body.len() as u32),
+            env_seq: U32::new(seq),
+        };
+
+        let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
+        frame.extend_from_slice(envelope.as_bytes());
+        frame.extend_from_slice(body);
+
+        let tx = {
+            let guard = self.write_tx.lock().unwrap();
+            guard.as_ref().cloned()
+        };
+
+        match tx {
+            Some(tx) => tx.send(Bytes::from(frame)).await
+                .map_err(|_| ClientError::Disconnected),
+            None => Err(ClientError::Disconnected),
+        }
+    }
+
     /// Send a frame with no reply expected (internal use only, e.g. Pong).
     fn send_no_reply(
         &self,
