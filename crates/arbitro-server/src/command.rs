@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 pub enum ShardCommand {
     // Hot path
     Publish(PublishCmd),
+    PublishAccumulate(PublishCmd),
     Claim(ClaimCmd),
     Ack(AckCmd),
     Nack(NackCmd),

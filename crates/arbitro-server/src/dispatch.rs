@@ -58,6 +58,7 @@ pub async fn dispatch_frame(
     match action {
         // ── Hot path ────────────────────────────────────────────────
         Action::Publish => dispatch_publish(conn_id, stream_id, env_seq, &frame, server, registry).await,
+        Action::PublishAccumulate => dispatch_publish_accumulate(conn_id, stream_id, env_seq, &frame, server, registry).await,
         Action::Ack => dispatch_ack(stream_id, body, server).await,
         Action::AckSync => dispatch_ack_sync(conn_id, stream_id, env_seq, body, server, registry).await,
         Action::Nack => dispatch_nack(stream_id, body, server).await,
@@ -117,6 +118,32 @@ async fn dispatch_publish(
 
     // Shard handles: validate stream → store.append → RepOk + gate.release
     if let Err(_) = shard.publish(StreamId(stream_id), conn_id, env_seq, entries).await {
+        send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
+    }
+}
+
+/// PublishAccumulate — shard accumulates entries, flushes after deadline/threshold.
+/// Same wire format as Publish, different action code.
+async fn dispatch_publish_accumulate(
+    conn_id: u64,
+    stream_id: u32,
+    env_seq: u32,
+    frame: &Bytes,
+    server: &Server,
+    registry: &ConnectionRegistry,
+) {
+    let shard = server.shard_for(StreamId(stream_id));
+    let body = &frame[ENVELOPE_SIZE..];
+    let iter = BatchIter::new(body);
+
+    let entries: Vec<PublishEntryOwned> = iter
+        .map(|view| PublishEntryOwned {
+            subject: frame.slice_ref(view.subject()),
+            payload: frame.slice_ref(view.payload()),
+        })
+        .collect();
+
+    if let Err(_) = shard.publish_accumulate(StreamId(stream_id), conn_id, env_seq, entries).await {
         send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
     }
 }

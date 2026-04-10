@@ -5,7 +5,8 @@
 #[repr(u16)]
 pub enum Action {
     // 0x01xx — Publish
-    Publish       = 0x0101,
+    Publish           = 0x0101,
+    PublishAccumulate = 0x0102,
 
     // 0x02xx — Delivery
     Deliver       = 0x0200,
@@ -56,6 +57,7 @@ impl Action {
     pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
             0x0101 => Some(Self::Publish),
+            0x0102 => Some(Self::PublishAccumulate),
 
             0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
@@ -105,12 +107,12 @@ impl Action {
     /// Hot-path actions: publish, ack, nack.
     #[inline(always)]
     pub const fn is_hot(self) -> bool {
-        matches!(self, Self::Publish | Self::Ack | Self::Nack | Self::BatchAck | Self::AckSync | Self::BatchAckSync)
+        matches!(self, Self::Publish | Self::PublishAccumulate | Self::Ack | Self::Nack | Self::BatchAck | Self::AckSync | Self::BatchAckSync)
     }
 
     /// Actions that carry a subject for routing.
     #[inline(always)]
     pub const fn has_subject(self) -> bool {
-        matches!(self, Self::Publish | Self::Subscribe)
+        matches!(self, Self::Publish | Self::PublishAccumulate | Self::Subscribe)
     }
 }

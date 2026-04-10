@@ -1,690 +1,493 @@
-//! Benchmark: step-by-step pipeline profiling.
+//! Raw TCP benchmark: Batch Ack (Simulated) vs Flusher Service (Pipelined).
 //!
-//! Measures each layer's cost by adding one component at a time:
-//!
-//!   Level 0 — TCP only:       encode → send → recv → decode → reply
-//!   Level 1 — + Store:        … → store.append_batch → …
-//!   Level 2 — + Engine:       … → engine.publish + drain_fanout → …
-//!   Level 3 — + Channel hop:  client → mpsc → worker thread → mpsc → reply
-//!
-//! 1K msgs/batch × 64B payload. 5000 iterations per level.
-//! Runs 1 core (current_thread) then all cores (multi_thread), 1 connection.
-//!
-//! EntryRef / EnginePublishEntry vecs are pre-computed once from a leaked
-//! copy of the wire body — the loop only does TCP + store + engine work.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+//! This benchmark compares two high-performance batching strategies:
+//!   1. BatchAck (Simulated): Client sends 512 msgs, server sends 1 response.
+//!   2. Flusher Service (Pipelined): Real Arbitro Flusher service on a dedicated thread.
 
 extern crate libc;
 
-use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use zerocopy::byteorder::little_endian::{U16, U32};
-use zerocopy::IntoBytes;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
-use arbitro_proto::action::Action;
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use arbitro_proto::wire::publish::{BatchIter, PublishEntry, PUBLISH_ENTRY_SIZE};
-use arbitro_store::{EntryRef, MemoryStore, Store};
+use arbitro_proto::config::StreamConfig;
+use arbitro_server::{ArbitroServer, Config as ServerConfig};
+use arbitro_server::flusher::Flusher;
+use tokio::runtime::Runtime;
 
-// ── Settings ─────────────────────────────────────────────────────
+// ── Settings ────────────────────────────────────────────────────
 
-const MSGS_PER_BATCH: u16 = 256;
-const SUBJECT: &[u8] = b"bench.msg";
-const PAYLOAD_LEN: usize = 64;
-const ITERATIONS: u32 = 1000;
+const MSGS_PER_CONN: u32 = 10_000;
+const CONCURRENCY: &[usize] = &[1, 2, 4, 8, 16, 32];
+const BATCH_ACK_SIZE: u32 = 512;
 
-// ── Wire helpers ─────────────────────────────────────────────────
+// ── Wire constants ──────────────────────────────────────────────
 
-fn encode_publish_batch(stream_id: u32, count: u16, subject: &[u8], payload: &[u8]) -> Vec<u8> {
-    let entry_wire = PUBLISH_ENTRY_SIZE + subject.len() + payload.len();
-    let body_len = 2 + entry_wire * count as usize;
-    let total = ENVELOPE_SIZE + body_len;
-    let mut buf = Vec::with_capacity(total);
+const ENVELOPE_SIZE: usize = 16;
+const ACTION_CONNECT: u16 = 0x0603;
+const ACTION_CONNECTED: u16 = 0x0604;
+const ACTION_REPOK: u16 = 0x0203;
+const ACTION_PUBLISH: u16 = 0x0101;
+const ACTION_PUBLISH_ACCUMULATE: u16 = 0x0102;
 
-    let env = Envelope {
-        action: U16::new(Action::Publish.as_u16()),
-        flags: 0, _rsv: 0,
-        stream_id: U32::new(stream_id),
-        msg_len: U32::new(body_len as u32),
-        env_seq: U32::new(0),
-    };
-    buf.extend_from_slice(env.as_bytes());
-    buf.extend_from_slice(&count.to_le_bytes());
+const REPOK_FRAME: usize = ENVELOPE_SIZE + 16;
+const BATCH_ACK_BODY: usize = 8;
+const BATCH_ACK_FRAME: usize = ENVELOPE_SIZE + BATCH_ACK_BODY;
 
-    for _ in 0..count {
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0, _pad: [0; 3],
-        };
-        buf.extend_from_slice(entry.as_bytes());
-        buf.extend_from_slice(subject);
-        buf.extend_from_slice(payload);
+// ── Helpers ─────────────────────────────────────────────────────
+
+#[cfg(unix)]
+pub fn pin_to_core(core_id: usize) {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(core_id, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
     }
+}
+#[cfg(not(unix))]
+pub fn pin_to_core(_: usize) {}
+
+fn make_envelope(action: u16, stream_id: u32, msg_len: u32, env_seq: u32) -> [u8; ENVELOPE_SIZE] {
+    let mut buf = [0u8; ENVELOPE_SIZE];
+    buf[0..2].copy_from_slice(&action.to_le_bytes());
+    buf[4..8].copy_from_slice(&stream_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&msg_len.to_le_bytes());
+    buf[12..16].copy_from_slice(&env_seq.to_le_bytes());
     buf
 }
 
-fn rep_ok_bytes() -> [u8; ENVELOPE_SIZE] {
-    let env = Envelope {
-        action: U16::new(Action::RepOk.as_u16()),
-        flags: 0, _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(0),
-        env_seq: U32::new(0),
-    };
-    let mut b = [0u8; ENVELOPE_SIZE];
-    b.copy_from_slice(env.as_bytes());
-    b
+fn tcp_read_exact(stream: &mut TcpStream, buf: &mut [u8]) {
+    stream.read_exact(buf).expect("tcp read failed");
 }
 
-// ── Pre-computed batch entries (leaked, 'static) ─────────────────
-
-fn leak_body(frame: &[u8]) -> &'static [u8] {
-    let body = &frame[ENVELOPE_SIZE..];
-    Box::leak(body.to_vec().into_boxed_slice())
+fn fnv1a_32(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in data { h ^= b as u32; h = h.wrapping_mul(0x0100_0193); }
+    h
 }
 
-fn precompute_store_entries(body: &'static [u8]) -> Vec<EntryRef<'static>> {
-    BatchIter::new(body)
-        .map(|e| EntryRef { subject: e.subject(), payload: e.payload() })
-        .collect()
+fn pick_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-
-// ── TCP read frame helper ────────────────────────────────────────
-
-async fn read_frame(stream: &mut TcpStream, header: &mut [u8; ENVELOPE_SIZE], body: &mut BytesMut) -> bool {
-    if stream.read_exact(header.as_mut()).await.is_err() { return false; }
-    let msg_len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-    body.clear();
-    body.resize(msg_len, 0);
-    if msg_len > 0 {
-        if stream.read_exact(&mut body[..]).await.is_err() { return false; }
-    }
-    true
+/// Frame de publish para el servidor real (Publish o PublishAccumulate).
+fn build_publish_real(action: u16, stream_id: u32, seq: u32) -> Vec<u8> {
+    let subject = b"bench.subject";
+    let payload = [0u8; 64];
+    let body_len = 2 + 12 + subject.len() + payload.len();
+    let env = make_envelope(action, stream_id, body_len as u32, seq);
+    let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body_len);
+    frame.extend_from_slice(&env);
+    frame.extend_from_slice(&1u16.to_le_bytes());
+    let mut entry_hdr = [0u8; 12];
+    entry_hdr[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    entry_hdr[4..6].copy_from_slice(&(subject.len() as u16).to_le_bytes());
+    frame.extend_from_slice(&entry_hdr);
+    frame.extend_from_slice(subject);
+    frame.extend_from_slice(&payload);
+    frame
 }
 
-// ── Client (shared for all levels) ───────────────────────────────
-
-async fn run_client(addr: &str, frame: &[u8], iterations: u32) {
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
-    let _ = stream.set_nodelay(true);
-    let mut reply = [0u8; ENVELOPE_SIZE];
-    for _ in 0..iterations {
-        stream.write_all(frame).await.expect("write");
-        stream.read_exact(&mut reply).await.expect("read");
-    }
-}
-
-// ── Level 0: TCP only ────────────────────────────────────────────
-
-async fn server_l0(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        let iter = BatchIter::new(&body);
-        for entry in iter { let _ = entry.subject(); let _ = entry.payload(); }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 1: TCP + Store ─────────────────────────────────────────
-
-async fn server_l1(listener: TcpListener, store_entries: &'static [EntryRef<'static>]) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut buf = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    let mut store = MemoryStore::new();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut buf).await { break; }
-        store.purge();
-        let _ = store.append_batch(store_entries, 0);
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 2x: crossbeam channel hop only (no store) ─────────────
-
-async fn server_l2_crossbeam(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, shard_rx) = crossbeam_channel::bounded::<()>(65536);
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            while shard_rx.recv().is_ok() {
-                let _ = done_tx.send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).is_err() { break; }
-        if done_rx.recv().is_err() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 3x: crossbeam + Store (real publish with crossbeam) ───
-
-async fn server_l3_crossbeam(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (shard_tx, shard_rx) = crossbeam_channel::bounded::<()>(65536);
-    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(65536);
-
-    std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            let mut store = MemoryStore::new();
-
-            while shard_rx.recv().is_ok() {
-                store.purge();
-                let _ = store.append_batch(store_entries, 0);
-                let _ = done_tx.send(());
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        if shard_tx.send(()).is_err() { break; }
-        if done_rx.recv().is_err() { break; }
-        stream.write_all(&reply).await.ok();
-    }
-}
-
-// ── Level 2s: spin channel hop (no store) ───────────────────────
-//
-// Pure atomic spin — no kernel syscall, no parking.
-
-async fn server_l2_spin(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let ready = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let ready2 = ready.clone(); let done2 = done.clone(); let stop2 = stop.clone();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            loop {
-                while !ready2.load(Ordering::Acquire) {
-                    if stop2.load(Ordering::Relaxed) { return; }
-                    std::hint::spin_loop();
-                }
-                ready2.store(false, Ordering::Release);
-                done2.store(true, Ordering::Release);
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        ready.store(true, Ordering::Release);
-        while !done.load(Ordering::Acquire) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Release);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    let _ = jh.join();
-}
-
-// ── Level 3s: spin + Store ──────────────────────────────────────
-
-async fn server_l3_spin(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let ready = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let ready2 = ready.clone(); let done2 = done.clone(); let stop2 = stop.clone();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            let mut store = MemoryStore::new();
-            loop {
-                while !ready2.load(Ordering::Acquire) {
-                    if stop2.load(Ordering::Relaxed) { return; }
-                    std::hint::spin_loop();
-                }
-                ready2.store(false, Ordering::Release);
-                store.purge();
-                let _ = store.append_batch(store_entries, 0);
-                done2.store(true, Ordering::Release);
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        ready.store(true, Ordering::Release);
-        while !done.load(Ordering::Acquire) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Release);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    let _ = jh.join();
-}
-
-// ── Gate (matches server: spin 512 → park, same as production) ──
-
-#[repr(align(64))]
-struct Gate {
-    locked: AtomicBool,
-    parked: AtomicBool,
-    worker: std::cell::UnsafeCell<Option<std::thread::Thread>>,
-}
-unsafe impl Sync for Gate {}
-
-impl Gate {
-    fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(true),
-            parked: AtomicBool::new(false),
-            worker: std::cell::UnsafeCell::new(None),
-        }
-    }
-    fn set_worker(&self, t: std::thread::Thread) {
-        unsafe { *self.worker.get() = Some(t); }
-    }
-    #[inline] fn release(&self) {
-        self.locked.store(false, Ordering::Relaxed);
-        if self.parked.load(Ordering::Relaxed) {
-            unsafe { if let Some(t) = &*self.worker.get() { t.unpark(); } }
-        }
-    }
-    #[inline] fn lock(&self) {
-        self.locked.store(true, Ordering::Relaxed);
-    }
-    #[inline] fn is_open(&self) -> bool {
-        !self.locked.load(Ordering::Relaxed)
-    }
-    /// Spin 512× then park once. Returns on any unpark.
-    #[inline] fn acquire(&self) {
-        if !self.locked.load(Ordering::Relaxed) { return; }
-        for _ in 0..512 {
-            if !self.locked.load(Ordering::Relaxed) { return; }
-            std::hint::spin_loop();
-        }
-        self.parked.store(true, Ordering::Relaxed);
-        std::thread::park();
-        self.parked.store(false, Ordering::Relaxed);
-    }
-}
-
-// ── Level 2g: Gate channel hop (no store) ───────────────────────
-
-async fn server_l2_gate(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let gate = Arc::new(Gate::new());
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let gate2 = gate.clone();
-    let done2 = done.clone();
-    let stop2 = stop.clone();
-    let main_thread = std::thread::current();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            gate2.set_worker(std::thread::current());
-            loop {
-                if stop2.load(Ordering::Relaxed) { return; }
-                if gate2.is_open() {
-                    done2.store(true, Ordering::Relaxed);
-                    main_thread.unpark();
-                    gate2.lock();
-                }
-                if !gate2.is_open() {
-                    gate2.acquire(); // spin 512 → park
-                }
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        gate.release();
-        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Relaxed);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    gate.release();
-    let _ = jh.join();
-}
-
-// ── Level 3g: Gate + Store ──────────────────────────────────────
-
-async fn server_l3_gate(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let gate = Arc::new(Gate::new());
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let gate2 = gate.clone();
-    let done2 = done.clone();
-    let stop2 = stop.clone();
-    let main_thread = std::thread::current();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            gate2.set_worker(std::thread::current());
-            let mut store = MemoryStore::new();
-            loop {
-                if stop2.load(Ordering::Relaxed) { return; }
-                if gate2.is_open() {
-                    store.purge();
-                    let _ = store.append_batch(store_entries, 0);
-                    done2.store(true, Ordering::Relaxed);
-                    main_thread.unpark();
-                    gate2.lock();
-                }
-                if !gate2.is_open() {
-                    gate2.acquire(); // spin 512 → park
-                }
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        gate.release();
-        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Relaxed);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    gate.release();
-    let _ = jh.join();
-}
-
-// ── Level 2gx: crossbeam cmd + Gate signal (no store) ──────────
-
-async fn server_l2_crossbeam_gate(listener: TcpListener) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<()>(65536);
-    let gate = Arc::new(Gate::new());
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let gate2 = gate.clone();
-    let done2 = done.clone();
-    let stop2 = stop.clone();
-    let main_thread = std::thread::current();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            gate2.set_worker(std::thread::current());
-            loop {
-                if stop2.load(Ordering::Relaxed) { return; }
-                if gate2.is_open() {
-                    while cmd_rx.try_recv().is_ok() {}
-                    done2.store(true, Ordering::Relaxed);
-                    main_thread.unpark();
-                    gate2.lock();
-                }
-                if !gate2.is_open() {
-                    gate2.acquire(); // spin 512 → park
-                }
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        let _ = cmd_tx.send(());
-        gate.release();
-        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Relaxed);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    gate.release();
-    let _ = jh.join();
-}
-
-// ── Level 3gx: crossbeam cmd + Gate + Store ────────────────────
-
-async fn server_l3_crossbeam_gate(
-    listener: TcpListener,
-    store_entries: &'static [EntryRef<'static>],
-) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let _ = stream.set_nodelay(true);
-
-    let (cmd_tx, cmd_rx) = crossbeam_channel::bounded::<()>(65536);
-    let gate = Arc::new(Gate::new());
-    let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let gate2 = gate.clone();
-    let done2 = done.clone();
-    let stop2 = stop.clone();
-    let main_thread = std::thread::current();
-
-    let jh = std::thread::Builder::new()
-        .name("shard-bench".into())
-        .spawn(move || {
-            gate2.set_worker(std::thread::current());
-            let mut store = MemoryStore::new();
-            loop {
-                if stop2.load(Ordering::Relaxed) { return; }
-                if gate2.is_open() {
-                    while cmd_rx.try_recv().is_ok() {
-                        store.purge();
-                        let _ = store.append_batch(store_entries, 0);
-                    }
-                    done2.store(true, Ordering::Relaxed);
-                    main_thread.unpark();
-                    gate2.lock();
-                }
-                if !gate2.is_open() {
-                    gate2.acquire(); // spin 512 → park
-                }
-            }
-        })
-        .unwrap();
-
-    let mut header = [0u8; ENVELOPE_SIZE];
-    let mut body = BytesMut::with_capacity(128 * 1024);
-    let reply = rep_ok_bytes();
-
-    loop {
-        if !read_frame(&mut stream, &mut header, &mut body).await { break; }
-        let _ = cmd_tx.send(());
-        gate.release();
-        while !done.load(Ordering::Relaxed) { std::hint::spin_loop(); }
-        done.store(false, Ordering::Relaxed);
-        stream.write_all(&reply).await.ok();
-    }
-    stop.store(true, Ordering::Relaxed);
-    gate.release();
-    let _ = jh.join();
-}
-
-// ── Runner ───────────────────────────────────────────────────────
-
-fn portpicker() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-/// Read RSS (resident set size) in KB from /proc/self/statm.
-fn rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4) // page size = 4KB on Linux
-        .unwrap_or(0)
-}
-
-/// Process CPU time (user + system) in nanoseconds via clock_gettime.
-/// Nanosecond resolution — works for sub-millisecond measurements.
 fn cpu_time_ns() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts); }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-fn run_level<F, Fut>(rt: &tokio::runtime::Runtime, label: &str, frame: &[u8], msgs_per_batch: u16, server_fn: F)
-where
-    F: FnOnce(TcpListener) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    let port = portpicker();
-    let addr = format!("127.0.0.1:{port}");
-    let total_msgs = msgs_per_batch as u64 * ITERATIONS as u64;
+fn rss_kb() -> u64 {
+    let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = s.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    pages * 4
+}
 
-    rt.block_on(async {
-        let listener = TcpListener::bind(&addr).await.unwrap();
-        tokio::spawn(server_fn(listener));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+fn build_publish_accumulate(seq: u32) -> Vec<u8> {
+    let subject = b"bench.msg";
+    let payload = [0u8; 64];
+    let body_len = 2 + 12 + subject.len() + payload.len();
+    let env = make_envelope(ACTION_PUBLISH_ACCUMULATE, 0, body_len as u32, seq);
+    let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body_len);
+    frame.extend_from_slice(&env);
+    frame.extend_from_slice(&1u16.to_le_bytes()); // entry count
+    let mut entry = [0u8; 12];
+    entry[0..4].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    entry[4..6].copy_from_slice(&(subject.len() as u16).to_le_bytes());
+    frame.extend_from_slice(&entry);
+    frame.extend_from_slice(subject);
+    frame.extend_from_slice(&payload);
+    frame
+}
 
-        let rss_before = rss_kb();
-        let cpu_before = cpu_time_ns();
+fn start_flusher_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            if let Ok(mut stream) = s {
+                std::thread::spawn(move || {
+                    stream.set_nodelay(true).unwrap();
+                    let mut hdr = [0u8; ENVELOPE_SIZE];
+                    if stream.read_exact(&mut hdr).is_err() { return; }
+                    let _ = stream.write_all(&make_envelope(ACTION_CONNECTED, 0, 16, 0));
+                    let _ = stream.write_all(&[0u8; 16]);
+                    
+                    let mut write_stream = stream.try_clone().unwrap();
+                    let flusher = Flusher::new()
+                        .on_flush(move |seqs| {
+                            let mut buf = vec![0u8; seqs.len() * REPOK_FRAME];
+                            for (i, &seq) in seqs.iter().enumerate() {
+                                let env = make_envelope(ACTION_REPOK, 0, 16, seq);
+                                buf[i*REPOK_FRAME..i*REPOK_FRAME+ENVELOPE_SIZE].copy_from_slice(&env);
+                            }
+                            let _ = write_stream.write_all(&buf);
+                        })
+                        .spawn();
+
+                    loop {
+                        let mut env_buf = [0u8; ENVELOPE_SIZE];
+                        if stream.read_exact(&mut env_buf).is_err() { break; }
+                        let msg_len = u32::from_le_bytes([env_buf[8], env_buf[9], env_buf[10], env_buf[11]]) as usize;
+                        let env_seq = u32::from_le_bytes([env_buf[12], env_buf[13], env_buf[14], env_buf[15]]);
+                        if msg_len > 0 {
+                            let mut skip = vec![0u8; msg_len];
+                            if stream.read_exact(&mut skip).is_err() { break; }
+                        }
+                        flusher.push(env_seq, msg_len);
+                    }
+                });
+            }
+        }
+    });
+    addr
+}
+
+// ── BatchAck Server ─────────────────────────────────────────────
+
+fn spawn_batch_server(stop: Arc<AtomicBool>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !stop.load(Relaxed) {
+            if let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    stream.set_nodelay(true).unwrap();
+                    let mut hdr = [0u8; ENVELOPE_SIZE];
+                    if stream.read_exact(&mut hdr).is_ok() {
+                        let _ = stream.write_all(&make_envelope(ACTION_CONNECTED, 0, 16, 0));
+                        let _ = stream.write_all(&[0u8; 16]);
+                        let mut count = 0;
+                        loop {
+                            let mut env = [0u8; ENVELOPE_SIZE];
+                            if stream.read_exact(&mut env).is_err() { break; }
+                            count += 1;
+                            if count >= BATCH_ACK_SIZE {
+                                let last_seq = u32::from_le_bytes([env[12], env[13], env[14], env[15]]);
+                                let mut ack = [0u8; BATCH_ACK_FRAME];
+                                ack[..ENVELOPE_SIZE].copy_from_slice(&make_envelope(ACTION_REPOK, 0, 8, last_seq));
+                                if stream.write_all(&ack).is_err() { break; }
+                                count = 0;
+                            }
+                        }
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    addr
+}
+
+// ── Main Bench Logic ────────────────────────────────────────────
+
+struct ThreadResult { elapsed: Duration, msgs: u64 }
+
+/// Todos los mensajes se lanzan como tokio::spawn independientes.
+/// Cada task envía su publish y awaits su RepOk sin bloquear a los demás.
+/// Un reader task demultiplexa los RepOks por env_seq via oneshot channels.
+/// El Flusher recibe todos los msgs casi simultáneamente → acumula → flush en batch.
+fn run_bench_tokio(addr: &str) -> ThreadResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Handshake
+        writer.write_all(&make_envelope(ACTION_CONNECT, 0, 16, 0)).await.unwrap();
+        writer.write_all(&[0u8; 16]).await.unwrap();
+        let mut hdr = [0u8; ENVELOPE_SIZE + 16];
+        reader.read_exact(&mut hdr).await.unwrap();
+
+        // Writer task: cada task envía su frame por channel, sin contención
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MSGS_PER_CONN as usize);
+        tokio::spawn(async move {
+            while let Some(data) = write_rx.recv().await {
+                writer.write_all(&data).await.unwrap();
+            }
+        });
+
+        let pending: Arc<tokio::sync::Mutex<HashMap<u32, oneshot::Sender<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Reader task: lee RepOks y despacha al task correcto via oneshot
+        let pending_r = pending.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut frame = [0u8; REPOK_FRAME];
+                if reader.read_exact(&mut frame).await.is_err() { break; }
+                let seq = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
+                if let Some(tx) = pending_r.lock().await.remove(&seq) { let _ = tx.send(()); }
+            }
+        });
+
         let start = Instant::now();
+        let seq_counter = Arc::new(AtomicU32::new(1));
+        let mut join_set = tokio::task::JoinSet::new();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            run_client(&addr, frame, ITERATIONS),
-        ).await;
+        for _ in 0..MSGS_PER_CONN {
+            let write_tx = write_tx.clone();
+            let pending = pending.clone();
+            let seq = seq_counter.fetch_add(1, Relaxed);
 
-        let elapsed = start.elapsed();
-        let cpu_after = cpu_time_ns();
-        let rss_after = rss_kb();
-
-        if result.is_err() {
-            println!("  {label:40} | TIMEOUT (10s) — level hung");
-            return;
+            join_set.spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                pending.lock().await.insert(seq, tx);
+                write_tx.send(build_publish_accumulate(seq)).await.unwrap();
+                let _ = rx.await;
+            });
         }
 
-        let throughput = total_msgs as f64 / elapsed.as_secs_f64();
-        let data_mb = (frame.len() as f64 * ITERATIONS as f64) / 1_000_000.0;
-        let rate = data_mb / elapsed.as_secs_f64();
-        let rss_delta = rss_after.saturating_sub(rss_before);
-        let cpu_ns = cpu_after.saturating_sub(cpu_before);
-        let wall_ns = elapsed.as_nanos() as u64;
-        let cpu_pct = if wall_ns > 0 { (cpu_ns as f64 / wall_ns as f64) * 100.0 } else { 0.0 };
+        while join_set.join_next().await.is_some() {}
 
-        println!(
-            "  {label:40} | {elapsed:>9.2?} | {throughput:>10.0} msg/s | {rate:>6.1} MB/s | {rss_after:>6} KB | +{rss_delta:<4} KB | cpu {cpu_pct:>5.1}%",
-        );
-    });
+        ThreadResult { elapsed: start.elapsed(), msgs: MSGS_PER_CONN as u64 }
+    })
 }
 
-struct BatchPrecomputed {
-    frame: Vec<u8>,
-    store_entries: &'static [EntryRef<'static>],
-    batch_size: u16,
-}
+/// Conecta al servidor real, lanza MSGS_PER_CONN tasks concurrentes.
+/// Cada task envía un frame (Publish o PublishAccumulate) y awaita su RepOk.
+fn run_bench_real_tokio(rt: &Runtime, addr: &str, action: u16, stream_id: u32) -> ThreadResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
 
-fn precompute_batch(batch_size: u16) -> BatchPrecomputed {
-    let payload = vec![0u8; PAYLOAD_LEN];
-    let frame = encode_publish_batch(1, batch_size, SUBJECT, &payload);
-    let body: &'static [u8] = leak_body(&frame);
-    let store_entries: &'static [EntryRef<'static>] =
-        Box::leak(precompute_store_entries(body).into_boxed_slice());
-    BatchPrecomputed { frame, store_entries, batch_size }
-}
+    rt.block_on(async move {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (mut reader, mut writer) = stream.into_split();
 
-fn run_suite(rt: &tokio::runtime::Runtime, suite_label: &str, b: &BatchPrecomputed) {
-    println!("\n[ {suite_label} — batch={} ]", b.batch_size);
-    println!("  {:40} | {:>9} | {:>10} | {:>6} | {:>9} | {:>8} | {:>7}", "Level", "Time", "Throughput", "Data", "RSS", "Δ RSS", "CPU");
-    println!("  {}", "-".repeat(105));
+        // Handshake
+        writer.write_all(&make_envelope(ACTION_CONNECT, 0, 16, 0)).await.unwrap();
+        writer.write_all(&[0u8; 16]).await.unwrap();
+        let mut hdr = [0u8; ENVELOPE_SIZE + 16];
+        reader.read_exact(&mut hdr).await.unwrap();
 
-    let se = b.store_entries;
+        // Writer task: recibe frames por channel, escribe sin contención
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(MSGS_PER_CONN as usize);
+        tokio::spawn(async move {
+            while let Some(data) = write_rx.recv().await {
+                writer.write_all(&data).await.unwrap();
+            }
+        });
 
-    run_level(rt, "L0  TCP baseline", &b.frame, b.batch_size, server_l0);
-    run_level(rt, "L1  + Store", &b.frame, b.batch_size, move |l| server_l1(l, se));
-    run_level(rt, "L2x crossbeam (no store)", &b.frame, b.batch_size, server_l2_crossbeam);
-    run_level(rt, "L2s spin (no store)", &b.frame, b.batch_size, server_l2_spin);
-    run_level(rt, "L2g Gate only (no store)", &b.frame, b.batch_size, server_l2_gate);
-    run_level(rt, "L3x crossbeam + Store", &b.frame, b.batch_size, move |l| server_l3_crossbeam(l, se));
-    run_level(rt, "L3s spin + Store", &b.frame, b.batch_size, move |l| server_l3_spin(l, se));
-    run_level(rt, "L3g Gate + Store", &b.frame, b.batch_size, move |l| server_l3_gate(l, se));
-    run_level(rt, "L2gx crossbeam + Gate (no store)", &b.frame, b.batch_size, server_l2_crossbeam_gate);
-    run_level(rt, "L3gx crossbeam + Gate + Store ★", &b.frame, b.batch_size, move |l| server_l3_crossbeam_gate(l, se));
+        // Pending map compartido entre tasks y reader
+        let pending: Arc<tokio::sync::Mutex<HashMap<u32, oneshot::Sender<()>>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+        // Reader task: lee RepOks y despacha por env_seq
+        let pending_r = pending.clone();
+        tokio::spawn(async move {
+            loop {
+                let mut frame = [0u8; REPOK_FRAME];
+                if reader.read_exact(&mut frame).await.is_err() { break; }
+                let seq = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
+                if let Some(tx) = pending_r.lock().await.remove(&seq) { let _ = tx.send(()); }
+            }
+        });
+
+        let start = Instant::now();
+        let seq_counter = Arc::new(AtomicU32::new(1));
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for _ in 0..MSGS_PER_CONN {
+            let write_tx = write_tx.clone();
+            let pending = pending.clone();
+            let seq = seq_counter.fetch_add(1, Relaxed);
+            join_set.spawn(async move {
+                let (tx, rx) = oneshot::channel();
+                pending.lock().await.insert(seq, tx);
+                write_tx.send(build_publish_real(action, stream_id, seq)).await.unwrap();
+                let _ = rx.await;
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
+        ThreadResult { elapsed: start.elapsed(), msgs: MSGS_PER_CONN as u64 }
+    })
 }
 
 fn main() {
-    let batches = [1u16, 256, 1000];
-    let precomputed: Vec<_> = batches.iter().map(|&b| precompute_batch(b)).collect();
+    // ── Real arbitro server ─────────────────────────────────────────
+    let rt = Runtime::new().unwrap();
+    let real_port = pick_port();
+    let real_addr = format!("127.0.0.1:{real_port}");
+    {
+        let listen = real_addr.clone();
+        rt.spawn(async move {
+            let cfg = ServerConfig::default().listen_addr(listen).max_connections(200);
+            let _ = ArbitroServer::new(cfg).run().await;
+        });
+    }
+    std::thread::sleep(Duration::from_millis(150));
 
-    println!("\nPipeline Profiling: {PAYLOAD_LEN}B payload, {ITERATIONS} iterations");
-    println!("{}", "=".repeat(115));
+    // Crear stream "bench" con filtro ">"
+    let stream_id = fnv1a_32(b"bench");
+    rt.block_on(async {
+        let client = arbitro_client::Client::connect_with_timeout(
+            &real_addr, Duration::from_secs(5),
+        ).await.unwrap();
+        client.create_stream(&StreamConfig::new(b"bench", b">").build()).await.unwrap();
+    });
 
-    for b in &precomputed {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap();
-        run_suite(&rt, "current_thread — 1 core", b);
+    let batch_stop = Arc::new(AtomicBool::new(false));
+
+    // 1. BatchAck Simulated
+    let batch_addr = spawn_batch_server(batch_stop.clone());
+    std::thread::sleep(Duration::from_millis(100));
+    println!("\n[ BatchAck (Simulated) — 1 reply per 512 msgs ]");
+    print_header();
+    for &n in CONCURRENCY {
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+        let results = run_bench(n, &batch_addr, true);
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        print_row(&format!("{n} conn"), &results, cpu_before, cpu_after, rss_before, rss_after);
     }
 
-    println!("\n{}", "=".repeat(115));
+    // 2. Flusher Fire & Forget
+    let flusher_addr = start_flusher_server();
+    std::thread::sleep(Duration::from_millis(100));
+    println!("\n[ Flusher — Fire & Forget (send all → read all RepOks) ]");
+    print_header();
+    for &n in CONCURRENCY {
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+        let results = run_bench(n, &flusher_addr, false);
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        print_row(&format!("{n} conn"), &results, cpu_before, cpu_after, rss_before, rss_after);
+    }
+
+    // 3. Flusher tokio::spawn — cada msg awaita su RepOk sin bloquear a los demás
+    let flusher_addr2 = start_flusher_server();
+    std::thread::sleep(Duration::from_millis(100));
+    println!("\n[ Flusher — tokio::spawn por msg (todos en vuelo simultáneamente) ]");
+    print_header();
+    {
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+        let result = run_bench_tokio(&flusher_addr2);
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        print_row(&format!("{MSGS_PER_CONN} msgs"), &[result], cpu_before, cpu_after, rss_before, rss_after);
+    }
+
+    // 4. Publish single — real server, concurrent tokio::spawn
+    println!("\n[ Publish — real server, concurrent tokio::spawn ({MSGS_PER_CONN} msgs) ]");
+    print_header();
+    {
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+        let result = run_bench_real_tokio(&rt, &real_addr, ACTION_PUBLISH, stream_id);
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        print_row(&format!("{MSGS_PER_CONN} msgs"), &[result], cpu_before, cpu_after, rss_before, rss_after);
+    }
+
+    // 5. PublishAccumulate — real server, concurrent tokio::spawn
+    println!("\n[ PublishAccumulate — real server, concurrent tokio::spawn ({MSGS_PER_CONN} msgs) ]");
+    print_header();
+    {
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+        let result = run_bench_real_tokio(&rt, &real_addr, ACTION_PUBLISH_ACCUMULATE, stream_id);
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        print_row(&format!("{MSGS_PER_CONN} msgs"), &[result], cpu_before, cpu_after, rss_before, rss_after);
+    }
+
+    batch_stop.store(true, Relaxed);
+}
+
+fn run_bench(n: usize, addr: &str, is_batch: bool) -> Vec<ThreadResult> {
+    let barrier = Arc::new(Barrier::new(n + 1));
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let addr = addr.to_string();
+        let bar = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_nodelay(true).unwrap();
+            let _ = tcp.write_all(&make_envelope(ACTION_CONNECT, 0, 16, 0));
+            let _ = tcp.write_all(&[0u8; 16]);
+            let mut hdr = [0u8; ENVELOPE_SIZE];
+            tcp_read_exact(&mut tcp, &mut hdr);
+            tcp_read_exact(&mut tcp, &mut [0u8; 16]);
+            
+            bar.wait();
+            let start = Instant::now();
+            let mut seq = 1;
+            if is_batch {
+                let batches = MSGS_PER_CONN / BATCH_ACK_SIZE;
+                for _ in 0..batches {
+                    for _ in 0..BATCH_ACK_SIZE {
+                        let env = make_envelope(ACTION_PUBLISH, 0, 0, seq);
+                        tcp.write_all(&env).expect("write failed");
+                        seq += 1;
+                    }
+                    let mut ack = [0u8; BATCH_ACK_FRAME];
+                    tcp_read_exact(&mut tcp, &mut ack);
+                }
+            } else {
+                for _ in 0..MSGS_PER_CONN {
+                    let frame = build_publish_accumulate(seq);
+                    tcp.write_all(&frame).expect("write failed");
+                    seq += 1;
+                }
+                let mut received = 0;
+                let mut buf = [0u8; REPOK_FRAME * 512];
+                while received < MSGS_PER_CONN {
+                    if let Ok(n_bytes) = tcp.read(&mut buf) {
+                        if n_bytes == 0 { break; }
+                        received += (n_bytes / REPOK_FRAME) as u32;
+                    } else { break; }
+                }
+            }
+            ThreadResult { elapsed: start.elapsed(), msgs: MSGS_PER_CONN as u64 }
+        }));
+    }
+    barrier.wait();
+    handles.into_iter().map(|h| h.join().unwrap()).collect()
+}
+
+fn print_header() {
+    println!("  {:12} | {:>15} | {:>10} | {:>7} | {:>9} | {:>9}",
+        "Config", "Throughput", "Avg Lat", "CPU%", "RSS(KB)", "ΔRSS(KB)");
+    println!("  {}", "-".repeat(75));
+}
+
+fn print_row(label: &str, results: &[ThreadResult], cpu_before: u64, cpu_after: u64, rss_before: u64, rss_after: u64) {
+    let wall = results.iter().map(|r| r.elapsed).max().unwrap();
+    let total_msgs: u64 = results.iter().map(|r| r.msgs).sum();
+    let throughput = total_msgs as f64 / wall.as_secs_f64();
+    let avg = wall / (total_msgs as u32 / results.len() as u32);
+    let cpu_pct = (cpu_after.saturating_sub(cpu_before) as f64 / wall.as_nanos() as f64) * 100.0;
+    let rss_delta = rss_after as i64 - rss_before as i64;
+    println!("  {:12} | {:>10.0} msg/s | {:>8.2?} | {:>5.1}% | {:>9} | {:>+9}",
+        label, throughput, avg, cpu_pct, rss_after, rss_delta);
 }

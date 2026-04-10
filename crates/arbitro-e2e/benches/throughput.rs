@@ -72,18 +72,18 @@ async fn connect(addr: &str) -> Client {
 
 async fn run_single(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> Duration {
     let start = Instant::now();
-    let mut handles = Vec::with_capacity(clients.len());
+    let mut js = tokio::task::JoinSet::new();
     for (i, client) in clients.iter().enumerate() {
         let c = client.clone();
         let stream = stream_names[i % stream_names.len()].clone();
-        handles.push(tokio::spawn(async move {
+        js.spawn(async move {
             let payload = vec![0u8; 64];
             for _ in 0..msgs {
                 c.publish(&stream, b"bench.msg", &payload).await.expect("publish");
             }
-        }));
+        });
     }
-    for h in handles { h.await.unwrap(); }
+    while js.join_next().await.is_some() {}
     start.elapsed()
 }
 
@@ -91,19 +91,61 @@ async fn run_single(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> 
 
 async fn run_batch(clients: &[Client], stream_names: &[Vec<u8>], batch_size: usize) -> Duration {
     let start = Instant::now();
-    let mut handles = Vec::with_capacity(clients.len());
+    let mut js = tokio::task::JoinSet::new();
     for (i, client) in clients.iter().enumerate() {
         let c = client.clone();
         let stream = stream_names[i % stream_names.len()].clone();
-        handles.push(tokio::spawn(async move {
+        js.spawn(async move {
             let payload = vec![0u8; 64];
             let entries: Vec<(&[u8], &[u8])> = (0..batch_size)
                 .map(|_| (b"bench.msg".as_slice(), payload.as_slice()))
                 .collect();
             c.publish_batch(&stream, &entries).await.expect("publish_batch");
-        }));
+        });
     }
-    for h in handles { h.await.unwrap(); }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Accumulate publish (fire-and-forget, server batches) ────────
+
+async fn run_accumulate(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        js.spawn(async move {
+            let payload = vec![0u8; 64];
+            for _ in 0..msgs {
+                c.publish_accumulate(&stream, b"bench.msg", &payload).await.expect("publish_accumulate");
+            }
+        });
+    }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Accumulate sync (all msgs concurrent, each awaits its RepOk) ─
+
+async fn run_accumulate_sync(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        // Spawn one task per message — all msgs concurrent, no serial bottleneck.
+        // JoinSet aborts all on drop if timeout fires → no orphaned tasks.
+        for _ in 0..msgs {
+            let c2 = c.clone();
+            let s2 = stream.clone();
+            js.spawn(async move {
+                let payload = vec![0u8; 64];
+                c2.publish_accumulate_sync(&s2, b"bench.msg", &payload).await.expect("accumulate_sync");
+            });
+        }
+    }
+    while js.join_next().await.is_some() {}
     start.elapsed()
 }
 
@@ -293,6 +335,16 @@ fn main() {
             });
         });
     }
+
+    // ── Accumulate publish (disabled) ──────────────────────────────
+    // println!("\n[ publish_accumulate — {MSGS_PER_CLIENT} msgs/client/iter, server batches ]");
+    // print_header();
+    // for &n in CONCURRENCY { ... }
+
+    // ── Accumulate sync (disabled) ──────────────────────────────────
+    // println!("\n[ publish_accumulate_sync — {MSGS_PER_CLIENT} msgs/client/iter, server batches ]");
+    // print_header();
+    // for &n in CONCURRENCY { ... }
 
     println!("\n{}", "=".repeat(110));
 }

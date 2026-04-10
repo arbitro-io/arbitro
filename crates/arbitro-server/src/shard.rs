@@ -9,6 +9,7 @@
 //!   Gate locks when nothing to deliver. Ack/nack/publish reopen it.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use arbitro_engine_v2::batch::*;
 use arbitro_engine_v2::types::*;
@@ -37,6 +38,43 @@ struct ActiveBinding {
     stream_id: StreamId,
 }
 
+// ── Flusher for PublishAccumulate ────────────────────────────────────────────
+
+/// Flusher configuration — controls when accumulated entries are flushed.
+struct FlusherConfig {
+    /// Flush immediately when accumulated entry count reaches this.
+    max_size: usize,
+    /// Flush immediately when accumulated bytes (subject + payload) reach this.
+    max_bytes: usize,
+    /// Milliseconds of silence after last entry before flushing.
+    /// Timer resets on every new entry. Stops when no data pending.
+    interval_ms: u64,
+}
+
+impl Default for FlusherConfig {
+    fn default() -> Self {
+        Self {
+            max_size: 1024,
+            max_bytes: 4 * 1024 * 1024, // 4 MB
+            interval_ms: 5,
+        }
+    }
+}
+
+/// Tracks who to reply to after an accumulated flush.
+struct AccumCaller {
+    conn_id: u64,
+    env_seq: u32,
+    entry_count: u32,
+}
+
+/// Per-stream accumulation buffer.
+struct StreamAccum {
+    store_entries: Vec<PublishEntryOwned>,
+    callers: Vec<AccumCaller>,
+    bytes: usize,
+}
+
 /// A shard worker that exclusively owns an `ArbitroEngine` and per-stream stores.
 pub struct ShardWorker {
     engine: ArbitroEngine,
@@ -55,6 +93,13 @@ pub struct ShardWorker {
     // Scratch buffers — allocated once, reused
     scratch_ack: Vec<AckEntry>,
     scratch_nack: Vec<NackEntry>,
+    // Flusher for PublishAccumulate — batches individual publishes
+    flusher_config: FlusherConfig,
+    accum_streams: HashMap<StreamId, StreamAccum>,
+    /// Deadline = last entry arrival + interval_ms. None = timer stopped (no data).
+    accum_deadline: Option<Instant>,
+    accum_total: usize,
+    accum_bytes: usize,
 }
 
 impl ShardWorker {
@@ -78,6 +123,11 @@ impl ShardWorker {
             last_engine_seq: HashMap::new(),
             scratch_ack: Vec::with_capacity(64),
             scratch_nack: Vec::with_capacity(64),
+            flusher_config: FlusherConfig::default(),
+            accum_streams: HashMap::new(),
+            accum_deadline: None,
+            accum_total: 0,
+            accum_bytes: 0,
         }
     }
 
@@ -104,18 +154,39 @@ impl ShardWorker {
             }
             if got_shutdown { break; }
 
-            // 2. If gate is open → run delivery
+            // 2. Flush accumulator: max_size, max_bytes, or interval expired
+            if self.accum_total > 0 {
+                let force = self.accum_total >= self.flusher_config.max_size
+                    || self.accum_bytes >= self.flusher_config.max_bytes;
+                let expired = self.accum_deadline
+                    .map_or(false, |d| Instant::now() >= d);
+                if force || expired {
+                    self.flush_accumulator();
+                }
+            }
+
+            // 3. If gate is open → run delivery
             if self.gate.is_open() {
                 self.handle_drain_deliver();
             }
 
-            // 3. Spin-wait then park if nothing to do (both mpsc empty AND gate locked)
-            //    acquire: spin 512× (~1µs) then park once. Returns on any unpark
-            //    (gate.release or ShardHandle.unpark). Avoids park syscall under load.
+            // 4. Spin-wait then park if nothing to do (both mpsc empty AND gate locked)
+            //    When accumulator has pending entries, park with timeout to ensure
+            //    flush deadline is met. Otherwise use gate.acquire (spin 512× + park).
             if self.rx.is_empty() && !self.gate.is_open() {
-                self.gate.acquire();
+                if let Some(deadline) = self.accum_deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::park_timeout(remaining);
+                    }
+                } else {
+                    self.gate.acquire();
+                }
             }
         }
+
+        // ── Flush remaining accumulated entries before shutdown ────────
+        self.flush_accumulator();
 
         // ── Store shutdown ─────────────────────────────────────────────
         for (id, store) in &mut self.stores {
@@ -129,6 +200,7 @@ impl ShardWorker {
     fn dispatch_command(&mut self, cmd: ShardCommand) {
         match cmd {
             ShardCommand::Publish(cmd) => self.handle_publish(cmd),
+            ShardCommand::PublishAccumulate(cmd) => self.handle_publish_accumulate(cmd),
             ShardCommand::Claim(cmd) => self.handle_claim(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
@@ -225,6 +297,94 @@ impl ShardWorker {
         // 3. Reply + signal — engine processing happens in drain_deliver
         self.send_rep_ok(cmd.conn_id, cmd.env_seq, first_seq);
         self.gate.release();
+    }
+
+    fn handle_publish_accumulate(&mut self, cmd: PublishCmd) {
+        if !self.stores.contains_key(&cmd.stream_id) {
+            self.send_error(cmd.conn_id, cmd.env_seq, ErrorCode::StreamNotFound);
+            return;
+        }
+
+        let entry_count = cmd.entries.len() as u32;
+        let entry_bytes: usize = cmd.entries.iter()
+            .map(|e| e.subject.len() + e.payload.len())
+            .sum();
+
+        let accum = self.accum_streams.entry(cmd.stream_id).or_insert_with(|| StreamAccum {
+            store_entries: Vec::new(),
+            callers: Vec::new(),
+            bytes: 0,
+        });
+
+        accum.store_entries.extend(cmd.entries);
+        accum.callers.push(AccumCaller {
+            conn_id: cmd.conn_id,
+            env_seq: cmd.env_seq,
+            entry_count,
+        });
+        accum.bytes += entry_bytes;
+
+        self.accum_total += entry_count as usize;
+        self.accum_bytes += entry_bytes;
+
+        // Reset timer on every new entry — flush only after interval_ms of silence
+        let interval = Duration::from_millis(self.flusher_config.interval_ms);
+        self.accum_deadline = Some(Instant::now() + interval);
+    }
+
+    fn flush_accumulator(&mut self) {
+        if self.accum_total == 0 { return; }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let stream_ids: Vec<StreamId> = self.accum_streams.keys().copied().collect();
+
+        for stream_id in stream_ids {
+            let accum = self.accum_streams.get_mut(&stream_id).unwrap();
+            if accum.store_entries.is_empty() { continue; }
+
+            let store_entries = std::mem::take(&mut accum.store_entries);
+            let callers = std::mem::take(&mut accum.callers);
+            accum.bytes = 0;
+
+            let store = match self.stores.get_mut(&stream_id) {
+                Some(s) => s,
+                None => {
+                    for caller in &callers {
+                        self.send_error(caller.conn_id, caller.env_seq, ErrorCode::StreamNotFound);
+                    }
+                    continue;
+                }
+            };
+
+            let refs: Vec<EntryRef<'_>> = store_entries.iter()
+                .map(|e| EntryRef { subject: &e.subject, payload: &e.payload })
+                .collect();
+
+            match store.append_batch(&refs, now_ms) {
+                Ok(first_seq) => {
+                    let mut seq_offset = 0u64;
+                    for caller in &callers {
+                        self.send_rep_ok(caller.conn_id, caller.env_seq, first_seq + seq_offset);
+                        seq_offset += caller.entry_count as u64;
+                    }
+                    self.gate.release();
+                }
+                Err(_) => {
+                    for caller in &callers {
+                        self.send_error(caller.conn_id, caller.env_seq, ErrorCode::StreamFull);
+                    }
+                }
+            }
+        }
+
+        // Stop timer — no data pending
+        self.accum_deadline = None;
+        self.accum_total = 0;
+        self.accum_bytes = 0;
     }
 
     fn handle_claim(&mut self, cmd: ClaimCmd) {
