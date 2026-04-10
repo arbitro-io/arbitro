@@ -1,6 +1,6 @@
-//! Benchmark: in-memory publish (ingestion) throughput.
+//! Benchmark: publish ingestion + replay (drain) throughput.
 //!
-//! Measures publish throughput scaling across cores.
+//! Measures publish and replay throughput scaling across cores.
 //! Each connection publishes to its own stream → different shards → real parallelism.
 //!
 //! No Criterion — direct measurement with timeout protection.
@@ -12,17 +12,25 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 use arbitro_client::Client;
-use arbitro_proto::config::StreamConfig;
+use arbitro_proto::config::{ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
 // ── Settings ────────────────────────────────────────────────────
 
-const ITERATIONS: u32 = 50;
-const MSGS_PER_CLIENT: u32 = 1_000;
-const BATCH_SIZE: usize = 1_000;
-const CONCURRENCY: &[usize] = &[1, 2, 4, 8, 16, 32];
-const MAX_STREAMS: usize = 32;
+/// Switch between Memory and Tolerant (disk mmap) without touching anything else.
+const JOURNAL_KIND: JournalKind = JournalKind::Memory;
+/// Only used when JOURNAL_KIND == Tolerant.
+const TOLERANT_DATA_DIR: &str = "/tmp/arbitro_bench_tolerant";
+
+const ITERATIONS: u32        = 50;
+const MSGS_PER_CLIENT: u32   = 1_000;
+const BATCH_SIZE: usize      = 1_000;
+/// Messages pre-published per stream for the replay scenario.
+const REPLAY_MSGS: u32       = 10_000;
+const CONCURRENCY: &[usize]  = &[1, 2, 4, 8, 16, 32];
+const MAX_STREAMS: usize     = 32;
 const LEVEL_TIMEOUT: Duration = Duration::from_secs(15);
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Metrics ─────────────────────────────────────────────────────
 
@@ -51,10 +59,14 @@ async fn start_server() -> String {
     let port = portpicker();
     let addr = format!("127.0.0.1:{port}");
 
-    let config = Config::default()
+    let mut config = Config::default()
         .listen_addr(addr.clone())
-        .max_connections(200)
+        .max_connections(500)
         .write_buffer_cap(8192);
+
+    if matches!(JOURNAL_KIND, JournalKind::Tolerant) {
+        config = config.data_dir(TOLERANT_DATA_DIR);
+    }
 
     let server = ArbitroServer::new(config);
     tokio::spawn(async move { let _ = server.run().await; });
@@ -87,7 +99,7 @@ async fn run_single(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> 
     start.elapsed()
 }
 
-// ── Batch publish (1K msgs per RTT) ────────────────────────────
+// ── Batch publish (BATCH_SIZE msgs per RTT) ────────────────────
 
 async fn run_batch(clients: &[Client], stream_names: &[Vec<u8>], batch_size: usize) -> Duration {
     let start = Instant::now();
@@ -107,49 +119,72 @@ async fn run_batch(clients: &[Client], stream_names: &[Vec<u8>], batch_size: usi
     start.elapsed()
 }
 
-// ── Accumulate publish (fire-and-forget, server batches) ────────
+// ── Replay drain (subscribe from seq=1, drain all pre-published msgs) ──
 
-async fn run_accumulate(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> Duration {
-    let start = Instant::now();
+/// Pre-populate each stream with REPLAY_MSGS messages.
+async fn prefill_streams(client: &Client, stream_names: &[Vec<u8>], n: usize, msgs: u32) {
+    let payload = vec![0u8; 64];
     let mut js = tokio::task::JoinSet::new();
-    for (i, client) in clients.iter().enumerate() {
+    for i in 0..n {
         let c = client.clone();
         let stream = stream_names[i % stream_names.len()].clone();
+        let payload = payload.clone();
+        let batches = (msgs as usize + BATCH_SIZE - 1) / BATCH_SIZE;
         js.spawn(async move {
-            let payload = vec![0u8; 64];
-            for _ in 0..msgs {
-                c.publish_accumulate(&stream, b"bench.msg", &payload).await.expect("publish_accumulate");
+            for _ in 0..batches {
+                let size = BATCH_SIZE.min(msgs as usize);
+                let entries: Vec<(&[u8], &[u8])> = (0..size)
+                    .map(|_| (b"bench.msg".as_slice(), payload.as_slice()))
+                    .collect();
+                c.publish_batch(&stream, &entries).await.expect("prefill publish_batch");
             }
+        });
+    }
+    while js.join_next().await.is_some() {}
+}
+
+/// One replay iteration: for each of the n streams, create a consumer from seq=1
+/// and drain all REPLAY_MSGS messages. Returns elapsed time.
+async fn run_replay(
+    setup_client: &Client,
+    stream_names: &[Vec<u8>],
+    n: usize,
+    msgs_per_stream: u32,
+    iter: u32,
+) -> Duration {
+    // Create n consumers (one per stream), all with DeliverPolicy::All (replay from start).
+    let mut consumers = Vec::with_capacity(n);
+    for i in 0..n {
+        let stream = &stream_names[i % stream_names.len()];
+        let name = format!("replay_{}_{i}", iter);
+        let cfg = ConsumerConfig::new(name.as_bytes(), stream)
+            .deliver_policy(DeliverPolicy::All)
+            .build();
+        let consumer = setup_client.create_consumer(&cfg).await.expect("create consumer");
+        consumers.push(consumer);
+    }
+
+    // Subscribe all consumers and drain concurrently.
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for consumer in consumers {
+        let expected = msgs_per_stream;
+        js.spawn(async move {
+            let mut handle = consumer.subscribe(None).await.expect("subscribe");
+            let mut count = 0u32;
+            while count < expected {
+                if handle.next().await.is_none() { break; }
+                count += 1;
+            }
+            // Clean up consumer after drain
+            let _ = consumer.delete().await;
         });
     }
     while js.join_next().await.is_some() {}
     start.elapsed()
 }
 
-// ── Accumulate sync (all msgs concurrent, each awaits its RepOk) ─
-
-async fn run_accumulate_sync(clients: &[Client], stream_names: &[Vec<u8>], msgs: u32) -> Duration {
-    let start = Instant::now();
-    let mut js = tokio::task::JoinSet::new();
-    for (i, client) in clients.iter().enumerate() {
-        let c = client.clone();
-        let stream = stream_names[i % stream_names.len()].clone();
-        // Spawn one task per message — all msgs concurrent, no serial bottleneck.
-        // JoinSet aborts all on drop if timeout fires → no orphaned tasks.
-        for _ in 0..msgs {
-            let c2 = c.clone();
-            let s2 = stream.clone();
-            js.spawn(async move {
-                let payload = vec![0u8; 64];
-                c2.publish_accumulate_sync(&s2, b"bench.msg", &payload).await.expect("accumulate_sync");
-            });
-        }
-    }
-    while js.join_next().await.is_some() {}
-    start.elapsed()
-}
-
-// ── Runner ──────────────────────────────────────────────────────
+// ── Bench result ────────────────────────────────────────────────
 
 struct BenchResult {
     label: String,
@@ -159,37 +194,6 @@ struct BenchResult {
     rss: u64,
     rss_delta: u64,
     cpu_pct: f64,
-}
-
-fn run_level<F, Fut>(
-    rt: &Runtime,
-    n: usize,
-    label: String,
-    stream_names: &[Vec<u8>],
-    addr: &str,
-    make_run: F,
-) -> Option<BenchResult>
-where
-    F: Fn(Vec<Client>, Vec<Vec<u8>>) -> Fut,
-    Fut: std::future::Future<Output = Option<(Duration, u64)>>,
-{
-    let clients: Vec<Client> = rt.block_on(async {
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n { v.push(connect(addr).await); }
-        v
-    });
-
-    let streams: Vec<Vec<u8>> = stream_names.to_vec();
-
-    rt.block_on(async {
-        let result = make_run(clients, streams).await;
-        result.map(|(total_time, total_msgs_all)| {
-            let avg = total_time / ITERATIONS;
-            let throughput = total_msgs_all as f64 / total_time.as_secs_f64();
-            let per_conn = throughput / n as f64;
-            BenchResult { label, avg, throughput, per_conn, rss: 0, rss_delta: 0, cpu_pct: 0.0 }
-        })
-    })
 }
 
 fn print_header() {
@@ -204,13 +208,44 @@ fn print_result(r: &BenchResult) {
         r.rss / 1024, r.rss_delta as i64 / 1024, r.cpu_pct);
 }
 
+// ── Cleanup ─────────────────────────────────────────────────────
+
+fn cleanup_tolerant() {
+    if !matches!(JOURNAL_KIND, JournalKind::Tolerant) { return; }
+    let data_path = std::path::Path::new(TOLERANT_DATA_DIR);
+    if data_path.exists() {
+        let total_bytes = walkdir(data_path);
+        println!("Tolerant store data written: {:.2} MB — cleaning up...", total_bytes as f64 / 1_048_576.0);
+        let _ = std::fs::remove_dir_all(data_path);
+        println!("Cleaned up: {}", if data_path.exists() { "FAILED" } else { "OK" });
+    } else {
+        println!("WARNING: data_dir was never created — Tolerant store did not write to disk!");
+    }
+}
+
+fn walkdir(p: &std::path::Path) -> u64 {
+    std::fs::read_dir(p).ok().map(|rd| {
+        rd.filter_map(|e| e.ok()).map(|e| {
+            let m = e.metadata().ok();
+            if e.path().is_dir() { walkdir(&e.path()) }
+            else { m.map(|m| m.len()).unwrap_or(0) }
+        }).sum()
+    }).unwrap_or(0)
+}
+
 // ── Main ────────────────────────────────────────────────────────
 
 fn main() {
+    let journal_label = match JOURNAL_KIND {
+        JournalKind::Memory   => "memory",
+        JournalKind::Disk     => "disk",
+        JournalKind::Tolerant => "tolerant",
+    };
+
     let rt = Runtime::new().unwrap();
     let addr = rt.block_on(start_server());
 
-    // Create streams (enough for max concurrency)
+    // Create streams (enough for max concurrency).
     let stream_names: Vec<Vec<u8>> = (0..MAX_STREAMS)
         .map(|i| format!("ingest_{i}").into_bytes())
         .collect();
@@ -218,12 +253,18 @@ fn main() {
     let setup_client = rt.block_on(connect(&addr));
     rt.block_on(async {
         for name in &stream_names {
-            setup_client.create_stream(&StreamConfig::new(name, b">").build())
-                .await.expect("create stream");
+            setup_client
+                .create_stream(
+                    &StreamConfig::new(name, b">")
+                        .journal_kind(JOURNAL_KIND)
+                        .build(),
+                )
+                .await
+                .expect("create stream");
         }
     });
 
-    println!("\nPublish Throughput: 64B payload, {ITERATIONS} iterations, store=yes");
+    println!("\nPublish + Replay Throughput — 64B payload, {ITERATIONS} iter, journal={journal_label}");
     println!("{}", "=".repeat(110));
 
     // ── Single publish ──────────────────────────────────────────
@@ -240,42 +281,34 @@ fn main() {
         let total_msgs_per_iter = MSGS_PER_CLIENT as u64 * n as u64;
         let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
-        let result = rt.block_on(async {
-            // warmup
-            let _ = tokio::time::timeout(
-                LEVEL_TIMEOUT,
-                run_single(&clients, &stream_names, 100),
-            ).await;
+        rt.block_on(async {
+            let _ = tokio::time::timeout(LEVEL_TIMEOUT, run_single(&clients, &stream_names, 100)).await;
 
             let rss_before = rss_kb();
             let cpu_before = cpu_time_ns();
-
             let mut total_time = Duration::ZERO;
+
             for _ in 0..ITERATIONS {
                 match tokio::time::timeout(LEVEL_TIMEOUT, run_single(&clients, &stream_names, MSGS_PER_CLIENT)).await {
                     Ok(d) => total_time += d,
-                    Err(_) => {
-                        println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})");
-                        return;
-                    }
+                    Err(_) => { println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})"); return; }
                 }
             }
 
             let cpu_after = cpu_time_ns();
             let rss_after = rss_kb();
             let wall_ns = total_time.as_nanos() as u64;
-            let cpu_ns = cpu_after.saturating_sub(cpu_before);
-            let cpu_pct = if wall_ns > 0 { (cpu_ns as f64 / wall_ns as f64) * 100.0 } else { 0.0 };
-
+            let cpu_ns  = cpu_after.saturating_sub(cpu_before);
+            let cpu_pct = if wall_ns > 0 { cpu_ns as f64 / wall_ns as f64 * 100.0 } else { 0.0 };
             let total_msgs_all = total_msgs_per_iter * ITERATIONS as u64;
-            let avg = total_time / ITERATIONS;
-            let throughput = total_msgs_all as f64 / total_time.as_secs_f64();
-            let per_conn = throughput / n as f64;
 
             print_result(&BenchResult {
-                label, avg, throughput, per_conn,
-                rss: rss_after,
-                rss_delta: rss_after.saturating_sub(rss_before),
+                label,
+                avg:        total_time / ITERATIONS,
+                throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
+                per_conn:   total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
+                rss:        rss_after,
+                rss_delta:  rss_after.saturating_sub(rss_before),
                 cpu_pct,
             });
         });
@@ -295,56 +328,84 @@ fn main() {
         let total_msgs_per_iter = BATCH_SIZE as u64 * n as u64;
         let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
-        let result = rt.block_on(async {
-            // warmup
-            let _ = tokio::time::timeout(
-                LEVEL_TIMEOUT,
-                run_batch(&clients, &stream_names, BATCH_SIZE),
-            ).await;
+        rt.block_on(async {
+            let _ = tokio::time::timeout(LEVEL_TIMEOUT, run_batch(&clients, &stream_names, BATCH_SIZE)).await;
 
             let rss_before = rss_kb();
             let cpu_before = cpu_time_ns();
-
             let mut total_time = Duration::ZERO;
+
             for _ in 0..ITERATIONS {
                 match tokio::time::timeout(LEVEL_TIMEOUT, run_batch(&clients, &stream_names, BATCH_SIZE)).await {
                     Ok(d) => total_time += d,
-                    Err(_) => {
-                        println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})");
-                        return;
-                    }
+                    Err(_) => { println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})"); return; }
                 }
             }
 
             let cpu_after = cpu_time_ns();
             let rss_after = rss_kb();
             let wall_ns = total_time.as_nanos() as u64;
-            let cpu_ns = cpu_after.saturating_sub(cpu_before);
-            let cpu_pct = if wall_ns > 0 { (cpu_ns as f64 / wall_ns as f64) * 100.0 } else { 0.0 };
-
+            let cpu_ns  = cpu_after.saturating_sub(cpu_before);
+            let cpu_pct = if wall_ns > 0 { cpu_ns as f64 / wall_ns as f64 * 100.0 } else { 0.0 };
             let total_msgs_all = total_msgs_per_iter * ITERATIONS as u64;
-            let avg = total_time / ITERATIONS;
-            let throughput = total_msgs_all as f64 / total_time.as_secs_f64();
-            let per_conn = throughput / n as f64;
 
             print_result(&BenchResult {
-                label, avg, throughput, per_conn,
-                rss: rss_after,
-                rss_delta: rss_after.saturating_sub(rss_before),
+                label,
+                avg:        total_time / ITERATIONS,
+                throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
+                per_conn:   total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
+                rss:        rss_after,
+                rss_delta:  rss_after.saturating_sub(rss_before),
                 cpu_pct,
             });
         });
     }
 
-    // ── Accumulate publish (disabled) ──────────────────────────────
-    // println!("\n[ publish_accumulate — {MSGS_PER_CLIENT} msgs/client/iter, server batches ]");
-    // print_header();
-    // for &n in CONCURRENCY { ... }
+    // ── Replay (drain pre-published backlog) ────────────────────
+    println!("\n[ replay_drain — {REPLAY_MSGS} msgs pre-loaded/stream, DeliverPolicy::All ]");
+    print_header();
 
-    // ── Accumulate sync (disabled) ──────────────────────────────────
-    // println!("\n[ publish_accumulate_sync — {MSGS_PER_CLIENT} msgs/client/iter, server batches ]");
-    // print_header();
-    // for &n in CONCURRENCY { ... }
+    for &n in CONCURRENCY {
+        let total_msgs_per_iter = REPLAY_MSGS as u64 * n as u64;
+        let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
+
+        rt.block_on(async {
+            // Pre-fill streams with REPLAY_MSGS messages each (done once per n, outside timing).
+            prefill_streams(&setup_client, &stream_names, n, REPLAY_MSGS).await;
+
+            let rss_before = rss_kb();
+            let cpu_before = cpu_time_ns();
+            let mut total_time = Duration::ZERO;
+
+            for iter in 0..ITERATIONS {
+                match tokio::time::timeout(
+                    REPLAY_TIMEOUT,
+                    run_replay(&setup_client, &stream_names, n, REPLAY_MSGS, iter),
+                ).await {
+                    Ok(d) => total_time += d,
+                    Err(_) => { println!("  {label:30} | TIMEOUT ({REPLAY_TIMEOUT:?})"); return; }
+                }
+            }
+
+            let cpu_after = cpu_time_ns();
+            let rss_after = rss_kb();
+            let wall_ns = total_time.as_nanos() as u64;
+            let cpu_ns  = cpu_after.saturating_sub(cpu_before);
+            let cpu_pct = if wall_ns > 0 { cpu_ns as f64 / wall_ns as f64 * 100.0 } else { 0.0 };
+            let total_msgs_all = total_msgs_per_iter * ITERATIONS as u64;
+
+            print_result(&BenchResult {
+                label,
+                avg:        total_time / ITERATIONS,
+                throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
+                per_conn:   total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
+                rss:        rss_after,
+                rss_delta:  rss_after.saturating_sub(rss_before),
+                cpu_pct,
+            });
+        });
+    }
 
     println!("\n{}", "=".repeat(110));
+    cleanup_tolerant();
 }

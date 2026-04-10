@@ -6,8 +6,8 @@
 use std::time::Duration;
 
 use arbitro_client::Client;
-use arbitro_proto::config::{ConsumerConfig, StreamConfig};
 use arbitro_proto::config::AckPolicy;
+use arbitro_proto::config::{ConsumerConfig, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 use tokio::sync::watch;
 
@@ -94,7 +94,7 @@ async fn publish_to_missing_stream_errors() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let result = client.publish(b"ghost", b"ghost_event", b"data").await;
+    let result = client.publish_sync(b"ghost", b"ghost_event", b"data").await;
     assert!(
         result.is_err(),
         "publish to non-existent stream should fail"
@@ -157,11 +157,10 @@ async fn publish_single_delivers_correctly() {
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
-    let seq = client
+    client
         .publish(b"chat", b"chat_hello", b"world")
         .await
         .unwrap();
-    assert!(seq > 0, "sequence should be positive");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), sub.next())
         .await
@@ -212,18 +211,9 @@ async fn publish_sequences_monotonic() {
     let stream = StreamConfig::new(b"counter", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let seq1 = client
-        .publish(b"counter", b"counter_inc", b"1")
-        .await
-        .unwrap();
-    let seq2 = client
-        .publish(b"counter", b"counter_inc", b"2")
-        .await
-        .unwrap();
-    let seq3 = client
-        .publish(b"counter", b"counter_inc", b"3")
-        .await
-        .unwrap();
+    let seq1 = client.publish_sync(b"counter", b"counter_inc", b"1").await.unwrap();
+    let seq2 = client.publish_sync(b"counter", b"counter_inc", b"2").await.unwrap();
+    let seq3 = client.publish_sync(b"counter", b"counter_inc", b"3").await.unwrap();
 
     assert!(seq2 > seq1, "seq2 ({seq2}) > seq1 ({seq1})");
     assert!(seq3 > seq2, "seq3 ({seq3}) > seq2 ({seq2})");
@@ -553,7 +543,10 @@ async fn ack_sync_returns_ok() {
 
     // No redelivery after confirmed ack
     let extra = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
-    assert!(extra.is_err(), "after ack_sync, no redelivery should happen");
+    assert!(
+        extra.is_err(),
+        "after ack_sync, no redelivery should happen"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -581,16 +574,28 @@ async fn max_inflight_caps_delivery() {
 
     // Publish 5 messages
     for i in 0..5u8 {
-        client.publish(b"inf_stream", b"inf_subj", &[i]).await.unwrap();
+        client
+            .publish(b"inf_stream", b"inf_subj", &[i])
+            .await
+            .unwrap();
     }
 
     // Should receive exactly 2 (the inflight cap)
-    let m1 = tokio::time::timeout(Duration::from_secs(2), sub.next()).await.unwrap().unwrap();
-    let m2 = tokio::time::timeout(Duration::from_secs(2), sub.next()).await.unwrap().unwrap();
+    let m1 = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let m2 = tokio::time::timeout(Duration::from_secs(2), sub.next())
+        .await
+        .unwrap()
+        .unwrap();
 
     // Third should NOT arrive — we're at the cap
     let blocked = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
-    assert!(blocked.is_err(), "3rd message should be blocked by max_inflight=2");
+    assert!(
+        blocked.is_err(),
+        "3rd message should be blocked by max_inflight=2"
+    );
 
     // Ack one → frees a slot → third arrives
     m1.ack_sync().await.unwrap();
@@ -661,41 +666,71 @@ async fn max_subject_inflight_multiple_patterns() {
         }
     }
 
-    let premium_count = received.iter()
-        .filter(|m| m.subject.starts_with(b"message.premium.")).count();
-    let freemium_count = received.iter()
-        .filter(|m| m.subject.starts_with(b"message.freemium.")).count();
-    let other_count = received.iter()
-        .filter(|m| m.subject.starts_with(b"other.")).count();
+    let premium_count = received
+        .iter()
+        .filter(|m| m.subject.starts_with(b"message.premium."))
+        .count();
+    let freemium_count = received
+        .iter()
+        .filter(|m| m.subject.starts_with(b"message.freemium."))
+        .count();
+    let other_count = received
+        .iter()
+        .filter(|m| m.subject.starts_with(b"other."))
+        .count();
 
-    assert_eq!(premium_count, 3, "premium should be capped at 3, got {premium_count}");
-    assert_eq!(freemium_count, 1, "freemium should be capped at 1, got {freemium_count}");
-    assert_eq!(other_count, 3, "other has no cap, all 3 should arrive, got {other_count}");
-    assert_eq!(received.len(), 7, "total initial should be 7, got {}", received.len());
+    assert_eq!(
+        premium_count, 3,
+        "premium should be capped at 3, got {premium_count}"
+    );
+    assert_eq!(
+        freemium_count, 1,
+        "freemium should be capped at 1, got {freemium_count}"
+    );
+    assert_eq!(
+        other_count, 3,
+        "other has no cap, all 3 should arrive, got {other_count}"
+    );
+    assert_eq!(
+        received.len(),
+        7,
+        "total initial should be 7, got {}",
+        received.len()
+    );
 
     // ── Ack one premium → 4th premium should arrive ──
-    let first_premium = received.iter()
+    let first_premium = received
+        .iter()
         .find(|m| m.subject.starts_with(b"message.premium."))
         .unwrap();
     first_premium.ack_sync().await.unwrap();
 
     let next = tokio::time::timeout(Duration::from_secs(2), sub.next())
-        .await.expect("4th premium should arrive after ack");
+        .await
+        .expect("4th premium should arrive after ack");
     let msg = next.unwrap();
-    assert!(msg.subject.starts_with(b"message.premium."),
-        "expected premium, got {:?}", String::from_utf8_lossy(&msg.subject));
+    assert!(
+        msg.subject.starts_with(b"message.premium."),
+        "expected premium, got {:?}",
+        String::from_utf8_lossy(&msg.subject)
+    );
 
     // ── Ack one freemium → 2nd freemium should arrive ──
-    let first_freemium = received.iter()
+    let first_freemium = received
+        .iter()
         .find(|m| m.subject.starts_with(b"message.freemium."))
         .unwrap();
     first_freemium.ack_sync().await.unwrap();
 
     let next = tokio::time::timeout(Duration::from_secs(2), sub.next())
-        .await.expect("2nd freemium should arrive after ack");
+        .await
+        .expect("2nd freemium should arrive after ack");
     let msg = next.unwrap();
-    assert!(msg.subject.starts_with(b"message.freemium."),
-        "expected freemium, got {:?}", String::from_utf8_lossy(&msg.subject));
+    assert!(
+        msg.subject.starts_with(b"message.freemium."),
+        "expected freemium, got {:?}",
+        String::from_utf8_lossy(&msg.subject)
+    );
 
     // Cleanup
     for msg in &received {
