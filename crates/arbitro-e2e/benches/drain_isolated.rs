@@ -21,7 +21,7 @@ use arbitro_engine_v2::ArbitroEngine;
 use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::action::Action;
-use arbitro_store::{EntryRef, MemoryStore, SeedHeader, Store};
+use arbitro_store::{EntryRef, MemoryStore, SeedHeader, Store, TolerantStore};
 
 const PAYLOAD_SIZE: usize = 64;
 const CLAIM_BATCH: usize = 256;
@@ -646,6 +646,106 @@ fn layer4_channel(total_msgs: usize) {
     );
 }
 
+// ─── Layer 1T: TolerantStore comparison ─────────────────────────────────────
+
+fn layer1_tolerant(total_msgs: usize) {
+    let tmp = std::env::temp_dir().join("arbitro_bench_tolerant");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let mut store: Box<dyn Store> = Box::new(TolerantStore::new(tmp.clone()));
+    store.init().unwrap();
+
+    let subject = b"bench.drain.subject";
+    let payload = vec![0x42u8; PAYLOAD_SIZE];
+    for _ in 0..total_msgs {
+        store.append(EntryRef { subject, payload: &payload }, 0).unwrap();
+    }
+    let info = store.info();
+    assert_eq!(info.messages, total_msgs as u64, "tolerant: message count mismatch");
+    assert_eq!(info.first_seq, 1, "tolerant: first_seq should be 1");
+    assert_eq!(info.last_seq, total_msgs as u64, "tolerant: last_seq mismatch");
+
+    // Verify seed_index matches for_each data
+    {
+        let seeds = store.seed_index(1, info.last_seq + 1);
+        assert_eq!(seeds.len(), total_msgs, "tolerant: seed_index length mismatch");
+        let expected_hash = fnv1a_32(b"bench.drain.subject");
+        for (i, s) in seeds.iter().enumerate() {
+            assert_eq!(s.seq.get(), (i + 1) as u64, "tolerant: seq mismatch at {}", i);
+            assert_eq!(s.subject_hash.get(), expected_hash, "tolerant: hash mismatch at {}", i);
+        }
+    }
+
+    // A. for_each (validates data integrity)
+    {
+        let mut count = 0usize;
+        let t0 = Instant::now();
+        store.for_each(1, info.last_seq + 1, &mut |entry| {
+            assert_eq!(entry.subject, b"bench.drain.subject", "tolerant: subject corrupted at seq {}", entry.seq);
+            assert_eq!(entry.payload.len(), PAYLOAD_SIZE, "tolerant: payload len wrong at seq {}", entry.seq);
+            count += 1;
+        }).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(count, total_msgs);
+        println!(
+            "    for_each                {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    // B. seed_index all
+    {
+        let t0 = Instant::now();
+        let seeds = store.seed_index(1, info.last_seq + 1);
+        let slice_elapsed = t0.elapsed();
+        assert_eq!(seeds.len(), total_msgs);
+
+        let t_iter = Instant::now();
+        let mut accum = 0u64;
+        for s in seeds {
+            accum = accum.wrapping_add(s.seq.get());
+            std::hint::black_box(s.subject_hash.get());
+        }
+        let iter_elapsed = t_iter.elapsed();
+        std::hint::black_box(accum);
+        let total_elapsed = slice_elapsed + iter_elapsed;
+        println!(
+            "    seed_index all           {} ({} msg/s)  [slice: {}, iter: {}]",
+            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+            fmt_ns(slice_elapsed), fmt_ms(iter_elapsed),
+        );
+    }
+
+    // C. seed_index capped 256
+    {
+        let cap = MAX_FEED_PER_CYCLE;
+        let mut total_fed = 0usize;
+        let t0 = Instant::now();
+        let mut start = 1u64;
+        let last = info.last_seq;
+        while start <= last {
+            let end = (start + cap).min(last + 1);
+            let seeds = store.seed_index(start, end);
+            for s in seeds {
+                std::hint::black_box(s.seq.get());
+                std::hint::black_box(s.subject_hash.get());
+            }
+            total_fed += seeds.len();
+            start = end;
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(total_fed, total_msgs);
+        println!(
+            "    seed_index capped 256    {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -664,6 +764,9 @@ fn main() {
 
         println!("  Layer 1: get_messages");
         layer1_get_messages(msgs);
+
+        println!("  Layer 1T: TolerantStore");
+        layer1_tolerant(msgs);
 
         println!("  Layer 2: + ready queue");
         layer2_ready_queue(msgs);
