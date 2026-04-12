@@ -13,7 +13,7 @@ use arbitro_proto::metadata::{
 };
 use arbitro_proto::wire::manager::CreateConsumerView;
 use arbitro_proto::wire::stream::CreateStreamView;
-use crate::router::Server;
+use crate::shard::router::ShardRouter;
 
 /// A buffered command for async replay.
 enum ReplayCommand {
@@ -41,12 +41,12 @@ enum ReplayCommand {
 /// Commands are parsed and buffered in `apply()` (sync), then dispatched
 /// to shards in `flush()` (async).
 pub struct ReplayApplier {
-    server: Server,
+    server: ShardRouter,
     commands: Vec<ReplayCommand>,
 }
 
 impl ReplayApplier {
-    pub fn new(server: Server) -> Self {
+    pub fn new(server: ShardRouter) -> Self {
         Self { server, commands: Vec::new() }
     }
 
@@ -141,7 +141,12 @@ impl MetadataApplier for ReplayApplier {
             CMD_CREATE_STREAM => {
                 let sv = CreateStreamView::new(view.body());
                 let name = sv.name();
-                let stream_id = StreamId(arbitro_engine_v2::catalog::fnv1a_32(name));
+                // Wire stream_id is the client-side fnv1a_32(name); translate
+                // through NameRegistry to a small sequential engine StreamId
+                // (the engine catalog indexes match_tables by raw u32 — see
+                // common::name_registry for full rationale).
+                let wire_id = arbitro_engine_v2::catalog::fnv1a_32(name);
+                let (stream_id, _created) = self.server.names().get_or_create_stream(wire_id);
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
                     config: StreamConfig {
@@ -154,21 +159,34 @@ impl MetadataApplier for ReplayApplier {
             CMD_DELETE_STREAM => {
                 let sv = arbitro_proto::wire::stream::DeleteStreamView::new(view.body());
                 let name = sv.name();
-                let stream_id = StreamId(arbitro_engine_v2::catalog::fnv1a_32(name));
+                let wire_id = arbitro_engine_v2::catalog::fnv1a_32(name);
+                let stream_id = match self.server.names().stream_seq(wire_id) {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(name = %String::from_utf8_lossy(name),
+                            "replay DeleteStream for unknown stream — skipping");
+                        return;
+                    }
+                };
+                self.server.names().remove_stream(wire_id);
                 self.commands.push(ReplayCommand::DeleteStream { stream_id });
             }
             CMD_CREATE_CONSUMER => {
                 let cv = CreateConsumerView::new(view.body());
-                let stream_id = StreamId(cv.stream_id());
-                let consumer_name = cv.name();
-                let consumer_id = ConsumerId(arbitro_engine_v2::catalog::fnv1a_32(consumer_name));
+                // Translate the client-supplied wire stream id.
+                let wire_stream = cv.stream_id();
+                let (stream_id, _) = self.server.names().get_or_create_stream(wire_stream);
 
+                let consumer_name = cv.name();
+                let (consumer_id, _) = self.server.names().get_or_create_consumer(consumer_name);
+
+                // Same content-addressed queue allocation as live dispatch:
+                // `(seq_stream, group) → small QueueId`. Replay must hit
+                // the same id allocator so the post-restart queue topology
+                // matches the pre-restart one for any group sharing.
                 let group = cv.group();
-                let queue_id = if group.is_empty() {
-                    QueueId(cv.stream_id())
-                } else {
-                    QueueId(arbitro_engine_v2::catalog::fnv1a_32(group))
-                };
+                let queue_id = self.server.names().get_or_create_queue(stream_id, group);
+                self.server.names().set_consumer_queue(consumer_id, queue_id);
 
                 let ack_policy = match cv.ack_policy() {
                     0 => AckPolicy::None,
@@ -196,12 +214,13 @@ impl MetadataApplier for ReplayApplier {
             CMD_DELETE_CONSUMER => {
                 let dv = arbitro_proto::wire::manager::DeleteConsumerView::new(view.body());
                 // DeleteConsumer doesn't carry stream_id in the wire body.
-                // We need the stream_id to route to the right shard.
-                // For now, fan out to all shards — delete is idempotent.
+                // The wire consumer_id is the small sequential id the server
+                // handed out at CreateConsumer time, so we forward it as-is
+                // (no NameRegistry translation needed — the id is already
+                // engine-native). stream_id is unknown at replay time;
+                // delete on the wrong shard is a no-op.
                 // TODO: encode stream_id in delete consumer wire format.
                 let consumer_id = ConsumerId(dv.consumer_id());
-                // Use consumer_id as a rough shard selector (won't always be correct,
-                // but delete on wrong shard is a no-op).
                 self.commands.push(ReplayCommand::DeleteConsumer {
                     stream_id: StreamId(dv.consumer_id()),
                     consumer_id,

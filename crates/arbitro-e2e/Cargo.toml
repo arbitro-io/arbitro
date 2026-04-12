@@ -47,25 +47,7 @@ name    = "endurance"
 harness = false
 
 [[bench]]
-name    = "queue_balance"
+name    = "queue"
 harness = false
 
-[[bench]]
-name    = "tcp_wire"
-harness = false
-
-[[bench]]
-name    = "gate"
-harness = false
-
-[[bench]]
-name    = "gate_cpu"
-harness = false
-
-[[bench]]
-name    = "shard_loop"
-harness = false
-
-[[bench]]
-name = "flush_bench"
-harness = false
+ 

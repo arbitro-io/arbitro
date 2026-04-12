@@ -15,30 +15,29 @@ use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfi
 use arbitro_engine_v2::types::*;
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_proto::wire::delivery::{
-    AckView, BatchAckView, DeliveryEntryHeader, NackView, RepBatchFixed, RepErrorAction,
-    RepOkAction, DELIVERY_ENTRY_HEADER_SIZE, REP_BATCH_FIXED_SIZE,
-};
+use arbitro_proto::wire::delivery::{AckView, BatchAckView, NackView};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
 use arbitro_proto::wire::manager::{CreateConsumerView, DeleteConsumerView};
 use arbitro_proto::wire::publish::BatchIter;
 use arbitro_proto::wire::stream::{CreateStreamView, DeleteStreamView};
-use arbitro_proto::wire::subscribe::{FetchView, SubscribeView, UnsubscribeView};
+use arbitro_proto::wire::subscribe::{SubscribeView, UnsubscribeView};
 use arbitro_proto::wire::system::{ConnectView, ConnectedAction, PingView, PongAction};
 use bytes::{Bytes, BytesMut};
 use zerocopy::IntoBytes;
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::byteorder::little_endian::U64;
 
-use crate::command::PublishEntryOwned;
-use crate::command_log::SharedCommandLog;
-use crate::router::Server;
+use crate::common::reply::{send_error, send_rep_ok, timestamp_now};
+use crate::lifecycle_trace;
+use crate::persistence::command_log::SharedCommandLog;
+use crate::shard::command::PublishEntryOwned;
+use crate::shard::router::ShardRouter;
 use crate::transport::ConnectionRegistry;
 
 /// Dispatch a raw frame to the appropriate shard.
 pub async fn dispatch_frame(
     conn_id: u64,
     frame: Bytes,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     command_log: Option<&SharedCommandLog>,
 ) {
@@ -68,7 +67,6 @@ pub async fn dispatch_frame(
         // ── Subscription ────────────────────────────────────────────
         Action::Subscribe => dispatch_subscribe(conn_id, stream_id, env_seq, body, server, registry).await,
         Action::Unsubscribe => dispatch_unsubscribe(conn_id, stream_id, env_seq, body, server, registry).await,
-        Action::Fetch => dispatch_fetch(conn_id, stream_id, body, server, registry).await,
 
         // ── Stream management ───────────────────────────────────────
         Action::CreateStream => dispatch_create_stream(conn_id, env_seq, body, server, registry, command_log).await,
@@ -95,31 +93,59 @@ pub async fn dispatch_frame(
 
 // ── Hot path dispatchers ───────────────────────────────────────────────────
 
+/// Translate the client-computed wire stream id to the engine seq id, or
+/// reply `StreamNotFound` and return `None`. See `common::name_registry` for
+/// why this lives at the dispatch boundary.
+#[inline]
+fn translate_stream_or_error(
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+    conn_id: u64,
+    env_seq: u32,
+    wire_stream: u32,
+) -> Option<StreamId> {
+    match server.names().stream_seq(wire_stream) {
+        Some(seq) => Some(seq),
+        None => {
+            send_error(registry, conn_id, env_seq, ErrorCode::StreamNotFound);
+            None
+        }
+    }
+}
+
+/// Same as `translate_stream_or_error` but silent — for fire-and-forget
+/// paths (`Ack`, `Nack`) where there is no caller waiting for a reply.
+#[inline]
+fn translate_stream_silent(server: &ShardRouter, wire_stream: u32) -> Option<StreamId> {
+    server.names().stream_seq(wire_stream)
+}
+
 /// Fire & forget — shard validates, stores, and replies directly.
 async fn dispatch_publish(
     conn_id: u64,
     stream_id: u32,
     env_seq: u32,
     frame: &Bytes,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let shard = server.shard_for(StreamId(stream_id));
+    lifecycle_trace::record("05_dispatch_publish_enter", conn_id, 0, "frame_loop");
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let shard = server.shard_for(seq_stream);
     let body = &frame[ENVELOPE_SIZE..];
-    let iter = BatchIter::new(body);
-
-    // Zero-copy: slice_ref returns a Bytes sharing the same Arc-backed buffer.
-    let entries: Vec<PublishEntryOwned> = iter
-        .map(|view| PublishEntryOwned {
-            subject: frame.slice_ref(view.subject()),
-            payload: frame.slice_ref(view.payload()),
-        })
+    let entries: Vec<PublishEntryOwned> = BatchIter::new(body)
+        .map(|view| PublishEntryOwned::from_wire(&view, frame))
         .collect();
+    lifecycle_trace::record("06_wire_parsed", conn_id, entries.len() as u64, "frame_loop");
 
     // Shard handles: validate stream → store.append → RepOk + gate.release
-    if let Err(_) = shard.publish(StreamId(stream_id), conn_id, env_seq, entries).await {
+    if shard.publish(seq_stream, conn_id, env_seq, entries).await.is_err() {
         send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
     }
+    lifecycle_trace::record("18_dispatch_publish_returned", conn_id, 0, "frame_loop");
 }
 
 /// PublishAccumulate — shard accumulates entries, flushes after deadline/threshold.
@@ -129,37 +155,46 @@ async fn dispatch_publish_accumulate(
     stream_id: u32,
     env_seq: u32,
     frame: &Bytes,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let shard = server.shard_for(StreamId(stream_id));
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let shard = server.shard_for(seq_stream);
     let body = &frame[ENVELOPE_SIZE..];
-    let iter = BatchIter::new(body);
-
-    let entries: Vec<PublishEntryOwned> = iter
-        .map(|view| PublishEntryOwned {
-            subject: frame.slice_ref(view.subject()),
-            payload: frame.slice_ref(view.payload()),
-        })
+    let entries: Vec<PublishEntryOwned> = BatchIter::new(body)
+        .map(|view| PublishEntryOwned::from_wire(&view, frame))
         .collect();
 
-    if let Err(_) = shard.publish_accumulate(StreamId(stream_id), conn_id, env_seq, entries).await {
+    if shard.publish_accumulate(seq_stream, conn_id, env_seq, entries).await.is_err() {
         send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
     }
 }
 
-async fn dispatch_ack(stream_id: u32, body: &[u8], server: &Server) {
+async fn dispatch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
+    lifecycle_trace::record("a05_dispatch_ack_enter", 0, 0, "frame_loop");
+    let seq_stream = match translate_stream_silent(server, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = AckView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
     let _ = shard
         .ack(ConsumerId(view.consumer_id()), vec![AckEntry { seq: view.sequence() }], now)
         .await;
+    lifecycle_trace::record("a18_dispatch_ack_returned", 0, 0, "frame_loop");
 }
 
-async fn dispatch_nack(stream_id: u32, body: &[u8], server: &Server) {
+async fn dispatch_nack(stream_id: u32, body: &[u8], server: &ShardRouter) {
+    let seq_stream = match translate_stream_silent(server, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = NackView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
     let _ = shard
         .nack(ConsumerId(view.consumer_id()), vec![NackEntry { seq: view.sequence(), retry_at: None }], now)
@@ -171,11 +206,15 @@ async fn dispatch_ack_sync(
     stream_id: u32,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = AckView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
     match shard
         .ack(ConsumerId(view.consumer_id()), vec![AckEntry { seq: view.sequence() }], now)
@@ -186,9 +225,13 @@ async fn dispatch_ack_sync(
     }
 }
 
-async fn dispatch_batch_ack(stream_id: u32, body: &[u8], server: &Server) {
+async fn dispatch_batch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
+    let seq_stream = match translate_stream_silent(server, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = BatchAckView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
     let entries: Vec<AckEntry> = view.sequences().map(|seq| AckEntry { seq }).collect();
     let _ = shard.ack(ConsumerId(view.consumer_id()), entries, now).await;
@@ -199,11 +242,15 @@ async fn dispatch_batch_ack_sync(
     stream_id: u32,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = BatchAckView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
     let entries: Vec<AckEntry> = view.sequences().map(|seq| AckEntry { seq }).collect();
     match shard.ack(ConsumerId(view.consumer_id()), entries, now).await {
@@ -219,33 +266,41 @@ async fn dispatch_subscribe(
     stream_id: u32,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = SubscribeView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let consumer_id = view.consumer_id();
     let now = timestamp_now();
 
     let subject = view.subject().to_vec();
-    let group = view.group();
-    // group empty → default to stream_id (same as hashing the stream name)
-    let queue_id = if group.is_empty() {
-        QueueId(stream_id)
-    } else {
-        QueueId(arbitro_engine_v2::catalog::fnv1a_32(group))
-    };
+    // The Subscribe wire body carries no group, so we cannot re-derive
+    // the queue here. We MUST recover the exact queue id that
+    // `dispatch_create_consumer` allocated for this consumer, otherwise
+    // `ensure_subscription` would register the match table against a
+    // different queue than the binding reads from — every claim would
+    // pop an empty ring. Fall back to a per-stream default for the
+    // never-explicitly-created path (subscribe-only flow).
+    let queue_id = server
+        .names()
+        .consumer_queue(ConsumerId(consumer_id))
+        .unwrap_or_else(|| server.names().get_or_create_queue(seq_stream, b""));
 
     let reply = shard
         .subscribe(
             StreamConfig {
-                id: StreamId(stream_id),
+                id: seq_stream,
                 name: vec![],
             },
             ConsumerConfig {
                 id: ConsumerId(consumer_id),
                 queue_id,
-                stream_id: StreamId(stream_id),
+                stream_id: seq_stream,
                 durable: true,
                 ack_policy: if view.deliver_mode() == 0 {
                     AckPolicy::None
@@ -256,7 +311,7 @@ async fn dispatch_subscribe(
             },
             SubscriptionConfig {
                 id: SubscriptionId(consumer_id),
-                stream_id: StreamId(stream_id),
+                stream_id: seq_stream,
                 consumer_id: ConsumerId(consumer_id),
                 filters: if subject.is_empty() {
                     vec![]
@@ -280,11 +335,15 @@ async fn dispatch_unsubscribe(
     stream_id: u32,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = UnsubscribeView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
     let now = timestamp_now();
 
     match shard
@@ -300,57 +359,29 @@ async fn dispatch_unsubscribe(
     }
 }
 
-async fn dispatch_fetch(
-    conn_id: u64,
-    stream_id: u32,
-    body: &[u8],
-    server: &Server,
-    registry: &ConnectionRegistry,
-) {
-    let view = FetchView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
-    let consumer_id = view.consumer_id();
-    let now = timestamp_now();
-
-    let result = shard
-        .claim(
-            QueueId(consumer_id),
-            ConnectionId(conn_id),
-            ConsumerId(consumer_id),
-            view.max_msgs() as u16,
-            now,
-        )
-        .await;
-
-    match result {
-        Ok(reply) => {
-            send_rep_batch(registry, conn_id, consumer_id, &reply);
-        }
-        Err(_) => {
-            send_error(registry, conn_id, 0, ErrorCode::InternalError);
-        }
-    }
-}
-
 // ── Stream management dispatchers ──────────────────────────────────────────
 
 async fn dispatch_create_stream(
     conn_id: u64,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     command_log: Option<&SharedCommandLog>,
 ) {
     let view = CreateStreamView::new(body);
     let name = view.name();
-    let stream_id = arbitro_engine_v2::catalog::fnv1a_32(name);
-    let shard = server.shard_for(StreamId(stream_id));
+    // Wire id is what the client computes locally (and ships in subsequent
+    // frame envelopes); seq id is what the engine indexes by. The registry
+    // pairs them up so the rest of dispatch can look the seq up by wire id.
+    let wire_stream = arbitro_engine_v2::catalog::fnv1a_32(name);
+    let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
+    let shard = server.shard_for(seq_stream);
 
     match shard
         .create_stream(
             StreamConfig {
-                id: StreamId(stream_id),
+                id: seq_stream,
                 name: name.to_vec(),
             },
             view.journal_kind(),
@@ -364,7 +395,9 @@ async fn dispatch_create_stream(
                     tracing::error!(error = %e, "failed to record CreateStream to command log");
                 }
             }
-            send_rep_ok(registry, conn_id, env_seq, stream_id as u64);
+            // Reply with the wire id — the client never reads it back, but
+            // sticking to the convention keeps observability tools sane.
+            send_rep_ok(registry, conn_id, env_seq, wire_stream as u64);
         }
         Ok(_) => send_error(registry, conn_id, env_seq, ErrorCode::StreamAlreadyExists),
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
@@ -375,20 +408,31 @@ async fn dispatch_delete_stream(
     conn_id: u64,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     command_log: Option<&SharedCommandLog>,
 ) {
     let view = DeleteStreamView::new(body);
     let name = view.name();
-    let stream_id = arbitro_engine_v2::catalog::fnv1a_32(name);
-    let shard = server.shard_for(StreamId(stream_id));
+    let wire_stream = arbitro_engine_v2::catalog::fnv1a_32(name);
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None => {
+            send_error(registry, conn_id, env_seq, ErrorCode::StreamNotFound);
+            return;
+        }
+    };
+    let shard = server.shard_for(seq_stream);
 
     match shard
-        .delete_stream(StreamId(stream_id), DrainMode::ReleaseAndRequeue, true)
+        .delete_stream(seq_stream, DrainMode::ReleaseAndRequeue, true)
         .await
     {
         Ok(_) => {
+            // Drop the registry mapping AFTER the engine confirms removal,
+            // so an in-flight publish racing with delete still finds the
+            // seq id while the engine is the authoritative source.
+            server.names().remove_stream(wire_stream);
             if let Some(log) = command_log {
                 let cmd = arbitro_proto::metadata::build_delete_stream(body);
                 if let Err(e) = log.record(&cmd) {
@@ -404,7 +448,7 @@ async fn dispatch_delete_stream(
 async fn dispatch_list_streams(
     conn_id: u64,
     env_seq: u32,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
     // Fan out to all shards and merge results (cold path — allocs acceptable)
@@ -422,18 +466,18 @@ async fn dispatch_list_streams(
     let total = ENVELOPE_SIZE + body_len;
     let mut buf = BytesMut::with_capacity(total);
 
-    let envelope = Envelope {
-        action: U16::new(Action::ListStreams.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(body_len as u32),
-        env_seq: U32::new(env_seq),
-    };
+    let envelope = Envelope::new(Action::ListStreams, 0, body_len as u32, env_seq);
     buf.extend_from_slice(envelope.as_bytes());
     buf.extend_from_slice(&(all_streams.len() as u32).to_le_bytes());
-    for (stream_id, name) in &all_streams {
-        buf.extend_from_slice(&stream_id.to_le_bytes());
+    for (seq_id, name) in &all_streams {
+        // Send back the WIRE id (what the client computes locally with
+        // fnv1a_32), not the engine seq id, so client-side caches stay
+        // consistent across list/create/delete.
+        let wire_id = server
+            .names()
+            .stream_wire(StreamId(*seq_id))
+            .unwrap_or(*seq_id);
+        buf.extend_from_slice(&wire_id.to_le_bytes());
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
         buf.extend_from_slice(name);
     }
@@ -444,7 +488,7 @@ async fn dispatch_list_streams(
 async fn dispatch_list_consumers(
     conn_id: u64,
     env_seq: u32,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
     // Fan out to all shards and merge results (cold path — allocs acceptable)
@@ -463,14 +507,7 @@ async fn dispatch_list_consumers(
     let total = ENVELOPE_SIZE + body_len;
     let mut buf = BytesMut::with_capacity(total);
 
-    let envelope = Envelope {
-        action: U16::new(Action::ListConsumers.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(body_len as u32),
-        env_seq: U32::new(env_seq),
-    };
+    let envelope = Envelope::new(Action::ListConsumers, 0, body_len as u32, env_seq);
     buf.extend_from_slice(envelope.as_bytes());
     buf.extend_from_slice(&(all_consumers.len() as u32).to_le_bytes());
     for (consumer_id, stream_id, queue_id, paused) in &all_consumers {
@@ -489,22 +526,35 @@ async fn dispatch_create_consumer(
     conn_id: u64,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     command_log: Option<&SharedCommandLog>,
 ) {
     let view = CreateConsumerView::new(body);
-    let stream_id = view.stream_id();
-    let consumer_name = view.name();
-    let consumer_id = arbitro_engine_v2::catalog::fnv1a_32(consumer_name);
-    let shard = server.shard_for(StreamId(stream_id));
-
-    let group = view.group();
-    let queue_id = if group.is_empty() {
-        QueueId(stream_id)
-    } else {
-        QueueId(arbitro_engine_v2::catalog::fnv1a_32(group))
+    let wire_stream = view.stream_id();
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, wire_stream) {
+        Some(s) => s,
+        None => return,
     };
+    let consumer_name = view.name();
+    // Allocate a small sequential consumer id by name. The integer the
+    // client receives in the reply is what it will echo on subsequent
+    // wire frames (subscribe/ack/delete), so the engine never sees a
+    // huge fnv1a_32 hash on the ConsumerId Vec index path.
+    let (seq_consumer, _created) = server.names().get_or_create_consumer(consumer_name);
+    let shard = server.shard_for(seq_stream);
+
+    // Queue id is content-addressed by `(seq_stream, group)` so two
+    // consumers with the same group on the same stream resolve to the
+    // SAME ready ring (queue-group round-robin semantics, see
+    // `name_registry.rs`). The original code used `fnv1a_32(group)` for
+    // this, but that produces ~4B integers — fine for the catalog's
+    // HashMap-keyed QueueId, fatal if any path ever indexes by it. We
+    // also remember the resolved queue per consumer so the subscribe
+    // path (which carries no group on the wire) can recover it.
+    let group = view.group();
+    let queue_id = server.names().get_or_create_queue(seq_stream, group);
+    server.names().set_consumer_queue(seq_consumer, queue_id);
 
     let ack_policy = match view.ack_policy() {
         0 => AckPolicy::None,
@@ -520,9 +570,9 @@ async fn dispatch_create_consumer(
     match shard
         .create_consumer(
             ConsumerConfig {
-                id: ConsumerId(consumer_id),
+                id: seq_consumer,
                 queue_id,
-                stream_id: StreamId(stream_id),
+                stream_id: seq_stream,
                 durable: true,
                 ack_policy,
                 max_inflight: if view.max_inflight() == 0 { u32::MAX } else { view.max_inflight() as u32 },
@@ -538,7 +588,7 @@ async fn dispatch_create_consumer(
                     tracing::error!(error = %e, "failed to record CreateConsumer to command log");
                 }
             }
-            send_rep_ok(registry, conn_id, env_seq, consumer_id as u64);
+            send_rep_ok(registry, conn_id, env_seq, seq_consumer.0 as u64);
         }
         Ok(_) => send_error(registry, conn_id, env_seq, ErrorCode::ConsumerAlreadyExists),
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
@@ -550,12 +600,16 @@ async fn dispatch_delete_consumer(
     stream_id: u32,
     env_seq: u32,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     command_log: Option<&SharedCommandLog>,
 ) {
+    let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
+        Some(s) => s,
+        None => return,
+    };
     let view = DeleteConsumerView::new(body);
-    let shard = server.shard_for(StreamId(stream_id));
+    let shard = server.shard_for(seq_stream);
 
     match shard
         .delete_consumer(ConsumerId(view.consumer_id()), DrainMode::ReleaseAndRequeue)
@@ -579,7 +633,7 @@ async fn dispatch_delete_consumer(
 async fn dispatch_connect(
     conn_id: u64,
     body: &[u8],
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
     let _view = ConnectView::new(body);
@@ -591,14 +645,7 @@ async fn dispatch_connect(
     }
 
     // Structs on stack, as_bytes() gives &[u8] pointing to them — no copy
-    let envelope = Envelope {
-        action: U16::new(Action::Connected.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(16),
-        env_seq: U32::new(0),
-    };
+    let envelope = Envelope::new(Action::Connected, 0, 16, 0);
     let connected = ConnectedAction {
         conn_id: U64::new(conn_id),
         proto_version: 1,
@@ -610,7 +657,7 @@ async fn dispatch_connect(
 
 async fn dispatch_disconnect(
     conn_id: u64,
-    server: &Server,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
     let now = timestamp_now();
@@ -627,135 +674,10 @@ async fn dispatch_disconnect(
 
 fn dispatch_ping(conn_id: u64, body: &[u8], registry: &ConnectionRegistry) {
     let view = PingView::new(body);
-    let envelope = Envelope {
-        action: U16::new(Action::Pong.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(8),
-        env_seq: U32::new(0),
-    };
+    let envelope = Envelope::new(Action::Pong, 0, 8, 0);
     let pong = PongAction {
         ping_id: U64::new(view.ping_id()),
     };
     registry.send_parts(conn_id, &[envelope.as_bytes(), pong.as_bytes()]);
 }
 
-// ── Reply builders ─────────────────────────────────────────────────────────
-//
-// Pattern: build zerocopy structs on stack → send_parts with as_bytes().
-// ONE alloc+copy in send_parts. No intermediate [u8; N] buffer.
-
-/// Send RepOk. Client uses ref_seq differently per action:
-/// - CreateConsumer → consumer_id
-/// - Publish → first assigned sequence
-/// - Others → echo of env_seq
-#[inline]
-fn send_rep_ok(registry: &ConnectionRegistry, conn_id: u64, env_seq: u32, ref_seq: u64) {
-    let envelope = Envelope {
-        action: U16::new(Action::RepOk.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(16),
-        env_seq: U32::new(env_seq),
-    };
-    let body = RepOkAction {
-        ref_seq: U64::new(ref_seq),
-        _pad: U64::new(0),
-    };
-    registry.send_parts(conn_id, &[envelope.as_bytes(), body.as_bytes()]);
-}
-
-#[inline]
-fn send_error(registry: &ConnectionRegistry, conn_id: u64, env_seq: u32, code: ErrorCode) {
-    let envelope = Envelope {
-        action: U16::new(Action::RepError.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(16),
-        env_seq: U32::new(env_seq),
-    };
-    let body = RepErrorAction {
-        ref_seq: U64::new(env_seq as u64),
-        error_code: U16::new(code.as_u16()),
-        _pad: [0u8; 6],
-    };
-    registry.send_parts(conn_id, &[envelope.as_bytes(), body.as_bytes()]);
-}
-
-/// Deliver notification (push mode). Minimal frame — full payload
-/// delivered by shard thread drain loop via Store.
-#[inline]
-fn send_deliver(
-    registry: &ConnectionRegistry,
-    conn_id: u64,
-    stream_id: u32,
-    seq: u64,
-) {
-    let envelope = Envelope {
-        action: U16::new(Action::Deliver.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(stream_id),
-        msg_len: U32::new(2),
-        env_seq: U32::new(seq as u32),
-    };
-    let subj_len: [u8; 2] = [0, 0];
-    registry.send_parts(conn_id, &[envelope.as_bytes(), &subj_len]);
-}
-
-/// RepBatch for Fetch results. Variable-length — builds Bytes directly.
-fn send_rep_batch(
-    registry: &ConnectionRegistry,
-    conn_id: u64,
-    consumer_id: u32,
-    entries: &[arbitro_engine_v2::batch::ClaimedEntry],
-) {
-    if entries.is_empty() {
-        return;
-    }
-
-    let body_len = REP_BATCH_FIXED_SIZE + entries.len() * DELIVERY_ENTRY_HEADER_SIZE;
-    let total = ENVELOPE_SIZE + body_len;
-    let mut buf = BytesMut::with_capacity(total);
-
-    let envelope = Envelope {
-        action: U16::new(Action::RepBatch.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(body_len as u32),
-        env_seq: U32::new(0),
-    };
-    buf.extend_from_slice(envelope.as_bytes());
-
-    let batch_fixed = RepBatchFixed {
-        consumer_id: U32::new(consumer_id),
-        count: U16::new(entries.len() as u16),
-        _pad: U16::new(0),
-    };
-    buf.extend_from_slice(batch_fixed.as_bytes());
-
-    for entry in entries {
-        let header = DeliveryEntryHeader {
-            seq: U64::new(entry.seq),
-            subj_len: U16::new(0),
-            data_len: U32::new(0),
-        };
-        buf.extend_from_slice(header.as_bytes());
-    }
-
-    registry.send_bytes(conn_id, buf.freeze());
-}
-
-#[inline]
-fn timestamp_now() -> Timestamp {
-    Timestamp::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-    )
-}

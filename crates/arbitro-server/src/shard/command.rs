@@ -7,6 +7,7 @@ use arbitro_engine_v2::batch::{AckEntry, ClaimedEntry, DrainReport, NackEntry};
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
 
+use arbitro_proto::wire::publish::PublishView;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
@@ -17,9 +18,14 @@ pub enum ShardCommand {
     // Hot path
     Publish(PublishCmd),
     PublishAccumulate(PublishCmd),
-    Claim(ClaimCmd),
     Ack(AckCmd),
     Nack(NackCmd),
+
+    /// Test-only direct claim probe — bypasses the gate-driven drainer to let
+    /// integration tests inspect engine state. NOT used on the production wire
+    /// path (clients receive deliveries via `RepBatch` frames driven by the
+    /// drainer in `handle_drain_deliver`).
+    Claim(ClaimCmd),
 
     // Subscription management
     Subscribe(SubscribeCmd),
@@ -72,14 +78,16 @@ pub struct PublishEntryOwned {
     pub payload: Bytes,
 }
 
-/// Claim messages from a queue.
-pub struct ClaimCmd {
-    pub queue_id: QueueId,
-    pub connection_id: ConnectionId,
-    pub consumer_id: ConsumerId,
-    pub max_items: u16,
-    pub now: Timestamp,
-    pub reply: oneshot::Sender<Vec<ClaimedEntry>>,
+impl PublishEntryOwned {
+    /// Build an owned entry from a wire view, sharing the underlying frame
+    /// buffer via `Bytes::slice_ref` (zero-copy — refcount on the same Arc).
+    #[inline]
+    pub fn from_wire(view: &PublishView<'_>, frame: &Bytes) -> Self {
+        Self {
+            subject: frame.slice_ref(view.subject()),
+            payload: frame.slice_ref(view.payload()),
+        }
+    }
 }
 
 /// Acknowledge messages. Engine AckEntry directly — no conversion needed.
@@ -108,6 +116,17 @@ pub struct NackCmd {
 pub struct NackReply {
     pub requeued: u32,
     pub not_found: u32,
+}
+
+/// Test-only claim probe. Returns owned `ClaimedEntry`s — copies engine scratch
+/// out so the caller can inspect them after the shard releases its borrow.
+pub struct ClaimCmd {
+    pub queue_id: QueueId,
+    pub connection_id: ConnectionId,
+    pub consumer_id: ConsumerId,
+    pub max_items: u16,
+    pub now: Timestamp,
+    pub reply: oneshot::Sender<Vec<ClaimedEntry>>,
 }
 
 // ── Subscription management ─────────────────────────────────────────────────

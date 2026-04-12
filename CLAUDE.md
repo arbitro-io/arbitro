@@ -18,5 +18,8 @@ Read `.agent/rules/arch-boundaries.md` before modifying module structure, crossi
 ## Engine Contract
 Read `.agent/rules/engine-contract.md` before adding new commands, modifying the shard worker, or calling ArbitroEngine methods.
 
+## Roles
+Read `.agent/rules/roles.md` before adding, moving, or modifying any handler in `shard.rs`. Defines the hot/cold path boundaries and which role (publisher, accumulator, acker, drainer, admin, seeder) owns which primitive. INVIOLABLE.
+
 ## Concurrency
 Read `.agent/rules/concurrency.md` before touching channels, thread spawning, shutdown, or async boundaries.

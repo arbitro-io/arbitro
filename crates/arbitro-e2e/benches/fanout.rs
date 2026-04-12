@@ -1,5 +1,5 @@
 //! Benchmark: Multi-client High-Density Fanout & Filtering Stress Test.
-//! 
+//!
 //! Density:
 //! - 3 Clients (Connections)
 //! - 20 Subscriptions per Client (Total: 60)
@@ -38,7 +38,9 @@ async fn create_test_server() -> String {
         .write_buffer_cap(1024 * 1024);
     let write_cap = config.write_buffer_cap;
     let server = ArbitroServer::new(config, Arc::new(TokioTransport::new(write_cap)), None);
-    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
     addr
 }
@@ -49,12 +51,20 @@ async fn main() {
     let stream_name = b"high_density_fanout";
 
     let setup_client = Client::connect(&addr).await.unwrap();
-    setup_client.create_stream(&StreamConfig::new(stream_name, b">").build()).await.unwrap();
+    setup_client
+        .create_stream(&StreamConfig::new(stream_name, b">").build())
+        .await
+        .unwrap();
 
     let mut stats = Vec::new();
     let mut tasks = Vec::new();
 
-    println!("Scaling: {} clients * {} subs = {} total subscriptions...", NUM_CLIENTS, SUBS_PER_CLIENT, NUM_CLIENTS * SUBS_PER_CLIENT);
+    println!(
+        "Scaling: {} clients * {} subs = {} total subscriptions...",
+        NUM_CLIENTS,
+        SUBS_PER_CLIENT,
+        NUM_CLIENTS * SUBS_PER_CLIENT
+    );
 
     for c_idx in 0..NUM_CLIENTS {
         let client = Client::connect(&addr).await.unwrap();
@@ -82,9 +92,12 @@ async fn main() {
             stats.push(sub_stat.clone());
 
             let sc = sub_stat.clone();
-            let handle = consumer.subscribe_callback(Some(filter.as_bytes()), move |_msg| {
-                sc.count.fetch_add(1, Relaxed);
-            }).await.unwrap();
+            let handle = consumer
+                .subscribe_callback(Some(filter.as_bytes()), move |_msg| {
+                    sc.count.fetch_add(1, Relaxed);
+                })
+                .await
+                .unwrap();
             tasks.push(handle);
         }
     }
@@ -95,9 +108,30 @@ async fn main() {
     let batch_size = 1000;
 
     println!("Bursting 3,000,000 messages across 3 types...");
-    publish_burst(&setup_client, stream_name, b"iot.1.status", &payload, batch_size).await; // 1M
-    publish_burst(&setup_client, stream_name, b"iot.2.status", &payload, batch_size).await; // 1M
-    publish_burst(&setup_client, stream_name, b"other.logs", &payload, batch_size).await;   // 1M
+    publish_burst(
+        &setup_client,
+        stream_name,
+        b"iot.1.status",
+        &payload,
+        batch_size,
+    )
+    .await; // 1M
+    publish_burst(
+        &setup_client,
+        stream_name,
+        b"iot.2.status",
+        &payload,
+        batch_size,
+    )
+    .await; // 1M
+    publish_burst(
+        &setup_client,
+        stream_name,
+        b"other.logs",
+        &payload,
+        batch_size,
+    )
+    .await; // 1M
 
     println!("Waiting for delivery (High Density Delivery)...");
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -114,21 +148,31 @@ async fn main() {
         let count = s.count.load(Relaxed);
         total_received += count;
         let is_ok = count == s.expected;
-        if !is_ok { failures += 1; }
+        if !is_ok {
+            failures += 1;
+        }
 
         // Only show first 8 and last 4 if list is long, but always check all
         if i < 8 || i > stats.len() - 5 {
             let status = if is_ok { "OK" } else { "FAIL" };
-            println!("| {:<8} | {:<18} | {:<14} | {:<14} | {:<10} |", s.id, s.filter, count, s.expected, status);
+            println!(
+                "| {:<8} | {:<18} | {:<14} | {:<14} | {:<10} |",
+                s.id, s.filter, count, s.expected, status
+            );
         } else if i == 8 {
-            println!("| ...      | ...                | ...            | ...            | ...        |");
+            println!(
+                "| ...      | ...                | ...            | ...            | ...        |"
+            );
         }
     }
 
     println!("+----------+--------------------+----------------+----------------+------------+");
     println!("Total Logical Deliveries: {}", total_received);
     println!("Total Failures: {}/{}", failures, stats.len());
-    println!("Overall Throughput: {:.2} msg/s", total_received as f64 / elapsed.as_secs_f64());
+    println!(
+        "Overall Throughput: {:.2} msg/s",
+        total_received as f64 / elapsed.as_secs_f64()
+    );
     println!("Total Elapsed: {:?}", elapsed);
 
     if failures > 0 {
@@ -136,10 +180,18 @@ async fn main() {
     }
 }
 
-async fn publish_burst(client: &Client, stream: &[u8], subject: &[u8], payload: &[u8], batch: usize) {
+async fn publish_burst(
+    client: &Client,
+    stream: &[u8],
+    subject: &[u8],
+    payload: &[u8],
+    batch: usize,
+) {
     for _ in 0..(MSG_PER_TYPE / batch as u64) {
         let mut entries = Vec::with_capacity(batch);
-        for _ in 0..batch { entries.push((subject, payload)); }
+        for _ in 0..batch {
+            entries.push((subject, payload));
+        }
         client.publish_batch(stream, &entries).await.unwrap();
     }
 }

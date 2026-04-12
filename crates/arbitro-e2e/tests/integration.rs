@@ -70,14 +70,17 @@ async fn test_create_consumer() {
         .unwrap();
 
     let ok = shard
-        .create_consumer(ConsumerConfig {
-            id: ConsumerId(1),
-            queue_id: QueueId(1),
-            stream_id: StreamId(1),
-            durable: true,
-            ack_policy: AckPolicy::Explicit,
-            max_inflight: 1000,
-        }, vec![])
+        .create_consumer(
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 1000,
+            },
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -162,14 +165,17 @@ async fn test_publish_ack_cycle() {
         .unwrap();
 
     shard
-        .create_consumer(ConsumerConfig {
-            id: ConsumerId(1),
-            queue_id: QueueId(1),
-            stream_id: StreamId(1),
-            durable: true,
-            ack_policy: AckPolicy::Explicit,
-            max_inflight: 1000,
-        }, vec![])
+        .create_consumer(
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 1000,
+            },
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -212,7 +218,10 @@ async fn test_publish_ack_cycle() {
         })
         .collect();
 
-    shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
+    shard
+        .publish(StreamId(1), conn_id, 1, entries)
+        .await
+        .unwrap();
 
     // Give shard a moment to process
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -258,7 +267,10 @@ async fn test_publish_batch() {
         .collect();
 
     // Fire & forget — shard replies directly to connection
-    shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
+    shard
+        .publish(StreamId(1), conn_id, 1, entries)
+        .await
+        .unwrap();
 
     server.shutdown();
 }
@@ -282,14 +294,17 @@ async fn test_fanout_delivery() {
 
     for i in 1..=3u32 {
         shard
-            .create_consumer(ConsumerConfig {
-                id: ConsumerId(i),
-                queue_id: QueueId(i),
-                stream_id: StreamId(1),
-                durable: true,
-                ack_policy: AckPolicy::Explicit,
-                max_inflight: 100,
-            }, vec![])
+            .create_consumer(
+                ConsumerConfig {
+                    id: ConsumerId(i),
+                    queue_id: QueueId(i),
+                    stream_id: StreamId(1),
+                    durable: true,
+                    ack_policy: AckPolicy::Explicit,
+                    max_inflight: 100,
+                },
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -351,14 +366,17 @@ async fn test_nack_redelivery() {
         .unwrap();
 
     shard
-        .create_consumer(ConsumerConfig {
-            id: ConsumerId(1),
-            queue_id: QueueId(1),
-            stream_id: StreamId(1),
-            durable: true,
-            ack_policy: AckPolicy::Explicit,
-            max_inflight: 100,
-        }, vec![])
+        .create_consumer(
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+            },
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -397,25 +415,42 @@ async fn test_nack_redelivery() {
         subject: bytes::Bytes::from_static(b"nack_test_msg"),
         payload: bytes::Bytes::from_static(b"data"),
     }];
-    shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
+    shard
+        .publish(StreamId(1), conn_id, 1, entries)
+        .await
+        .unwrap();
 
     // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Drain the auto-delivered frames from connection rx to get the seq
-    // Frames: RepOk (publish reply) + Deliver (auto-delivered)
+    // Drain the auto-delivered frames from connection rx to get the seq.
+    // Frames: RepOk (publish reply) + RepBatch (auto-delivered).
+    // RepBatch body: [4 consumer_id][2 count][2 pad][8 seq][...].
     let mut delivered_seq = None;
     while let Ok(frame) = rx.try_recv() {
         let action = u16::from_le_bytes([frame[0], frame[1]]);
-        if action == Action::Deliver.as_u16() {
-            let seq = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]) as u64;
+        if action == Action::RepBatch.as_u16() {
+            let off = ENVELOPE_SIZE + 8;
+            let seq = u64::from_le_bytes([
+                frame[off],
+                frame[off + 1],
+                frame[off + 2],
+                frame[off + 3],
+                frame[off + 4],
+                frame[off + 5],
+                frame[off + 6],
+                frame[off + 7],
+            ]);
             delivered_seq = Some(seq);
         }
     }
     let seq = delivered_seq.expect("should have received auto-delivered message");
 
     // Nack — should requeue the auto-delivered message
-    let nack_entries = vec![NackEntry { seq, retry_at: None }];
+    let nack_entries = vec![NackEntry {
+        seq,
+        retry_at: None,
+    }];
     let nack = shard.nack(ConsumerId(1), nack_entries, ts).await.unwrap();
     assert_eq!(nack.requeued, 1);
 
@@ -426,11 +461,14 @@ async fn test_nack_redelivery() {
     let mut redelivered = false;
     while let Ok(frame) = rx.try_recv() {
         let action = u16::from_le_bytes([frame[0], frame[1]]);
-        if action == Action::Deliver.as_u16() {
+        if action == Action::RepBatch.as_u16() {
             redelivered = true;
         }
     }
-    assert!(redelivered, "nacked message should be re-delivered via Gate");
+    assert!(
+        redelivered,
+        "nacked message should be re-delivered via Gate"
+    );
 
     server.shutdown();
 }
@@ -457,14 +495,17 @@ async fn test_disconnect_releases_pending() {
         .unwrap();
 
     shard
-        .create_consumer(ConsumerConfig {
-            id: ConsumerId(1),
-            queue_id: QueueId(1),
-            stream_id: StreamId(1),
-            durable: true,
-            ack_policy: AckPolicy::Explicit,
-            max_inflight: 100,
-        }, vec![])
+        .create_consumer(
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+            },
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -506,7 +547,10 @@ async fn test_disconnect_releases_pending() {
             payload: bytes::Bytes::from_static(b"data"),
         })
         .collect();
-    shard.publish(StreamId(1), conn_id, 1, entries).await.unwrap();
+    shard
+        .publish(StreamId(1), conn_id, 1, entries)
+        .await
+        .unwrap();
 
     // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
     // Messages become inflight automatically — no explicit claim needed
@@ -518,7 +562,10 @@ async fn test_disconnect_releases_pending() {
         .await
         .unwrap();
 
-    assert!(drain.pending_requeued > 0, "pending should be requeued on disconnect");
+    assert!(
+        drain.pending_requeued > 0,
+        "pending should be requeued on disconnect"
+    );
 
     // Reconnect and re-claim
     shard
@@ -536,7 +583,10 @@ async fn test_disconnect_releases_pending() {
         .await
         .unwrap();
 
-    assert!(!reclaimed.is_empty(), "messages should be reclaimable after disconnect");
+    assert!(
+        !reclaimed.is_empty(),
+        "messages should be reclaimable after disconnect"
+    );
 
     server.shutdown();
 }
@@ -560,14 +610,17 @@ async fn test_pause_resume_consumer() {
         .unwrap();
 
     shard
-        .create_consumer(ConsumerConfig {
-            id: ConsumerId(1),
-            queue_id: QueueId(1),
-            stream_id: StreamId(1),
-            durable: true,
-            ack_policy: AckPolicy::Explicit,
-            max_inflight: 100,
-        }, vec![])
+        .create_consumer(
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+            },
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -637,14 +690,17 @@ async fn test_graceful_shutdown() {
 async fn test_list_streams() {
     let (server, _registry) = test_server();
 
+    // Use small sequential stream IDs — the engine catalog indexes
+    // match_tables by stream_id.0 directly, so hash-derived IDs blow up
+    // memory. Names stay distinct so list_streams content is still meaningful.
     let names: &[&[u8]] = &[b"orders", b"payments", b"events"];
-    for name in names {
-        let stream_id = arbitro_proto::config::fnv1a_32(name);
-        let shard = server.shard_for(StreamId(stream_id));
+    for (i, name) in names.iter().enumerate() {
+        let stream_id = StreamId((i + 1) as u32);
+        let shard = server.shard_for(stream_id);
         shard
             .create_stream(
                 StreamConfig {
-                    id: StreamId(stream_id),
+                    id: stream_id,
                     name: name.to_vec(),
                 },
                 0,
@@ -762,34 +818,55 @@ async fn test_end_to_end_publish_deliver_ack() {
 
     // Verify it's a RepOk
     let action_bytes = u16::from_le_bytes([rep_ok_frame[0], rep_ok_frame[1]]);
-    assert_eq!(action_bytes, Action::RepOk.as_u16(), "first frame should be RepOk");
+    assert_eq!(
+        action_bytes,
+        Action::RepOk.as_u16(),
+        "first frame should be RepOk"
+    );
 
     // 6. Wait for shard thread to drain-deliver (gate auto-releases on publish)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 7. Receive deliver frames — one per message
+    // 7. Receive RepBatch frames — drainer batches all entries into one frame.
+    //    RepBatch body: [4 consumer_id][2 count][2 pad][entries...]
+    //    Entry: [8 seq][2 subj_len][4 data_len][subject][payload]
     let mut delivered_count = 0u32;
     loop {
         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(frame)) => {
                 let action = u16::from_le_bytes([frame[0], frame[1]]);
-                if action == Action::Deliver.as_u16() {
-                    delivered_count += 1;
-
-                    // Parse seq from envelope env_seq (bytes 12..16)
-                    let seq = u32::from_le_bytes([
-                        frame[12], frame[13], frame[14], frame[15],
-                    ]) as u64;
-                    assert!(seq > 0, "seq should be positive");
-
-                    // Body format: [4 consumer_id][2 subj_len][subject][payload]
+                if action == Action::RepBatch.as_u16() {
                     let body_start = ENVELOPE_SIZE;
-                    let subj_len = u16::from_le_bytes([
-                        frame[body_start + 4],
-                        frame[body_start + 5],
-                    ]) as usize;
-                    let subject = &frame[body_start + 6..body_start + 6 + subj_len];
-                    assert_eq!(subject, b"orders_new");
+                    let count =
+                        u16::from_le_bytes([frame[body_start + 4], frame[body_start + 5]]) as u32;
+                    delivered_count += count;
+
+                    // Walk entries and verify subject of the first one.
+                    let mut off = body_start + 8;
+                    for _ in 0..count {
+                        let seq = u64::from_le_bytes([
+                            frame[off],
+                            frame[off + 1],
+                            frame[off + 2],
+                            frame[off + 3],
+                            frame[off + 4],
+                            frame[off + 5],
+                            frame[off + 6],
+                            frame[off + 7],
+                        ]);
+                        assert!(seq > 0, "seq should be positive");
+                        let subj_len =
+                            u16::from_le_bytes([frame[off + 8], frame[off + 9]]) as usize;
+                        let data_len = u32::from_le_bytes([
+                            frame[off + 10],
+                            frame[off + 11],
+                            frame[off + 12],
+                            frame[off + 13],
+                        ]) as usize;
+                        let subject = &frame[off + 14..off + 14 + subj_len];
+                        assert_eq!(subject, b"orders_new");
+                        off += 14 + data_len;
+                    }
                 }
             }
             _ => break,
@@ -831,53 +908,87 @@ async fn test_gate_auto_delivery_smoke() {
 
         let (conn_id, mut rx) = registry.register();
 
-        shard.open_connection(ConnectionId(conn_id), NodeId(1), ts).await.unwrap();
+        shard
+            .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+            .await
+            .unwrap();
 
-        shard.create_stream(
-            StreamConfig { id: StreamId(1), name: b"gate_smoke".to_vec() }, 0,
-        ).await.unwrap();
+        shard
+            .create_stream(
+                StreamConfig {
+                    id: StreamId(1),
+                    name: b"gate_smoke".to_vec(),
+                },
+                0,
+            )
+            .await
+            .unwrap();
 
-        shard.subscribe(
-            StreamConfig { id: StreamId(1), name: b"gate_smoke".to_vec() },
-            ConsumerConfig {
-                id: ConsumerId(1), queue_id: QueueId(1), stream_id: StreamId(1),
-                durable: true, ack_policy: AckPolicy::Explicit, max_inflight: 100,
-            },
-            SubscriptionConfig {
-                id: SubscriptionId(1), stream_id: StreamId(1),
-                consumer_id: ConsumerId(1), filters: vec![],
-            },
-            ConnectionId(conn_id), ts,
-        ).await.unwrap();
+        shard
+            .subscribe(
+                StreamConfig {
+                    id: StreamId(1),
+                    name: b"gate_smoke".to_vec(),
+                },
+                ConsumerConfig {
+                    id: ConsumerId(1),
+                    queue_id: QueueId(1),
+                    stream_id: StreamId(1),
+                    durable: true,
+                    ack_policy: AckPolicy::Explicit,
+                    max_inflight: 100,
+                },
+                SubscriptionConfig {
+                    id: SubscriptionId(1),
+                    stream_id: StreamId(1),
+                    consumer_id: ConsumerId(1),
+                    filters: vec![],
+                },
+                ConnectionId(conn_id),
+                ts,
+            )
+            .await
+            .unwrap();
 
         // 3 rounds — publish 5 msgs each, verify auto-delivery
         for round in 0..3u32 {
-            let entries: Vec<_> = (0..5).map(|i| {
-                arbitro_server::command::PublishEntryOwned {
+            let entries: Vec<_> = (0..5)
+                .map(|i| arbitro_server::command::PublishEntryOwned {
                     subject: bytes::Bytes::from_static(b"gate.smoke"),
                     payload: bytes::Bytes::from(format!("r{round}-{i}").into_bytes()),
-                }
-            }).collect();
+                })
+                .collect();
 
-            shard.publish(StreamId(1), conn_id, round + 1, entries).await.unwrap();
+            shard
+                .publish(StreamId(1), conn_id, round + 1, entries)
+                .await
+                .unwrap();
 
             // Wait for shard to auto-deliver
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            // Drain rx — count Deliver frames
+            // Drain rx — count entries inside RepBatch frames
             let mut delivers = 0u32;
             while let Ok(frame) = rx.try_recv() {
                 let action = u16::from_le_bytes([frame[0], frame[1]]);
-                if action == Action::Deliver.as_u16() {
-                    delivers += 1;
+                if action == Action::RepBatch.as_u16() {
+                    let body_start = ENVELOPE_SIZE;
+                    let count =
+                        u16::from_le_bytes([frame[body_start + 4], frame[body_start + 5]]) as u32;
+                    delivers += count;
                 }
             }
 
-            assert_eq!(delivers, 5, "round {round}: expected 5 auto-delivered messages");
+            assert_eq!(
+                delivers, 5,
+                "round {round}: expected 5 auto-delivered messages"
+            );
 
             // Ack all so inflight is freed for next round
             let ack_entries: Vec<AckEntry> = (1..=5u64)
-                .map(|i| AckEntry { seq: round as u64 * 5 + i })
+                .map(|i| AckEntry {
+                    seq: round as u64 * 5 + i,
+                })
                 .collect();
             shard.ack(ConsumerId(1), ack_entries, ts).await.unwrap();
         }
@@ -885,5 +996,7 @@ async fn test_gate_auto_delivery_smoke() {
         server.shutdown();
     });
 
-    overall.await.expect("test_gate_auto_delivery_smoke hung — Gate is blocked");
+    overall
+        .await
+        .expect("test_gate_auto_delivery_smoke hung — Gate is blocked");
 }

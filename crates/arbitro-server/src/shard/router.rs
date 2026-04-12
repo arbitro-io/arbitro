@@ -1,4 +1,4 @@
-//! Server — spawn shards, route commands by stream_id.
+//! ShardRouter — spawn shard workers, route commands by stream_id.
 
 use std::sync::Arc;
 
@@ -6,33 +6,51 @@ use arbitro_engine_v2::types::StreamId;
 use arbitro_engine_v2::ArbitroEngine;
 use tokio::sync::mpsc;
 
+use crate::common::gate::Gate;
+use crate::common::NameRegistry;
 use crate::config::Config;
-use crate::gate::Gate;
-use crate::handle::ShardHandle;
-use crate::shard::ShardWorker;
+use crate::shard::handle::ShardHandle;
+use crate::shard::worker::ShardWorker;
 use crate::transport::ConnectionRegistry;
 
-/// The server routes commands to the correct shard by stream_id.
+/// Routes commands to the correct shard worker by stream_id.
 /// Clone-friendly — backed by Arc.
 #[derive(Clone)]
-pub struct Server {
+pub struct ShardRouter {
     shards: Arc<[ShardHandle]>,
+    /// Server-wide name → small-int registry. Required because the engine
+    /// catalog uses `StreamId` and `ConsumerId` as direct `Vec` indices, so
+    /// the server cannot derive them by hashing names. See
+    /// `common::name_registry` for full rationale.
+    names: Arc<NameRegistry>,
 }
 
-impl Server {
+impl ShardRouter {
     /// Spawn N shard workers on dedicated OS threads.
     pub fn spawn(config: &Config, registry: &ConnectionRegistry) -> Self {
         let shard_count = config.shard_count;
         let channel_capacity = config.channel_capacity;
 
         let mut handles = Vec::with_capacity(shard_count);
+        // One registry shared across all shards. Stream/consumer ids are
+        // process-wide identifiers; sharding by hash assigns each stream to
+        // exactly one shard, but the registry itself is consulted by every
+        // shard's drainer when translating outbound envelopes.
+        let names = Arc::new(NameRegistry::new());
 
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
             let engine = ArbitroEngine::new();
             let gate = Gate::new();
 
-            let worker = ShardWorker::new(engine, rx, gate, registry.clone(), config.data_dir.clone());
+            let worker = ShardWorker::new(
+                engine,
+                rx,
+                gate,
+                registry.clone(),
+                config.data_dir.clone(),
+                Arc::clone(&names),
+            );
 
             // Named thread — mandatory per concurrency.md
             let join_handle = std::thread::Builder::new()
@@ -46,7 +64,15 @@ impl Server {
 
         Self {
             shards: handles.into(),
+            names,
         }
+    }
+
+    /// Shared name → small-int registry. Used by `transport::dispatch` and
+    /// `persistence::recovery` to assign sequential `StreamId` / `ConsumerId`.
+    #[inline]
+    pub fn names(&self) -> &Arc<NameRegistry> {
+        &self.names
     }
 
     /// Route to the shard that owns this stream.

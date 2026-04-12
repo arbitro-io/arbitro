@@ -4,7 +4,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::byteorder::little_endian::{U16, U64};
 use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
@@ -14,16 +14,17 @@ use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 
 use arbitro_proto::lifecycle::LifeCycle;
 
-use crate::command_log::SharedCommandLog;
 use crate::config::Config;
-use crate::dispatch;
-use crate::router::Server;
+use crate::lifecycle_trace;
+use crate::persistence::command_log::SharedCommandLog;
+use crate::shard::router::ShardRouter;
+use crate::transport::dispatch;
 use crate::transport::ConnectionRegistry;
 
 /// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
     config: Config,
-    server: Server,
+    server: ShardRouter,
     registry: ConnectionRegistry,
     services: Vec<Box<dyn LifeCycle>>,
     command_log: Option<SharedCommandLog>,
@@ -32,10 +33,9 @@ pub struct ArbitroServer {
 impl ArbitroServer {
     pub fn new(config: Config) -> Self {
         let registry = ConnectionRegistry::new(config.write_buffer_cap);
-        let server = Server::spawn(&config, &registry);
+        let server = ShardRouter::spawn(&config, &registry);
 
-        let mut services: Vec<Box<dyn LifeCycle>> = Vec::new();
-        services.push(Box::new(registry.clone()));
+        let services: Vec<Box<dyn LifeCycle>> = vec![Box::new(registry.clone())];
 
         Self {
             config,
@@ -64,7 +64,7 @@ impl ArbitroServer {
     }
 
     /// Access the shard router.
-    pub fn server(&self) -> &Server {
+    pub fn server(&self) -> &ShardRouter {
         &self.server
     }
 
@@ -92,7 +92,7 @@ impl ArbitroServer {
         // ── Replay command log → re-create streams/consumers ───────────
         if let Some(ref log) = self.command_log {
             let server = self.server.clone();
-            let mut applier = crate::recovery::ReplayApplier::new(server);
+            let mut applier = crate::persistence::recovery::ReplayApplier::new(server);
             match log.replay(&mut applier) {
                 Ok(n) if n > 0 => tracing::info!(count = n, "metadata replay complete"),
                 Ok(_) => {}
@@ -140,7 +140,6 @@ impl ArbitroServer {
 
                                 let _ = stream.set_nodelay(true);
                                 let (reader, writer) = stream.into_split();
-
                                 tokio::spawn(write_loop(conn_id, writer, rx));
 
                                 let tx = frame_tx.clone();
@@ -174,10 +173,12 @@ impl ArbitroServer {
                 frame = frame_rx.recv() => {
                     match frame {
                         Some((conn_id, frame)) => {
+                            lifecycle_trace::record("04_frame_chan_recv", conn_id, 0, "frame_loop");
                             dispatch::dispatch_frame(
                                 conn_id, frame, &self.server, &self.registry,
                                 self.command_log.as_ref(),
                             ).await;
+                            lifecycle_trace::record("19_dispatch_returned", conn_id, 0, "frame_loop");
                         }
                         None => break,
                     }
@@ -251,6 +252,7 @@ async fn read_loop(
                 break;
             }
         }
+        lifecycle_trace::record("01_tcp_read_header", conn_id, 0, "transport_read");
 
         // Parse msg_len from envelope (bytes 8..12, little-endian u32)
         let msg_len =
@@ -268,12 +270,14 @@ async fn read_loop(
                 break;
             }
         }
+        lifecycle_trace::record("02_tcp_read_body", conn_id, 0, "transport_read");
 
         registry.touch(conn_id);
 
         if tx.send((conn_id, buf.freeze())).await.is_err() {
             break;
         }
+        lifecycle_trace::record("03_frame_chan_send", conn_id, 0, "transport_read");
     }
 
     // Build and send disconnect frame
@@ -295,6 +299,7 @@ async fn write_loop(
             Some(frame) => batch.push(frame),
             None => break,
         }
+        lifecycle_trace::record("31_write_loop_recv", _conn_id, 0, "transport_write");
 
         // Coalesce: drain all ready frames without blocking
         while let Ok(frame) = rx.try_recv() {
@@ -306,6 +311,7 @@ async fn write_loop(
         } else {
             write_all_vectored(&mut writer, &batch).await.is_err()
         };
+        lifecycle_trace::record("32_tcp_write_done", _conn_id, batch.len() as u64, "transport_write");
 
         if failed {
             break;
@@ -357,25 +363,11 @@ async fn write_all_vectored(
 }
 
 fn build_disconnect_frame() -> Envelope {
-    Envelope {
-        action: U16::new(Action::Disconnect.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(0),
-        env_seq: U32::new(0),
-    }
+    Envelope::new(Action::Disconnect, 0, 0, 0)
 }
 
 fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
-    let envelope = Envelope {
-        action: U16::new(Action::RepError.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(16),
-        env_seq: U32::new(0),
-    };
+    let envelope = Envelope::new(Action::RepError, 0, 16, 0);
     let body = RepErrorAction {
         ref_seq: U64::new(0),
         error_code: U16::new(ErrorCode::ServerShuttingDown.as_u16()),
@@ -385,14 +377,7 @@ fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
 }
 
 async fn reject_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
-    let envelope = Envelope {
-        action: U16::new(Action::RepError.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(16),
-        env_seq: U32::new(0),
-    };
+    let envelope = Envelope::new(Action::RepError, 0, 16, 0);
     let body = RepErrorAction {
         ref_seq: U64::new(0),
         error_code: U16::new(ErrorCode::InternalError.as_u16()),
@@ -428,13 +413,6 @@ async fn keepalive_loop(
 }
 
 fn send_ping(registry: &ConnectionRegistry, conn_id: u64) {
-    let envelope = Envelope {
-        action: U16::new(Action::Ping.as_u16()),
-        flags: 0,
-        _rsv: 0,
-        stream_id: U32::new(0),
-        msg_len: U32::new(0),
-        env_seq: U32::new(0),
-    };
+    let envelope = Envelope::new(Action::Ping, 0, 0, 0);
     registry.send_parts(conn_id, &[envelope.as_bytes()]);
 }

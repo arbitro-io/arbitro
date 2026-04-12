@@ -79,22 +79,26 @@ impl<'a> PublishView<'a> {
 
 /// Zero-allocation iterator over batch entries.
 /// Constructed from the body of a publish frame (after envelope).
+///
+/// Wire layout: `[4 count][entries...]`. Count is `u32` so a single batch
+/// can carry up to 4 G entries — well above any practical shard pressure.
+/// (Was `u16` and silently truncated past 65535, corrupting the body.)
 pub struct BatchIter<'a> {
     buf: &'a [u8],
     offset: usize,
-    remaining: u16,
+    remaining: u32,
 }
 
 impl<'a> BatchIter<'a> {
-    /// Create from frame body (starts with 2-byte count).
+    /// Create from frame body (starts with 4-byte count).
     #[inline(always)]
     pub fn new(body: &'a [u8]) -> Self {
-        let count = u16::from_le_bytes([body[0], body[1]]);
-        Self { buf: body, offset: 2, remaining: count }
+        let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        Self { buf: body, offset: 4, remaining: count }
     }
 
     #[inline(always)]
-    pub fn count(&self) -> u16 {
+    pub fn count(&self) -> u32 {
         self.remaining
     }
 }

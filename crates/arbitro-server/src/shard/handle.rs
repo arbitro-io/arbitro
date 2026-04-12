@@ -10,7 +10,7 @@ use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfi
 use arbitro_engine_v2::types::*;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::command::*;
+use crate::shard::command::*;
 
 /// Async handle to a shard worker.
 #[derive(Clone)]
@@ -64,6 +64,25 @@ impl ShardHandle {
         })).await
     }
 
+    pub async fn ack(
+        &self,
+        consumer_id: ConsumerId,
+        entries: Vec<AckEntry>,
+        now: Timestamp,
+    ) -> Result<AckReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::Ack(AckCmd {
+            consumer_id,
+            entries,
+            now,
+            reply: tx,
+        })).await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Test-only direct claim probe. Production delivery flows through the
+    /// drainer (`handle_drain_deliver`) and `RepBatch` frames — this bypass
+    /// exists so integration tests can inspect engine state synchronously.
     pub async fn claim(
         &self,
         queue_id: QueueId,
@@ -78,22 +97,6 @@ impl ShardHandle {
             connection_id,
             consumer_id,
             max_items,
-            now,
-            reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    pub async fn ack(
-        &self,
-        consumer_id: ConsumerId,
-        entries: Vec<AckEntry>,
-        now: Timestamp,
-    ) -> Result<AckReply, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::Ack(AckCmd {
-            consumer_id,
-            entries,
             now,
             reply: tx,
         })).await?;
@@ -330,8 +333,10 @@ impl ShardHandle {
     // ── Internal ────────────────────────────────────────────────────────
 
     pub async fn send(&self, cmd: ShardCommand) -> Result<(), SendError> {
+        crate::lifecycle_trace::record("07_handle_send_enter", 0, 0, "frame_loop");
         self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)?;
         self.shard_thread.unpark();
+        crate::lifecycle_trace::record("08_handle_send_done", 0, 0, "frame_loop");
         Ok(())
     }
 

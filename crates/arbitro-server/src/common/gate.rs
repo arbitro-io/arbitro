@@ -25,6 +25,12 @@ pub struct Gate {
 // `locked` and `parked` are AtomicBool — safe across threads.
 unsafe impl Sync for Gate {}
 
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Gate {
     pub fn new() -> Self {
         Self {

@@ -201,9 +201,9 @@ impl Client {
             _pad: [0u8; 3],
         };
 
-        let body_len = 2 + 12 + subject.len() + payload.len();
+        let body_len = 4 + 12 + subject.len() + payload.len();
         let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        body.extend_from_slice(&1u32.to_le_bytes()); // count = 1 (u32, see proto/wire/publish.rs)
         body.extend_from_slice(entry.as_bytes());
         body.extend_from_slice(subject);
         body.extend_from_slice(payload);
@@ -219,12 +219,12 @@ impl Client {
     ) -> Result<(), ClientError> {
         let stream_id = fnv1a_32(stream_name);
 
-        let total_body: usize = 2 + entries.iter()
+        let total_body: usize = 4 + entries.iter()
             .map(|(s, p)| 12 + s.len() + p.len())
             .sum::<usize>();
 
         let mut body = Vec::with_capacity(total_body);
-        body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
         for (subject, payload) in entries {
             let entry = PublishEntry {
@@ -260,9 +260,9 @@ impl Client {
             _pad: [0u8; 3],
         };
 
-        let body_len = 2 + 12 + subject.len() + payload.len();
+        let body_len = 4 + 12 + subject.len() + payload.len();
         let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(entry.as_bytes());
         body.extend_from_slice(subject);
         body.extend_from_slice(payload);
@@ -288,9 +288,9 @@ impl Client {
             _pad: [0u8; 3],
         };
 
-        let body_len = 2 + 12 + subject.len() + payload.len();
+        let body_len = 4 + 12 + subject.len() + payload.len();
         let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(entry.as_bytes());
         body.extend_from_slice(subject);
         body.extend_from_slice(payload);
@@ -316,9 +316,9 @@ impl Client {
             _pad: [0u8; 3],
         };
 
-        let body_len = 2 + 12 + subject.len() + payload.len();
+        let body_len = 4 + 12 + subject.len() + payload.len();
         let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(entry.as_bytes());
         body.extend_from_slice(subject);
         body.extend_from_slice(payload);
@@ -335,12 +335,12 @@ impl Client {
     ) -> Result<u64, ClientError> {
         let stream_id = fnv1a_32(stream_name);
 
-        let total_body: usize = 2 + entries.iter()
+        let total_body: usize = 4 + entries.iter()
             .map(|(s, p)| 12 + s.len() + p.len())
             .sum::<usize>();
 
         let mut body = Vec::with_capacity(total_body);
-        body.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
         for (subject, payload) in entries {
             let entry = PublishEntry {

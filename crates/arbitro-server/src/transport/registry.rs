@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 
 use arbitro_proto::lifecycle::LifeCycle;
 
-use crate::session::{ConnIdGen, Session};
+use crate::common::session::{ConnIdGen, Session};
 
 /// TCP transport backed by per-connection bounded channels.
 ///

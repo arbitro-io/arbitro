@@ -211,12 +211,65 @@ async fn publish_sequences_monotonic() {
     let stream = StreamConfig::new(b"counter", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let seq1 = client.publish_sync(b"counter", b"counter_inc", b"1").await.unwrap();
-    let seq2 = client.publish_sync(b"counter", b"counter_inc", b"2").await.unwrap();
-    let seq3 = client.publish_sync(b"counter", b"counter_inc", b"3").await.unwrap();
+    let seq1 = client
+        .publish_sync(b"counter", b"counter_inc", b"1")
+        .await
+        .unwrap();
+
+    let seq2 = client
+        .publish_sync(b"counter", b"counter_inc", b"2")
+        .await
+        .unwrap();
+
+    let seq3 = client
+        .publish_sync(b"counter", b"counter_inc", b"3")
+        .await
+        .unwrap();
 
     assert!(seq2 > seq1, "seq2 ({seq2}) > seq1 ({seq1})");
     assert!(seq3 > seq2, "seq3 ({seq3}) > seq2 ({seq2})");
+}
+
+/// publish-before-subscribe replay: publish N msgs, then create consumer with
+/// DeliverPolicy::All and subscribe — should receive all N historical messages.
+#[tokio::test]
+async fn replay_deliver_all_historical() {
+    use arbitro_proto::config::DeliverPolicy;
+
+    let (_tx, addr) = start_server().await;
+    let client = connect(&addr).await;
+
+    let stream = StreamConfig::new(b"history", b">").build();
+    client.create_stream(&stream).await.unwrap();
+
+    // Publish 100 messages BEFORE any consumer exists.
+    let entries: Vec<(&[u8], &[u8])> = (0..100).map(|_| (&b"history.evt"[..], &b"data"[..])).collect();
+    client.publish_batch(b"history", &entries).await.unwrap();
+
+    // Small delay so the shard drain loop processes publish_pending_to_engine.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Create consumer with DeliverPolicy::All — should replay from seq=1.
+    let consumer = client
+        .create_consumer(
+            &ConsumerConfig::new(b"replayer", b"history")
+                .deliver_policy(DeliverPolicy::All)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+    let mut sub = consumer.subscribe(None).await.unwrap();
+
+    let mut count = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+            Ok(Some(_)) => count += 1,
+            _ => break,
+        }
+    }
+
+    assert_eq!(count, 100, "replay should deliver all 100 historical messages, got {count}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

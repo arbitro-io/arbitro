@@ -1,4 +1,4 @@
-//! Consumer — push (subscribe) and pull (fetch) modes.
+//! Consumer — push (subscribe) mode.
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -10,7 +10,6 @@ use zerocopy::byteorder::little_endian::U32;
 use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
-use arbitro_proto::wire::subscribe::FetchFixed;
 
 use crate::error::ClientError;
 use crate::inner::Inner;
@@ -110,23 +109,6 @@ impl Consumer {
             inner,
             sub_id,
         })
-    }
-
-    /// Pull mode — fetch up to N messages from the server.
-    pub async fn fetch(&self, max_msgs: u32) -> Result<Vec<Message>, ClientError> {
-        let body = FetchFixed {
-            consumer_id: U32::new(self.consumer_id),
-            max_msgs: U32::new(max_msgs),
-        };
-
-        self.inner
-            .request(Action::Fetch, self.stream_id, body.as_bytes())
-            .await?;
-
-        // After fetch request, messages arrive as Deliver frames.
-        // For now, we return empty — the messages will come via subscription.
-        // A proper pull implementation would use a dedicated channel.
-        Ok(Vec::new())
     }
 
     /// Get the consumer ID.

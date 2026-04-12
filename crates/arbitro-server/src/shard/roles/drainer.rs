@@ -1,0 +1,277 @@
+//! Drainer role — the worker that touches the journal to extract messages
+//! and ships them as `RepBatch` frames to subscribed consumers.
+//!
+//! Per `.agent/rules/roles.md` DRAINER MUST — in this exact order:
+//!   1. Guard 0 (first statement): `bindings.is_empty()` → `gate.lock` + return.
+//!   2. Feed engine only for streams with ≥1 binding, up to
+//!      `store.info().last_seq`. First time → seeder path. Otherwise →
+//!      incremental feed from `last_engine_seq+1`. Both preserve store seqs.
+//!   3. Per binding: loop `claim(64)` → `store.get(seq)` → `send_deliver_frame`.
+//!   4. Close cycle: delivered something → `gate.release()`; nothing → `gate.lock()`.
+//!
+//! MUST NOT: reply to publishes, do engine work for streams with no bindings,
+//! block network I/O, mutate `bindings`/store/catalog.
+//!
+//! Invariant: no speculative work. Past `bindings.is_empty()`, every stream
+//! touched has ≥1 destinatario.
+
+use arbitro_engine_v2::batch::ClaimBatch;
+use arbitro_engine_v2::types::Timestamp;
+use arbitro_proto::action::Action;
+use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
+use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
+use bytes::BytesMut;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
+
+use crate::lifecycle_trace;
+use crate::shard::worker::ShardWorker;
+
+impl ShardWorker {
+    /// Feed pending journal entries into the engine so they become claimable.
+    ///
+    /// Per `roles.md` DRAINER MUST #2: incremental feed uses `enqueue_ready`
+    /// (preserves store seqs) — never `engine.publish` (which reassigns seqs
+    /// from `ctx.next_seq` and is fragile under any desync). The seeder owns
+    /// the initial bulk load for unseeded streams; this function handles the
+    /// ongoing delta from `last_engine_seq+1` to `store.info().last_seq`.
+    ///
+    /// Skips streams with no active bindings per the "no speculative engine
+    /// work" invariant.
+    pub(in crate::shard) fn publish_pending_to_engine(&mut self, _now: Timestamp) {
+        lifecycle_trace::record("p01_ppte_enter", 0, 0, "shard");
+        // Reuse scratch buffer instead of allocating per call.
+        self.scratch_stream_ids.clear();
+        self.scratch_stream_ids.extend(self.stores.keys().copied());
+        lifecycle_trace::record("p02_ppte_keys_collected", self.scratch_stream_ids.len() as u64, 0, "shard");
+
+        for i in 0..self.scratch_stream_ids.len() {
+            let stream_id = self.scratch_stream_ids[i];
+
+            // No bindings on this stream → nothing will consume; skip.
+            if !self.bindings.iter().any(|b| b.stream_id == stream_id) {
+                continue;
+            }
+            lifecycle_trace::record("p03_binding_check_pass", stream_id.raw() as u64, 0, "shard");
+            let last = self.last_engine_seq.get(&stream_id).copied().unwrap_or(0);
+            let info = self.stores[&stream_id].info();
+            lifecycle_trace::record("p04_store_info_done", info.last_seq, last, "shard");
+            if info.last_seq <= last { continue; }
+
+            let start = last + 1;
+            let end = info.last_seq + 1;
+
+            // Temporarily remove store to avoid borrow conflict with self.engine
+            let store = self.stores.remove(&stream_id).unwrap();
+            lifecycle_trace::record("p05_store_removed", stream_id.raw() as u64, end - start, "shard");
+
+            let engine = &mut self.engine;
+            store.for_each(start, end, &mut |entry| {
+                let subject_hash = arbitro_engine_v2::catalog::fnv1a_32(entry.subject);
+                engine.enqueue_ready(stream_id, entry.subject, subject_hash, entry.seq);
+            }).ok();
+            lifecycle_trace::record("p06_for_each_done", stream_id.raw() as u64, end - start, "shard");
+
+            self.stores.insert(stream_id, store);
+            self.last_engine_seq.insert(stream_id, info.last_seq);
+            lifecycle_trace::record("p07_store_reinserted", stream_id.raw() as u64, 0, "shard");
+
+            // Keep ctx.next_seq aligned so any future live publish that goes
+            // through engine.publish assigns seqs after the store's tail.
+            let next = info.last_seq + 1;
+            if self.engine.ctx().next_seq < next {
+                self.engine.ctx_mut().next_seq = next;
+            }
+        }
+        lifecycle_trace::record("p08_ppte_exit", 0, 0, "shard");
+    }
+
+    /// Iterate all active bindings, claim from engine, read store, build one
+    /// `RepBatch` frame per claim (≤ `CLAIM_BATCH` entries). Loops per binding
+    /// until the queue is drained or `max_inflight` is hit.
+    ///
+    /// Hot-path discipline (`roles.md` DRAINER + `performance.md` rule 21):
+    /// * `now` is read **once** per wakeup, not per message.
+    /// * Claimed entries are copied as bare seqs (8 B) into `scratch_seqs` —
+    ///   no `Vec<ClaimedEntry>::to_vec()` per claim.
+    /// * Subject + payload are copied straight from `Store::get` into the
+    ///   reusable `scratch_batch_body` buffer; no per-entry frame allocation.
+    pub(in crate::shard) fn handle_drain_deliver(&mut self) {
+        lifecycle_trace::record("21_drainer_enter", 0, self.bindings.len() as u64, "shard");
+        // Guard 0 (roles.md DRAINER MUST #1): without destinatarios the drainer
+        // does zero work. No engine feed, no store read, no clock syscall.
+        if self.bindings.is_empty() {
+            self.gate.lock();
+            return;
+        }
+
+        // Hoist the wall-clock read out of the per-message loop (rule 21).
+        let now = Timestamp::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+
+        // 1. Feed new journal entries into engine
+        lifecycle_trace::record("22_feed_engine_start", 0, 0, "shard");
+        self.publish_pending_to_engine(now);
+        lifecycle_trace::record("23_feed_engine_done", 0, 0, "shard");
+
+        const CLAIM_BATCH: u16 = 256;
+        let mut any_delivered = false;
+        // True if any binding hit a full CLAIM_BATCH — meaning the engine
+        // probably has more ready entries that we couldn't fit this cycle.
+        // Used to decide whether to re-arm the gate (release) or lock it.
+        // Without this, every successful drain re-fires the gate, causing
+        // a full empty cycle (~5 µs of CPU) immediately after delivery.
+        let mut more_pending = false;
+
+        for i in 0..self.bindings.len() {
+            let binding = &self.bindings[i];
+            let queue_id = binding.queue_id;
+            let connection_id = binding.connection_id;
+            let consumer_id = binding.consumer_id;
+            let stream_id = binding.stream_id;
+            let subscription_id = binding.subscription_id;
+            let binding_id = binding.binding_id;
+            let max_inflight = binding.max_inflight;
+
+            // Pre-filter (cached) — paused: skip without any engine call.
+            if binding.paused {
+                lifecycle_trace::record("24_drain_binding_paused", connection_id.0, stream_id.raw() as u64, "shard");
+                continue;
+            }
+            // Pre-filter (~3 ns) — saturated consumer: claim would return
+            // empty. Skip the entire claim path for this binding.
+            if !self.engine.consumer_has_capacity(consumer_id, max_inflight) {
+                lifecycle_trace::record("24_drain_binding_saturated", connection_id.0, stream_id.raw() as u64, "shard");
+                continue;
+            }
+            lifecycle_trace::record("24_drain_binding_start", connection_id.0, stream_id.raw() as u64, "shard");
+
+            // Loop: claim batches until queue empty or inflight limit hit
+            loop {
+                // Adaptive batch size — never ask for more than the consumer
+                // can accept right now. Caps at CLAIM_BATCH so the wire
+                // RepBatch stays under sane size.
+                let remaining = self
+                    .engine
+                    .consumer_capacity_remaining(consumer_id, max_inflight);
+                if remaining == 0 {
+                    break;
+                }
+                let max_items = CLAIM_BATCH.min(remaining as u16);
+
+                // 1. Claim — copy seqs out so the engine borrow ends here.
+                self.scratch_seqs.clear();
+                lifecycle_trace::record("25_claim_start", connection_id.0, max_items as u64, "shard");
+                {
+                    let claimed = self.engine.claim(
+                        &ClaimBatch {
+                            queue_id,
+                            connection_id,
+                            consumer_id,
+                            max_items,
+                            now,
+                        },
+                        subscription_id,
+                        binding_id,
+                    );
+                    if claimed.entries().is_empty() {
+                        lifecycle_trace::record("26_claim_empty", connection_id.0, 0, "shard");
+                        break;
+                    }
+                    self.scratch_seqs.extend(claimed.entries().iter().map(|e| e.seq));
+                }
+                let claimed_count = self.scratch_seqs.len();
+                lifecycle_trace::record("26_claim_done", connection_id.0, claimed_count as u64, "shard");
+                any_delivered = true;
+
+                // 2. Build one RepBatch body in the reusable scratch buffer.
+                let store = match self.stores.get(&stream_id) {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                self.scratch_batch_body.clear();
+                self.scratch_batch_body.extend_from_slice(
+                    RepBatchFixed {
+                        consumer_id: U32::new(consumer_id.0),
+                        count: U16::new(claimed_count as u16),
+                        _pad: U16::new(0),
+                    }
+                    .as_bytes(),
+                );
+
+                lifecycle_trace::record("27_store_get_loop_start", connection_id.0, claimed_count as u64, "shard");
+                let body = &mut self.scratch_batch_body;
+                for &seq in &self.scratch_seqs {
+                    store.get(seq, &mut |entry| {
+                        let subj_len = entry.subject.len();
+                        let data_len = subj_len + entry.payload.len();
+                        let header = DeliveryEntryHeader {
+                            seq: U64::new(seq),
+                            subj_len: U16::new(subj_len as u16),
+                            data_len: U32::new(data_len as u32),
+                        };
+                        body.extend_from_slice(header.as_bytes());
+                        body.extend_from_slice(entry.subject);
+                        body.extend_from_slice(entry.payload);
+                    }).ok();
+                }
+                lifecycle_trace::record("28_store_get_loop_done", connection_id.0, claimed_count as u64, "shard");
+
+                // 3. Frame: envelope + body in one Bytes, sent via send_bytes.
+                //    The wire id (what the client computed locally with
+                //    fnv1a_32 and uses to demux incoming frames) is what
+                //    must go on the envelope, NOT the engine seq id. Fall
+                //    back to seq if the registry mapping is missing — the
+                //    client wouldn't know that wire id either, so the frame
+                //    is dropped on its side anyway and we avoid panicking.
+                let wire_stream_id = self
+                    .names
+                    .stream_wire(stream_id)
+                    .unwrap_or_else(|| stream_id.raw());
+                let body_len = self.scratch_batch_body.len();
+                let envelope = Envelope::new(
+                    Action::RepBatch,
+                    wire_stream_id,
+                    body_len as u32,
+                    0,
+                );
+                let mut frame = BytesMut::with_capacity(ENVELOPE_SIZE + body_len);
+                frame.extend_from_slice(envelope.as_bytes());
+                frame.extend_from_slice(&self.scratch_batch_body);
+                lifecycle_trace::record("29_frame_built", connection_id.0, body_len as u64, "shard");
+                self.registry.send_bytes(connection_id.0, frame.freeze());
+                lifecycle_trace::record("30_send_bytes_done", connection_id.0, body_len as u64, "shard");
+
+                // If claim returned fewer than max_items, queue is drained
+                // (or capped by inflight). Either way, no more this cycle.
+                if claimed_count < max_items as usize {
+                    break;
+                }
+                // Hit a full batch AND we asked for the full window —
+                // engine likely has more ready, re-arm the gate.
+                if max_items == CLAIM_BATCH {
+                    more_pending = true;
+                }
+            }
+        }
+
+        if more_pending {
+            // Engine still has work we couldn't fit this cycle — re-arm.
+            self.gate.release();
+            lifecycle_trace::record("33_drainer_exit_released", 0, 0, "shard");
+        } else {
+            // Either delivered everything ready, or nothing was ready.
+            // Lock gate until publisher/acker/binder explicitly releases it.
+            // Note: any_delivered=true with !more_pending is the steady-state
+            // happy path — no need to re-fire and burn an empty cycle.
+            let _ = any_delivered;
+            self.gate.lock();
+            lifecycle_trace::record("33_drainer_exit_locked", 0, 0, "shard");
+        }
+    }
+}
