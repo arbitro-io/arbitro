@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 use bytes::BytesMut;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_engine_v2::catalog::{self, fnv1a_32};
@@ -210,27 +210,240 @@ fn layer0_fnv(total_msgs: usize) {
     );
 }
 
-// ─── Layer 1: get_messages — pure store read + validate ─────────────────────
+// ─── Layer 1: get_messages — store read strategies ──────────────────────────
 
 fn layer1_get_messages(total_msgs: usize) {
     let store = make_store(total_msgs);
     let info = store.info();
 
-    let mut count = 0usize;
+    // ── A. for_each (zero-copy callback, zero-alloc) ────────────────
+    {
+        let mut count = 0usize;
+        let t0 = Instant::now();
+        store.for_each(1, info.last_seq + 1, &mut |entry| {
+            std::hint::black_box(entry.subject);
+            std::hint::black_box(entry.payload);
+            count += 1;
+        }).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(count, total_msgs);
+        println!(
+            "    for_each (zero-copy)    {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
 
-    let t0 = Instant::now();
-    store.for_each(1, info.last_seq + 1, &mut |entry| {
-        assert!(!entry.subject.is_empty());
-        assert_eq!(entry.payload.len(), PAYLOAD_SIZE);
-        count += 1;
-    }).unwrap();
-    let elapsed = t0.elapsed();
+    // ── B. read_range (returns Vec<Entry>, allocs Vec) ──────────────
+    {
+        let t0 = Instant::now();
+        let entries = store.read_range(1, info.last_seq + 1).unwrap();
+        let read_elapsed = t0.elapsed();
+        assert_eq!(entries.len(), total_msgs);
 
-    assert_eq!(count, total_msgs);
-    println!(
-        "    store.for_each          {} ({} msg/s)",
-        fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
-    );
+        // Iterate to simulate the work the caller would do
+        let t_iter = Instant::now();
+        let mut count = 0usize;
+        for entry in &entries {
+            std::hint::black_box(entry.subject);
+            std::hint::black_box(entry.payload);
+            count += 1;
+        }
+        let iter_elapsed = t_iter.elapsed();
+        let total_elapsed = read_elapsed + iter_elapsed;
+        assert_eq!(count, total_msgs);
+        println!(
+            "    read_range (Vec alloc)  {} ({} msg/s)  [read: {}, iter: {}]",
+            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(read_elapsed), fmt_ms(iter_elapsed),
+        );
+    }
+
+    // ── C. for_each + accumulate (hash, seq) — zero-copy + batch-ready
+    {
+        let mut items: Vec<(u32, u64)> = Vec::with_capacity(total_msgs);
+        let t0 = Instant::now();
+        store.for_each(1, info.last_seq + 1, &mut |entry| {
+            let hash = fnv1a_32(entry.subject);
+            items.push((hash, entry.seq));
+        }).unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(items.len(), total_msgs);
+        println!(
+            "    for_each + accum hash   {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    // ── D. read_range + build batch items (subject ref + hash + seq)
+    {
+        let t0 = Instant::now();
+        let entries = store.read_range(1, info.last_seq + 1).unwrap();
+        let items: Vec<(&[u8], u32, u64)> = entries.iter()
+            .map(|e| (e.subject, fnv1a_32(e.subject), e.seq))
+            .collect();
+        let elapsed = t0.elapsed();
+        assert_eq!(items.len(), total_msgs);
+        println!(
+            "    read_range + batch map  {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    // ── E. Capped: for_each in 256-chunks + accum ───────────────────
+    {
+        let mut total_fed = 0usize;
+        let mut scratch: Vec<(u32, u64)> = Vec::with_capacity(MAX_FEED_PER_CYCLE as usize);
+        let t0 = Instant::now();
+        let mut start = 1u64;
+        let last = info.last_seq;
+        while start <= last {
+            let end = (start + MAX_FEED_PER_CYCLE).min(last + 1);
+            scratch.clear();
+            store.for_each(start, end, &mut |entry| {
+                let hash = fnv1a_32(entry.subject);
+                scratch.push((hash, entry.seq));
+            }).unwrap();
+            total_fed += scratch.len();
+            start = end;
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(total_fed, total_msgs);
+        println!(
+            "    for_each capped 256     {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    // ── F. Capped: read_range in 256-chunks + batch map ─────────────
+    {
+        let mut total_fed = 0usize;
+        let t0 = Instant::now();
+        let mut start = 1u64;
+        let last = info.last_seq;
+        while start <= last {
+            let end = (start + MAX_FEED_PER_CYCLE).min(last + 1);
+            let entries = store.read_range(start, end).unwrap();
+            let items: Vec<(&[u8], u32, u64)> = entries.iter()
+                .map(|e| (e.subject, fnv1a_32(e.subject), e.seq))
+                .collect();
+            total_fed += items.len();
+            start = end;
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(total_fed, total_msgs);
+        println!(
+            "    read_range capped 256   {} ({} msg/s)",
+            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        );
+    }
+
+    // ── G. Zero-copy: pre-computed headers in contiguous buffer ──────
+    //
+    // Simulates a store that stores subject_hash at append time in a
+    // fixed-size #[repr(C)] header. The drainer casts the raw byte buffer
+    // directly to &[SeedHeader] — no per-entry iteration, no fnv, no decode.
+    {
+        // Build the contiguous buffer simulating what the store would have
+        let subject_hash = fnv1a_32(b"bench.drain.subject");
+        let header_size = std::mem::size_of::<SeedHeader>();
+        let buf_len = header_size * total_msgs;
+        let mut buf: Vec<u8> = Vec::with_capacity(buf_len);
+        for i in 0..total_msgs {
+            let hdr = SeedHeader {
+                seq: U64::new((i + 1) as u64),
+                subject_hash: U32::new(subject_hash),
+            };
+            buf.extend_from_slice(hdr.as_bytes());
+        }
+        assert_eq!(buf.len(), buf_len);
+
+        // G1: Cast entire buffer at once — single zerocopy::Ref, no iteration
+        {
+            let t0 = Instant::now();
+            let headers: &[SeedHeader] = <[SeedHeader]>::ref_from_bytes(&buf).unwrap();
+            let cast_elapsed = t0.elapsed();
+
+            // Iterate to build (subject_hash, seq) pairs — simulating what
+            // enqueue_ready_batch needs
+            let t_iter = Instant::now();
+            let mut count = 0usize;
+            let mut accum_seq = 0u64;
+            for hdr in headers {
+                accum_seq = accum_seq.wrapping_add(hdr.seq.get());
+                std::hint::black_box(hdr.subject_hash.get());
+                count += 1;
+            }
+            let iter_elapsed = t_iter.elapsed();
+            std::hint::black_box(accum_seq);
+            let total_elapsed = cast_elapsed + iter_elapsed;
+
+            assert_eq!(count, total_msgs);
+            println!(
+                "    zerocopy cast all       {} ({} msg/s)  [cast: {}, iter: {}]",
+                fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+                fmt_ns(cast_elapsed), fmt_ms(iter_elapsed),
+            );
+        }
+
+        // G2: Cast in 256-chunks — simulating capped feed with zerocopy
+        {
+            let cap = MAX_FEED_PER_CYCLE as usize;
+            let mut total_fed = 0usize;
+            let t0 = Instant::now();
+            let mut offset = 0usize;
+            while offset < buf.len() {
+                let chunk_end = (offset + cap * header_size).min(buf.len());
+                let chunk = &buf[offset..chunk_end];
+                let headers: &[SeedHeader] = <[SeedHeader]>::ref_from_bytes(chunk).unwrap();
+                for hdr in headers {
+                    std::hint::black_box(hdr.seq.get());
+                    std::hint::black_box(hdr.subject_hash.get());
+                }
+                total_fed += headers.len();
+                offset = chunk_end;
+            }
+            let elapsed = t0.elapsed();
+            assert_eq!(total_fed, total_msgs);
+            println!(
+                "    zerocopy capped 256     {} ({} msg/s)",
+                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            );
+        }
+
+        // G3: Direct pointer cast (unsafe baseline) — absolute minimum cost
+        {
+            let t0 = Instant::now();
+            let ptr = buf.as_ptr() as *const SeedHeader;
+            let headers: &[SeedHeader] = unsafe { std::slice::from_raw_parts(ptr, total_msgs) };
+            let mut count = 0usize;
+            let mut accum = 0u64;
+            for hdr in headers {
+                accum = accum.wrapping_add(hdr.seq.get());
+                std::hint::black_box(hdr.subject_hash.get());
+                count += 1;
+            }
+            let elapsed = t0.elapsed();
+            std::hint::black_box(accum);
+            assert_eq!(count, total_msgs);
+            println!(
+                "    unsafe ptr cast (base)  {} ({} msg/s)",
+                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            );
+        }
+    }
+}
+
+// ─── SeedHeader: what the store would have per entry ────────────────────────
+
+/// Fixed-size header pre-computed at append time. Contains only what the
+/// drainer needs for enqueue_ready_batch — no subject bytes, no payload.
+///
+/// 12 bytes per entry. 1M entries = 12 MB contiguous. Fits in L3 cache.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, Debug)]
+#[repr(C)]
+struct SeedHeader {
+    seq: U64,
+    subject_hash: U32,
 }
 
 // ─── Layer 2: + ready queue (capped feed + pop + store read) ────────────────
