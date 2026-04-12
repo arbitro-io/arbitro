@@ -154,6 +154,8 @@ pub struct ShardWorker {
     /// alternative (caching wire id per binding, threading it through every
     /// command) requires more invasive plumbing.
     pub(super) names: Arc<crate::common::NameRegistry>,
+    /// Max messages fed into the engine ready queue per drain cycle.
+    pub(super) max_feed_per_cycle: usize,
 }
 
 impl ShardWorker {
@@ -165,6 +167,7 @@ impl ShardWorker {
         registry: ConnectionRegistry,
         data_dir: Option<String>,
         names: Arc<crate::common::NameRegistry>,
+        max_feed_per_cycle: usize,
     ) -> Self {
         Self {
             engine,
@@ -189,6 +192,7 @@ impl ShardWorker {
             accum_total: 0,
             accum_bytes: 0,
             names,
+            max_feed_per_cycle,
         }
     }
 

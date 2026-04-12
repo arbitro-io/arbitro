@@ -20,6 +20,8 @@ pub struct Config {
     pub keepalive_interval: Duration,
     /// Shutdown timeout — max wait for graceful drain (default: 10s).
     pub shutdown_timeout: Duration,
+    /// Max messages fed into the engine ready queue per drain cycle (default: 256).
+    pub max_feed_per_cycle: usize,
     /// Data directory for persistence (None = in-memory only).
     pub data_dir: Option<String>,
 }
@@ -33,6 +35,7 @@ impl Config {
                 std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
             ),
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
+            max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
             max_connections: env_parse("ARBITRO_MAX_CONNECTIONS", 10_000),
             write_buffer_cap: env_parse("ARBITRO_WRITE_BUFFER_CAP", 8192),
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
@@ -59,6 +62,11 @@ impl Config {
 
     pub fn max_connections(mut self, max: u32) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    pub fn max_feed_per_cycle(mut self, cap: usize) -> Self {
+        self.max_feed_per_cycle = cap;
         self
     }
 
@@ -94,6 +102,7 @@ impl Default for Config {
             listen_addr: "0.0.0.0:9898".into(),
             shard_count: std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
             channel_capacity: 4096,
+            max_feed_per_cycle: 256,
             max_connections: 10_000,
             write_buffer_cap: 8192,
             idle_timeout: Duration::from_secs(300),

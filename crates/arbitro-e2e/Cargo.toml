@@ -50,4 +50,12 @@ harness = false
 name    = "queue"
 harness = false
 
+[[bench]]
+name    = "channel_overhead"
+harness = false
+
+[[bench]]
+name    = "drain_isolated"
+harness = false
+
  

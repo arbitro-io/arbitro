@@ -50,6 +50,7 @@ impl ShardRouter {
                 registry.clone(),
                 config.data_dir.clone(),
                 Arc::clone(&names),
+                config.max_feed_per_cycle,
             );
 
             // Named thread — mandatory per concurrency.md

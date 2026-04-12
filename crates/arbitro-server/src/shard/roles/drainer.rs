@@ -59,26 +59,35 @@ impl ShardWorker {
             if info.last_seq <= last { continue; }
 
             let start = last + 1;
-            let end = info.last_seq + 1;
+            let cap = self.max_feed_per_cycle as u64;
+            let end = (start + cap).min(info.last_seq + 1);
 
             // Temporarily remove store to avoid borrow conflict with self.engine
             let store = self.stores.remove(&stream_id).unwrap();
             lifecycle_trace::record("p05_store_removed", stream_id.raw() as u64, end - start, "shard");
 
             let engine = &mut self.engine;
+            let mut fed_last: u64 = last;
+            let mut fed_entries: u64 = 0;
+            let mut fed_no_match: u64 = 0;
+            let mut fed_queues: u64 = 0;
             store.for_each(start, end, &mut |entry| {
                 let subject_hash = arbitro_engine_v2::catalog::fnv1a_32(entry.subject);
-                engine.enqueue_ready(stream_id, entry.subject, subject_hash, entry.seq);
+                let pushed = engine.enqueue_ready(stream_id, entry.subject, subject_hash, entry.seq);
+                fed_entries += 1;
+                if pushed == 0 { fed_no_match += 1; } else { fed_queues += pushed as u64; }
+                fed_last = entry.seq;
             }).ok();
+            engine.flush_seed_metrics(fed_entries, fed_no_match, fed_queues);
             lifecycle_trace::record("p06_for_each_done", stream_id.raw() as u64, end - start, "shard");
 
             self.stores.insert(stream_id, store);
-            self.last_engine_seq.insert(stream_id, info.last_seq);
+            self.last_engine_seq.insert(stream_id, fed_last);
             lifecycle_trace::record("p07_store_reinserted", stream_id.raw() as u64, 0, "shard");
 
             // Keep ctx.next_seq aligned so any future live publish that goes
             // through engine.publish assigns seqs after the store's tail.
-            let next = info.last_seq + 1;
+            let next = fed_last + 1;
             if self.engine.ctx().next_seq < next {
                 self.engine.ctx_mut().next_seq = next;
             }
