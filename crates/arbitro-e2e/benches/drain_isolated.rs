@@ -67,6 +67,7 @@ fn make_engine() -> ArbitroEngine {
 }
 
 /// Feed up to `MAX_FEED_PER_CYCLE` entries starting from `last_seq + 1`.
+/// Uses for_each + per-message enqueue_ready (old path).
 /// Returns the last seq fed, or `last_seq` if nothing was fed.
 fn feed_engine_capped(
     store: &dyn Store,
@@ -85,6 +86,32 @@ fn feed_engine_capped(
         fed_last = entry.seq;
     }).unwrap();
     fed_last
+}
+
+/// Feed up to `MAX_FEED_PER_CYCLE` entries using seed_index (zero-copy path).
+/// Uses seed_index + enqueue_ready_seed_batch — no subject decode, no fnv.
+/// Returns the last seq fed, or `last_seq` if nothing was fed.
+fn feed_engine_seed(
+    store: &dyn Store,
+    engine: &mut ArbitroEngine,
+    last_seq: u64,
+    scratch: &mut Vec<(u32, u64)>,
+) -> u64 {
+    let info = store.info();
+    if info.last_seq <= last_seq { return last_seq; }
+    let stream_id = StreamId(1);
+    let start = last_seq + 1;
+    let end = (start + MAX_FEED_PER_CYCLE).min(info.last_seq + 1);
+    let seeds = store.seed_index(start, end);
+    if seeds.is_empty() { return last_seq; }
+
+    scratch.clear();
+    for s in seeds {
+        scratch.push((s.subject_hash.get(), s.seq.get()));
+    }
+
+    engine.enqueue_ready_seed_batch(stream_id, scratch);
+    seeds.last().map(|s| s.seq.get()).unwrap_or(last_seq)
 }
 
 /// Pop a batch of seqs from the ready queue into scratch_seqs. Returns count.
@@ -487,58 +514,96 @@ fn layer1_get_messages(total_msgs: usize) {
 // ─── Layer 2: + ready queue (capped feed + pop + store read) ────────────────
 
 fn layer2_ready_queue(total_msgs: usize) {
-    let store = make_store(total_msgs);
-    let mut engine = make_engine();
-    let mut scratch_seqs: Vec<u64> = Vec::with_capacity(CLAIM_BATCH);
+    // ── A. Old path: for_each + enqueue_ready (per-message) ─────────
+    {
+        let store = make_store(total_msgs);
+        let mut engine = make_engine();
+        let mut scratch_seqs: Vec<u64> = Vec::with_capacity(CLAIM_BATCH);
 
-    let mut last_fed: u64 = 0;
-    let mut drained = 0usize;
-    let mut cycles = 0usize;
-    let mut feed_total = std::time::Duration::ZERO;
-    let mut pop_total = std::time::Duration::ZERO;
+        let mut last_fed: u64 = 0;
+        let mut drained = 0usize;
+        let mut cycles = 0usize;
+        let mut feed_total = std::time::Duration::ZERO;
+        let mut pop_total = std::time::Duration::ZERO;
 
-    let t0 = Instant::now();
-    loop {
-        // Feed up to MAX_FEED_PER_CYCLE
-        let t_feed = Instant::now();
-        let new_last = feed_engine_capped(store.as_ref(), &mut engine, last_fed);
-        feed_total += t_feed.elapsed();
-        let nothing_fed = new_last == last_fed;
-        last_fed = new_last;
-
-        // Pop + read
-        let t_pop = Instant::now();
+        let t0 = Instant::now();
         loop {
-            let count = pop_batch(&mut engine, &mut scratch_seqs);
-            if count == 0 { break; }
-            let first = scratch_seqs[0];
-            let last = scratch_seqs[count - 1];
-            store.for_each(first, last + 1, &mut |entry| {
-                assert!(!entry.subject.is_empty());
-                assert_eq!(entry.payload.len(), PAYLOAD_SIZE);
-            }).unwrap();
-            drained += count;
+            let t_feed = Instant::now();
+            let new_last = feed_engine_capped(store.as_ref(), &mut engine, last_fed);
+            feed_total += t_feed.elapsed();
+            let nothing_fed = new_last == last_fed;
+            last_fed = new_last;
+
+            let t_pop = Instant::now();
+            loop {
+                let count = pop_batch(&mut engine, &mut scratch_seqs);
+                if count == 0 { break; }
+                drained += count;
+            }
+            pop_total += t_pop.elapsed();
+
+            cycles += 1;
+            if nothing_fed { break; }
         }
-        pop_total += t_pop.elapsed();
+        let total_elapsed = t0.elapsed();
 
-        cycles += 1;
-        if nothing_fed { break; }
+        assert_eq!(drained, total_msgs);
+        println!(
+            "    old: for_each+enqueue   {} ({} msg/s)  [feed: {}, pop: {}]",
+            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(feed_total), fmt_ms(pop_total),
+        );
     }
-    let total_elapsed = t0.elapsed();
 
-    assert_eq!(drained, total_msgs);
-    println!(
-        "    feed (capped {})      {} ({} msg/s)",
-        MAX_FEED_PER_CYCLE, fmt_ms(feed_total), fmt_rate(total_msgs, feed_total),
-    );
-    println!(
-        "    pop + store.for_each    {} ({} msg/s)",
-        fmt_ms(pop_total), fmt_rate(total_msgs, pop_total),
-    );
-    println!(
-        "    total ({} cycles)    {} ({} msg/s)",
-        cycles, fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-    );
+    // ── B. New path: seed_index + enqueue_ready_seed_batch ──────────
+    {
+        let store = make_store(total_msgs);
+        let mut engine = make_engine();
+        let stream_id = StreamId(1);
+        let mut scratch_seqs: Vec<u64> = Vec::with_capacity(CLAIM_BATCH);
+        let mut seed_scratch: Vec<(u32, u64)> = Vec::with_capacity(MAX_FEED_PER_CYCLE as usize);
+
+        // Pre-resolve the subject pattern (required once per unique subject)
+        let subject = b"bench.drain.subject";
+        let hash = fnv1a_32(subject);
+        engine.enqueue_ready(stream_id, subject, hash, 0);
+        // Pop the dummy entry
+        engine.ctx_mut().ready.pop(QueueId(1));
+
+        let mut last_fed: u64 = 0;
+        let mut drained = 0usize;
+        let mut cycles = 0usize;
+        let mut feed_total = std::time::Duration::ZERO;
+        let mut pop_total = std::time::Duration::ZERO;
+
+        let t0 = Instant::now();
+        loop {
+            let t_feed = Instant::now();
+            let new_last = feed_engine_seed(store.as_ref(), &mut engine, last_fed, &mut seed_scratch);
+            feed_total += t_feed.elapsed();
+            let nothing_fed = new_last == last_fed;
+            last_fed = new_last;
+
+            let t_pop = Instant::now();
+            loop {
+                let count = pop_batch(&mut engine, &mut scratch_seqs);
+                if count == 0 { break; }
+                drained += count;
+            }
+            pop_total += t_pop.elapsed();
+
+            cycles += 1;
+            if nothing_fed { break; }
+        }
+        let total_elapsed = t0.elapsed();
+
+        assert_eq!(drained, total_msgs);
+        println!(
+            "    new: seed+batch         {} ({} msg/s)  [feed: {}, pop: {}]",
+            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(feed_total), fmt_ms(pop_total),
+        );
+    }
 }
 
 // ─── Layer 3: + frame build (RepBatch + envelope + freeze) ──────────────────
