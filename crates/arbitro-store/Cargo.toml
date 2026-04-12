@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 arbitro-proto     = { path = "../arbitro-proto" }
 arbitro-engine-v2 = { workspace = true }
+zerocopy          = { workspace = true }
 memmap2 = "0.9"
 
 [dev-dependencies]

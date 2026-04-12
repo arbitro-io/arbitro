@@ -116,6 +116,7 @@ dependencies = [
  "arbitro-proto",
  "memmap2",
  "tempfile",
+ "zerocopy",
 ]
 
 [[package]]

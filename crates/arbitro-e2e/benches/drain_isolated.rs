@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 use bytes::BytesMut;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_engine_v2::catalog::{self, fnv1a_32};
@@ -21,7 +21,7 @@ use arbitro_engine_v2::ArbitroEngine;
 use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::action::Action;
-use arbitro_store::{EntryRef, MemoryStore, Store};
+use arbitro_store::{EntryRef, MemoryStore, SeedHeader, Store};
 
 const PAYLOAD_SIZE: usize = 64;
 const CLAIM_BATCH: usize = 256;
@@ -431,19 +431,57 @@ fn layer1_get_messages(total_msgs: usize) {
             );
         }
     }
-}
 
-// ─── SeedHeader: what the store would have per entry ────────────────────────
+    // ���─ H. store.seed_index() — zero-copy slice from store ────────
+    {
+        // H1: seed_index all at once (single slice, zero alloc)
+        {
+            let t0 = Instant::now();
+            let seeds = store.seed_index(1, info.last_seq + 1);
+            let cast_elapsed = t0.elapsed();
+            assert_eq!(seeds.len(), total_msgs);
 
-/// Fixed-size header pre-computed at append time. Contains only what the
-/// drainer needs for enqueue_ready_batch — no subject bytes, no payload.
-///
-/// 12 bytes per entry. 1M entries = 12 MB contiguous. Fits in L3 cache.
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, Debug)]
-#[repr(C)]
-struct SeedHeader {
-    seq: U64,
-    subject_hash: U32,
+            let t_iter = Instant::now();
+            let mut accum = 0u64;
+            for s in seeds {
+                accum = accum.wrapping_add(s.seq.get());
+                std::hint::black_box(s.subject_hash.get());
+            }
+            let iter_elapsed = t_iter.elapsed();
+            std::hint::black_box(accum);
+            let total_elapsed = cast_elapsed + iter_elapsed;
+            println!(
+                "    seed_index all           {} ({} msg/s)  [slice: {}, iter: {}]",
+                fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
+                fmt_ns(cast_elapsed), fmt_ms(iter_elapsed),
+            );
+        }
+
+        // H2: seed_index capped 256 (sub-slices, zero alloc)
+        {
+            let cap = MAX_FEED_PER_CYCLE;
+            let mut total_fed = 0usize;
+            let t0 = Instant::now();
+            let mut start = 1u64;
+            let last = info.last_seq;
+            while start <= last {
+                let end = (start + cap).min(last + 1);
+                let seeds = store.seed_index(start, end);
+                for s in seeds {
+                    std::hint::black_box(s.seq.get());
+                    std::hint::black_box(s.subject_hash.get());
+                }
+                total_fed += seeds.len();
+                start = end;
+            }
+            let elapsed = t0.elapsed();
+            assert_eq!(total_fed, total_msgs);
+            println!(
+                "    seed_index capped 256    {} ({} msg/s)",
+                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            );
+        }
+    }
 }
 
 // ─── Layer 2: + ready queue (capped feed + pop + store read) ────────────────

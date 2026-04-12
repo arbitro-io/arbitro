@@ -6,7 +6,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::segment::{self, SegmentMetadata, MAX_SEGMENT_BYTES};
-use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo};
+use crate::store::{Entry, EntryRef, SeedHeader, Store, StoreError, StoreInfo};
+use arbitro_engine_v2::catalog::fnv1a_32;
+use zerocopy::byteorder::little_endian::{U32, U64};
 
 #[derive(Debug, Clone, Copy)]
 struct LogMetadata {
@@ -16,6 +18,8 @@ struct LogMetadata {
     pub payload_len: u32,
     pub offset: u32,
     pub segment_idx: u32,
+    #[allow(dead_code)]
+    pub subject_hash: u32,
 }
 
 pub struct TolerantStore {
@@ -25,6 +29,8 @@ pub struct TolerantStore {
     sealed_segments: Vec<Mmap>,
     segments: Vec<SegmentMetadata>,
     index: Vec<LogMetadata>,
+    /// Contiguous seed index for zero-copy drainer access.
+    seed_idx: Vec<SeedHeader>,
     next_seq: u64,
     first_seq: u64,
     total_bytes: u64,
@@ -43,6 +49,7 @@ impl TolerantStore {
             sealed_segments: Vec::new(),
             segments: Vec::new(),
             index: Vec::new(), // Pre-allocated in init()
+            seed_idx: Vec::new(),
             next_seq: 1,
             first_seq: 1,
             total_bytes: 0,
@@ -115,8 +122,11 @@ impl TolerantStore {
 
             if first == 0 { first = seq; }
             last = seq;
-            self.index.push(LogMetadata { seq, ts, subj_len, payload_len, offset: (offset + HEADER_SIZE) as u32, segment_idx });
-            
+            let data_off = offset + HEADER_SIZE;
+            let subject_hash = fnv1a_32(&mmap[data_off..data_off + subj_len as usize]);
+            self.index.push(LogMetadata { seq, ts, subj_len, payload_len, offset: data_off as u32, segment_idx, subject_hash });
+            self.seed_idx.push(SeedHeader { seq: U64::new(seq), subject_hash: U32::new(subject_hash) });
+
             offset += HEADER_SIZE + (subj_len as usize) + (payload_len as usize);
             self.next_seq = seq + 1;
             self.total_bytes += (subj_len as u64) + (payload_len as u64);
@@ -132,9 +142,10 @@ impl TolerantStore {
 
 impl Store for TolerantStore {
     fn init(&mut self) -> Result<(), StoreError> {
-        // Pre-allocate index to 1M entries for zero-alloc hot path
+        // Pre-allocate indices to 1M entries for zero-alloc hot path
         // WHY: Realloc on hot path violates Hardware Sympathy.
         self.index = Vec::with_capacity(1_000_000);
+        self.seed_idx = Vec::with_capacity(1_000_000);
         self.scan_segments()?;
         if self.active_mmap.is_none() { self.rotate()?; }
         if let Some(f) = self.index.first() { self.first_seq = f.seq; }
@@ -168,7 +179,9 @@ impl Store for TolerantStore {
             .copy_from_slice(entry.payload);
 
         // WHY: Zero-allocation push (capacity guaranteed by init())
-        self.index.push(LogMetadata { seq, ts: timestamp, subj_len: slen, payload_len: plen, offset: data_off as u32, segment_idx: self.sealed_segments.len() as u32 });
+        let subject_hash = fnv1a_32(entry.subject);
+        self.index.push(LogMetadata { seq, ts: timestamp, subj_len: slen, payload_len: plen, offset: data_off as u32, segment_idx: self.sealed_segments.len() as u32, subject_hash });
+        self.seed_idx.push(SeedHeader { seq: U64::new(seq), subject_hash: U32::new(subject_hash) });
 
         self.next_seq += 1;
         self.total_bytes += entry_total;
@@ -209,6 +222,7 @@ impl Store for TolerantStore {
         }
 
         self.index.drain(0..idx);
+        self.seed_idx.drain(0..idx);
         if dropped > 0 {
             for m in &mut self.index { m.segment_idx -= dropped as u32; }
         }
@@ -232,6 +246,7 @@ impl Store for TolerantStore {
     fn purge(&mut self) -> u64 {
         let count = self.index.len() as u64;
         self.index.clear();
+        self.seed_idx.clear();
         self.sealed_segments.clear();
         self.segments.clear();
         self.active_mmap = None;
@@ -253,6 +268,14 @@ impl Store for TolerantStore {
         Ok(first)
     }
     
+    fn seed_index(&self, start: u64, end: u64) -> &[SeedHeader] {
+        let s = if start < self.first_seq { 0 } else { (start - self.first_seq) as usize };
+        let e = if end < self.first_seq { 0 } else { (end - self.first_seq) as usize };
+        let e = e.min(self.seed_idx.len());
+        let s = s.min(e);
+        &self.seed_idx[s..e]
+    }
+
     fn read(&self, _: u64) -> Result<Option<Entry<'_>>, StoreError> { Err(StoreError::NotFound) }
     fn read_range(&self, _: u64, _: u64) -> Result<Vec<Entry<'_>>, StoreError> { Err(StoreError::NotFound) }
     fn drain(&mut self, _: &[u8]) -> u64 { 0 }
