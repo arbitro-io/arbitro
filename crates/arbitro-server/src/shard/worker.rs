@@ -46,6 +46,10 @@ pub(super) struct ActiveBinding {
     /// loop passes this to `engine.consumer_has_capacity()` (~3 ns) instead
     /// of re-reading the catalog (~20 ns). Updated only on resubscribe.
     pub(super) max_inflight: u32,
+    /// `true` when `AckPolicy::None` — the drainer bypasses `engine.claim`
+    /// (which creates PendingNodes + edges + inflight) and pops directly
+    /// from `ctx.ready`. No tracking, no cleanup cost at delete time.
+    pub(super) fire_and_forget: bool,
     /// Mirror of `engine.consumer_paused()` for this consumer. Maintained
     /// by `handle_pause_consumer` / `handle_resume_consumer`. The drainer
     /// uses this to skip a binding entirely without paying for any engine

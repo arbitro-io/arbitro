@@ -134,6 +134,43 @@ impl ConnectionRegistry {
         self.try_send_to(conn_id, data)
     }
 
+    /// Blocking send — applies natural backpressure when the per-conn
+    /// write channel is full.
+    ///
+    /// **MUST be called from a non-async context** (the shard worker
+    /// thread). Tokio's `blocking_send` panics if invoked from inside an
+    /// async runtime.
+    ///
+    /// Returns `false` only when the connection is unknown or already
+    /// closed (channel rx dropped). The caller can safely treat this as
+    /// "connection gone" and stop draining for that binding.
+    ///
+    /// This is the path used by the **drainer** to ship `RepBatch` frames.
+    /// The previous `try_send` path silently dropped frames on `Full`,
+    /// which broke the consumer's view of the stream because the engine
+    /// had already moved those seqs to inflight. Backpressure here is
+    /// correct: a slow consumer slows its own delivery, not the entire
+    /// shard's other bindings (the shard finishes the current claim and
+    /// loops to the next binding before parking).
+    #[inline]
+    pub fn send_bytes_blocking(&self, conn_id: u64, data: Bytes) -> bool {
+        // Clone the sender out from under the lock so the lock is not
+        // held across the (potentially blocking) send. Holding the
+        // sessions Mutex while parking would block every other shard
+        // doing accept/remove/touch on this registry.
+        let tx = {
+            let sessions = self.inner.sessions.lock().unwrap();
+            match sessions.get(&conn_id) {
+                Some(session) => session.tx.clone(),
+                None => return false,
+            }
+        };
+        match tx.blocking_send(data) {
+            Ok(()) => true,
+            Err(_) => false, // channel closed → connection gone
+        }
+    }
+
     fn try_send_to(&self, conn_id: u64, frame: Bytes) -> bool {
         let sessions = self.inner.sessions.lock().unwrap();
         if let Some(session) = sessions.get(&conn_id) {

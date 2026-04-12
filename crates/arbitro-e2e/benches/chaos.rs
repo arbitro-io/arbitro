@@ -103,8 +103,13 @@ async fn run_manager() -> Result<(), Box<dyn std::error::Error>> {
             .map(|_| (b"chaos.test".as_slice(), payload.as_slice()))
             .collect();
 
+        // Use the *_sync variant: every await resolves only after the
+        // server has persisted the batch and replied RepOk. The plain
+        // publish_batch is fire-and-forget — at SIGKILL time most of the
+        // 100k would still be sitting in the client write buffer, and
+        // the durability claim would be untestable.
         for _ in 0..(TOTAL_MSGS / MSGS_PER_BATCH as u64) {
-            client.publish_batch(stream_name, &entries).await?;
+            client.publish_batch_sync(stream_name, &entries).await?;
         }
         println!("  [Manager] Killing server now...");
     } 
@@ -120,7 +125,7 @@ async fn run_manager() -> Result<(), Box<dyn std::error::Error>> {
 
         let client = Client::connect(addr).await?;
         let consumer = client.create_consumer(&ConsumerConfig::new(b"verifier", b"chaos_durable")
-            .filter(b">").ack_policy(AckPolicy::None).deliver_policy(arbitro_proto::config::DeliverPolicy::All).build()).await?;
+            .filter(b">").ack_policy(AckPolicy::None).deliver_policy(arbitro_proto::config::DeliverPolicy::All).build().expect("consumer cfg")).await?;
         let mut sub = consumer.subscribe(None).await?;
         
         println!("  [Manager] Verifying data...");

@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 use arbitro_client::Client;
-use arbitro_proto::config::{ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
+use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
 // ── Settings ────────────────────────────────────────────────────
@@ -37,9 +37,37 @@ const JOURNAL_KIND: JournalKind = JournalKind::Memory;
 /// Only used when JOURNAL_KIND == Tolerant.
 const TOLERANT_DATA_DIR: &str = "/tmp/arbitro_bench_tolerant";
 
-const ITERATIONS: u32 = 1;
-const MSGS_PER_CLIENT: u32 = 100;
+// Defaults; override at runtime via env: BENCH_ITERATIONS, BENCH_MSGS,
+// BENCH_BATCH, BENCH_CONCURRENCY (comma list, e.g. "1,2,4,8,16").
+//
+// BENCH_MSGS is the TOTAL messages per iteration, split evenly across the
+// active connections. So `BENCH_MSGS=1000000 BENCH_CONCURRENCY=4` publishes
+// 250k per connection per iter — 1M total, regardless of conn count.
+const ITERATIONS: u32 = 5;
+const TOTAL_MSGS: u32 = 25000;
 const BATCH_SIZE: usize = 256;
+
+fn env_u32(k: &str, default: u32) -> u32 {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+fn env_usize(k: &str, default: usize) -> usize {
+    std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
+fn env_concurrency(default: &[usize]) -> Vec<usize> {
+    match std::env::var("BENCH_CONCURRENCY") {
+        Ok(s) => s.split(',').filter_map(|p| p.trim().parse().ok()).collect(),
+        Err(_) => default.to_vec(),
+    }
+}
+fn cfg_iterations() -> u32 { env_u32("BENCH_ITERATIONS", ITERATIONS) }
+fn cfg_total_msgs() -> u32 { env_u32("BENCH_MSGS", TOTAL_MSGS) }
+fn cfg_batch_size() -> usize { env_usize("BENCH_BATCH", BATCH_SIZE).min(256) }
+fn cfg_replay_msgs() -> u32 { env_u32("BENCH_REPLAY_MSGS", REPLAY_MSGS) }
+fn cfg_replay_iterations() -> u32 { env_u32("BENCH_REPLAY_ITERATIONS", REPLAY_ITERATIONS) }
+/// "publish" | "replay" | "all" (default).
+fn cfg_mode() -> String {
+    std::env::var("BENCH_MODE").unwrap_or_else(|_| "all".to_string()).to_lowercase()
+}
 /// Messages pre-published per stream for the replay scenario.
 /// See bench_safety waiver in the file header.
 const REPLAY_MSGS: u32 = 500_000;
@@ -48,7 +76,7 @@ const REPLAY_MSGS: u32 = 500_000;
 /// TODO: investigate `seeded_streams` / `last_engine_seq` cleanup in
 /// handle_subscribe — this workaround masks a real shard bug.
 const REPLAY_ITERATIONS: u32 = 1;
-const CONCURRENCY: &[usize] = &[1];
+const CONCURRENCY: &[usize] = &[1, 2, 4, 8, 16];
 /// Replay uses its own (smaller) concurrency set because each stream is
 /// pre-loaded with REPLAY_MSGS messages — total in-memory state grows as
 /// REPLAY_MSGS * n, so high concurrency would be wasteful.
@@ -99,7 +127,7 @@ async fn start_server() -> String {
     let mut config = Config::default()
         .listen_addr(addr.clone())
         .max_connections(500)
-        // Large write buffer so replay bursts (10k frames) never saturate try_send.
+        // Large write buffer so replay bursts never saturate blocking_send.
         .write_buffer_cap(65536);
 
     if matches!(JOURNAL_KIND, JournalKind::Tolerant) {
@@ -162,11 +190,12 @@ async fn run_single(
     start.elapsed()
 }
 
-// ── Batch publish (BATCH_SIZE msgs per RTT) ────────────────────
+// ── Batch publish (fragments `total` msgs into `batch_size`-sized batches) ──
 
 async fn run_batch(
     clients: &[Client],
     stream_names: &[Vec<u8>],
+    total: usize,
     batch_size: usize,
     payload: &Arc<[u8]>,
 ) -> Duration {
@@ -177,15 +206,19 @@ async fn run_batch(
         let stream = stream_names[i % stream_names.len()].clone();
         let payload = payload.clone();
         js.spawn(async move {
-            // entries is allocated once per spawn (not per msg). The Vec
-            // holds borrows into the shared Arc<[u8]> payload — no payload
-            // copy. Capacity is exact: zero realloc.
-            let entries: Vec<(&[u8], &[u8])> = (0..batch_size)
-                .map(|_| (b"bench.msg".as_slice(), &payload[..]))
-                .collect();
-            c.publish_batch(&stream, &entries)
-                .await
-                .expect("publish_batch");
+            // Pre-allocate one full-size entries Vec; reuse across batches
+            // by slicing. Zero realloc on the hot loop (perf rule #5).
+            let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                entries.push((b"bench.msg".as_slice(), &payload[..]));
+            }
+            let batches = total.div_ceil(batch_size);
+            for b in 0..batches {
+                let size = batch_size.min(total - b * batch_size);
+                c.publish_batch(&stream, &entries[..size])
+                    .await
+                    .expect("publish_batch");
+            }
         });
     }
     while js.join_next().await.is_some() {}
@@ -254,9 +287,14 @@ async fn run_replay(
     for i in 0..n {
         let stream = &stream_names[i % stream_names.len()];
         let name = format!("replay_{}_{i}", iter);
+        // Replay measures pure drain throughput. AckPolicy::None keeps the
+        // engine from tracking inflight, which is what made this scenario
+        // hit the drainer's u16 truncation cliff in the first place.
         let cfg = ConsumerConfig::new(name.as_bytes(), stream)
             .deliver_policy(DeliverPolicy::All)
-            .build();
+            .ack_policy(AckPolicy::None)
+            .build()
+            .expect("consumer cfg");
         let consumer = setup_client
             .create_consumer(&cfg)
             .await
@@ -407,6 +445,16 @@ fn main() {
         JournalKind::Tolerant => "tolerant",
     };
 
+    let iterations = cfg_iterations();
+    let total_msgs = cfg_total_msgs();
+    let batch_size = cfg_batch_size();
+    let concurrency = env_concurrency(CONCURRENCY);
+    let mode = cfg_mode();
+    let run_publish = matches!(mode.as_str(), "publish" | "all");
+    let run_replay_section = matches!(mode.as_str(), "replay" | "all");
+    let replay_msgs = cfg_replay_msgs();
+    let replay_iterations = cfg_replay_iterations();
+
     let rt = Runtime::new().unwrap();
     let addr = rt.block_on(start_server());
 
@@ -422,16 +470,21 @@ fn main() {
     let payload = shared_payload();
 
     println!(
-        "\nPublish + Replay Throughput — 64B payload, {ITERATIONS} iter, journal={journal_label}"
+        "\nPublish + Replay Throughput — 64B payload, {iterations} iter, journal={journal_label}"
+    );
+    println!(
+        "Config: mode={mode}, total_msgs={total_msgs} (split across conns), batch={batch_size}, concurrency={concurrency:?}, replay_msgs={replay_msgs}"
     );
     println!("{}", "=".repeat(110));
 
+    if run_publish {
     // ── Single publish ──────────────────────────────────────────
-    println!("\n[ publish_single — {MSGS_PER_CLIENT} msgs/client/iter ]");
+    println!("\n[ publish_single — {total_msgs} msgs total/iter ]");
     rt.block_on(reset_streams(&setup_client, &stream_names));
     print_header();
 
-    for &n in CONCURRENCY {
+    for &n in &concurrency {
+        let msgs_per_client = total_msgs / n as u32;
         let clients: Vec<Client> = rt.block_on(async {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -440,7 +493,7 @@ fn main() {
             v
         });
 
-        let total_msgs_per_iter = MSGS_PER_CLIENT as u64 * n as u64;
+        let total_msgs_per_iter = msgs_per_client as u64 * n as u64;
         let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
         rt.block_on(async {
@@ -454,10 +507,10 @@ fn main() {
             let cpu_before = cpu_time_ns();
             let mut total_time = Duration::ZERO;
 
-            for _ in 0..ITERATIONS {
+            for _ in 0..iterations {
                 match tokio::time::timeout(
                     LEVEL_TIMEOUT,
-                    run_single(&clients, &stream_names, MSGS_PER_CLIENT, &payload),
+                    run_single(&clients, &stream_names, msgs_per_client, &payload),
                 )
                 .await
                 {
@@ -478,11 +531,11 @@ fn main() {
             } else {
                 0.0
             };
-            let total_msgs_all = total_msgs_per_iter * ITERATIONS as u64;
+            let total_msgs_all = total_msgs_per_iter * iterations as u64;
 
             print_result(&BenchResult {
                 label,
-                avg: total_time / ITERATIONS,
+                avg: total_time / iterations,
                 throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
                 per_conn: total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
                 rss: rss_after,
@@ -493,11 +546,16 @@ fn main() {
     }
 
     // ── Batch publish ───────────────────────────────────────────
-    println!("\n[ publish_batch — {BATCH_SIZE} msgs/batch/client/iter ]");
+    // Same total volume as publish_single, fragmented into `batch_size`
+    // batches per task.
+    println!(
+        "\n[ publish_batch — batch={batch_size}, {total_msgs} msgs total/iter ]"
+    );
     rt.block_on(reset_streams(&setup_client, &stream_names));
     print_header();
 
-    for &n in CONCURRENCY {
+    for &n in &concurrency {
+        let msgs_per_client = total_msgs / n as u32;
         let clients: Vec<Client> = rt.block_on(async {
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
@@ -506,13 +564,19 @@ fn main() {
             v
         });
 
-        let total_msgs_per_iter = BATCH_SIZE as u64 * n as u64;
+        let total_msgs_per_iter = msgs_per_client as u64 * n as u64;
         let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
         rt.block_on(async {
             let _ = tokio::time::timeout(
                 LEVEL_TIMEOUT,
-                run_batch(&clients, &stream_names, BATCH_SIZE, &payload),
+                run_batch(
+                    &clients,
+                    &stream_names,
+                    msgs_per_client as usize,
+                    batch_size,
+                    &payload,
+                ),
             )
             .await;
 
@@ -520,10 +584,16 @@ fn main() {
             let cpu_before = cpu_time_ns();
             let mut total_time = Duration::ZERO;
 
-            for _ in 0..ITERATIONS {
+            for _ in 0..iterations {
                 match tokio::time::timeout(
                     LEVEL_TIMEOUT,
-                    run_batch(&clients, &stream_names, BATCH_SIZE, &payload),
+                    run_batch(
+                        &clients,
+                        &stream_names,
+                        msgs_per_client as usize,
+                        batch_size,
+                        &payload,
+                    ),
                 )
                 .await
                 {
@@ -544,11 +614,11 @@ fn main() {
             } else {
                 0.0
             };
-            let total_msgs_all = total_msgs_per_iter * ITERATIONS as u64;
+            let total_msgs_all = total_msgs_per_iter * iterations as u64;
 
             print_result(&BenchResult {
                 label,
-                avg: total_time / ITERATIONS,
+                avg: total_time / iterations,
                 throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
                 per_conn: total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
                 rss: rss_after,
@@ -558,17 +628,20 @@ fn main() {
         });
     }
 
+    } // close `if run_publish`
+
+    if run_replay_section {
     // ── Replay (drain pre-published backlog) ────────────────────
     //
     // Uses DEDICATED streams ("rpstream_{n}_{i}") created fresh per concurrency
     // level so that publish_single/batch messages never pollute the replay store.
-    // Each stream is prefilled with exactly REPLAY_MSGS messages once, then
-    // ITERATIONS replay cycles each create a new consumer and drain from seq=1.
-    println!("\n[ replay_drain — {REPLAY_MSGS} msgs pre-loaded/stream, DeliverPolicy::All ]");
+    // Each stream is prefilled with exactly replay_msgs messages once, then
+    // replay_iterations cycles each create a new consumer and drain from seq=1.
+    println!("\n[ replay_drain — {replay_msgs} msgs pre-loaded/stream, DeliverPolicy::All ]");
     print_header();
 
-    for &n in REPLAY_CONCURRENCY {
-        let total_msgs_per_iter = REPLAY_MSGS as u64 * n as u64;
+    for &n in &concurrency {
+        let total_msgs_per_iter = replay_msgs as u64 * n as u64;
         let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
         rt.block_on(async {
@@ -589,17 +662,17 @@ fn main() {
                     .expect("create replay stream");
             }
 
-            // Prefill exactly REPLAY_MSGS messages into each stream (outside timing).
-            prefill_streams(&setup_client, &rp_names, n, REPLAY_MSGS, &payload).await;
+            // Prefill exactly replay_msgs messages into each stream (outside timing).
+            prefill_streams(&setup_client, &rp_names, n, replay_msgs, &payload).await;
 
             let rss_before = rss_kb();
             let cpu_before = cpu_time_ns();
             let mut total_time = Duration::ZERO;
 
-            for iter in 0..REPLAY_ITERATIONS {
+            for iter in 0..replay_iterations {
                 match tokio::time::timeout(
                     REPLAY_TIMEOUT,
-                    run_replay(&setup_client, &rp_names, n, REPLAY_MSGS, iter),
+                    run_replay(&setup_client, &rp_names, n, replay_msgs, iter),
                 )
                 .await
                 {
@@ -627,11 +700,11 @@ fn main() {
             } else {
                 0.0
             };
-            let total_msgs_all = total_msgs_per_iter * REPLAY_ITERATIONS as u64;
+            let total_msgs_all = total_msgs_per_iter * replay_iterations as u64;
 
             print_result(&BenchResult {
                 label,
-                avg: total_time / REPLAY_ITERATIONS,
+                avg: total_time / replay_iterations,
                 throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
                 per_conn: total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
                 rss: rss_after,
@@ -645,6 +718,8 @@ fn main() {
             }
         });
     }
+
+    } // close `if run_replay_section`
 
     println!("\n{}", "=".repeat(110));
     cleanup_tolerant();

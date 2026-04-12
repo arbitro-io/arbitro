@@ -114,7 +114,10 @@ async fn consumer_create_returns_id() {
     let stream = StreamConfig::new(b"orders", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders").build();
+    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     assert!(consumer.id() > 0, "consumer ID should be non-zero");
 }
@@ -128,7 +131,10 @@ async fn consumer_delete() {
     let stream = StreamConfig::new(b"orders", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders").build();
+    let consumer_cfg = ConsumerConfig::new(b"worker", b"orders")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let cid = consumer.id();
 
@@ -153,7 +159,10 @@ async fn publish_single_delivers_correctly() {
     let stream = StreamConfig::new(b"chat", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"reader", b"chat").build();
+    let consumer_cfg = ConsumerConfig::new(b"reader", b"chat")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -181,7 +190,10 @@ async fn publish_batch_delivers_all() {
     let stream = StreamConfig::new(b"logs", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"sink", b"logs").build();
+    let consumer_cfg = ConsumerConfig::new(b"sink", b"logs")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -254,7 +266,9 @@ async fn replay_deliver_all_historical() {
         .create_consumer(
             &ConsumerConfig::new(b"replayer", b"history")
                 .deliver_policy(DeliverPolicy::All)
-                .build(),
+                .ack_policy(AckPolicy::Explicit)
+                .build()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -285,7 +299,10 @@ async fn ack_prevents_redelivery() {
     let stream = StreamConfig::new(b"acktest", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"acker", b"acktest").build();
+    let consumer_cfg = ConsumerConfig::new(b"acker", b"acktest")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -314,7 +331,10 @@ async fn nack_causes_redelivery() {
     let stream = StreamConfig::new(b"nacktest", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"nacker", b"nacktest").build();
+    let consumer_cfg = ConsumerConfig::new(b"nacker", b"nacktest")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -354,7 +374,10 @@ async fn delivery_preserves_order() {
     let stream = StreamConfig::new(b"ordered", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"reader", b"ordered").build();
+    let consumer_cfg = ConsumerConfig::new(b"reader", b"ordered")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -399,11 +422,15 @@ async fn fanout_two_consumers_each_receive_all() {
     // Two consumers with DIFFERENT groups → separate queues → fan-out
     let c1_cfg = ConsumerConfig::new(b"svc_a", b"events")
         .group(b"group_a")
-        .build();
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
 
     let c2_cfg = ConsumerConfig::new(b"svc_b", b"events")
         .group(b"group_b")
-        .build();
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
 
     let c1 = client.create_consumer(&c1_cfg).await.unwrap();
     let c2 = client.create_consumer(&c2_cfg).await.unwrap();
@@ -445,8 +472,14 @@ async fn queue_group_distributes_messages() {
     client.create_stream(&stream).await.unwrap();
 
     // Two consumers with the SAME default group → same queue → round-robin
-    let c1_cfg = ConsumerConfig::new(b"worker1", b"tasks").build();
-    let c2_cfg = ConsumerConfig::new(b"worker2", b"tasks").build();
+    let c1_cfg = ConsumerConfig::new(b"worker1", b"tasks")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
+    let c2_cfg = ConsumerConfig::new(b"worker2", b"tasks")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
 
     let c1 = client.create_consumer(&c1_cfg).await.unwrap();
     let c2 = client.create_consumer(&c2_cfg).await.unwrap();
@@ -503,8 +536,14 @@ async fn consumers_on_different_streams_isolated() {
     client.create_stream(&s2).await.unwrap();
 
     // Unique consumer names (consumer_id = fnv1a of name, must be distinct)
-    let c1 = ConsumerConfig::new(b"log_sink", b"logs").build();
-    let c2 = ConsumerConfig::new(b"metric_sink", b"metrics").build();
+    let c1 = ConsumerConfig::new(b"log_sink", b"logs")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
+    let c2 = ConsumerConfig::new(b"metric_sink", b"metrics")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
 
     let consumer1 = client.create_consumer(&c1).await.unwrap();
     let consumer2 = client.create_consumer(&c2).await.unwrap();
@@ -548,7 +587,10 @@ async fn streams_are_isolated() {
     client.create_stream(&stream_a).await.unwrap();
     client.create_stream(&stream_b).await.unwrap();
 
-    let consumer_b_cfg = ConsumerConfig::new(b"beta_reader", b"beta").build();
+    let consumer_b_cfg = ConsumerConfig::new(b"beta_reader", b"beta")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer_b = client.create_consumer(&consumer_b_cfg).await.unwrap();
     let mut sub_b = consumer_b.subscribe(None).await.unwrap();
 
@@ -576,7 +618,10 @@ async fn ack_sync_returns_ok() {
     let stream = StreamConfig::new(b"acksync", b">").build();
     client.create_stream(&stream).await.unwrap();
 
-    let consumer_cfg = ConsumerConfig::new(b"syncer", b"acksync").build();
+    let consumer_cfg = ConsumerConfig::new(b"syncer", b"acksync")
+        .ack_policy(AckPolicy::Explicit)
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -621,7 +666,8 @@ async fn max_inflight_caps_delivery() {
     let consumer_cfg = ConsumerConfig::new(b"inf_consumer", b"inf_stream")
         .ack_policy(AckPolicy::Explicit)
         .max_inflight(2)
-        .build();
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -687,7 +733,8 @@ async fn max_subject_inflight_multiple_patterns() {
         .max_inflight(100)
         .max_subject_inflight(b"message.premium.>", 3)
         .max_subject_inflight(b"message.freemium.>", 1)
-        .build();
+        .build()
+        .unwrap();
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 

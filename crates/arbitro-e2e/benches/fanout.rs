@@ -71,7 +71,8 @@ async fn main() {
         let ccfg = ConsumerConfig::new(format!("c{}", c_idx).as_bytes(), stream_name)
             .deliver_mode(DeliverMode::Fanout)
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&ccfg).await.unwrap();
 
         for s_idx in 0..SUBS_PER_CLIENT {

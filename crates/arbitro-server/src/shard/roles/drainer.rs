@@ -142,47 +142,62 @@ impl ShardWorker {
                 lifecycle_trace::record("24_drain_binding_paused", connection_id.0, stream_id.raw() as u64, "shard");
                 continue;
             }
-            // Pre-filter (~3 ns) — saturated consumer: claim would return
-            // empty. Skip the entire claim path for this binding.
-            if !self.engine.consumer_has_capacity(consumer_id, max_inflight) {
+            let fire_and_forget = binding.fire_and_forget;
+            // Tracked consumers: skip if saturated (~3 ns). Fire-and-forget
+            // never tracks inflight so the check is meaningless.
+            if !fire_and_forget && !self.engine.consumer_has_capacity(consumer_id, max_inflight) {
                 lifecycle_trace::record("24_drain_binding_saturated", connection_id.0, stream_id.raw() as u64, "shard");
                 continue;
             }
             lifecycle_trace::record("24_drain_binding_start", connection_id.0, stream_id.raw() as u64, "shard");
 
-            // Loop: claim batches until queue empty or inflight limit hit
+            // Loop: claim/pop batches until queue empty or inflight limit hit
             loop {
-                // Adaptive batch size — never ask for more than the consumer
-                // can accept right now. Caps at CLAIM_BATCH so the wire
-                // RepBatch stays under sane size.
-                let remaining = self
-                    .engine
-                    .consumer_capacity_remaining(consumer_id, max_inflight);
-                if remaining == 0 {
-                    break;
-                }
-                let max_items = CLAIM_BATCH.min(remaining as u16);
-
-                // 1. Claim — copy seqs out so the engine borrow ends here.
                 self.scratch_seqs.clear();
-                lifecycle_trace::record("25_claim_start", connection_id.0, max_items as u64, "shard");
-                {
-                    let claimed = self.engine.claim(
-                        &ClaimBatch {
-                            queue_id,
-                            connection_id,
-                            consumer_id,
-                            max_items,
-                            now,
-                        },
-                        subscription_id,
-                        binding_id,
-                    );
-                    if claimed.entries().is_empty() {
-                        lifecycle_trace::record("26_claim_empty", connection_id.0, 0, "shard");
+
+                let max_items: u16 = if fire_and_forget {
+                    // Fire-and-forget: pop directly from the ready queue.
+                    // No PendingNode, no edges, no inflight tracking — the
+                    // engine never learns these seqs were delivered, so
+                    // consumer.delete() has zero cleanup cost.
+                    lifecycle_trace::record("25_pop_start", connection_id.0, CLAIM_BATCH as u64, "shard");
+                    for _ in 0..CLAIM_BATCH {
+                        match self.engine.ctx_mut().ready.pop(queue_id) {
+                            Some((_subject_hash, seq)) => self.scratch_seqs.push(seq),
+                            None => break,
+                        }
+                    }
+                    CLAIM_BATCH
+                } else {
+                    // Tracked consumer: adaptive batch size capped by inflight.
+                    let remaining = self
+                        .engine
+                        .consumer_capacity_remaining(consumer_id, max_inflight);
+                    if remaining == 0 {
                         break;
                     }
-                    self.scratch_seqs.extend(claimed.entries().iter().map(|e| e.seq));
+                    let max = (CLAIM_BATCH as u32).min(remaining) as u16;
+                    lifecycle_trace::record("25_claim_start", connection_id.0, max as u64, "shard");
+                    {
+                        let claimed = self.engine.claim(
+                            &ClaimBatch {
+                                queue_id,
+                                connection_id,
+                                consumer_id,
+                                max_items: max,
+                                now,
+                            },
+                            subscription_id,
+                            binding_id,
+                        );
+                        self.scratch_seqs.extend(claimed.entries().iter().map(|e| e.seq));
+                    }
+                    max
+                };
+
+                if self.scratch_seqs.is_empty() {
+                    lifecycle_trace::record("26_claim_empty", connection_id.0, 0, "shard");
+                    break;
                 }
                 let claimed_count = self.scratch_seqs.len();
                 lifecycle_trace::record("26_claim_done", connection_id.0, claimed_count as u64, "shard");
@@ -206,12 +221,23 @@ impl ShardWorker {
 
                 lifecycle_trace::record("27_store_get_loop_start", connection_id.0, claimed_count as u64, "shard");
                 let body = &mut self.scratch_batch_body;
-                for &seq in &self.scratch_seqs {
-                    store.get(seq, &mut |entry| {
+                // Fast path: when the engine returned a contiguous range of
+                // seqs (the dominant case in DeliverPolicy::All replay and
+                // any single-consumer steady-state drain), `store.for_each`
+                // does one `find_lower_bound` (binary search) + a linear
+                // walk over the index, instead of `claimed_count` independent
+                // `seq_to_idx` lookups. Saves the per-message lookup cost on
+                // the hot drain path. Slow path retained verbatim for the
+                // sparse case (multi-consumer fan-out where claims interleave).
+                let first = self.scratch_seqs[0];
+                let last = self.scratch_seqs[claimed_count - 1];
+                let contiguous = (last - first + 1) as usize == claimed_count;
+                if contiguous {
+                    store.for_each(first, last + 1, &mut |entry| {
                         let subj_len = entry.subject.len();
                         let data_len = subj_len + entry.payload.len();
                         let header = DeliveryEntryHeader {
-                            seq: U64::new(seq),
+                            seq: U64::new(entry.seq),
                             subj_len: U16::new(subj_len as u16),
                             data_len: U32::new(data_len as u32),
                         };
@@ -219,6 +245,21 @@ impl ShardWorker {
                         body.extend_from_slice(entry.subject);
                         body.extend_from_slice(entry.payload);
                     }).ok();
+                } else {
+                    for &seq in &self.scratch_seqs {
+                        store.get(seq, &mut |entry| {
+                            let subj_len = entry.subject.len();
+                            let data_len = subj_len + entry.payload.len();
+                            let header = DeliveryEntryHeader {
+                                seq: U64::new(seq),
+                                subj_len: U16::new(subj_len as u16),
+                                data_len: U32::new(data_len as u32),
+                            };
+                            body.extend_from_slice(header.as_bytes());
+                            body.extend_from_slice(entry.subject);
+                            body.extend_from_slice(entry.payload);
+                        }).ok();
+                    }
                 }
                 lifecycle_trace::record("28_store_get_loop_done", connection_id.0, claimed_count as u64, "shard");
 
@@ -244,8 +285,23 @@ impl ShardWorker {
                 frame.extend_from_slice(envelope.as_bytes());
                 frame.extend_from_slice(&self.scratch_batch_body);
                 lifecycle_trace::record("29_frame_built", connection_id.0, body_len as u64, "shard");
-                self.registry.send_bytes(connection_id.0, frame.freeze());
+                // Blocking send: applies natural backpressure when the
+                // per-conn write channel is full. Without this, the prior
+                // `try_send` silently dropped frames on `Full` and the
+                // consumer hung forever waiting for seqs the engine had
+                // already marked as inflight. The shard thread is a
+                // dedicated OS thread (not a tokio worker), so blocking
+                // here is safe — see registry::send_bytes_blocking.
+                let sent = self
+                    .registry
+                    .send_bytes_blocking(connection_id.0, frame.freeze());
                 lifecycle_trace::record("30_send_bytes_done", connection_id.0, body_len as u64, "shard");
+                if !sent {
+                    // Connection is gone — stop draining this binding for
+                    // the rest of the cycle. The next subscribe/bind for a
+                    // new connection re-arms the gate.
+                    break;
+                }
 
                 // If claim returned fewer than max_items, queue is drained
                 // (or capped by inflight). Either way, no more this cycle.

@@ -217,7 +217,8 @@ async fn consumer_survives_restart() {
         client.create_stream(&StreamConfig::new(b"orders", b"orders.>").build()).await.unwrap();
         let c = ConsumerConfig::new(b"worker1", b"orders")
             .ack_policy(AckPolicy::Explicit)
-            .build();
+            .build()
+            .unwrap();
         client.create_consumer(&c).await.unwrap();
 
         let consumers = client.list_consumers().await.unwrap();
@@ -280,7 +281,8 @@ async fn messages_survive_restart_with_disk_store() {
 
         let c = ConsumerConfig::new(b"reader", b"durable")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&c).await.unwrap();
         let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -435,7 +437,8 @@ async fn deleted_disk_stream_data_does_not_leak() {
 
         let c = ConsumerConfig::new(b"reader", b"recycled")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&c).await.unwrap();
         let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -479,7 +482,8 @@ async fn consumer_and_messages_survive_together() {
 
         let c = ConsumerConfig::new(b"worker", b"durable")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         client.create_consumer(&c).await.unwrap();
 
         for i in 0u32..5 {
@@ -505,7 +509,8 @@ async fn consumer_and_messages_survive_together() {
         // Subscribe with the recovered consumer
         let c = ConsumerConfig::new(b"worker", b"durable")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&c).await.unwrap();
         let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -557,7 +562,8 @@ async fn publish_after_restart_continues() {
         // Subscribe first — triggers seed_from_store (engine seqs align with store seqs)
         let c = ConsumerConfig::new(b"reader", b"seq")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&c).await.unwrap();
         let mut sub = consumer.subscribe(None).await.unwrap();
 
@@ -643,7 +649,8 @@ async fn messages_survive_multiple_restarts() {
 
         let c = ConsumerConfig::new(b"reader", b"multi")
             .ack_policy(AckPolicy::None)
-            .build();
+            .build()
+            .unwrap();
         let consumer = client.create_consumer(&c).await.unwrap();
         let mut sub = consumer.subscribe(None).await.unwrap();
 

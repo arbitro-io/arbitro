@@ -67,7 +67,8 @@ fn bench_limits_e2e(c: &mut Criterion) {
         .max_inflight(10000)
         .max_subject_inflight(b"orders.premium.>", 10)
         .max_subject_inflight(b"orders.basic.>", 1)
-        .build();
+        .build()
+        .unwrap();
 
     let mut group = c.benchmark_group("E2E Subject Isolation");
     let payload = vec![0u8; 64];

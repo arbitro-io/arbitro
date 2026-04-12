@@ -82,7 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .deliver_policy(DeliverPolicy::All)
                     .deliver_mode(d_mode)
                     .max_inflight(5000)
-                    .build();
+                    .build()
+                    .expect("consumer cfg");
                 
                 let consumer = client.create_consumer(&ccfg).await.expect("create consumer");
                 let mut sub = consumer.subscribe(None).await.expect("subscribe");

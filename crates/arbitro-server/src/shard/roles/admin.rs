@@ -84,10 +84,14 @@ impl ShardWorker {
             //  - paused: catalog + graph chain → cached bool, drainer skips
             //    paused bindings without any engine call.
             // Both are kept fresh by handle_pause_consumer/resume_consumer.
-            let max_inflight = self
-                .engine
-                .consumer_max_inflight(consumer_id)
-                .unwrap_or(u32::MAX);
+            let consumer_key = self.engine.ctx().catalog.consumer_key(consumer_id);
+            let (max_inflight, fire_and_forget) = match consumer_key {
+                Ok(k) => match self.engine.ctx().graph.get_consumer(k) {
+                    Ok(n) => (n.max_inflight, n.ack_policy == AckPolicy::None),
+                    Err(_) => (u32::MAX, false),
+                },
+                Err(_) => (u32::MAX, false),
+            };
             let paused = self.engine.consumer_paused(consumer_id);
 
             // Track active binding for delivery
@@ -99,6 +103,7 @@ impl ShardWorker {
                 subscription_id,
                 binding_id,
                 max_inflight,
+                fire_and_forget,
                 paused,
             });
 
