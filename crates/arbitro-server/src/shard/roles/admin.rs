@@ -21,6 +21,7 @@
 use arbitro_engine_v2::batch::{BindBatch, BindEntry, DrainConnectionReq, OpenConnectionReq};
 use arbitro_engine_v2::types::*;
 use arbitro_store::{MemoryStore, Store, TolerantStore};
+use tokio::sync::mpsc;
 
 use crate::shard::command::*;
 use crate::shard::worker::{ActiveBinding, ShardWorker};
@@ -94,6 +95,18 @@ impl ShardWorker {
             };
             let paused = self.engine.consumer_paused(consumer_id);
 
+            // Cache the connection's write-channel sender so the drainer
+            // hot path can try_send directly without the registry Mutex.
+            // If the connection isn't registered yet (e.g. recovery replay
+            // or test harness ordering), fall back to a dummy channel —
+            // the drainer will get Closed on try_send and skip this binding
+            // until the connection is re-established.
+            let tx = self.registry.get_sender(connection_id.0)
+                .unwrap_or_else(|| {
+                    let (tx, _rx) = mpsc::channel(1);
+                    tx
+                });
+
             // Track active binding for delivery
             self.bindings.push(ActiveBinding {
                 queue_id,
@@ -105,6 +118,7 @@ impl ShardWorker {
                 max_inflight,
                 fire_and_forget,
                 paused,
+                tx,
             });
 
             // Wake drain task — there may be pending messages (e.g. after recovery)

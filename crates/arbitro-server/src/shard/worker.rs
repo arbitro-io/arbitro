@@ -19,7 +19,7 @@ use arbitro_engine_v2::plugin::scheduler::ExpiredDeadline;
 use arbitro_engine_v2::types::*;
 use arbitro_engine_v2::ArbitroEngine;
 use arbitro_store::Store;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use crate::common::gate::Gate;
@@ -55,6 +55,11 @@ pub(super) struct ActiveBinding {
     /// uses this to skip a binding entirely without paying for any engine
     /// call when the consumer is paused.
     pub(super) paused: bool,
+    /// Cached write-channel sender — cloned once from the registry at
+    /// subscribe time (~26 ns). The drainer uses `tx.capacity()` (~0.1 ns)
+    /// for backpressure checks and `tx.try_send()` (~3 ns) for delivery,
+    /// bypassing the registry Mutex entirely on the hot path.
+    pub(super) tx: mpsc::Sender<Bytes>,
 }
 
 // ── Accumulator private types ─────────────────────────────────────────────

@@ -71,7 +71,7 @@ impl TolerantStore {
         self.active_segment_id = self.next_seq;
         let path = segment::segment_path(&self.base_path, self.active_segment_id);
         let mmap = segment::create_active_segment(&path).map_err(|_| StoreError::NotFound)?;
-        
+
         self.active_mmap = Some(mmap);
         self.current_segment_offset = 0;
         Ok(())
@@ -85,7 +85,8 @@ impl TolerantStore {
 
         let mut paths: Vec<_> = fs::read_dir(&self.base_path)
             .map_err(|_| StoreError::NotFound)?
-            .filter_map(|e| e.ok()).map(|e| e.path())
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
             .filter(|p| p.extension().map_or(false, |ext| ext == "log"))
             .collect();
         paths.sort();
@@ -99,7 +100,9 @@ impl TolerantStore {
     fn load_segment(&mut self, path: &std::path::Path) -> Result<(), StoreError> {
         let file = fs::File::open(path).map_err(|_| StoreError::NotFound)?;
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        if len < HEADER_SIZE as u64 { return Ok(()); }
+        if len < HEADER_SIZE as u64 {
+            return Ok(());
+        }
 
         let mmap = unsafe { Mmap::map(&file).map_err(|_| StoreError::NotFound)? };
         let segment_idx = self.sealed_segments.len() as u32;
@@ -108,8 +111,8 @@ impl TolerantStore {
         let mut last = 0;
 
         while offset + HEADER_SIZE <= mmap.len() {
-            let h = &mmap[offset..offset+HEADER_SIZE];
-            
+            let h = &mmap[offset..offset + HEADER_SIZE];
+
             // CRASH CONSISTENCY: Stop if Magic is missing (end of valid data in pre-allocated segment)
             if h[0] != MAGIC {
                 break;
@@ -120,12 +123,25 @@ impl TolerantStore {
             let ts = u64::from_le_bytes([h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14]]);
             let seq = u64::from_le_bytes([h[15], h[16], h[17], h[18], h[19], h[20], h[21], h[22]]);
 
-            if first == 0 { first = seq; }
+            if first == 0 {
+                first = seq;
+            }
             last = seq;
             let data_off = offset + HEADER_SIZE;
             let subject_hash = fnv1a_32(&mmap[data_off..data_off + subj_len as usize]);
-            self.index.push(LogMetadata { seq, ts, subj_len, payload_len, offset: data_off as u32, segment_idx, subject_hash });
-            self.seed_idx.push(SeedHeader { seq: U64::new(seq), subject_hash: U32::new(subject_hash) });
+            self.index.push(LogMetadata {
+                seq,
+                ts,
+                subj_len,
+                payload_len,
+                offset: data_off as u32,
+                segment_idx,
+                subject_hash,
+            });
+            self.seed_idx.push(SeedHeader {
+                seq: U64::new(seq),
+                subject_hash: U32::new(subject_hash),
+            });
 
             offset += HEADER_SIZE + (subj_len as usize) + (payload_len as usize);
             self.next_seq = seq + 1;
@@ -133,7 +149,10 @@ impl TolerantStore {
         }
 
         if first != 0 {
-            self.segments.push(SegmentMetadata { first_seq: first, last_seq: last });
+            self.segments.push(SegmentMetadata {
+                first_seq: first,
+                last_seq: last,
+            });
             self.sealed_segments.push(mmap);
         }
         Ok(())
@@ -147,8 +166,12 @@ impl Store for TolerantStore {
         self.index = Vec::with_capacity(1_000_000);
         self.seed_idx = Vec::with_capacity(1_000_000);
         self.scan_segments()?;
-        if self.active_mmap.is_none() { self.rotate()?; }
-        if let Some(f) = self.index.first() { self.first_seq = f.seq; }
+        if self.active_mmap.is_none() {
+            self.rotate()?;
+        }
+        if let Some(f) = self.index.first() {
+            self.first_seq = f.seq;
+        }
         Ok(())
     }
 
@@ -180,8 +203,19 @@ impl Store for TolerantStore {
 
         // WHY: Zero-allocation push (capacity guaranteed by init())
         let subject_hash = fnv1a_32(entry.subject);
-        self.index.push(LogMetadata { seq, ts: timestamp, subj_len: slen, payload_len: plen, offset: data_off as u32, segment_idx: self.sealed_segments.len() as u32, subject_hash });
-        self.seed_idx.push(SeedHeader { seq: U64::new(seq), subject_hash: U32::new(subject_hash) });
+        self.index.push(LogMetadata {
+            seq,
+            ts: timestamp,
+            subj_len: slen,
+            payload_len: plen,
+            offset: data_off as u32,
+            segment_idx: self.sealed_segments.len() as u32,
+            subject_hash,
+        });
+        self.seed_idx.push(SeedHeader {
+            seq: U64::new(seq),
+            subject_hash: U32::new(subject_hash),
+        });
 
         self.next_seq += 1;
         self.total_bytes += entry_total;
@@ -190,27 +224,43 @@ impl Store for TolerantStore {
     }
 
     fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
-        if seq < self.first_seq { return Ok(false); }
+        if seq < self.first_seq {
+            return Ok(false);
+        }
         let idx = (seq - self.first_seq) as usize;
-        if idx >= self.index.len() { return Ok(false); }
+        if idx >= self.index.len() {
+            return Ok(false);
+        }
         let m = &self.index[idx];
         let data = if m.segment_idx == self.sealed_segments.len() as u32 {
-            self.active_mmap.as_ref().map(|m| &m[..]).ok_or(StoreError::NotFound)?
+            self.active_mmap
+                .as_ref()
+                .map(|m| &m[..])
+                .ok_or(StoreError::NotFound)?
         } else {
             &self.sealed_segments[m.segment_idx as usize][..]
         };
 
         let sub_end = (m.offset as usize) + (m.subj_len as usize);
-        f(&Entry { seq: m.seq, timestamp: m.ts, subject: &data[m.offset as usize..sub_end], payload: &data[sub_end..sub_end + (m.payload_len as usize)] });
+        f(&Entry {
+            seq: m.seq,
+            timestamp: m.ts,
+            subject: &data[m.offset as usize..sub_end],
+            payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+        });
         Ok(true)
     }
 
     fn truncate_front(&mut self, target: u64) -> u64 {
-        if self.index.is_empty() || target <= self.first_seq { return 0; }
-        
+        if self.index.is_empty() || target <= self.first_seq {
+            return 0;
+        }
+
         let idx = (target - self.first_seq) as usize;
         let idx = idx.min(self.index.len());
-        if idx == 0 { return 0; }
+        if idx == 0 {
+            return 0;
+        }
 
         let mut dropped = 0;
         while !self.segments.is_empty() && self.segments[0].last_seq < target {
@@ -224,10 +274,16 @@ impl Store for TolerantStore {
         self.index.drain(0..idx);
         self.seed_idx.drain(0..idx);
         if dropped > 0 {
-            for m in &mut self.index { m.segment_idx -= dropped as u32; }
+            for m in &mut self.index {
+                m.segment_idx -= dropped as u32;
+            }
         }
         self.first_seq = target;
-        self.total_bytes = self.index.iter().map(|m| (m.subj_len as u64) + (m.payload_len as u64)).sum();
+        self.total_bytes = self
+            .index
+            .iter()
+            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
+            .sum();
         idx as u64
     }
 
@@ -258,33 +314,112 @@ impl Store for TolerantStore {
     }
 
     fn info(&self) -> StoreInfo {
-        StoreInfo { messages: self.index.len() as u64, bytes: self.total_bytes, first_seq: self.first_seq, last_seq: self.next_seq.saturating_sub(1) }
+        StoreInfo {
+            messages: self.index.len() as u64,
+            bytes: self.total_bytes,
+            first_seq: self.first_seq,
+            last_seq: self.next_seq.saturating_sub(1),
+        }
     }
 
     fn append_batch(&mut self, entries: &[EntryRef<'_>], ts: u64) -> Result<u64, StoreError> {
-        if entries.is_empty() { return Ok(self.next_seq); }
+        if entries.is_empty() {
+            return Ok(self.next_seq);
+        }
         let first = self.next_seq;
-        for e in entries { self.append(*e, ts)?; }
+        for e in entries {
+            self.append(*e, ts)?;
+        }
         Ok(first)
     }
-    
+
     fn seed_index(&self, start: u64, end: u64) -> &[SeedHeader] {
-        let s = if start < self.first_seq { 0 } else { (start - self.first_seq) as usize };
-        let e = if end < self.first_seq { 0 } else { (end - self.first_seq) as usize };
+        let s = if start < self.first_seq {
+            0
+        } else {
+            (start - self.first_seq) as usize
+        };
+        let e = if end < self.first_seq {
+            0
+        } else {
+            (end - self.first_seq) as usize
+        };
         let e = e.min(self.seed_idx.len());
         let s = s.min(e);
         &self.seed_idx[s..e]
     }
 
-    fn read(&self, _: u64) -> Result<Option<Entry<'_>>, StoreError> { Err(StoreError::NotFound) }
-    fn read_range(&self, _: u64, _: u64) -> Result<Vec<Entry<'_>>, StoreError> { Err(StoreError::NotFound) }
-    fn drain(&mut self, _: &[u8]) -> u64 { 0 }
+    fn read(&self, seq: u64) -> Result<Option<Entry<'_>>, StoreError> {
+        if seq < self.first_seq {
+            return Ok(None);
+        }
+        let idx = (seq - self.first_seq) as usize;
+        if idx >= self.index.len() {
+            return Ok(None);
+        }
+        let m = &self.index[idx];
+        let data = if m.segment_idx == self.sealed_segments.len() as u32 {
+            self.active_mmap
+                .as_ref()
+                .map(|mm| &mm[..])
+                .ok_or(StoreError::NotFound)?
+        } else {
+            &self.sealed_segments[m.segment_idx as usize][..]
+        };
+        let sub_end = (m.offset as usize) + (m.subj_len as usize);
+        Ok(Some(Entry {
+            seq: m.seq,
+            timestamp: m.ts,
+            subject: &data[m.offset as usize..sub_end],
+            payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+        }))
+    }
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
+        let s = if start < self.first_seq { 0 } else { (start - self.first_seq) as usize };
+        let e = if end < self.first_seq { 0 } else { (end - self.first_seq) as usize };
+        let e = e.min(self.index.len());
+        let s = s.min(e);
+
+        let mut result = Vec::with_capacity(e - s);
+        for i in s..e {
+            let m = &self.index[i];
+            let data = if m.segment_idx == self.sealed_segments.len() as u32 {
+                self.active_mmap
+                    .as_ref()
+                    .map(|mm| &mm[..])
+                    .ok_or(StoreError::NotFound)?
+            } else {
+                &self.sealed_segments[m.segment_idx as usize][..]
+            };
+            let sub_end = (m.offset as usize) + (m.subj_len as usize);
+            result.push(Entry {
+                seq: m.seq,
+                timestamp: m.ts,
+                subject: &data[m.offset as usize..sub_end],
+                payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+            });
+        }
+        Ok(result)
+    }
+    fn drain(&mut self, _: &[u8]) -> u64 {
+        0
+    }
     fn for_each(&self, s: u64, e: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
-        let start = if s < self.first_seq { 0 } else { (s - self.first_seq) as usize };
-        let end = if e < self.first_seq { 0 } else { (e - self.first_seq) as usize };
+        let start = if s < self.first_seq {
+            0
+        } else {
+            (s - self.first_seq) as usize
+        };
+        let end = if e < self.first_seq {
+            0
+        } else {
+            (e - self.first_seq) as usize
+        };
         let end = end.min(self.index.len());
         let start = start.min(end);
-        for i in start..end { self.get(self.index[i].seq, f)?; }
+        for i in start..end {
+            self.get(self.index[i].seq, f)?;
+        }
         Ok(())
     }
 }
@@ -304,22 +439,28 @@ mod tests {
         let mut store = TolerantStore::new(dir.path().join("store"));
         store.init().unwrap();
 
-        let seq = store.append(make_entry(b"orders.created", b"{\"id\":1}"), 1000).unwrap();
+        let seq = store
+            .append(make_entry(b"orders.created", b"{\"id\":1}"), 1000)
+            .unwrap();
         assert_eq!(seq, 1);
 
         let mut found = false;
-        let ok = store.get(1, &mut |entry| {
-            assert_eq!(entry.seq, 1);
-            assert_eq!(entry.subject, b"orders.created");
-            assert_eq!(entry.payload, b"{\"id\":1}");
-            assert_eq!(entry.timestamp, 1000);
-            found = true;
-        }).unwrap();
+        let ok = store
+            .get(1, &mut |entry| {
+                assert_eq!(entry.seq, 1);
+                assert_eq!(entry.subject, b"orders.created");
+                assert_eq!(entry.payload, b"{\"id\":1}");
+                assert_eq!(entry.timestamp, 1000);
+                found = true;
+            })
+            .unwrap();
         assert!(ok);
         assert!(found);
 
         // Not found returns false
-        let ok = store.get(999, &mut |_| panic!("should not be called")).unwrap();
+        let ok = store
+            .get(999, &mut |_| panic!("should not be called"))
+            .unwrap();
         assert!(!ok);
     }
 
@@ -342,10 +483,12 @@ mod tests {
 
         let mut count = 0u32;
         let mut seqs = Vec::new();
-        store.for_each(1, 6, &mut |entry| {
-            seqs.push(entry.seq);
-            count += 1;
-        }).unwrap();
+        store
+            .for_each(1, 6, &mut |entry| {
+                seqs.push(entry.seq);
+                count += 1;
+            })
+            .unwrap();
         assert_eq!(count, 5);
         assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
     }
@@ -379,9 +522,15 @@ mod tests {
         {
             let mut store = TolerantStore::new(path.clone());
             store.init().unwrap();
-            store.append(make_entry(b"subj.a", b"payload1"), 10).unwrap();
-            store.append(make_entry(b"subj.b", b"payload2"), 20).unwrap();
-            store.append(make_entry(b"subj.c", b"payload3"), 30).unwrap();
+            store
+                .append(make_entry(b"subj.a", b"payload1"), 10)
+                .unwrap();
+            store
+                .append(make_entry(b"subj.b", b"payload2"), 20)
+                .unwrap();
+            store
+                .append(make_entry(b"subj.c", b"payload3"), 30)
+                .unwrap();
             store.shutdown().unwrap();
         }
 
@@ -394,9 +543,11 @@ mod tests {
             assert_eq!(info.messages, 3);
 
             let mut found_subjects = Vec::new();
-            store.for_each(1, 4, &mut |entry| {
-                found_subjects.push(entry.subject.to_vec());
-            }).unwrap();
+            store
+                .for_each(1, 4, &mut |entry| {
+                    found_subjects.push(entry.subject.to_vec());
+                })
+                .unwrap();
             assert_eq!(found_subjects.len(), 3);
             assert_eq!(found_subjects[0], b"subj.a");
             assert_eq!(found_subjects[1], b"subj.b");
@@ -404,12 +555,14 @@ mod tests {
 
             // Verify individual get works
             let mut ok = false;
-            store.get(2, &mut |entry| {
-                assert_eq!(entry.subject, b"subj.b");
-                assert_eq!(entry.payload, b"payload2");
-                assert_eq!(entry.timestamp, 20);
-                ok = true;
-            }).unwrap();
+            store
+                .get(2, &mut |entry| {
+                    assert_eq!(entry.subject, b"subj.b");
+                    assert_eq!(entry.payload, b"payload2");
+                    assert_eq!(entry.timestamp, 20);
+                    ok = true;
+                })
+                .unwrap();
             assert!(ok);
         }
     }
@@ -426,7 +579,9 @@ mod tests {
         let mut expected_bytes = 0u64;
         for i in 0..count {
             let payload = format!("payload-{}", i);
-            store.append(make_entry(b"test.subject", payload.as_bytes()), i).unwrap();
+            store
+                .append(make_entry(b"test.subject", payload.as_bytes()), i)
+                .unwrap();
             expected_bytes += b"test.subject".len() as u64 + payload.len() as u64;
         }
 
@@ -438,10 +593,12 @@ mod tests {
 
         // Verify for_each over the full range
         let mut seen = 0u64;
-        store.for_each(1, count + 1, &mut |entry| {
-            assert_eq!(entry.subject, b"test.subject");
-            seen += 1;
-        }).unwrap();
+        store
+            .for_each(1, count + 1, &mut |entry| {
+                assert_eq!(entry.subject, b"test.subject");
+                seen += 1;
+            })
+            .unwrap();
         assert_eq!(seen, count);
     }
 
@@ -481,19 +638,23 @@ mod tests {
 
         // First 5 entries should be gone
         for seq in 1..=5 {
-            let ok = store.get(seq, &mut |_| panic!("should not be found")).unwrap();
+            let ok = store
+                .get(seq, &mut |_| panic!("should not be found"))
+                .unwrap();
             assert!(!ok);
         }
 
         // Last 5 entries should be readable
         for seq in 6..=10 {
             let mut found = false;
-            let ok = store.get(seq, &mut |entry| {
-                assert_eq!(entry.seq, seq);
-                // payload is (seq - 1) as u8
-                assert_eq!(entry.payload, &[(seq - 1) as u8]);
-                found = true;
-            }).unwrap();
+            let ok = store
+                .get(seq, &mut |entry| {
+                    assert_eq!(entry.seq, seq);
+                    // payload is (seq - 1) as u8
+                    assert_eq!(entry.payload, &[(seq - 1) as u8]);
+                    found = true;
+                })
+                .unwrap();
             assert!(ok);
             assert!(found);
         }
@@ -548,22 +709,89 @@ mod tests {
         assert_eq!(info.messages, 2);
 
         let mut found = false;
-        store.get(1, &mut |entry| {
-            assert_eq!(entry.subject, b"a");
-            assert_eq!(entry.payload, b"bb");
-            assert_eq!(entry.timestamp, 100);
-            found = true;
-        }).unwrap();
+        store
+            .get(1, &mut |entry| {
+                assert_eq!(entry.subject, b"a");
+                assert_eq!(entry.payload, b"bb");
+                assert_eq!(entry.timestamp, 100);
+                found = true;
+            })
+            .unwrap();
         assert!(found);
 
         found = false;
-        store.get(2, &mut |entry| {
-            assert_eq!(entry.subject, b"c");
-            assert_eq!(entry.payload, b"dd");
-            assert_eq!(entry.timestamp, 200);
-            found = true;
-        }).unwrap();
+        store
+            .get(2, &mut |entry| {
+                assert_eq!(entry.subject, b"c");
+                assert_eq!(entry.payload, b"dd");
+                assert_eq!(entry.timestamp, 200);
+                found = true;
+            })
+            .unwrap();
         assert!(found);
+    }
+
+    #[test]
+    fn read_range_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        let entries = [
+            make_entry(b"a", b"1"),
+            make_entry(b"b", b"2"),
+            make_entry(b"c", b"3"),
+            make_entry(b"d", b"4"),
+            make_entry(b"e", b"5"),
+        ];
+        store.append_batch(&entries, 100).unwrap();
+
+        // Full range
+        let range = store.read_range(1, 6).unwrap();
+        assert_eq!(range.len(), 5);
+        assert_eq!(range[0].subject, b"a");
+        assert_eq!(range[0].payload, b"1");
+        assert_eq!(range[0].seq, 1);
+        assert_eq!(range[4].subject, b"e");
+        assert_eq!(range[4].seq, 5);
+
+        // Partial range
+        let range = store.read_range(2, 4).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].subject, b"b");
+        assert_eq!(range[1].subject, b"c");
+
+        // Empty range
+        let range = store.read_range(10, 20).unwrap();
+        assert!(range.is_empty());
+    }
+
+    #[test]
+    fn read_range_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+
+        {
+            let mut store = TolerantStore::new(path.clone());
+            store.init().unwrap();
+            store.append(make_entry(b"subj.a", b"p1"), 10).unwrap();
+            store.append(make_entry(b"subj.b", b"p2"), 20).unwrap();
+            store.append(make_entry(b"subj.c", b"p3"), 30).unwrap();
+            store.shutdown().unwrap();
+        }
+
+        {
+            let mut store = TolerantStore::new(path);
+            store.init().unwrap();
+
+            let range = store.read_range(1, 4).unwrap();
+            assert_eq!(range.len(), 3);
+            assert_eq!(range[0].subject, b"subj.a");
+            assert_eq!(range[0].payload, b"p1");
+            assert_eq!(range[1].subject, b"subj.b");
+            assert_eq!(range[2].subject, b"subj.c");
+            assert_eq!(range[2].timestamp, 30);
+        }
     }
 
     #[test]
@@ -578,7 +806,9 @@ mod tests {
         assert_eq!(info.first_seq, 1);
 
         // get on empty store returns false
-        let ok = store.get(1, &mut |_| panic!("should not be called")).unwrap();
+        let ok = store
+            .get(1, &mut |_| panic!("should not be called"))
+            .unwrap();
         assert!(!ok);
     }
 }

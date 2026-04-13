@@ -79,6 +79,15 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Clone the write-side sender for a connection. O(1) — one Arc
+    /// refcount bump. Used by the shard worker to cache the sender in
+    /// `ActiveBinding` at subscribe time so the drainer hot path can
+    /// `try_send` without touching the registry Mutex.
+    pub fn get_sender(&self, conn_id: u64) -> Option<mpsc::Sender<Bytes>> {
+        let sessions = self.inner.sessions.lock().unwrap();
+        sessions.get(&conn_id).map(|s| s.tx.clone())
+    }
+
     /// Number of active sessions.
     pub fn active_count(&self) -> usize {
         self.inner.sessions.lock().unwrap().len()

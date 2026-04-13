@@ -58,4 +58,8 @@ harness = false
 name    = "drain_isolated"
 harness = false
 
+[[bench]]
+name    = "capacity_check"
+harness = false
+
  

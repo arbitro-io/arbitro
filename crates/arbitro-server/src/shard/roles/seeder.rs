@@ -37,10 +37,6 @@ impl ShardWorker {
         };
 
         store.for_each(first, end, &mut |entry| {
-            // Use enqueue_ready instead of engine.publish() so we preserve the
-            // store's original seq numbers. engine.publish() would assign new seqs
-            // (ctx.next_seq++) that don't match the store, causing store.get() to
-            // return nothing during delivery.
             let subject_hash = arbitro_engine_v2::catalog::fnv1a_32(entry.subject);
             self.engine.enqueue_ready(stream_id, entry.subject, subject_hash, entry.seq);
             seeded += 1;

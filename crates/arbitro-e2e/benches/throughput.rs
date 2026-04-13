@@ -451,7 +451,8 @@ fn main() {
     let concurrency = env_concurrency(CONCURRENCY);
     let mode = cfg_mode();
     let run_publish = matches!(mode.as_str(), "publish" | "all");
-    let run_replay_section = matches!(mode.as_str(), "replay" | "all");
+    let run_replay_section = matches!(mode.as_str(), "replay" | "all" | "fanout");
+    let run_fanout = matches!(mode.as_str(), "fanout" | "all");
     let replay_msgs = cfg_replay_msgs();
     let replay_iterations = cfg_replay_iterations();
 
@@ -718,6 +719,186 @@ fn main() {
             }
         });
     }
+
+    // ── Fanout replay: 3 clients × 3 consumers/client, 1 stream ──────
+    //
+    // 1 stream pre-filled with replay_msgs messages.
+    // 3 clients (3 TCP connections), each with 3 consumers on the SAME stream.
+    // All consumers are fanout (each gets ALL messages). AckPolicy::None.
+    //
+    // Total deliveries = replay_msgs × 9 consumers.
+    // Per-connection: server sends replay_msgs × 3 consumers = 3 RepBatch streams.
+    // Measures: per-consumer throughput and total aggregate throughput.
+    if run_fanout {
+    let n_clients = 3usize;
+    let n_consumers_per_client = 3usize;
+    let total_consumers = n_clients * n_consumers_per_client;
+
+    println!(
+        "\n[ replay_fanout — {replay_msgs} msgs, {n_clients} clients × {n_consumers_per_client} consumers, fanout ]"
+    );
+    println!(
+        "  {:30} | {:>9} | {:>12} | {:>10} | {:>8} | {:>8} | {:>7}",
+        "Config", "Avg time", "Throughput", "Per-consumer", "RSS", "Δ RSS", "CPU"
+    );
+    println!("  {}", "-".repeat(100));
+
+    rt.block_on(async {
+        // 1. Create one stream
+        let fanout_stream = b"fanout_bench".to_vec();
+        let _ = setup_client.delete_stream(&fanout_stream).await;
+        setup_client
+            .create_stream(
+                &StreamConfig::new(&fanout_stream, b">")
+                    .journal_kind(JOURNAL_KIND)
+                    .build(),
+            )
+            .await
+            .expect("create fanout stream");
+
+        // 2. Create 3 clients (separate TCP connections)
+        let mut clients = Vec::with_capacity(n_clients);
+        for _ in 0..n_clients {
+            clients.push(connect(&addr).await);
+        }
+
+        // 3. Create 9 consumers and subscribe them BEFORE publishing.
+        //    The engine seeds the store backlog on first subscribe per stream.
+        //    Consumers added after the seed never receive the historical
+        //    messages (known limitation). By subscribing first, all 9
+        //    consumers are active when messages arrive → true fanout.
+        let mut handles: Vec<(usize, arbitro_client::Consumer, arbitro_client::SubscriptionHandle)> = Vec::new();
+        for (ci, client) in clients.iter().enumerate() {
+            for si in 0..n_consumers_per_client {
+                let name = format!("fanout_c{ci}_s{si}");
+                let cfg = ConsumerConfig::new(name.as_bytes(), &fanout_stream)
+                    .group(name.as_bytes())
+                    .deliver_policy(DeliverPolicy::All)
+                    .ack_policy(AckPolicy::None)
+                    .build()
+                    .expect("consumer cfg");
+                let consumer = client
+                    .create_consumer(&cfg)
+                    .await
+                    .expect("create fanout consumer");
+                let handle = consumer.subscribe(None).await.expect("subscribe");
+                handles.push((ci, consumer, handle));
+            }
+        }
+
+        // 4. Now publish — all 9 consumers are already subscribed and active.
+        //    Use a separate client for publishing so we don't share a
+        //    connection with any consumer.
+        let pub_client = connect(&addr).await;
+        let rss_before = rss_kb();
+        let cpu_before = cpu_time_ns();
+
+        let expected = replay_msgs;
+        let start = Instant::now();
+
+        // Publish in batch (outside timed drain, but inside wall clock)
+        {
+            let batch_size = 256;
+            let total = expected as usize;
+            let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                entries.push((b"bench.msg".as_slice(), &payload[..]));
+            }
+            let batches = total.div_ceil(batch_size);
+            for b in 0..batches {
+                let size = batch_size.min(total - b * batch_size);
+                if b + 1 == batches {
+                    pub_client.publish_batch_sync(&fanout_stream, &entries[..size])
+                        .await
+                        .expect("fanout publish_batch_sync");
+                } else {
+                    pub_client.publish_batch(&fanout_stream, &entries[..size])
+                        .await
+                        .expect("fanout publish_batch");
+                }
+            }
+        }
+        let pub_elapsed = start.elapsed();
+        eprintln!("[fanout] published {expected} msgs in {:.0}ms", pub_elapsed.as_secs_f64() * 1000.0);
+
+        // 5. Drain all 9 consumers concurrently (timed region)
+        let mut js = tokio::task::JoinSet::new();
+
+        for (ci, consumer, mut handle) in handles {
+            js.spawn(async move {
+                let t0 = Instant::now();
+                let mut count = 0u32;
+                let mut last_log = Instant::now();
+                while count < expected {
+                    if handle.next().await.is_none() {
+                        break;
+                    }
+                    count += 1;
+                    if count % 50_000 == 0 {
+                        let dt = last_log.elapsed().as_millis();
+                        eprintln!(
+                            "[fanout] client={ci} progress={count} dt={dt}ms ({} msg/s)",
+                            if dt > 0 { 50_000_000 / dt } else { 0 },
+                        );
+                        last_log = Instant::now();
+                    }
+                }
+                let elapsed = t0.elapsed();
+                let rate = count as f64 / elapsed.as_secs_f64();
+                eprintln!(
+                    "[fanout] client={ci} DONE count={count} in {:.0}ms ({:.0} msg/s)",
+                    elapsed.as_secs_f64() * 1000.0,
+                    rate,
+                );
+                (ci, consumer, count, elapsed)
+            });
+        }
+
+        let mut results: Vec<(usize, arbitro_client::Consumer, u32, Duration)> = Vec::new();
+        while let Some(res) = js.join_next().await {
+            if let Ok(r) = res {
+                results.push(r);
+            }
+        }
+        let total_elapsed = start.elapsed();
+
+        let cpu_after = cpu_time_ns();
+        let rss_after = rss_kb();
+        let wall_ns = total_elapsed.as_nanos() as u64;
+        let cpu_ns = cpu_after.saturating_sub(cpu_before);
+        let cpu_pct = if wall_ns > 0 {
+            cpu_ns as f64 / wall_ns as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        // Per-consumer stats
+        let total_delivered: u64 = results.iter().map(|r| r.2 as u64).sum();
+        let aggregate_rate = total_delivered as f64 / total_elapsed.as_secs_f64();
+        let per_consumer_rate = aggregate_rate / total_consumers as f64;
+
+        let label = format!(
+            "{}cli×{}cons/{}msgs",
+            n_clients, n_consumers_per_client, replay_msgs
+        );
+        print_result(&BenchResult {
+            label,
+            avg: total_elapsed,
+            throughput: aggregate_rate,
+            per_conn: per_consumer_rate,
+            rss: rss_after,
+            rss_delta: rss_after.saturating_sub(rss_before),
+            cpu_pct,
+        });
+
+        // Cleanup consumers
+        for (_, consumer, _, _) in results {
+            let _ = consumer.delete().await;
+        }
+        let _ = setup_client.delete_stream(&fanout_stream).await;
+    });
+
+    } // close `if run_fanout`
 
     } // close `if run_replay_section`
 
