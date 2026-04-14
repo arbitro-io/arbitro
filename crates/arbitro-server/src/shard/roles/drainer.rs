@@ -20,7 +20,6 @@ use arbitro_engine_v2::types::Timestamp;
 use arbitro_proto::action::Action;
 use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use bytes::BytesMut;
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
@@ -220,7 +219,14 @@ impl ShardWorker {
                     None => break,
                 };
 
+                // 2. Build frame inline — envelope placeholder + batch header
+                //    + entries, then patch envelope. Single buffer, no double copy.
                 self.scratch_batch_body.clear();
+
+                // Envelope placeholder (patched after body is complete)
+                self.scratch_batch_body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+
+                // Batch header
                 self.scratch_batch_body.extend_from_slice(
                     RepBatchFixed {
                         consumer_id: U32::new(consumer_id.0),
@@ -274,33 +280,26 @@ impl ShardWorker {
                 }
                 lifecycle_trace::record("28_store_get_loop_done", connection_id.0, claimed_count as u64, "shard");
 
-                // 3. Frame: envelope + body in one Bytes, sent via send_bytes.
-                //    The wire id (what the client computed locally with
-                //    fnv1a_32 and uses to demux incoming frames) is what
-                //    must go on the envelope, NOT the engine seq id. Fall
-                //    back to seq if the registry mapping is missing — the
-                //    client wouldn't know that wire id either, so the frame
-                //    is dropped on its side anyway and we avoid panicking.
+                // 3. Patch envelope now that body_len is known.
                 let wire_stream_id = self
                     .names
                     .stream_wire(stream_id)
                     .unwrap_or_else(|| stream_id.raw());
-                let body_len = self.scratch_batch_body.len();
+                let body_len = self.scratch_batch_body.len() - ENVELOPE_SIZE;
                 let envelope = Envelope::new(
                     Action::RepBatch,
                     wire_stream_id,
                     body_len as u32,
                     0,
                 );
-                let mut frame = BytesMut::with_capacity(ENVELOPE_SIZE + body_len);
-                frame.extend_from_slice(envelope.as_bytes());
-                frame.extend_from_slice(&self.scratch_batch_body);
+                self.scratch_batch_body[..ENVELOPE_SIZE]
+                    .copy_from_slice(envelope.as_bytes());
                 lifecycle_trace::record("29_frame_built", connection_id.0, body_len as u64, "shard");
                 // Fast-path send via cached tx — bypasses registry Mutex.
                 // try_send: ~3 ns (vs 260 ns for mutex+clone+blocking_send).
                 // On Full: stop this binding for this cycle (backpressure).
                 // On Closed: connection gone, stop draining.
-                let frozen = frame.freeze();
+                let frozen = self.scratch_batch_body.split().freeze();
                 lifecycle_trace::record("30_send_bytes_done", connection_id.0, body_len as u64, "shard");
                 match self.bindings[i].tx.try_send(frozen) {
                     Ok(()) => {}
