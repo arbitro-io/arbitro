@@ -98,7 +98,7 @@ impl ShardWorker {
     }
 
     /// Iterate all active bindings, claim from engine, read store, build one
-    /// `RepBatch` frame per claim (≤ `CLAIM_BATCH` entries). Loops per binding
+    /// `RepBatch` frame per claim (≤ `claim_batch` entries). Loops per binding
     /// until the queue is drained or `max_inflight` is hit.
     ///
     /// Hot-path discipline (`roles.md` DRAINER + `performance.md` rule 21):
@@ -129,9 +129,9 @@ impl ShardWorker {
         self.publish_pending_to_engine(now);
         lifecycle_trace::record("23_feed_engine_done", 0, 0, "shard");
 
-        const CLAIM_BATCH: u16 = 256;
+        let claim_batch = self.max_feed_per_cycle as u16;
         let mut any_delivered = false;
-        // True if any binding hit a full CLAIM_BATCH — meaning the engine
+        // True if any binding hit a full claim_batch — meaning the engine
         // probably has more ready entries that we couldn't fit this cycle.
         // Used to decide whether to re-arm the gate (release) or lock it.
         // Without this, every successful drain re-fires the gate, causing
@@ -171,14 +171,14 @@ impl ShardWorker {
                     // No PendingNode, no edges, no inflight tracking — the
                     // engine never learns these seqs were delivered, so
                     // consumer.delete() has zero cleanup cost.
-                    lifecycle_trace::record("25_pop_start", connection_id.0, CLAIM_BATCH as u64, "shard");
-                    for _ in 0..CLAIM_BATCH {
+                    lifecycle_trace::record("25_pop_start", connection_id.0, claim_batch as u64, "shard");
+                    for _ in 0..claim_batch {
                         match self.engine.ctx_mut().ready.pop(queue_id) {
                             Some((_subject_hash, seq)) => self.scratch_seqs.push(seq),
                             None => break,
                         }
                     }
-                    CLAIM_BATCH
+                    claim_batch
                 } else {
                     // Tracked consumer: adaptive batch size capped by inflight.
                     let remaining = self
@@ -187,7 +187,7 @@ impl ShardWorker {
                     if remaining == 0 {
                         break;
                     }
-                    let max = (CLAIM_BATCH as u32).min(remaining) as u16;
+                    let max = (claim_batch as u32).min(remaining) as u16;
                     lifecycle_trace::record("25_claim_start", connection_id.0, max as u64, "shard");
                     {
                         let claimed = self.engine.claim(
@@ -324,7 +324,7 @@ impl ShardWorker {
                 }
                 // Hit a full batch AND we asked for the full window —
                 // engine likely has more ready, re-arm the gate.
-                if max_items == CLAIM_BATCH {
+                if max_items == claim_batch {
                     more_pending = true;
                 }
             }
