@@ -23,6 +23,7 @@ flume = "0.11"
 atomic-wait = "1"
 libc = "0.2"
 
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tokio-uring = { workspace = true }
 
@@ -61,5 +62,10 @@ harness = false
 [[bench]]
 name    = "capacity_check"
 harness = false
+
+[[bench]]
+name    = "fanout_lookup"
+harness = false
+
 
  

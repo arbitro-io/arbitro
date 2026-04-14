@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use arbitro_client::Client;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode, StreamConfig};
-use arbitro_server::{ArbitroServer, Config, TokioTransport};
+use arbitro_server::{ArbitroServer, Config};
 
 const NUM_CLIENTS: usize = 3;
 const SUBS_PER_CLIENT: usize = 20;
@@ -36,8 +36,7 @@ async fn create_test_server() -> String {
         .listen_addr(addr.clone())
         .max_connections(100)
         .write_buffer_cap(1024 * 1024);
-    let write_cap = config.write_buffer_cap;
-    let server = ArbitroServer::new(config, Arc::new(TokioTransport::new(write_cap)), None);
+    let server = ArbitroServer::new(config);
     tokio::spawn(async move {
         let _ = server.run().await;
     });

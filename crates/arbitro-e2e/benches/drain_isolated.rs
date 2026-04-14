@@ -10,20 +10,20 @@
 //!
 //! Run: cargo bench --bench drain_isolated -p arbitro-e2e
 
-use std::time::Instant;
 use bytes::BytesMut;
-use zerocopy::{FromBytes, IntoBytes};
+use std::time::Instant;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::{FromBytes, IntoBytes};
 
 use arbitro_engine_v2::catalog::{self, fnv1a_32};
 use arbitro_engine_v2::types::*;
 use arbitro_engine_v2::ArbitroEngine;
+use arbitro_proto::action::Action;
 use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-use arbitro_proto::action::Action;
 use arbitro_store::{EntryRef, MemoryStore, SeedHeader, Store, TolerantStore};
 
-const PAYLOAD_SIZE: usize = 64;
+const PAYLOAD_SIZE: usize = 1024 * 1;
 const CLAIM_BATCH: usize = 256;
 const MAX_FEED_PER_CYCLE: u64 = 256;
 
@@ -34,7 +34,15 @@ fn make_store(total_msgs: usize) -> Box<dyn Store> {
     let payload = vec![0x42u8; PAYLOAD_SIZE];
     let mut store: Box<dyn Store> = Box::new(MemoryStore::new());
     for _ in 0..total_msgs {
-        store.append(EntryRef { subject, payload: &payload }, 0).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject,
+                    payload: &payload,
+                },
+                0,
+            )
+            .unwrap();
     }
     store
 }
@@ -45,46 +53,52 @@ fn make_engine() -> ArbitroEngine {
     let consumer_id = ConsumerId(1);
 
     let mut engine = ArbitroEngine::new();
-    engine.ensure_stream(catalog::StreamConfig {
-        id: stream_id,
-        name: b"bench-stream".to_vec(),
-    }).unwrap();
-    engine.ensure_consumer(catalog::ConsumerConfig {
-        id: consumer_id,
-        queue_id,
-        stream_id,
-        durable: false,
-        ack_policy: AckPolicy::None,
-        max_inflight: u32::MAX,
-    }).unwrap();
-    engine.ensure_subscription(catalog::SubscriptionConfig {
-        id: SubscriptionId(1),
-        stream_id,
-        consumer_id,
-        filters: vec![],
-    }).unwrap();
+    engine
+        .ensure_stream(catalog::StreamConfig {
+            id: stream_id,
+            name: b"bench-stream".to_vec(),
+        })
+        .unwrap();
+    engine
+        .ensure_consumer(catalog::ConsumerConfig {
+            id: consumer_id,
+            queue_id,
+            stream_id,
+            durable: false,
+            ack_policy: AckPolicy::None,
+            max_inflight: u32::MAX,
+        })
+        .unwrap();
+    engine
+        .ensure_subscription(catalog::SubscriptionConfig {
+            id: SubscriptionId(1),
+            stream_id,
+            consumer_id,
+            filters: vec![],
+        })
+        .unwrap();
     engine
 }
 
 /// Feed up to `MAX_FEED_PER_CYCLE` entries starting from `last_seq + 1`.
 /// Uses for_each + per-message enqueue_ready (old path).
 /// Returns the last seq fed, or `last_seq` if nothing was fed.
-fn feed_engine_capped(
-    store: &dyn Store,
-    engine: &mut ArbitroEngine,
-    last_seq: u64,
-) -> u64 {
+fn feed_engine_capped(store: &dyn Store, engine: &mut ArbitroEngine, last_seq: u64) -> u64 {
     let info = store.info();
-    if info.last_seq <= last_seq { return last_seq; }
+    if info.last_seq <= last_seq {
+        return last_seq;
+    }
     let stream_id = StreamId(1);
     let start = last_seq + 1;
     let end = (start + MAX_FEED_PER_CYCLE).min(info.last_seq + 1);
     let mut fed_last = last_seq;
-    store.for_each(start, end, &mut |entry| {
-        let hash = fnv1a_32(entry.subject);
-        engine.enqueue_ready(stream_id, entry.subject, hash, entry.seq);
-        fed_last = entry.seq;
-    }).unwrap();
+    store
+        .for_each(start, end, &mut |entry| {
+            let hash = fnv1a_32(entry.subject);
+            engine.enqueue_ready(stream_id, entry.subject, hash, entry.seq);
+            fed_last = entry.seq;
+        })
+        .unwrap();
     fed_last
 }
 
@@ -98,12 +112,16 @@ fn feed_engine_seed(
     scratch: &mut Vec<(u32, u64)>,
 ) -> u64 {
     let info = store.info();
-    if info.last_seq <= last_seq { return last_seq; }
+    if info.last_seq <= last_seq {
+        return last_seq;
+    }
     let stream_id = StreamId(1);
     let start = last_seq + 1;
     let end = (start + MAX_FEED_PER_CYCLE).min(info.last_seq + 1);
     let seeds = store.seed_index(start, end);
-    if seeds.is_empty() { return last_seq; }
+    if seeds.is_empty() {
+        return last_seq;
+    }
 
     scratch.clear();
     for s in seeds {
@@ -141,23 +159,29 @@ fn read_batch_into_body(
             consumer_id: U32::new(consumer_id.0),
             count: U16::new(count as u16),
             _pad: U16::new(0),
-        }.as_bytes(),
+        }
+        .as_bytes(),
     );
 
     let first = scratch_seqs[0];
     let last = scratch_seqs[count - 1];
     let body = scratch_body;
-    store.for_each(first, last + 1, &mut |entry| {
-        let subj_len = entry.subject.len();
-        let data_len = subj_len + entry.payload.len();
-        body.extend_from_slice(DeliveryEntryHeader {
-            seq: U64::new(entry.seq),
-            subj_len: U16::new(subj_len as u16),
-            data_len: U32::new(data_len as u32),
-        }.as_bytes());
-        body.extend_from_slice(entry.subject);
-        body.extend_from_slice(entry.payload);
-    }).unwrap();
+    store
+        .for_each(first, last + 1, &mut |entry| {
+            let subj_len = entry.subject.len();
+            let data_len = subj_len + entry.payload.len();
+            body.extend_from_slice(
+                DeliveryEntryHeader {
+                    seq: U64::new(entry.seq),
+                    subj_len: U16::new(subj_len as u16),
+                    data_len: U32::new(data_len as u32),
+                }
+                .as_bytes(),
+            );
+            body.extend_from_slice(entry.subject);
+            body.extend_from_slice(entry.payload);
+        })
+        .unwrap();
 }
 
 /// Build envelope + body into a frozen Bytes frame.
@@ -213,7 +237,8 @@ fn layer0_store_info(store: &dyn Store, total_msgs: usize) {
     assert_eq!(last, total_msgs as u64);
     println!(
         "    store.info()            {} / call ({} × 1M calls)",
-        fmt_ns(per_call), fmt_ms(elapsed),
+        fmt_ns(per_call),
+        fmt_ms(elapsed),
     );
 }
 
@@ -233,7 +258,10 @@ fn layer0_fnv(total_msgs: usize) {
     std::hint::black_box(hash);
     println!(
         "    fnv1a_32({} bytes)      {} / call ({} × {})",
-        subject.len(), fmt_ns(per_call), fmt_ms(elapsed), fmt_rate(iterations, elapsed),
+        subject.len(),
+        fmt_ns(per_call),
+        fmt_ms(elapsed),
+        fmt_rate(iterations, elapsed),
     );
 }
 
@@ -247,16 +275,19 @@ fn layer1_get_messages(total_msgs: usize) {
     {
         let mut count = 0usize;
         let t0 = Instant::now();
-        store.for_each(1, info.last_seq + 1, &mut |entry| {
-            std::hint::black_box(entry.subject);
-            std::hint::black_box(entry.payload);
-            count += 1;
-        }).unwrap();
+        store
+            .for_each(1, info.last_seq + 1, &mut |entry| {
+                std::hint::black_box(entry.subject);
+                std::hint::black_box(entry.payload);
+                count += 1;
+            })
+            .unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(count, total_msgs);
         println!(
             "    for_each (zero-copy)    {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -280,8 +311,10 @@ fn layer1_get_messages(total_msgs: usize) {
         assert_eq!(count, total_msgs);
         println!(
             "    read_range (Vec alloc)  {} ({} msg/s)  [read: {}, iter: {}]",
-            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-            fmt_ms(read_elapsed), fmt_ms(iter_elapsed),
+            fmt_ms(total_elapsed),
+            fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(read_elapsed),
+            fmt_ms(iter_elapsed),
         );
     }
 
@@ -289,15 +322,18 @@ fn layer1_get_messages(total_msgs: usize) {
     {
         let mut items: Vec<(u32, u64)> = Vec::with_capacity(total_msgs);
         let t0 = Instant::now();
-        store.for_each(1, info.last_seq + 1, &mut |entry| {
-            let hash = fnv1a_32(entry.subject);
-            items.push((hash, entry.seq));
-        }).unwrap();
+        store
+            .for_each(1, info.last_seq + 1, &mut |entry| {
+                let hash = fnv1a_32(entry.subject);
+                items.push((hash, entry.seq));
+            })
+            .unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(items.len(), total_msgs);
         println!(
             "    for_each + accum hash   {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -305,14 +341,16 @@ fn layer1_get_messages(total_msgs: usize) {
     {
         let t0 = Instant::now();
         let entries = store.read_range(1, info.last_seq + 1).unwrap();
-        let items: Vec<(&[u8], u32, u64)> = entries.iter()
+        let items: Vec<(&[u8], u32, u64)> = entries
+            .iter()
             .map(|e| (e.subject, fnv1a_32(e.subject), e.seq))
             .collect();
         let elapsed = t0.elapsed();
         assert_eq!(items.len(), total_msgs);
         println!(
             "    read_range + batch map  {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -326,10 +364,12 @@ fn layer1_get_messages(total_msgs: usize) {
         while start <= last {
             let end = (start + MAX_FEED_PER_CYCLE).min(last + 1);
             scratch.clear();
-            store.for_each(start, end, &mut |entry| {
-                let hash = fnv1a_32(entry.subject);
-                scratch.push((hash, entry.seq));
-            }).unwrap();
+            store
+                .for_each(start, end, &mut |entry| {
+                    let hash = fnv1a_32(entry.subject);
+                    scratch.push((hash, entry.seq));
+                })
+                .unwrap();
             total_fed += scratch.len();
             start = end;
         }
@@ -337,7 +377,8 @@ fn layer1_get_messages(total_msgs: usize) {
         assert_eq!(total_fed, total_msgs);
         println!(
             "    for_each capped 256     {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -350,7 +391,8 @@ fn layer1_get_messages(total_msgs: usize) {
         while start <= last {
             let end = (start + MAX_FEED_PER_CYCLE).min(last + 1);
             let entries = store.read_range(start, end).unwrap();
-            let items: Vec<(&[u8], u32, u64)> = entries.iter()
+            let items: Vec<(&[u8], u32, u64)> = entries
+                .iter()
                 .map(|e| (e.subject, fnv1a_32(e.subject), e.seq))
                 .collect();
             total_fed += items.len();
@@ -360,7 +402,8 @@ fn layer1_get_messages(total_msgs: usize) {
         assert_eq!(total_fed, total_msgs);
         println!(
             "    read_range capped 256   {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -407,8 +450,10 @@ fn layer1_get_messages(total_msgs: usize) {
             assert_eq!(count, total_msgs);
             println!(
                 "    zerocopy cast all       {} ({} msg/s)  [cast: {}, iter: {}]",
-                fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-                fmt_ns(cast_elapsed), fmt_ms(iter_elapsed),
+                fmt_ms(total_elapsed),
+                fmt_rate(total_msgs, total_elapsed),
+                fmt_ns(cast_elapsed),
+                fmt_ms(iter_elapsed),
             );
         }
 
@@ -433,7 +478,8 @@ fn layer1_get_messages(total_msgs: usize) {
             assert_eq!(total_fed, total_msgs);
             println!(
                 "    zerocopy capped 256     {} ({} msg/s)",
-                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+                fmt_ms(elapsed),
+                fmt_rate(total_msgs, elapsed),
             );
         }
 
@@ -454,7 +500,8 @@ fn layer1_get_messages(total_msgs: usize) {
             assert_eq!(count, total_msgs);
             println!(
                 "    unsafe ptr cast (base)  {} ({} msg/s)",
-                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+                fmt_ms(elapsed),
+                fmt_rate(total_msgs, elapsed),
             );
         }
     }
@@ -479,8 +526,10 @@ fn layer1_get_messages(total_msgs: usize) {
             let total_elapsed = cast_elapsed + iter_elapsed;
             println!(
                 "    seed_index all           {} ({} msg/s)  [slice: {}, iter: {}]",
-                fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-                fmt_ns(cast_elapsed), fmt_ms(iter_elapsed),
+                fmt_ms(total_elapsed),
+                fmt_rate(total_msgs, total_elapsed),
+                fmt_ns(cast_elapsed),
+                fmt_ms(iter_elapsed),
             );
         }
 
@@ -505,7 +554,8 @@ fn layer1_get_messages(total_msgs: usize) {
             assert_eq!(total_fed, total_msgs);
             println!(
                 "    seed_index capped 256    {} ({} msg/s)",
-                fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+                fmt_ms(elapsed),
+                fmt_rate(total_msgs, elapsed),
             );
         }
     }
@@ -537,21 +587,27 @@ fn layer2_ready_queue(total_msgs: usize) {
             let t_pop = Instant::now();
             loop {
                 let count = pop_batch(&mut engine, &mut scratch_seqs);
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 drained += count;
             }
             pop_total += t_pop.elapsed();
 
             cycles += 1;
-            if nothing_fed { break; }
+            if nothing_fed {
+                break;
+            }
         }
         let total_elapsed = t0.elapsed();
 
         assert_eq!(drained, total_msgs);
         println!(
             "    old: for_each+enqueue   {} ({} msg/s)  [feed: {}, pop: {}]",
-            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-            fmt_ms(feed_total), fmt_ms(pop_total),
+            fmt_ms(total_elapsed),
+            fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(feed_total),
+            fmt_ms(pop_total),
         );
     }
 
@@ -579,7 +635,8 @@ fn layer2_ready_queue(total_msgs: usize) {
         let t0 = Instant::now();
         loop {
             let t_feed = Instant::now();
-            let new_last = feed_engine_seed(store.as_ref(), &mut engine, last_fed, &mut seed_scratch);
+            let new_last =
+                feed_engine_seed(store.as_ref(), &mut engine, last_fed, &mut seed_scratch);
             feed_total += t_feed.elapsed();
             let nothing_fed = new_last == last_fed;
             last_fed = new_last;
@@ -587,21 +644,27 @@ fn layer2_ready_queue(total_msgs: usize) {
             let t_pop = Instant::now();
             loop {
                 let count = pop_batch(&mut engine, &mut scratch_seqs);
-                if count == 0 { break; }
+                if count == 0 {
+                    break;
+                }
                 drained += count;
             }
             pop_total += t_pop.elapsed();
 
             cycles += 1;
-            if nothing_fed { break; }
+            if nothing_fed {
+                break;
+            }
         }
         let total_elapsed = t0.elapsed();
 
         assert_eq!(drained, total_msgs);
         println!(
             "    new: seed+batch         {} ({} msg/s)  [feed: {}, pop: {}]",
-            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-            fmt_ms(feed_total), fmt_ms(pop_total),
+            fmt_ms(total_elapsed),
+            fmt_rate(total_msgs, total_elapsed),
+            fmt_ms(feed_total),
+            fmt_ms(pop_total),
         );
     }
 }
@@ -631,9 +694,16 @@ fn layer3_frame_build(total_msgs: usize) {
 
         loop {
             let count = pop_batch(&mut engine, &mut scratch_seqs);
-            if count == 0 { break; }
+            if count == 0 {
+                break;
+            }
 
-            read_batch_into_body(store.as_ref(), &scratch_seqs, consumer_id, &mut scratch_body);
+            read_batch_into_body(
+                store.as_ref(),
+                &scratch_seqs,
+                consumer_id,
+                &mut scratch_body,
+            );
             let frame = build_frame(stream_id, &scratch_body);
 
             total_bytes += frame.len();
@@ -641,7 +711,9 @@ fn layer3_frame_build(total_msgs: usize) {
             drained += count;
         }
 
-        if nothing_fed { break; }
+        if nothing_fed {
+            break;
+        }
     }
     let elapsed = t0.elapsed();
 
@@ -649,7 +721,10 @@ fn layer3_frame_build(total_msgs: usize) {
     let mb = total_bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
     println!(
         "    feed+pop+frame+freeze   {} ({} msg/s, {:.0} MB/s, {} frames)",
-        fmt_ms(elapsed), fmt_rate(total_msgs, elapsed), mb, total_frames,
+        fmt_ms(elapsed),
+        fmt_rate(total_msgs, elapsed),
+        mb,
+        total_frames,
     );
 }
 
@@ -666,7 +741,9 @@ fn layer4_channel(total_msgs: usize) {
     let consumer = std::thread::spawn(move || {
         let mut total_received = 0usize;
         while let Ok(frame) = rx.recv() {
-            if frame.len() < ENVELOPE_SIZE + 8 { break; }
+            if frame.len() < ENVELOPE_SIZE + 8 {
+                break;
+            }
             let body = &frame[ENVELOPE_SIZE..];
             let count = u16::from_le_bytes([body[4], body[5]]) as usize;
             total_received += count;
@@ -689,15 +766,24 @@ fn layer4_channel(total_msgs: usize) {
 
         loop {
             let count = pop_batch(&mut engine, &mut scratch_seqs);
-            if count == 0 { break; }
+            if count == 0 {
+                break;
+            }
 
-            read_batch_into_body(store.as_ref(), &scratch_seqs, consumer_id, &mut scratch_body);
+            read_batch_into_body(
+                store.as_ref(),
+                &scratch_seqs,
+                consumer_id,
+                &mut scratch_body,
+            );
             let frame = build_frame(stream_id, &scratch_body);
             tx.send(frame).unwrap();
             drained += count;
         }
 
-        if nothing_fed { break; }
+        if nothing_fed {
+            break;
+        }
     }
     drop(tx);
     let received = consumer.join().unwrap();
@@ -707,7 +793,8 @@ fn layer4_channel(total_msgs: usize) {
     assert_eq!(received, total_msgs);
     println!(
         "    + crossbeam send/recv   {} ({} msg/s)",
-        fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+        fmt_ms(elapsed),
+        fmt_rate(total_msgs, elapsed),
     );
 }
 
@@ -724,21 +811,49 @@ fn layer1_tolerant(total_msgs: usize) {
     let subject = b"bench.drain.subject";
     let payload = vec![0x42u8; PAYLOAD_SIZE];
     for _ in 0..total_msgs {
-        store.append(EntryRef { subject, payload: &payload }, 0).unwrap();
+        store
+            .append(
+                EntryRef {
+                    subject,
+                    payload: &payload,
+                },
+                0,
+            )
+            .unwrap();
     }
     let info = store.info();
-    assert_eq!(info.messages, total_msgs as u64, "tolerant: message count mismatch");
+    assert_eq!(
+        info.messages, total_msgs as u64,
+        "tolerant: message count mismatch"
+    );
     assert_eq!(info.first_seq, 1, "tolerant: first_seq should be 1");
-    assert_eq!(info.last_seq, total_msgs as u64, "tolerant: last_seq mismatch");
+    assert_eq!(
+        info.last_seq, total_msgs as u64,
+        "tolerant: last_seq mismatch"
+    );
 
     // Verify seed_index matches for_each data
     {
         let seeds = store.seed_index(1, info.last_seq + 1);
-        assert_eq!(seeds.len(), total_msgs, "tolerant: seed_index length mismatch");
+        assert_eq!(
+            seeds.len(),
+            total_msgs,
+            "tolerant: seed_index length mismatch"
+        );
         let expected_hash = fnv1a_32(b"bench.drain.subject");
         for (i, s) in seeds.iter().enumerate() {
-            assert_eq!(s.seq.get(), (i + 1) as u64, "tolerant: seq mismatch at {}", i);
-            assert_eq!(s.subject_hash.get(), expected_hash, "tolerant: hash mismatch at {}", i);
+            assert_eq!(
+                s.seq.get(),
+                (i + 1) as u64,
+                "tolerant: seq mismatch at {}",
+                i
+            );
+            assert_eq!(
+                s.subject_hash.get(),
+                expected_hash,
+                "tolerant: hash mismatch at {}",
+                i
+            );
         }
     }
 
@@ -746,16 +861,28 @@ fn layer1_tolerant(total_msgs: usize) {
     {
         let mut count = 0usize;
         let t0 = Instant::now();
-        store.for_each(1, info.last_seq + 1, &mut |entry| {
-            assert_eq!(entry.subject, b"bench.drain.subject", "tolerant: subject corrupted at seq {}", entry.seq);
-            assert_eq!(entry.payload.len(), PAYLOAD_SIZE, "tolerant: payload len wrong at seq {}", entry.seq);
-            count += 1;
-        }).unwrap();
+        store
+            .for_each(1, info.last_seq + 1, &mut |entry| {
+                assert_eq!(
+                    entry.subject, b"bench.drain.subject",
+                    "tolerant: subject corrupted at seq {}",
+                    entry.seq
+                );
+                assert_eq!(
+                    entry.payload.len(),
+                    PAYLOAD_SIZE,
+                    "tolerant: payload len wrong at seq {}",
+                    entry.seq
+                );
+                count += 1;
+            })
+            .unwrap();
         let elapsed = t0.elapsed();
         assert_eq!(count, total_msgs);
         println!(
             "    for_each                {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -777,8 +904,10 @@ fn layer1_tolerant(total_msgs: usize) {
         let total_elapsed = slice_elapsed + iter_elapsed;
         println!(
             "    seed_index all           {} ({} msg/s)  [slice: {}, iter: {}]",
-            fmt_ms(total_elapsed), fmt_rate(total_msgs, total_elapsed),
-            fmt_ns(slice_elapsed), fmt_ms(iter_elapsed),
+            fmt_ms(total_elapsed),
+            fmt_rate(total_msgs, total_elapsed),
+            fmt_ns(slice_elapsed),
+            fmt_ms(iter_elapsed),
         );
     }
 
@@ -803,7 +932,8 @@ fn layer1_tolerant(total_msgs: usize) {
         assert_eq!(total_fed, total_msgs);
         println!(
             "    seed_index capped 256    {} ({} msg/s)",
-            fmt_ms(elapsed), fmt_rate(total_msgs, elapsed),
+            fmt_ms(elapsed),
+            fmt_rate(total_msgs, elapsed),
         );
     }
 
@@ -815,7 +945,10 @@ fn layer1_tolerant(total_msgs: usize) {
 
 fn main() {
     println!("Incremental drain bench — one layer at a time");
-    println!("payload={}B, batch={}, max_feed_per_cycle={}", PAYLOAD_SIZE, CLAIM_BATCH, MAX_FEED_PER_CYCLE);
+    println!(
+        "payload={}B, batch={}, max_feed_per_cycle={}",
+        PAYLOAD_SIZE, CLAIM_BATCH, MAX_FEED_PER_CYCLE
+    );
     println!("{}", "=".repeat(80));
 
     for &msgs in &[10_000, 100_000, 500_000, 1_000_000, 5_000_000] {
