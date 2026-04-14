@@ -127,21 +127,27 @@ async fn resubscribe_all(inner: &Arc<Inner>, write_tx: &mpsc::Sender<Bytes>) {
 
     let frames: Vec<Bytes> = {
         let subs = inner.subscriptions.lock().unwrap();
-        subs.values().map(|sub| {
-            let body = &sub.subscribe_body;
-            let envelope = Envelope {
-                action: U16::new(arbitro_proto::action::Action::Subscribe.as_u16()),
-                flags: 0,
-                _rsv: 0,
-                stream_id: U32::new(sub.stream_id),
-                msg_len: U32::new(body.len() as u32),
-                env_seq: U32::new(0), // no reply needed
-            };
-            let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
-            frame.extend_from_slice(envelope.as_bytes());
-            frame.extend_from_slice(body);
-            Bytes::from(frame)
-        }).collect()
+        let mut out = Vec::new();
+        for by_consumer in subs.values() {
+            for entries in by_consumer.values() {
+                for &(_, ref sub) in entries {
+                    let body = &sub.subscribe_body;
+                    let envelope = Envelope {
+                        action: U16::new(arbitro_proto::action::Action::Subscribe.as_u16()),
+                        flags: 0,
+                        _rsv: 0,
+                        stream_id: U32::new(sub.stream_id),
+                        msg_len: U32::new(body.len() as u32),
+                        env_seq: U32::new(0),
+                    };
+                    let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
+                    frame.extend_from_slice(envelope.as_bytes());
+                    frame.extend_from_slice(body);
+                    out.push(Bytes::from(frame));
+                }
+            }
+        }
+        out
     };
 
     for frame in frames {

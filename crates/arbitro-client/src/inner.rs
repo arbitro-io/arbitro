@@ -50,7 +50,8 @@ pub(crate) struct Inner {
     pub(crate) next_seq: AtomicU32,
 
     /// Active subscriptions for local demux.
-    pub(crate) subscriptions: Mutex<HashMap<u64, Subscription>>,
+    /// Indexed: stream_id → consumer_id → Vec<(sub_id, Subscription)>.
+    pub(crate) subscriptions: Mutex<HashMap<u32, HashMap<u32, Vec<(u64, Subscription)>>>>,
 
     /// Current ack/nack sender — replaced on each reconnect.
     /// Messages hold a clone; after reconnect the old clone goes stale
@@ -82,7 +83,7 @@ impl Inner {
             state_tx,
             pending: Mutex::new(HashMap::new()),
             next_seq: AtomicU32::new(1),
-            subscriptions: Mutex::new(HashMap::new()),
+            subscriptions: Mutex::new(HashMap::new()), // stream → consumer → subs
             subject_trie: Mutex::new(SubjectTrie::new()),
             ack_tx: Mutex::new(ack_tx),
             next_sub_id: AtomicU64::new(1),
@@ -96,11 +97,15 @@ impl Inner {
         let subs = self.subscriptions.lock().unwrap();
         let mut trie = self.subject_trie.lock().unwrap();
         trie.clear();
-        for (&id, sub) in subs.iter() {
-            if let Some(ref filter) = sub.filter {
-                trie.insert(filter, id as u32);
-            } else {
-                trie.insert(b">", id as u32); // No filter = match all
+        for by_consumer in subs.values() {
+            for entries in by_consumer.values() {
+                for &(id, ref sub) in entries {
+                    if let Some(ref filter) = sub.filter {
+                        trie.insert(filter, id as u32);
+                    } else {
+                        trie.insert(b">", id as u32); // No filter = match all
+                    }
+                }
             }
         }
     }
@@ -364,19 +369,20 @@ impl Inner {
         let payload = &body[6 + subj_len..];
 
         let ack_tx = self.ack_tx.lock().unwrap().clone();
-        for sub in subs.values() {
-            if sub.consumer_id == consumer_id && sub.stream_id == stream_id {
-                let msg = Message {
-                    seq,
-                    subject: Box::from(subject),
-                    payload: Bytes::copy_from_slice(payload),
-                    consumer_id,
-                    stream_id,
-                    ack_tx: ack_tx.clone(),
-                    inner: Arc::clone(self),
-                };
-                let _ = sub.tx.try_send(msg);
-                break; // one consumer_id → one subscription
+        if let Some(by_consumer) = subs.get(&stream_id) {
+            if let Some(entries) = by_consumer.get(&consumer_id) {
+                if let Some(&(_, ref sub)) = entries.first() {
+                    let msg = Message {
+                        seq,
+                        subject: Box::from(subject),
+                        payload: Bytes::copy_from_slice(payload),
+                        consumer_id,
+                        stream_id,
+                        ack_tx,
+                        inner: Arc::clone(self),
+                    };
+                    let _ = sub.tx.try_send(msg);
+                }
             }
         }
     }
@@ -389,12 +395,14 @@ impl Inner {
         let subs = self.subscriptions.lock().unwrap();
         let ack_tx = self.ack_tx.lock().unwrap().clone();
 
+        let entries = match subs.get(&stream_id).and_then(|m| m.get(&consumer_id)) {
+            Some(e) => e,
+            None => return,
+        };
+
         for entry in view.entries() {
-            for sub in subs.values() {
-                if sub.stream_id == stream_id
-                    && sub.consumer_id == consumer_id
-                    && sub.matches(entry.subject)
-                {
+            for &(_, ref sub) in entries {
+                if sub.matches(entry.subject) {
                     let msg = Message {
                         seq: entry.seq,
                         subject: Box::from(entry.subject),
@@ -434,27 +442,38 @@ impl Inner {
     }
 
     /// FanoutBatch frame: Efficient O(M) distribution using the SubjectTrie.
+    /// Indexed lookup by stream_id, then trie-match per entry across all
+    /// consumers on this stream. No consumer_id filter — the server sends
+    /// one frame per connection, client distributes to all local consumers.
     fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
-        let consumer_id = view.consumer_id();
         let subs = self.subscriptions.lock().unwrap();
+        let by_consumer = match subs.get(&stream_id) {
+            Some(m) => m,
+            None => return,
+        };
         let trie = self.subject_trie.lock().unwrap();
         let ack_tx = self.ack_tx.lock().unwrap().clone();
 
         for entry in view.entries() {
             trie.find_matches(entry.subject, |sub_id| {
-                if let Some(sub) = subs.get(&(sub_id as u64)) {
-                    if sub.stream_id == stream_id && sub.consumer_id == consumer_id {
-                        let msg = Message {
-                            seq: entry.seq,
-                            subject: Box::from(entry.subject),
-                            payload: Bytes::copy_from_slice(entry.payload),
-                            consumer_id,
-                            stream_id,
-                            ack_tx: ack_tx.clone(),
-                            inner: Arc::clone(self),
-                        };
-                        let _ = sub.tx.try_send(msg);
+                // Trie stores sub_id as u32; find the sub in the indexed map.
+                let sub_id_64 = sub_id as u64;
+                for entries in by_consumer.values() {
+                    for &(id, ref sub) in entries {
+                        if id == sub_id_64 {
+                            let msg = Message {
+                                seq: entry.seq,
+                                subject: Box::from(entry.subject),
+                                payload: Bytes::copy_from_slice(entry.payload),
+                                consumer_id: sub.consumer_id,
+                                stream_id,
+                                ack_tx: ack_tx.clone(),
+                                inner: Arc::clone(self),
+                            };
+                            let _ = sub.tx.try_send(msg);
+                            return;
+                        }
                     }
                 }
             });
@@ -465,7 +484,11 @@ impl Inner {
     pub(crate) fn add_subscription(&self, id: u64, sub: Subscription) {
         {
             let mut subs = self.subscriptions.lock().unwrap();
-            subs.insert(id, sub);
+            subs.entry(sub.stream_id)
+                .or_default()
+                .entry(sub.consumer_id)
+                .or_default()
+                .push((id, sub));
         }
         self.rebuild_trie();
     }
@@ -474,7 +497,14 @@ impl Inner {
     pub(crate) fn remove_subscription(&self, id: u64) {
         {
             let mut subs = self.subscriptions.lock().unwrap();
-            subs.remove(&id);
+            'outer: for by_consumer in subs.values_mut() {
+                for entries in by_consumer.values_mut() {
+                    if let Some(pos) = entries.iter().position(|&(sid, _)| sid == id) {
+                        entries.swap_remove(pos);
+                        break 'outer;
+                    }
+                }
+            }
         }
         self.rebuild_trie();
     }
