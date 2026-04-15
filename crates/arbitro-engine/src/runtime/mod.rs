@@ -15,4 +15,5 @@ pub mod claim;
 pub mod bind;
 pub mod drain;
 pub mod execute;
+pub mod group_ops;
 pub mod seed;
