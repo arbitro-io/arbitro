@@ -19,8 +19,9 @@ pub mod ready;
 // Level 0 — metrics (atomic counters, leaf module)
 pub mod metrics;
 
-// Level 1 — batch + reply + fanout + wire
+// Level 1 — batch + reply + fanout + wire + command vocabulary
 pub mod batch;
+pub mod command;
 pub mod fanout;
 pub mod reply;
 pub mod wire;
@@ -44,6 +45,7 @@ pub mod runtime;
 // don't have to know the internal module layout.
 
 pub use batch::{PublishBatchOwned, PublishEntryOwned};
+pub use command::{Command, DropReason, MsgRef, StreamSeq};
 pub use inflight::InFlightScope;
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 
@@ -621,6 +623,27 @@ impl ArbitroEngine {
     #[inline]
     pub fn metrics_snapshot(&self) -> metrics::MetricsSnapshot {
         self.ctx.metrics.snapshot()
+    }
+
+    // ── Command dispatch (kernel API, parallel to legacy path) ──────────
+    //
+    // `execute` / `execute_batch` are the forthcoming single entry point
+    // for the Command-based kernel (see plan W3). They are wired in
+    // parallel to `on_publish` / `on_ack` / `drain_fanout`; the server
+    // drainer will switch to them in Fase 2 of the migration. Until then
+    // these methods are observational only — they advance metrics, they
+    // do not mutate graph / inflight / ready state.
+
+    /// Apply a single `Command` to engine state.
+    #[inline]
+    pub fn execute(&mut self, cmd: &command::Command<'_>) {
+        runtime::execute::apply(&mut self.ctx, cmd);
+    }
+
+    /// Apply a slice of `Command`s in order.
+    #[inline]
+    pub fn execute_batch(&mut self, cmds: &[command::Command<'_>]) {
+        runtime::execute::apply_batch(&mut self.ctx, cmds);
     }
 }
 

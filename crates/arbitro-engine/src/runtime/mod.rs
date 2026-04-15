@@ -14,4 +14,5 @@ pub mod publish;
 pub mod claim;
 pub mod bind;
 pub mod drain;
+pub mod execute;
 pub mod seed;
