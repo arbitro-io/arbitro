@@ -1,0 +1,51 @@
+[package]
+name = "arbitro-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Graph-based runtime engine for Arbitro — pure sync, zero-copy, single-threaded"
+
+[dependencies]
+ahash = "0.8"
+bytes = "1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[[bench]]
+name = "publish_batch"
+harness = false
+
+[[bench]]
+name = "ack_release"
+harness = false
+
+[[bench]]
+name = "release_breakdown"
+harness = false
+
+[[bench]]
+name = "match_table"
+harness = false
+
+[[bench]]
+name = "drain_connection"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "inflight_limits"
+harness = false
+
+[[bench]]
+name = "wire_codec"
+harness = false
+
+[[bench]]
+name = "var_entry_zerocopy"
+harness = false
+

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["crates/arbitro-e2e", "crates/arbitro-client", "crates/arbitro-proto", "crates/arbitro-server", "crates/arbitro-store"]
+members  = ["crates/arbitro-e2e", "crates/arbitro-client", "crates/arbitro-engine", "crates/arbitro-proto", "crates/arbitro-server", "crates/arbitro-store"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,7 +8,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-arbitro-engine-v2 = { path = "../arbitro-engine", package = "arbitro-engine" }
+arbitro-engine-v2 = { path = "crates/arbitro-engine", package = "arbitro-engine" }
 zerocopy  = { version = "0.8", features = ["derive"] }
 bytes     = "1"
 serde     = { version = "1.0", features = ["derive"] }
