@@ -11,6 +11,16 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables the one-shot lifecycle profiler (lifecycle_trace.rs).
+# When OFF, `record()` compiles to a no-op `#[inline(always)] {}` and every
+# call site is eliminated by dead-code elimination — zero instructions in
+# the final binary, zero AtomicBool gate, zero cost on the hot path.
+# Enable with `cargo test --features lifecycle_trace` when you need to
+# profile end-to-end timings of a single message through the server.
+lifecycle_trace = []
+
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
 arbitro-proto     = { path = "../arbitro-proto" }

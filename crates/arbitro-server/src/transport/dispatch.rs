@@ -27,7 +27,6 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::U64;
 
 use crate::common::reply::{send_error, send_rep_ok, timestamp_now};
-use crate::lifecycle_trace;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::command::PublishEntryOwned;
 use crate::shard::router::ShardRouter;
@@ -129,7 +128,7 @@ async fn dispatch_publish(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    lifecycle_trace::record("05_dispatch_publish_enter", conn_id, 0, "frame_loop");
+    crate::lifecycle_trace!("05_dispatch_publish_enter", conn_id, 0, "frame_loop");
     let seq_stream = match translate_stream_or_error(server, registry, conn_id, env_seq, stream_id) {
         Some(s) => s,
         None => return,
@@ -139,13 +138,13 @@ async fn dispatch_publish(
     let entries: Vec<PublishEntryOwned> = BatchIter::new(body)
         .map(|view| PublishEntryOwned::from_wire(&view, frame))
         .collect();
-    lifecycle_trace::record("06_wire_parsed", conn_id, entries.len() as u64, "frame_loop");
+    crate::lifecycle_trace!("06_wire_parsed", conn_id, entries.len() as u64, "frame_loop");
 
     // Shard handles: validate stream → store.append → RepOk + gate.release
     if shard.publish(seq_stream, conn_id, env_seq, entries).await.is_err() {
         send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
     }
-    lifecycle_trace::record("18_dispatch_publish_returned", conn_id, 0, "frame_loop");
+    crate::lifecycle_trace!("18_dispatch_publish_returned", conn_id, 0, "frame_loop");
 }
 
 /// PublishAccumulate — shard accumulates entries, flushes after deadline/threshold.
@@ -174,7 +173,7 @@ async fn dispatch_publish_accumulate(
 }
 
 async fn dispatch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
-    lifecycle_trace::record("a05_dispatch_ack_enter", 0, 0, "frame_loop");
+    crate::lifecycle_trace!("a05_dispatch_ack_enter", 0, 0, "frame_loop");
     let seq_stream = match translate_stream_silent(server, stream_id) {
         Some(s) => s,
         None => return,
@@ -185,7 +184,7 @@ async fn dispatch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
     let _ = shard
         .ack(ConsumerId(view.consumer_id()), vec![AckEntry { seq: view.sequence() }], now)
         .await;
-    lifecycle_trace::record("a18_dispatch_ack_returned", 0, 0, "frame_loop");
+    crate::lifecycle_trace!("a18_dispatch_ack_returned", 0, 0, "frame_loop");
 }
 
 async fn dispatch_nack(stream_id: u32, body: &[u8], server: &ShardRouter) {

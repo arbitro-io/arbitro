@@ -3,17 +3,14 @@
 //! O(1) append, O(1) read by seq (index = seq - first_seq).
 //! No limits enforcement here — the engine checks before calling.
 
-use crate::store::{Entry, EntryRef, SeedHeader, Store, StoreError, StoreInfo, entry_matches};
+use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
 use arbitro_engine_v2::catalog::fnv1a_32;
-use zerocopy::byteorder::little_endian::{U32, U64};
 
 pub struct MemoryStore {
     /// Contiguous arena for all subjects and payloads.
     data: Vec<u8>,
     /// Metadata for each entry to allow O(1) access.
     index: Vec<LogMetadata>,
-    /// Contiguous seed index for zero-copy drainer access.
-    seed_idx: Vec<SeedHeader>,
     next_seq: u64,
     first_seq: u64,
     total_bytes: u64,
@@ -41,7 +38,6 @@ impl MemoryStore {
         Self {
             data: Vec::with_capacity(65536), // Initial 64KB
             index: Vec::with_capacity(1024),
-            seed_idx: Vec::with_capacity(1024),
             next_seq: 1,
             first_seq: 1,
             total_bytes: 0,
@@ -87,7 +83,7 @@ impl MemoryStore {
         self.data.extend_from_slice(entry.subject);
         self.data.extend_from_slice(entry.payload);
 
-        // 2. Register in both indices
+        // 2. Register in index
         self.index.push(LogMetadata {
             seq,
             ts: timestamp,
@@ -95,10 +91,6 @@ impl MemoryStore {
             payload_len,
             offset,
             subject_hash,
-        });
-        self.seed_idx.push(SeedHeader {
-            seq: U64::new(seq),
-            subject_hash: U32::new(subject_hash),
         });
 
         self.total_bytes += (subj_len as u64) + (payload_len as u64);
@@ -133,7 +125,6 @@ impl Store for MemoryStore {
             return Ok(self.next_seq);
         }
         self.index.reserve(entries.len());
-        self.seed_idx.reserve(entries.len());
         let first = self.next_seq;
         for entry in entries {
             self.push_entry(entry, timestamp);
@@ -184,14 +175,6 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn seed_index(&self, start: u64, end: u64) -> &[SeedHeader] {
-        let s = self.find_lower_bound(start);
-        let e = self.find_lower_bound(end);
-        let e = e.min(self.seed_idx.len());
-        let s = s.min(e);
-        &self.seed_idx[s..e]
-    }
-
     fn truncate_front(&mut self, first_seq: u64) -> u64 {
         if first_seq <= self.first_seq || self.index.is_empty() { return 0; }
         
@@ -208,9 +191,8 @@ impl Store for MemoryStore {
         // 1. Drain data arena (Hardware Sympathy: this is a memory move, O(N))
         self.data.drain(0..data_cut);
 
-        // 2. Drain both indices
+        // 2. Drain index
         self.index.drain(0..idx);
-        self.seed_idx.drain(0..idx);
 
         // 3. Update offsets in remaining index entries
         for meta in &mut self.index {
@@ -231,7 +213,6 @@ impl Store for MemoryStore {
         let count = self.index.len() as u64;
         self.data.clear();
         self.index.clear();
-        self.seed_idx.clear();
         self.first_seq = self.next_seq;
         self.total_bytes = 0;
         count
@@ -240,7 +221,6 @@ impl Store for MemoryStore {
     fn drain(&mut self, subject: &[u8]) -> u64 {
         let mut new_data = Vec::with_capacity(self.data.len());
         let mut new_index = Vec::with_capacity(self.index.len());
-        let mut new_seed = Vec::with_capacity(self.seed_idx.len());
         let mut removed = 0;
         let mut bytes = 0;
 
@@ -256,7 +236,6 @@ impl Store for MemoryStore {
                     offset,
                     ..meta
                 });
-                new_seed.push(self.seed_idx[i]);
                 bytes += (meta.subj_len as u64) + (meta.payload_len as u64);
             } else {
                 removed += 1;
@@ -265,7 +244,6 @@ impl Store for MemoryStore {
 
         self.data = new_data;
         self.index = new_index;
-        self.seed_idx = new_seed;
         self.total_bytes = bytes;
 
         if let Some(first) = self.index.first() {

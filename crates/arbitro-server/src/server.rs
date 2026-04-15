@@ -15,7 +15,6 @@ use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::config::Config;
-use crate::lifecycle_trace;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
 use crate::transport::dispatch;
@@ -173,12 +172,12 @@ impl ArbitroServer {
                 frame = frame_rx.recv() => {
                     match frame {
                         Some((conn_id, frame)) => {
-                            lifecycle_trace::record("04_frame_chan_recv", conn_id, 0, "frame_loop");
+                            crate::lifecycle_trace!("04_frame_chan_recv", conn_id, 0, "frame_loop");
                             dispatch::dispatch_frame(
                                 conn_id, frame, &self.server, &self.registry,
                                 self.command_log.as_ref(),
                             ).await;
-                            lifecycle_trace::record("19_dispatch_returned", conn_id, 0, "frame_loop");
+                            crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "frame_loop");
                         }
                         None => break,
                     }
@@ -252,7 +251,7 @@ async fn read_loop(
                 break;
             }
         }
-        lifecycle_trace::record("01_tcp_read_header", conn_id, 0, "transport_read");
+        crate::lifecycle_trace!("01_tcp_read_header", conn_id, 0, "transport_read");
 
         // Parse msg_len from envelope (bytes 8..12, little-endian u32)
         let msg_len =
@@ -270,14 +269,14 @@ async fn read_loop(
                 break;
             }
         }
-        lifecycle_trace::record("02_tcp_read_body", conn_id, 0, "transport_read");
+        crate::lifecycle_trace!("02_tcp_read_body", conn_id, 0, "transport_read");
 
         registry.touch(conn_id);
 
         if tx.send((conn_id, buf.freeze())).await.is_err() {
             break;
         }
-        lifecycle_trace::record("03_frame_chan_send", conn_id, 0, "transport_read");
+        crate::lifecycle_trace!("03_frame_chan_send", conn_id, 0, "transport_read");
     }
 
     // Build and send disconnect frame
@@ -299,7 +298,7 @@ async fn write_loop(
             Some(frame) => batch.push(frame),
             None => break,
         }
-        lifecycle_trace::record("31_write_loop_recv", _conn_id, 0, "transport_write");
+        crate::lifecycle_trace!("31_write_loop_recv", _conn_id, 0, "transport_write");
 
         // Coalesce: drain all ready frames without blocking
         while let Ok(frame) = rx.try_recv() {
@@ -311,7 +310,7 @@ async fn write_loop(
         } else {
             write_all_vectored(&mut writer, &batch).await.is_err()
         };
-        lifecycle_trace::record("32_tcp_write_done", _conn_id, batch.len() as u64, "transport_write");
+        crate::lifecycle_trace!("32_tcp_write_done", _conn_id, batch.len() as u64, "transport_write");
 
         if failed {
             break;

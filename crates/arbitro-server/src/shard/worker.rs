@@ -23,7 +23,6 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use crate::common::gate::Gate;
-use crate::lifecycle_trace;
 use crate::shard::command::*;
 use crate::transport::ConnectionRegistry;
 
@@ -217,7 +216,7 @@ impl ShardWorker {
             // 1. Drain all pending commands (non-blocking)
             let mut got_shutdown = false;
             while let Ok(cmd) = self.rx.try_recv() {
-                lifecycle_trace::record("09_worker_try_recv", 0, 0, "shard");
+                crate::lifecycle_trace!("09_worker_try_recv", 0, 0, "shard");
                 match cmd {
                     ShardCommand::Shutdown => { got_shutdown = true; break; }
                     cmd => self.dispatch_command(cmd),
@@ -261,7 +260,7 @@ impl ShardWorker {
 
             // 3. If gate is open → run delivery
             if self.gate.is_open() {
-                lifecycle_trace::record("20_gate_open_detected", 0, 0, "shard");
+                crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
                 self.handle_drain_deliver();
             }
 

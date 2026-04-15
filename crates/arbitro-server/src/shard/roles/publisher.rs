@@ -14,13 +14,12 @@ use arbitro_proto::error::ErrorCode;
 use arbitro_store::EntryRef;
 
 use crate::common::reply::{send_error, send_rep_ok};
-use crate::lifecycle_trace;
 use crate::shard::command::PublishCmd;
 use crate::shard::worker::ShardWorker;
 
 impl ShardWorker {
     pub(in crate::shard) fn handle_publish(&mut self, cmd: PublishCmd) {
-        lifecycle_trace::record("10_publisher_enter", cmd.conn_id, cmd.entries.len() as u64, "shard");
+        crate::lifecycle_trace!("10_publisher_enter", cmd.conn_id, cmd.entries.len() as u64, "shard");
         // 1. Stream exists?
         let store = match self.stores.get_mut(&cmd.stream_id) {
             Some(s) => s,
@@ -42,7 +41,7 @@ impl ShardWorker {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        lifecycle_trace::record("11_pub_store_append_start", cmd.conn_id, 0, "shard");
+        crate::lifecycle_trace!("11_pub_store_append_start", cmd.conn_id, 0, "shard");
 
         let first_seq = match store.append_batch(&store_entries, now_ms) {
             Ok(seq) => seq,
@@ -51,12 +50,12 @@ impl ShardWorker {
                 return;
             }
         };
-        lifecycle_trace::record("12_pub_store_append_done", cmd.conn_id, first_seq, "shard");
+        crate::lifecycle_trace!("12_pub_store_append_done", cmd.conn_id, first_seq, "shard");
 
         // 3. Reply + signal — engine processing happens in drain_deliver
         send_rep_ok(&self.registry, cmd.conn_id, cmd.env_seq, first_seq);
-        lifecycle_trace::record("13_pub_rep_ok_sent", cmd.conn_id, first_seq, "shard");
+        crate::lifecycle_trace!("13_pub_rep_ok_sent", cmd.conn_id, first_seq, "shard");
         self.gate.release();
-        lifecycle_trace::record("14_pub_gate_released", cmd.conn_id, first_seq, "shard");
+        crate::lifecycle_trace!("14_pub_gate_released", cmd.conn_id, first_seq, "shard");
     }
 }

@@ -126,7 +126,7 @@ async fn resubscribe_all(inner: &Arc<Inner>, write_tx: &mpsc::Sender<Bytes>) {
     use zerocopy::IntoBytes;
 
     let frames: Vec<Bytes> = {
-        let subs = inner.subscriptions.lock().unwrap();
+        let subs = inner.subscriptions.read().unwrap();
         let mut out = Vec::new();
         for by_consumer in subs.values() {
             for entries in by_consumer.values() {

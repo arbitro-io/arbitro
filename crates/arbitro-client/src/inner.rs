@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -51,16 +51,27 @@ pub(crate) struct Inner {
 
     /// Active subscriptions for local demux.
     /// Indexed: stream_id → consumer_id → Vec<(sub_id, Subscription)>.
-    pub(crate) subscriptions: Mutex<HashMap<u32, HashMap<u32, Vec<(u64, Subscription)>>>>,
+    ///
+    /// RwLock: hot-path frame delivery reads this on every RepBatch /
+    /// FanoutBatch / Deliver frame; writes only happen on subscribe /
+    /// unsubscribe (cold path). Heavy-read asymmetry justifies RwLock
+    /// over Mutex — readers don't block each other.
+    pub(crate) subscriptions: RwLock<HashMap<u32, HashMap<u32, Vec<(u64, Subscription)>>>>,
 
     /// Current ack/nack sender — replaced on each reconnect.
     /// Messages hold a clone; after reconnect the old clone goes stale
     /// (send fails silently) so stale ACKs are discarded automatically.
-    pub(crate) ack_tx: Mutex<mpsc::Sender<AckCmd>>,
+    ///
+    /// RwLock: cloned on every delivered frame (read), replaced only on
+    /// reconnect (write).
+    pub(crate) ack_tx: RwLock<mpsc::Sender<AckCmd>>,
 
     /// Precomputed Trie for O(M) fanout distribution.
     /// Rebuilt on each membership change (cold path).
-    pub(crate) subject_trie: Mutex<SubjectTrie>,
+    ///
+    /// RwLock: read on every FanoutBatch frame, rewritten only on
+    /// subscribe / unsubscribe.
+    pub(crate) subject_trie: RwLock<SubjectTrie>,
 
     /// Monotonic subscription ID — shared across all Consumer objects.
     pub(crate) next_sub_id: AtomicU64,
@@ -83,9 +94,9 @@ impl Inner {
             state_tx,
             pending: Mutex::new(HashMap::new()),
             next_seq: AtomicU32::new(1),
-            subscriptions: Mutex::new(HashMap::new()), // stream → consumer → subs
-            subject_trie: Mutex::new(SubjectTrie::new()),
-            ack_tx: Mutex::new(ack_tx),
+            subscriptions: RwLock::new(HashMap::new()), // stream → consumer → subs
+            subject_trie: RwLock::new(SubjectTrie::new()),
+            ack_tx: RwLock::new(ack_tx),
             next_sub_id: AtomicU64::new(1),
             request_timeout,
             addr,
@@ -94,8 +105,8 @@ impl Inner {
 
     /// Update the SubjectTrie from the current subscriptions (Cold Path).
     fn rebuild_trie(&self) {
-        let subs = self.subscriptions.lock().unwrap();
-        let mut trie = self.subject_trie.lock().unwrap();
+        let subs = self.subscriptions.read().unwrap();
+        let mut trie = self.subject_trie.write().unwrap();
         trie.clear();
         for by_consumer in subs.values() {
             for entries in by_consumer.values() {
@@ -115,7 +126,7 @@ impl Inner {
     /// Old Message handles hold the previous sender — their ACKs fail silently (correct).
     pub(crate) fn new_ack_channel(&self) -> mpsc::Receiver<AckCmd> {
         let (tx, rx) = mpsc::channel(4096);
-        *self.ack_tx.lock().unwrap() = tx;
+        *self.ack_tx.write().unwrap() = tx;
         rx
     }
 
@@ -352,7 +363,7 @@ impl Inner {
     /// Server body format: [4 consumer_id][2 subj_len][subject][payload]
     /// Sequence comes from envelope env_seq (u32).
     fn on_deliver(self: &Arc<Self>, stream_id: u32, env_seq: u32, body: &[u8]) {
-        let subs = self.subscriptions.lock().unwrap();
+        let subs = self.subscriptions.read().unwrap();
 
         if body.len() < 6 {
             return;
@@ -368,7 +379,7 @@ impl Inner {
         let subject = &body[6..6 + subj_len];
         let payload = &body[6 + subj_len..];
 
-        let ack_tx = self.ack_tx.lock().unwrap().clone();
+        let ack_tx = self.ack_tx.read().unwrap().clone();
         if let Some(by_consumer) = subs.get(&stream_id) {
             if let Some(entries) = by_consumer.get(&consumer_id) {
                 if let Some(&(_, ref sub)) = entries.first() {
@@ -392,8 +403,8 @@ impl Inner {
     fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
         let consumer_id = view.consumer_id();
-        let subs = self.subscriptions.lock().unwrap();
-        let ack_tx = self.ack_tx.lock().unwrap().clone();
+        let subs = self.subscriptions.read().unwrap();
+        let ack_tx = self.ack_tx.read().unwrap().clone();
 
         let entries = match subs.get(&stream_id).and_then(|m| m.get(&consumer_id)) {
             Some(e) => e,
@@ -447,13 +458,13 @@ impl Inner {
     /// one frame per connection, client distributes to all local consumers.
     fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
-        let subs = self.subscriptions.lock().unwrap();
+        let subs = self.subscriptions.read().unwrap();
         let by_consumer = match subs.get(&stream_id) {
             Some(m) => m,
             None => return,
         };
-        let trie = self.subject_trie.lock().unwrap();
-        let ack_tx = self.ack_tx.lock().unwrap().clone();
+        let trie = self.subject_trie.read().unwrap();
+        let ack_tx = self.ack_tx.read().unwrap().clone();
 
         for entry in view.entries() {
             trie.find_matches(entry.subject, |sub_id| {
@@ -483,7 +494,10 @@ impl Inner {
     /// Register a new local subscription.
     pub(crate) fn add_subscription(&self, id: u64, sub: Subscription) {
         {
-            let mut subs = self.subscriptions.lock().unwrap();
+            // Scoped write lock — MUST drop before rebuild_trie() which
+            // acquires subscriptions.read(); otherwise we deadlock against
+            // ourselves (write holder blocks reader on same thread).
+            let mut subs = self.subscriptions.write().unwrap();
             subs.entry(sub.stream_id)
                 .or_default()
                 .entry(sub.consumer_id)
@@ -496,7 +510,8 @@ impl Inner {
     /// Remove a local subscription.
     pub(crate) fn remove_subscription(&self, id: u64) {
         {
-            let mut subs = self.subscriptions.lock().unwrap();
+            // Scoped write lock — dropped before rebuild_trie() below.
+            let mut subs = self.subscriptions.write().unwrap();
             'outer: for by_consumer in subs.values_mut() {
                 for entries in by_consumer.values_mut() {
                     if let Some(pos) = entries.iter().position(|&(sid, _)| sid == id) {

@@ -25,7 +25,6 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use tokio::sync::mpsc;
 
-use crate::lifecycle_trace;
 use crate::shard::worker::ShardWorker;
 
 impl ShardWorker {
@@ -40,11 +39,11 @@ impl ShardWorker {
     /// Skips streams with no active bindings per the "no speculative engine
     /// work" invariant.
     pub(in crate::shard) fn publish_pending_to_engine(&mut self, _now: Timestamp) {
-        lifecycle_trace::record("p01_ppte_enter", 0, 0, "shard");
+        crate::lifecycle_trace!("p01_ppte_enter", 0, 0, "shard");
         // Reuse scratch buffer instead of allocating per call.
         self.scratch_stream_ids.clear();
         self.scratch_stream_ids.extend(self.stores.keys().copied());
-        lifecycle_trace::record("p02_ppte_keys_collected", self.scratch_stream_ids.len() as u64, 0, "shard");
+        crate::lifecycle_trace!("p02_ppte_keys_collected", self.scratch_stream_ids.len() as u64, 0, "shard");
 
         for i in 0..self.scratch_stream_ids.len() {
             let stream_id = self.scratch_stream_ids[i];
@@ -53,10 +52,10 @@ impl ShardWorker {
             if !self.bindings.iter().any(|b| b.stream_id == stream_id) {
                 continue;
             }
-            lifecycle_trace::record("p03_binding_check_pass", stream_id.raw() as u64, 0, "shard");
+            crate::lifecycle_trace!("p03_binding_check_pass", stream_id.raw() as u64, 0, "shard");
             let last = self.last_engine_seq.get(&stream_id).copied().unwrap_or(0);
             let info = self.stores[&stream_id].info();
-            lifecycle_trace::record("p04_store_info_done", info.last_seq, last, "shard");
+            crate::lifecycle_trace!("p04_store_info_done", info.last_seq, last, "shard");
             if info.last_seq <= last { continue; }
 
             let start = last + 1;
@@ -65,7 +64,7 @@ impl ShardWorker {
 
             // Temporarily remove store to avoid borrow conflict with self.engine
             let store = self.stores.remove(&stream_id).unwrap();
-            lifecycle_trace::record("p05_store_removed", stream_id.raw() as u64, end - start, "shard");
+            crate::lifecycle_trace!("p05_store_removed", stream_id.raw() as u64, end - start, "shard");
 
             let engine = &mut self.engine;
             let mut fed_last: u64 = last;
@@ -80,11 +79,11 @@ impl ShardWorker {
                 fed_last = entry.seq;
             }).ok();
             engine.flush_seed_metrics(fed_entries, fed_no_match, fed_queues);
-            lifecycle_trace::record("p06_for_each_done", stream_id.raw() as u64, end - start, "shard");
+            crate::lifecycle_trace!("p06_for_each_done", stream_id.raw() as u64, end - start, "shard");
 
             self.stores.insert(stream_id, store);
             self.last_engine_seq.insert(stream_id, fed_last);
-            lifecycle_trace::record("p07_store_reinserted", stream_id.raw() as u64, 0, "shard");
+            crate::lifecycle_trace!("p07_store_reinserted", stream_id.raw() as u64, 0, "shard");
 
             // Keep ctx.next_seq aligned so any future live publish that goes
             // through engine.publish assigns seqs after the store's tail.
@@ -93,7 +92,7 @@ impl ShardWorker {
                 self.engine.ctx_mut().next_seq = next;
             }
         }
-        lifecycle_trace::record("p08_ppte_exit", 0, 0, "shard");
+        crate::lifecycle_trace!("p08_ppte_exit", 0, 0, "shard");
     }
 
     /// Iterate all active bindings, claim from engine, read store, build one
@@ -107,7 +106,7 @@ impl ShardWorker {
     /// * Subject + payload are copied straight from `Store::get` into the
     ///   reusable `scratch_batch_body` buffer; no per-entry frame allocation.
     pub(in crate::shard) fn handle_drain_deliver(&mut self) {
-        lifecycle_trace::record("21_drainer_enter", 0, self.bindings.len() as u64, "shard");
+        crate::lifecycle_trace!("21_drainer_enter", 0, self.bindings.len() as u64, "shard");
         // Guard 0 (roles.md DRAINER MUST #1): without destinatarios the drainer
         // does zero work. No engine feed, no store read, no clock syscall.
         if self.bindings.is_empty() {
@@ -124,9 +123,9 @@ impl ShardWorker {
         );
 
         // 1. Feed new journal entries into engine
-        lifecycle_trace::record("22_feed_engine_start", 0, 0, "shard");
+        crate::lifecycle_trace!("22_feed_engine_start", 0, 0, "shard");
         self.publish_pending_to_engine(now);
-        lifecycle_trace::record("23_feed_engine_done", 0, 0, "shard");
+        crate::lifecycle_trace!("23_feed_engine_done", 0, 0, "shard");
 
         let claim_batch = self.max_feed_per_cycle as u16;
         let mut any_delivered = false;
@@ -149,17 +148,17 @@ impl ShardWorker {
 
             // Pre-filter (cached) — paused: skip without any engine call.
             if binding.paused {
-                lifecycle_trace::record("24_drain_binding_paused", connection_id.0, stream_id.raw() as u64, "shard");
+                crate::lifecycle_trace!("24_drain_binding_paused", connection_id.0, stream_id.raw() as u64, "shard");
                 continue;
             }
             let fire_and_forget = binding.fire_and_forget;
             // Tracked consumers: skip if saturated (~3 ns). Fire-and-forget
             // never tracks inflight so the check is meaningless.
             if !fire_and_forget && !self.engine.consumer_has_capacity(consumer_id, max_inflight) {
-                lifecycle_trace::record("24_drain_binding_saturated", connection_id.0, stream_id.raw() as u64, "shard");
+                crate::lifecycle_trace!("24_drain_binding_saturated", connection_id.0, stream_id.raw() as u64, "shard");
                 continue;
             }
-            lifecycle_trace::record("24_drain_binding_start", connection_id.0, stream_id.raw() as u64, "shard");
+            crate::lifecycle_trace!("24_drain_binding_start", connection_id.0, stream_id.raw() as u64, "shard");
 
             // Loop: claim/pop batches until queue empty or inflight limit hit
             loop {
@@ -170,7 +169,7 @@ impl ShardWorker {
                     // No PendingNode, no edges, no inflight tracking — the
                     // engine never learns these seqs were delivered, so
                     // consumer.delete() has zero cleanup cost.
-                    lifecycle_trace::record("25_pop_start", connection_id.0, claim_batch as u64, "shard");
+                    crate::lifecycle_trace!("25_pop_start", connection_id.0, claim_batch as u64, "shard");
                     for _ in 0..claim_batch {
                         match self.engine.ctx_mut().ready.pop(queue_id) {
                             Some((_subject_hash, seq)) => self.scratch_seqs.push(seq),
@@ -187,7 +186,7 @@ impl ShardWorker {
                         break;
                     }
                     let max = (claim_batch as u32).min(remaining) as u16;
-                    lifecycle_trace::record("25_claim_start", connection_id.0, max as u64, "shard");
+                    crate::lifecycle_trace!("25_claim_start", connection_id.0, max as u64, "shard");
                     {
                         let claimed = self.engine.claim(
                             &ClaimBatch {
@@ -206,11 +205,11 @@ impl ShardWorker {
                 };
 
                 if self.scratch_seqs.is_empty() {
-                    lifecycle_trace::record("26_claim_empty", connection_id.0, 0, "shard");
+                    crate::lifecycle_trace!("26_claim_empty", connection_id.0, 0, "shard");
                     break;
                 }
                 let claimed_count = self.scratch_seqs.len();
-                lifecycle_trace::record("26_claim_done", connection_id.0, claimed_count as u64, "shard");
+                crate::lifecycle_trace!("26_claim_done", connection_id.0, claimed_count as u64, "shard");
                 any_delivered = true;
 
                 // 2. Build one RepBatch body in the reusable scratch buffer.
@@ -236,7 +235,7 @@ impl ShardWorker {
                     .as_bytes(),
                 );
 
-                lifecycle_trace::record("27_store_get_loop_start", connection_id.0, claimed_count as u64, "shard");
+                crate::lifecycle_trace!("27_store_get_loop_start", connection_id.0, claimed_count as u64, "shard");
                 let body = &mut self.scratch_batch_body;
                 // Fast path: when the engine returned a contiguous range of
                 // seqs (the dominant case in DeliverPolicy::All replay and
@@ -278,7 +277,7 @@ impl ShardWorker {
                         }).ok();
                     }
                 }
-                lifecycle_trace::record("28_store_get_loop_done", connection_id.0, claimed_count as u64, "shard");
+                crate::lifecycle_trace!("28_store_get_loop_done", connection_id.0, claimed_count as u64, "shard");
 
                 // 3. Patch envelope now that body_len is known.
                 let wire_stream_id = self
@@ -294,13 +293,13 @@ impl ShardWorker {
                 );
                 self.scratch_batch_body[..ENVELOPE_SIZE]
                     .copy_from_slice(envelope.as_bytes());
-                lifecycle_trace::record("29_frame_built", connection_id.0, body_len as u64, "shard");
+                crate::lifecycle_trace!("29_frame_built", connection_id.0, body_len as u64, "shard");
                 // Fast-path send via cached tx — bypasses registry Mutex.
                 // try_send: ~3 ns (vs 260 ns for mutex+clone+blocking_send).
                 // On Full: stop this binding for this cycle (backpressure).
                 // On Closed: connection gone, stop draining.
                 let frozen = self.scratch_batch_body.split().freeze();
-                lifecycle_trace::record("30_send_bytes_done", connection_id.0, body_len as u64, "shard");
+                crate::lifecycle_trace!("30_send_bytes_done", connection_id.0, body_len as u64, "shard");
                 match self.bindings[i].tx.try_send(frozen) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -332,7 +331,7 @@ impl ShardWorker {
         if more_pending {
             // Engine still has work we couldn't fit this cycle — re-arm.
             self.gate.release();
-            lifecycle_trace::record("33_drainer_exit_released", 0, 0, "shard");
+            crate::lifecycle_trace!("33_drainer_exit_released", 0, 0, "shard");
         } else {
             // Either delivered everything ready, or nothing was ready.
             // Lock gate until publisher/acker/binder explicitly releases it.
@@ -340,7 +339,7 @@ impl ShardWorker {
             // happy path — no need to re-fire and burn an empty cycle.
             let _ = any_delivered;
             self.gate.lock();
-            lifecycle_trace::record("33_drainer_exit_locked", 0, 0, "shard");
+            crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
         }
     }
 }

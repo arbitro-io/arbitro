@@ -333,10 +333,10 @@ impl ShardHandle {
     // ── Internal ────────────────────────────────────────────────────────
 
     pub async fn send(&self, cmd: ShardCommand) -> Result<(), SendError> {
-        crate::lifecycle_trace::record("07_handle_send_enter", 0, 0, "frame_loop");
+        crate::lifecycle_trace!("07_handle_send_enter", 0, 0, "frame_loop");
         self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)?;
         self.shard_thread.unpark();
-        crate::lifecycle_trace::record("08_handle_send_done", 0, 0, "frame_loop");
+        crate::lifecycle_trace!("08_handle_send_done", 0, 0, "frame_loop");
         Ok(())
     }
 

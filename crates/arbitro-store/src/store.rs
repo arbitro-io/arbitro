@@ -4,8 +4,6 @@
 //! the server wraps it in spawn_blocking.
 
 use arbitro_engine_v2::common::subject_matches;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-use zerocopy::byteorder::little_endian::{U32, U64};
 
 /// A single stored message view.
 /// Borrows data from the store arena — zero allocations.
@@ -31,20 +29,6 @@ pub struct StoreInfo {
     pub bytes: u64,
     pub first_seq: u64,
     pub last_seq: u64,
-}
-
-/// Fixed-size header pre-computed at append time for the drainer.
-/// Contains only what enqueue_ready_batch needs: seq + subject_hash.
-///
-/// 12 bytes per entry, `#[repr(C)]` for zerocopy cast.
-/// 1M entries = 12 MB contiguous — fits in L3 cache.
-/// The store maintains a separate `Vec<SeedHeader>` index so the drainer
-/// can get `&[SeedHeader]` directly — zero alloc, zero copy.
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct SeedHeader {
-    pub seq: U64,
-    pub subject_hash: U32,
 }
 
 /// Store errors.
@@ -95,12 +79,6 @@ pub trait Store: Send + Sync {
     /// Zero-alloc: calls `f` for each entry in `[start..end)`.
     /// Borrows directly from internal storage — no cloning.
     fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError>;
-
-    /// Zero-copy seed index for `[start..end)`.
-    /// Returns a direct slice into the store's contiguous SeedHeader index —
-    /// no allocation, no copying, no per-entry decode.
-    /// The drainer uses this to feed enqueue_ready_batch.
-    fn seed_index(&self, start: u64, end: u64) -> &[SeedHeader];
 
     // ── Management ──────────────────────────────────────────────────
 

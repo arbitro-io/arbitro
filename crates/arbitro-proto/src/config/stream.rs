@@ -16,6 +16,21 @@ pub struct StreamConfig {
     pub filter: Box<[u8]>,
     pub max_msgs: u64,
     pub max_bytes: u64,
+    /// Per-message TTL in seconds. Lazy expiry: validated at read time, not
+    /// by a background sweeper. A message whose age exceeds `max_age_secs`
+    /// is treated as not found on the next `get` / `for_each` / consumer
+    /// delivery and becomes eligible for removal on the next mutating op.
+    ///
+    /// Policy:
+    /// - `0` = disabled (infinite retention, default).
+    /// - `> 0` = any positive value is valid (no minimum — there is no
+    ///   sweeper tick to respect since validation is on-read).
+    /// - Update: lowering the value is legitimate (ops, compliance,
+    ///   rebalance). Already-stored messages that fall outside the new
+    ///   window become eligible for expiry on their next access.
+    /// - Interaction with `RetentionPolicy::{Interest, WorkQueue}`:
+    ///   expiry must never drop a message with a pending ack — that is
+    ///   an independent invariant of the retention policy.
     pub max_age_secs: u64,
     pub replicas: u8,
     pub journal_kind: JournalKind,

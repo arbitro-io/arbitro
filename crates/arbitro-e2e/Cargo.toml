@@ -67,5 +67,13 @@ harness = false
 name    = "fanout_lookup"
 harness = false
 
+[[bench]]
+name    = "dst_entry"
+harness = false
+
+[[bench]]
+name    = "raw_tcp_pipeline"
+harness = false
+
 
  

@@ -16,34 +16,33 @@
 
 use arbitro_engine_v2::batch::{AckBatch, ClaimBatch, NackBatch};
 
-use crate::lifecycle_trace;
 use crate::shard::command::{AckCmd, AckReply, ClaimCmd, NackCmd, NackReply};
 use crate::shard::worker::ShardWorker;
 
 impl ShardWorker {
     pub(in crate::shard) fn handle_ack(&mut self, cmd: AckCmd) {
-        lifecycle_trace::record("a10_acker_enter", 0, cmd.entries.len() as u64, "shard");
+        crate::lifecycle_trace!("a10_acker_enter", 0, cmd.entries.len() as u64, "shard");
         self.scratch_ack.clear();
         self.scratch_ack.extend_from_slice(&cmd.entries);
 
-        lifecycle_trace::record("a11_engine_ack_start", 0, 0, "shard");
+        crate::lifecycle_trace!("a11_engine_ack_start", 0, 0, "shard");
         let result = self.engine.ack(&AckBatch {
             consumer_id: cmd.consumer_id,
             entries: &self.scratch_ack,
             now: cmd.now,
         });
-        lifecycle_trace::record("a12_engine_ack_done", 0, result.accepted as u64, "shard");
+        crate::lifecycle_trace!("a12_engine_ack_done", 0, result.accepted as u64, "shard");
 
         if result.accepted > 0 {
             self.gate.release();
-            lifecycle_trace::record("a13_acker_gate_released", 0, 0, "shard");
+            crate::lifecycle_trace!("a13_acker_gate_released", 0, 0, "shard");
         }
 
         let _ = cmd.reply.send(AckReply {
             accepted: result.accepted,
             rejected: result.rejected,
         });
-        lifecycle_trace::record("a14_acker_reply_sent", 0, 0, "shard");
+        crate::lifecycle_trace!("a14_acker_reply_sent", 0, 0, "shard");
     }
 
     pub(in crate::shard) fn handle_nack(&mut self, cmd: NackCmd) {
