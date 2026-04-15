@@ -55,6 +55,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitro-common"
+version = "0.1.0"
+dependencies = [
+ "arbitro-engine",
+]
+
+[[package]]
 name = "arbitro-e2e"
 version = "0.1.0"
 dependencies = [
@@ -100,6 +107,7 @@ name = "arbitro-server"
 version = "0.1.0"
 dependencies = [
  "arbitro-client",
+ "arbitro-common",
  "arbitro-engine",
  "arbitro-proto",
  "arbitro-store",

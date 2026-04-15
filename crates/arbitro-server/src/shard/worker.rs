@@ -22,7 +22,7 @@ use arbitro_store::Store;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
-use crate::common::gate::Gate;
+use crate::common::Gate;
 use crate::shard::command::*;
 use crate::transport::ConnectionRegistry;
 

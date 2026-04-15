@@ -6,8 +6,7 @@ use arbitro_engine_v2::types::StreamId;
 use arbitro_engine_v2::ArbitroEngine;
 use tokio::sync::mpsc;
 
-use crate::common::gate::Gate;
-use crate::common::NameRegistry;
+use crate::common::{Gate, NameRegistry};
 use crate::config::Config;
 use crate::shard::handle::ShardHandle;
 use crate::shard::worker::ShardWorker;

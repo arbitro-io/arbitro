@@ -1,0 +1,9 @@
+[package]
+name = "arbitro-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared primitives (gate, name registry) used across Arbitro crates"
+
+[dependencies]
+arbitro-engine-v2 = { workspace = true }

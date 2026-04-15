@@ -23,6 +23,7 @@ lifecycle_trace = []
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
+arbitro-common    = { workspace = true }
 arbitro-proto     = { path = "../arbitro-proto" }
 arbitro-store     = { path = "../arbitro-store" }
 tokio             = { workspace = true }
