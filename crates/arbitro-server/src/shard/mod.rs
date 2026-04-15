@@ -9,6 +9,7 @@
 //!   handlers owned by that role (see `.agent/rules/roles.md`).
 
 pub mod command;
+pub mod drainer_v2;
 pub mod handle;
 pub mod roles;
 pub mod router;
