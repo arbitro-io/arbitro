@@ -388,7 +388,13 @@ fn build_ack_frame(action: Action, stream_id: u32, consumer_id: u32, seq: u64) -
 
 /// Build a BatchAck frame into `buf`.
 ///
-/// Wire: [16B envelope][8B BatchAckFixed][N × 8B seq]
+/// Wire: `[16B envelope][8B BatchAckFixed][N × 16B BatchAckEntry]`
+/// where `BatchAckEntry = [8 seq][4 subject_hash][4 pad]`.
+///
+/// `subject_hash` is echoed from the `DeliveryEntryHeader` the client
+/// originally received, so the server can decrement `max_subject_inflight`
+/// credits in O(1) arithmetic. Until the client tracks it (Fase 5), we
+/// emit `0` — the legacy engine drops the field on receive.
 fn build_batch_ack_frame(
     stream_id: u32,
     consumer_id: u32,
@@ -396,7 +402,7 @@ fn build_batch_ack_frame(
     buf: &mut Vec<u8>,
 ) {
     let count = seqs.len() as u16;
-    let body_len = 8 + (seqs.len() * 8); // BatchAckFixed + N × u64
+    let body_len = 8 + (seqs.len() * 16); // BatchAckFixed + N × BatchAckEntry
 
     buf.clear();
 
@@ -416,9 +422,11 @@ fn build_batch_ack_frame(
     buf.extend_from_slice(&count.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
 
-    // Sequences
+    // Entries: [8 seq][4 subject_hash=0][4 pad]
     for &(_, _, seq) in seqs {
         buf.extend_from_slice(&seq.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // subject_hash (Fase 5 echoes real value)
+        buf.extend_from_slice(&0u32.to_le_bytes()); // pad
     }
 }
 

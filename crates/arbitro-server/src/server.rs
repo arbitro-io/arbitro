@@ -310,7 +310,12 @@ async fn write_loop(
         } else {
             write_all_vectored(&mut writer, &batch).await.is_err()
         };
-        crate::lifecycle_trace!("32_tcp_write_done", _conn_id, batch.len() as u64, "transport_write");
+        crate::lifecycle_trace!(
+            "32_tcp_write_done",
+            _conn_id,
+            batch.len() as u64,
+            "transport_write"
+        );
 
         if failed {
             break;

@@ -22,6 +22,10 @@ pub struct Config {
     pub shutdown_timeout: Duration,
     /// Max messages fed into the engine ready queue per drain cycle (default: 256).
     pub max_feed_per_cycle: usize,
+    /// Entries per RepBatch frame in the drain (default: 256).
+    /// Batching reduces frames from N to N/batch_size, cutting try_send
+    /// calls and TCP writes proportionally.
+    pub drain_batch_size: u16,
     /// Data directory for persistence (None = in-memory only).
     pub data_dir: Option<String>,
 }
@@ -35,7 +39,8 @@ impl Config {
                 std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
             ),
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
-            max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
+            max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 8192),
+            drain_batch_size: env_parse("ARBITRO_DRAIN_BATCH_SIZE", 256),
             max_connections: env_parse("ARBITRO_MAX_CONNECTIONS", 10_000),
             write_buffer_cap: env_parse("ARBITRO_WRITE_BUFFER_CAP", 8192),
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
@@ -102,7 +107,8 @@ impl Default for Config {
             listen_addr: "0.0.0.0:9898".into(),
             shard_count: std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
             channel_capacity: 4096,
-            max_feed_per_cycle: 256,
+            max_feed_per_cycle: 8192,
+            drain_batch_size: 256,
             max_connections: 10_000,
             write_buffer_cap: 8192,
             idle_timeout: Duration::from_secs(300),

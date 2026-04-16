@@ -19,6 +19,8 @@ struct LogMetadata {
     pub segment_idx: u32,
     #[allow(dead_code)]
     pub subject_hash: u32,
+    pub stream_id: u32,
+    pub flags: u8,
 }
 
 pub struct TolerantStore {
@@ -35,7 +37,15 @@ pub struct TolerantStore {
 }
 
 const MAGIC: u8 = 0xAF;
-const HEADER_SIZE: usize = 23;
+/// On-disk header layout (hand-rolled little-endian, breaking change from 23 B):
+/// [0]       MAGIC (1 B)
+/// [1..3]    subj_len u16
+/// [3..7]    payload_len u32
+/// [7..15]   ts u64
+/// [15..23]  seq u64
+/// [23..27]  stream_id u32
+/// [27]      flags u8
+const HEADER_SIZE: usize = 28;
 
 impl TolerantStore {
     pub fn new(base_path: PathBuf) -> Self {
@@ -118,6 +128,8 @@ impl TolerantStore {
             let payload_len = u32::from_le_bytes([h[3], h[4], h[5], h[6]]);
             let ts = u64::from_le_bytes([h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14]]);
             let seq = u64::from_le_bytes([h[15], h[16], h[17], h[18], h[19], h[20], h[21], h[22]]);
+            let stream_id = u32::from_le_bytes([h[23], h[24], h[25], h[26]]);
+            let flags = h[27];
 
             if first == 0 {
                 first = seq;
@@ -133,6 +145,8 @@ impl TolerantStore {
                 offset: data_off as u32,
                 segment_idx,
                 subject_hash,
+                stream_id,
+                flags,
             });
 
             offset += HEADER_SIZE + (subj_len as usize) + (payload_len as usize);
@@ -186,6 +200,8 @@ impl Store for TolerantStore {
         mmap[start + 3..start + 7].copy_from_slice(&plen.to_le_bytes());
         mmap[start + 7..start + 15].copy_from_slice(&timestamp.to_le_bytes());
         mmap[start + 15..start + 23].copy_from_slice(&seq.to_le_bytes());
+        mmap[start + 23..start + 27].copy_from_slice(&entry.stream_id.to_le_bytes());
+        mmap[start + 27] = entry.flags;
 
         let data_off = start + HEADER_SIZE;
         mmap[data_off..data_off + entry.subject.len()].copy_from_slice(entry.subject);
@@ -202,6 +218,8 @@ impl Store for TolerantStore {
             offset: data_off as u32,
             segment_idx: self.sealed_segments.len() as u32,
             subject_hash,
+            stream_id: entry.stream_id,
+            flags: entry.flags,
         });
 
         self.next_seq += 1;
@@ -231,9 +249,11 @@ impl Store for TolerantStore {
         let sub_end = (m.offset as usize) + (m.subj_len as usize);
         f(&Entry {
             seq: m.seq,
+            stream_id: m.stream_id,
             timestamp: m.ts,
             subject: &data[m.offset as usize..sub_end],
             payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+            flags: m.flags,
         });
         Ok(true)
     }
@@ -338,9 +358,11 @@ impl Store for TolerantStore {
         let sub_end = (m.offset as usize) + (m.subj_len as usize);
         Ok(Some(Entry {
             seq: m.seq,
+            stream_id: m.stream_id,
             timestamp: m.ts,
             subject: &data[m.offset as usize..sub_end],
             payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+            flags: m.flags,
         }))
     }
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
@@ -363,9 +385,11 @@ impl Store for TolerantStore {
             let sub_end = (m.offset as usize) + (m.subj_len as usize);
             result.push(Entry {
                 seq: m.seq,
+                stream_id: m.stream_id,
                 timestamp: m.ts,
                 subject: &data[m.offset as usize..sub_end],
                 payload: &data[sub_end..sub_end + (m.payload_len as usize)],
+                flags: m.flags,
             });
         }
         Ok(result)
@@ -399,7 +423,7 @@ mod tests {
     use crate::store::{EntryRef, Store};
 
     fn make_entry<'a>(subject: &'a [u8], payload: &'a [u8]) -> EntryRef<'a> {
-        EntryRef { subject, payload }
+        EntryRef { stream_id: 0, subject, payload, flags: 0 }
     }
 
     #[test]
@@ -650,6 +674,8 @@ mod tests {
             header[3..7].copy_from_slice(&(payload.len() as u32).to_le_bytes());
             header[7..15].copy_from_slice(&100u64.to_le_bytes());
             header[15..23].copy_from_slice(&1u64.to_le_bytes());
+            header[23..27].copy_from_slice(&0u32.to_le_bytes());
+            header[27] = 0;
             file.write_all(&header).unwrap();
             file.write_all(subj).unwrap();
             file.write_all(payload).unwrap();
@@ -662,6 +688,8 @@ mod tests {
             header[3..7].copy_from_slice(&(payload2.len() as u32).to_le_bytes());
             header[7..15].copy_from_slice(&200u64.to_le_bytes());
             header[15..23].copy_from_slice(&2u64.to_le_bytes());
+            header[23..27].copy_from_slice(&0u32.to_le_bytes());
+            header[27] = 0;
             file.write_all(&header).unwrap();
             file.write_all(subj2).unwrap();
             file.write_all(payload2).unwrap();

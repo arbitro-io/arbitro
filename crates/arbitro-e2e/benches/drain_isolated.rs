@@ -1,73 +1,58 @@
-//! Drain isolated bench — two scenarios that replicate production 1:1.
+//! Isolated bench — publish + ideal drain, full path with TCP.
 //!
-//! Scenario 1 — PUBLISH:
-//!   Mirrors `crates/arbitro-server/src/shard/roles/publisher.rs::handle_publish`:
-//!   stream lookup → build EntryRef vec → now_ms → store.append_batch → ok.
-//!   (no network — send_rep_ok and gate.release are excluded.)
+//! ## Scenario 1: PUBLISH (production 1:1)
+//!   Client → TCP → server read_loop → dispatch_publish:
+//!     BatchIter → store.lock().append_batch() → send_rep_ok → gate
+//!   Server write_loop → TCP → client counts RepOk
 //!
-//! Scenario 2 — DRAIN:
-//!   Mirrors `crates/arbitro-server/src/shard/roles/drainer.rs::handle_drain_deliver`:
-//!   publish_pending_to_engine (for_each + fnv1a_32 + enqueue_ready +
-//!   flush_seed_metrics) → per-binding claim loop → build inline frame
-//!   (envelope placeholder + RepBatchFixed + contiguous for_each entries +
-//!   envelope patch) → split().freeze() → tx.try_send to channel.
+//! ## Scenario 2: DRAIN IDEAL
+//!   Pre-populate store with N messages. Dedicated drain thread:
+//!     gate wakes → store.lock().for_each() → batch entries into RepBatch
+//!     frames (DRAIN_BATCH entries per frame) → try_send to channel.
+//!   Server write_loop → TCP → client parses RepBatch, counts entries.
+//!
+//!   The drain is IDEAL: its own thread, its own loop, no commands,
+//!   no engine, no shared loop. Only gate + store connect it to the world.
+//!   Entries are grouped into batched RepBatch frames (like publish groups
+//!   entries into batched Publish frames).
 //!
 //! Run: cargo bench --bench drain_isolated -p arbitro-e2e
 
-use bytes::BytesMut;
-use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
-use zerocopy::IntoBytes;
 
-use arbitro_engine_v2::batch::ClaimBatch;
-use arbitro_engine_v2::catalog::{self, fnv1a_32};
-use arbitro_engine_v2::types::*;
-use arbitro_engine_v2::ArbitroEngine;
+use bytes::{Bytes, BytesMut};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
+
+use arbitro_engine_v2::catalog::fnv1a_32;
 use arbitro_proto::action::Action;
-use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
+use arbitro_proto::wire::delivery::{
+    DeliveryEntryHeader, RepBatchFixed, RepOkAction, DELIVERY_ENTRY_HEADER_SIZE,
+    REP_BATCH_FIXED_SIZE,
+};
+use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
+use arbitro_proto::wire::publish::{BatchIter, PublishEntry, PUBLISH_ENTRY_SIZE};
 use arbitro_store::{EntryRef, MemoryStore, Store};
 
-const PAYLOAD_SIZE: usize = 1024;
-const PUBLISH_BATCH: usize = 256;
-const CLAIM_BATCH: u16 = 256;
-const MAX_FEED_PER_CYCLE: u64 = 256;
+// ── Settings ────────────────────────────────────────────────────────────────
 
-// ─── Shared helpers ─────────────────────────────────────────────────────────
+const PAYLOAD_SIZE: usize = 64;
+const SUBJECT: &[u8] = b"bench.publish.subj";
+const BATCH_SIZE: u32 = 256;
+/// Drain groups this many entries per RepBatch frame.
+const DRAIN_BATCH: usize = 256;
+/// Max entries scanned per drain cycle (matches production max_feed).
+const MAX_FEED: u64 = 8192;
+/// Server write channel capacity — matches throughput bench (65536).
+const WRITE_BUFFER_CAP: usize = 65536;
 
-fn make_engine() -> ArbitroEngine {
-    let stream_id = StreamId(1);
-    let queue_id = QueueId(1);
-    let consumer_id = ConsumerId(1);
-
-    let mut engine = ArbitroEngine::new();
-    engine
-        .ensure_stream(catalog::StreamConfig {
-            id: stream_id,
-            name: b"bench-stream".to_vec(),
-        })
-        .unwrap();
-    engine
-        .ensure_consumer(catalog::ConsumerConfig {
-            id: consumer_id,
-            queue_id,
-            stream_id,
-            durable: false,
-            ack_policy: AckPolicy::None,
-            max_inflight: u32::MAX,
-        })
-        .unwrap();
-    engine
-        .ensure_subscription(catalog::SubscriptionConfig {
-            id: SubscriptionId(1),
-            stream_id,
-            consumer_id,
-            filters: vec![],
-        })
-        .unwrap();
-    engine
-}
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn fmt_rate(msgs: usize, elapsed: std::time::Duration) -> String {
     let rate = msgs as f64 / elapsed.as_secs_f64();
@@ -82,326 +67,586 @@ fn fmt_rate(msgs: usize, elapsed: std::time::Duration) -> String {
     }
 }
 
-fn fmt_ms(elapsed: std::time::Duration) -> String {
-    format!("{:.2}ms", elapsed.as_secs_f64() * 1000.0)
+fn fmt_dur(elapsed: std::time::Duration) -> String {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if ms >= 1000.0 {
+        format!("{:.2}s", ms / 1000.0)
+    } else {
+        format!("{:.2}ms", ms)
+    }
 }
 
-// ─── Scenario 1: PUBLISH (mirrors handle_publish) ───────────────────────────
-//
-// For each publish call:
-//   1. HashMap lookup for the stream.
-//   2. Build Vec<EntryRef> from input entries (same as publisher.rs).
-//   3. now_ms via SystemTime syscall.
-//   4. store.append_batch.
-//   5. Return Ok (no network — send_rep_ok/gate.release excluded).
+// ── Shared: server write_loop ───────────────────────────────────────────────
 
-struct PublishEntry {
-    subject: Vec<u8>,
-    payload: Vec<u8>,
+/// Server write loop — mirrors server.rs:288-321.
+/// recv → coalesce via try_recv → write_all / write_all_vectored.
+async fn server_write_loop(
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut rx: mpsc::Receiver<Bytes>,
+) {
+    let mut batch: Vec<Bytes> = Vec::with_capacity(64);
+
+    loop {
+        match rx.recv().await {
+            Some(frame) => batch.push(frame),
+            None => break,
+        }
+
+        // Coalesce — drain all ready frames without blocking.
+        while let Ok(frame) = rx.try_recv() {
+            batch.push(frame);
+        }
+
+        let failed = if batch.len() == 1 {
+            writer.write_all(&batch[0]).await.is_err()
+        } else {
+            let slices: Vec<std::io::IoSlice<'_>> =
+                batch.iter().map(|f| std::io::IoSlice::new(f)).collect();
+            writer.write_vectored(&slices).await.is_err()
+        };
+
+        if failed {
+            break;
+        }
+        batch.clear();
+    }
 }
 
-fn scenario_publish(total_msgs: usize) {
-    let stream_id = StreamId(1);
+// ═══════════════════════════════════════════════════════════════════════════
+// SCENARIO 1: PUBLISH
+// ═══════════════════════════════════════════════════════════════════════════
 
-    // Build the entry pool once (not part of measurement — caller prepares cmd).
-    let subject = b"bench.drain.subject".to_vec();
-    let payload = vec![0x42u8; PAYLOAD_SIZE];
-    let pool: Vec<PublishEntry> = (0..PUBLISH_BATCH)
-        .map(|_| PublishEntry {
-            subject: subject.clone(),
-            payload: payload.clone(),
+fn build_publish_frame(
+    buf: &mut Vec<u8>,
+    stream_id: u32,
+    env_seq: u32,
+    batch_size: u32,
+    subject: &[u8],
+    payload: &[u8],
+) {
+    buf.clear();
+    buf.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+    buf.extend_from_slice(&batch_size.to_le_bytes());
+
+    for _ in 0..batch_size {
+        let header = PublishEntry {
+            data_len: U32::new(payload.len() as u32),
+            subj_len: U16::new(subject.len() as u16),
+            reply_len: U16::new(0),
+            flags: 0,
+            _pad: [0; 3],
+        };
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(subject);
+        buf.extend_from_slice(payload);
+    }
+
+    let body_len = (buf.len() - ENVELOPE_SIZE) as u32;
+    let envelope = Envelope::new(Action::Publish, stream_id, body_len, env_seq);
+    buf[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
+}
+
+#[inline(never)]
+fn dispatch_publish(
+    frame: &[u8],
+    store: &Arc<Mutex<Box<dyn Store>>>,
+    write_tx: &mpsc::Sender<Bytes>,
+    gate_counter: &AtomicU64,
+) {
+    let view = FrameView::new(frame);
+    let env_seq = view.envelope().env_seq.get();
+    let body = view.body();
+
+    let iter = BatchIter::new(body);
+    let store_entries: Vec<EntryRef<'_>> = iter
+        .map(|view| EntryRef {
+            stream_id: 1,
+            subject: view.subject(),
+            payload: view.payload(),
+            flags: 0,
         })
         .collect();
 
-    // Production state: shard's HashMap<StreamId, Box<dyn Store>>.
-    let mut stores: HashMap<StreamId, Box<dyn Store>> = HashMap::new();
-    stores.insert(stream_id, Box::new(MemoryStore::new()));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
-    let batches = total_msgs / PUBLISH_BATCH;
-    let mut published = 0usize;
+    let first_seq = store
+        .lock()
+        .unwrap()
+        .append_batch(&store_entries, now_ms)
+        .unwrap();
+
+    let rep_envelope = Envelope::new(Action::RepOk, 0, 16, env_seq);
+    let rep_body = RepOkAction {
+        ref_seq: U64::new(first_seq),
+        _pad: U64::new(0),
+    };
+    let mut rep_buf = BytesMut::with_capacity(ENVELOPE_SIZE + 16);
+    rep_buf.extend_from_slice(rep_envelope.as_bytes());
+    rep_buf.extend_from_slice(rep_body.as_bytes());
+    let _ = write_tx.try_send(rep_buf.freeze());
+
+    gate_counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn server_read_loop(
+    mut reader: TcpStream,
+    store: Arc<Mutex<Box<dyn Store>>>,
+    write_tx: mpsc::Sender<Bytes>,
+    gate_counter: Arc<AtomicU64>,
+) {
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut ring = Vec::with_capacity(1024 * 1024);
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        ring.extend_from_slice(&buf[..n]);
+
+        loop {
+            if ring.len() < ENVELOPE_SIZE {
+                break;
+            }
+            let msg_len = u32::from_le_bytes([
+                ring[8], ring[9], ring[10], ring[11],
+            ]) as usize;
+            let total = ENVELOPE_SIZE + msg_len;
+            if ring.len() < total {
+                break;
+            }
+
+            dispatch_publish(&ring[..total], &store, &write_tx, &gate_counter);
+            ring.drain(..total);
+        }
+    }
+}
+
+fn client_read_replies(mut reader: TcpStream, expected: usize) -> usize {
+    let mut buf = [0u8; 64 * 1024];
+    let mut ring = Vec::with_capacity(64 * 1024);
+    let mut count = 0usize;
+    let frame_size = ENVELOPE_SIZE + 16;
+
+    while count < expected {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        ring.extend_from_slice(&buf[..n]);
+
+        while ring.len() >= frame_size {
+            ring.drain(..frame_size);
+            count += 1;
+        }
+    }
+    count
+}
+
+fn scenario_publish(total_msgs: usize) {
+    let batches = total_msgs / BATCH_SIZE as usize;
+    let payload = vec![0x42u8; PAYLOAD_SIZE];
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_stream = TcpStream::connect(addr).unwrap();
+    client_stream.set_nodelay(true).unwrap();
+    let (server_stream, _) = listener.accept().unwrap();
+    server_stream.set_nodelay(true).unwrap();
+
+    let store: Arc<Mutex<Box<dyn Store>>> =
+        Arc::new(Mutex::new(Box::new(MemoryStore::new())));
+    let gate_counter = Arc::new(AtomicU64::new(0));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+
+    let (write_tx, write_rx) = mpsc::channel::<Bytes>(WRITE_BUFFER_CAP);
+
+    let server_std_clone = server_stream.try_clone().unwrap();
+    let server_tokio = rt.block_on(async {
+        tokio::net::TcpStream::from_std(server_std_clone).unwrap()
+    });
+    let (_server_read_half, server_write_half) = server_tokio.into_split();
+
+    let write_handle = std::thread::spawn(move || {
+        rt.block_on(server_write_loop(server_write_half, write_rx));
+    });
+
+    let store_clone = Arc::clone(&store);
+    let gate_clone = Arc::clone(&gate_counter);
+    let read_handle = std::thread::spawn(move || {
+        server_read_loop(server_stream, store_clone, write_tx, gate_clone);
+    });
+
+    let client_reader = client_stream.try_clone().unwrap();
+    let reply_handle = std::thread::spawn(move || {
+        client_read_replies(client_reader, batches)
+    });
+
+    let mut writer = client_stream;
+    writer.set_nodelay(true).unwrap();
+    let mut frame_buf = Vec::with_capacity(
+        ENVELOPE_SIZE + 4 + BATCH_SIZE as usize * (PUBLISH_ENTRY_SIZE + SUBJECT.len() + PAYLOAD_SIZE),
+    );
 
     let t0 = Instant::now();
-    for _ in 0..batches {
-        // 1. Stream exists? (mirrors `self.stores.get_mut(&cmd.stream_id)`)
-        let store = match stores.get_mut(&stream_id) {
-            Some(s) => s,
-            None => return,
-        };
-
-        // 2. Build store_entries (mirrors `cmd.entries.iter().map(...).collect()`)
-        let store_entries: Vec<EntryRef<'_>> = pool
-            .iter()
-            .map(|e| EntryRef {
-                subject: &e.subject,
-                payload: &e.payload,
-            })
-            .collect();
-
-        // 3. now_ms (mirrors publisher.rs line 41-44)
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // 4. store.append_batch
-        let _first_seq = store.append_batch(&store_entries, now_ms).unwrap();
-
-        published += store_entries.len();
+    for i in 0..batches {
+        build_publish_frame(&mut frame_buf, 1, i as u32, BATCH_SIZE, SUBJECT, &payload);
+        writer.write_all(&frame_buf).unwrap();
     }
+    drop(writer);
+    let replies = reply_handle.join().unwrap();
     let elapsed = t0.elapsed();
 
-    assert_eq!(published, batches * PUBLISH_BATCH);
-    let bytes = published * (PAYLOAD_SIZE + subject.len());
+    read_handle.join().unwrap();
+    write_handle.join().unwrap();
+
+    let published = batches * BATCH_SIZE as usize;
+    let bytes = published * (PAYLOAD_SIZE + SUBJECT.len());
     let mb = bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
     println!(
-        "    publish                 {} ({} msg/s, {:.0} MB/s, {} batches × {})",
-        fmt_ms(elapsed),
-        fmt_rate(published, elapsed),
-        mb,
-        batches,
-        PUBLISH_BATCH,
+        "    {total:>7}k  {time:>10}  {rate:>10} msg/s  {mb:>8.0} MB/s  (replies={replies})",
+        total = total_msgs / 1000,
+        time = fmt_dur(elapsed),
+        rate = fmt_rate(published, elapsed),
+        mb = mb,
+        replies = replies,
     );
 }
 
-// ─── Scenario 2: DRAIN (mirrors handle_drain_deliver) ───────────────────────
-//
-// Pre-populates the store with `total_msgs`, then measures the full drain:
-//   1. publish_pending_to_engine (for_each + fnv1a_32 + enqueue_ready +
-//      flush_seed_metrics).
-//   2. Per binding: claim loop → build inline frame (envelope placeholder +
-//      RepBatchFixed + contiguous for_each entries + envelope patch) →
-//      split().freeze() → tx.try_send to channel.
+// ═══════════════════════════════════════════════════════════════════════════
+// SCENARIO 2: DRAIN IDEAL
+// ═══════════════════════════════════════════════════════════════════════════
 
-fn scenario_drain(total_msgs: usize) {
-    let stream_id = StreamId(1);
-    let queue_id = QueueId(1);
-    let consumer_id = ConsumerId(1);
-    let subscription_id = SubscriptionId(1);
-    let binding_id = BindingId(1);
-    let connection_id = ConnectionId(1);
+/// Build a batched RepBatch frame into `body`.
+///
+/// Wire: [16B envelope][8B RepBatchFixed][N × (18B DeliveryEntryHeader + subject + payload)]
+///
+/// This is the IDEAL frame builder: N entries per frame, like publish batches
+/// N entries per Publish frame. The current production drain builds 1 entry
+/// per frame — 500k frames instead of ~2k.
+fn build_rep_batch(
+    body: &mut BytesMut,
+    stream_id: u32,
+    consumer_id: u32,
+    entries: &[DrainEntry<'_>],
+) {
+    body.clear();
+    // Envelope placeholder.
+    body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+    // RepBatchFixed header.
+    body.extend_from_slice(
+        RepBatchFixed {
+            consumer_id: U32::new(consumer_id),
+            count: U16::new(entries.len() as u16),
+            _pad: U16::new(0),
+        }
+        .as_bytes(),
+    );
+    // Entries.
+    for e in entries {
+        let subj_len = e.subject.len();
+        let data_len = subj_len + e.payload.len();
+        body.extend_from_slice(
+            DeliveryEntryHeader {
+                seq: U64::new(e.seq),
+                subj_len: U16::new(subj_len as u16),
+                data_len: U32::new(data_len as u32),
+                subject_hash: U32::new(e.subject_hash),
+            }
+            .as_bytes(),
+        );
+        body.extend_from_slice(e.subject);
+        body.extend_from_slice(e.payload);
+    }
+    // Patch envelope.
+    let body_len = body.len() - ENVELOPE_SIZE;
+    let envelope = Envelope::new(Action::RepBatch, stream_id, body_len as u32, 0);
+    body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
+}
 
-    // Pre-populate the store (not part of measurement).
-    let subject = b"bench.drain.subject";
-    let payload = vec![0x42u8; PAYLOAD_SIZE];
-    let mut store: Box<dyn Store> = Box::new(MemoryStore::new());
-    for _ in 0..total_msgs {
-        store
-            .append(
-                EntryRef {
-                    subject,
-                    payload: &payload,
-                },
-                0,
-            )
-            .unwrap();
+/// Temporary entry collected from store for batching.
+struct DrainEntry<'a> {
+    seq: u64,
+    subject: &'a [u8],
+    payload: &'a [u8],
+    subject_hash: u32,
+}
+
+/// Ideal drain thread — its own thread, its own loop, no commands, no engine,
+/// no shared loop. Only gate (AtomicBool) + store connect it to the world.
+///
+/// Reads from store in chunks of MAX_FEED. Groups entries into batched
+/// RepBatch frames (DRAIN_BATCH entries per frame). try_send to channel.
+/// When channel is Full, yields 50µs for the write_loop to drain.
+fn drain_thread(
+    store: Arc<Mutex<Box<dyn Store>>>,
+    write_tx: mpsc::Sender<Bytes>,
+    gate_open: Arc<AtomicBool>,
+    total_expected: u64,
+) {
+    let mut cursor: u64 = 0;
+    let mut body = BytesMut::with_capacity(
+        ENVELOPE_SIZE
+            + REP_BATCH_FIXED_SIZE
+            + DRAIN_BATCH * (DELIVERY_ENTRY_HEADER_SIZE + SUBJECT.len() + PAYLOAD_SIZE),
+    );
+
+    // Wait for gate to open (store is populated).
+    while !gate_open.load(Ordering::Acquire) {
+        std::thread::park();
     }
 
-    let mut engine = make_engine();
-    // Channel with generous capacity so try_send never hits Full.
-    let (tx, rx) = crossbeam_channel::bounded::<bytes::Bytes>(65536);
-
-    // Consumer thread drains the channel concurrently (matches prod where
-    // the writer task lives on another thread).
-    let consumer_thread = std::thread::spawn(move || {
-        let mut received = 0usize;
-        while let Ok(frame) = rx.recv() {
-            if frame.len() < ENVELOPE_SIZE + 8 {
-                break;
-            }
-            let body = &frame[ENVELOPE_SIZE..];
-            let count = u16::from_le_bytes([body[4], body[5]]) as usize;
-            received += count;
-        }
-        received
-    });
-
-    // Scratch buffers (match ShardWorker fields).
-    let mut scratch_seqs: Vec<u64> = Vec::with_capacity(CLAIM_BATCH as usize);
-    let mut scratch_batch_body = BytesMut::with_capacity(
-        ENVELOPE_SIZE
-            + 8
-            + CLAIM_BATCH as usize
-                * (std::mem::size_of::<DeliveryEntryHeader>() + 19 + PAYLOAD_SIZE),
-    );
-    let mut last_engine_seq: u64 = 0;
-    let mut drained = 0usize;
-
-    let t0 = Instant::now();
     loop {
-        // ─── publish_pending_to_engine ─────────────────────────────────────
-        let info = store.info();
-        let mut fed_this_cycle = false;
-        if info.last_seq > last_engine_seq {
-            let start = last_engine_seq + 1;
-            let end = (start + MAX_FEED_PER_CYCLE).min(info.last_seq + 1);
-            let mut fed_last: u64 = last_engine_seq;
-            let mut fed_entries: u64 = 0;
-            let mut fed_no_match: u64 = 0;
-            let mut fed_queues: u64 = 0;
-            let eng = &mut engine;
-            store
-                .for_each(start, end, &mut |entry| {
-                    let subject_hash = fnv1a_32(entry.subject);
-                    let pushed =
-                        eng.enqueue_ready(stream_id, entry.subject, subject_hash, entry.seq);
-                    fed_entries += 1;
-                    if pushed == 0 {
-                        fed_no_match += 1;
-                    } else {
-                        fed_queues += pushed as u64;
-                    }
-                    fed_last = entry.seq;
-                })
-                .ok();
-            engine.flush_seed_metrics(fed_entries, fed_no_match, fed_queues);
-            last_engine_seq = fed_last;
-            let next = fed_last + 1;
-            if engine.ctx().next_seq < next {
-                engine.ctx_mut().next_seq = next;
-            }
-            fed_this_cycle = true;
+        // Lock store, read a chunk, collect entries for batching.
+        // We must collect because store entries borrow from the lock guard.
+        let guard = store.lock().unwrap();
+        let info = guard.info();
+        if info.last_seq <= cursor {
+            break; // All done.
         }
 
-        // ─── per-binding drain (single binding here) ───────────────────────
-        let mut any_delivered = false;
-        let now = Timestamp::new(0);
-        loop {
-            scratch_seqs.clear();
+        let start = cursor + 1;
+        let end = (start + MAX_FEED).min(info.last_seq + 1);
 
-            // Tracked consumer: adaptive batch size (fire_and_forget = false).
-            let remaining =
-                engine.consumer_capacity_remaining(consumer_id, u32::MAX);
-            if remaining == 0 {
-                break;
-            }
-            let max_items = (CLAIM_BATCH as u32).min(remaining) as u16;
-            {
-                let claimed = engine.claim(
-                    &ClaimBatch {
-                        queue_id,
-                        connection_id,
-                        consumer_id,
-                        max_items,
-                        now,
-                    },
-                    subscription_id,
-                    binding_id,
-                );
-                scratch_seqs.extend(claimed.entries().iter().map(|e| e.seq));
-            }
-            if scratch_seqs.is_empty() {
-                break;
-            }
-            let claimed_count = scratch_seqs.len();
-            any_delivered = true;
+        // Collect entries from this chunk into owned batches and send them.
+        // We batch DRAIN_BATCH entries per RepBatch frame.
+        let mut batch_seqs: Vec<u64> = Vec::with_capacity(DRAIN_BATCH);
+        let mut batch_subjects: Vec<Vec<u8>> = Vec::with_capacity(DRAIN_BATCH);
+        let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(DRAIN_BATCH);
+        let mut batch_hashes: Vec<u32> = Vec::with_capacity(DRAIN_BATCH);
 
-            // ─── inline frame build (matches drainer.rs verbatim) ──────────
-            scratch_batch_body.clear();
-            scratch_batch_body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-            scratch_batch_body.extend_from_slice(
-                RepBatchFixed {
-                    consumer_id: U32::new(consumer_id.0),
-                    count: U16::new(claimed_count as u16),
-                    _pad: U16::new(0),
-                }
-                .as_bytes(),
-            );
+        guard
+            .for_each(start, end, &mut |entry| {
+                batch_seqs.push(entry.seq);
+                batch_subjects.push(entry.subject.to_vec());
+                batch_payloads.push(entry.payload.to_vec());
+                batch_hashes.push(fnv1a_32(entry.subject));
 
-            let first = scratch_seqs[0];
-            let last = scratch_seqs[claimed_count - 1];
-            let contiguous = (last - first + 1) as usize == claimed_count;
-            let body = &mut scratch_batch_body;
-            if contiguous {
-                store
-                    .for_each(first, last + 1, &mut |entry| {
-                        let subj_len = entry.subject.len();
-                        let data_len = subj_len + entry.payload.len();
-                        let header = DeliveryEntryHeader {
-                            seq: U64::new(entry.seq),
-                            subj_len: U16::new(subj_len as u16),
-                            data_len: U32::new(data_len as u32),
-                        };
-                        body.extend_from_slice(header.as_bytes());
-                        body.extend_from_slice(entry.subject);
-                        body.extend_from_slice(entry.payload);
-                    })
-                    .ok();
-            } else {
-                for &seq in scratch_seqs.iter() {
-                    store
-                        .get(seq, &mut |entry| {
-                            let subj_len = entry.subject.len();
-                            let data_len = subj_len + entry.payload.len();
-                            let header = DeliveryEntryHeader {
-                                seq: U64::new(seq),
-                                subj_len: U16::new(subj_len as u16),
-                                data_len: U32::new(data_len as u32),
-                            };
-                            body.extend_from_slice(header.as_bytes());
-                            body.extend_from_slice(entry.subject);
-                            body.extend_from_slice(entry.payload);
+                if batch_seqs.len() == DRAIN_BATCH {
+                    // Build and send a full batch.
+                    let entries: Vec<DrainEntry<'_>> = (0..batch_seqs.len())
+                        .map(|i| DrainEntry {
+                            seq: batch_seqs[i],
+                            subject: &batch_subjects[i],
+                            payload: &batch_payloads[i],
+                            subject_hash: batch_hashes[i],
                         })
-                        .ok();
+                        .collect();
+                    build_rep_batch(&mut body, 1, 1, &entries);
+                    let frozen = body.split().freeze();
+                    while write_tx.try_send(frozen.clone()).is_err() {
+                        std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    }
+                    batch_seqs.clear();
+                    batch_subjects.clear();
+                    batch_payloads.clear();
+                    batch_hashes.clear();
                 }
-            }
+            })
+            .ok();
 
-            // Patch envelope in-place.
-            let body_len = scratch_batch_body.len() - ENVELOPE_SIZE;
-            let envelope =
-                Envelope::new(Action::RepBatch, stream_id.raw(), body_len as u32, 0);
-            scratch_batch_body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
-
-            // split().freeze() — transfers ownership, no copy.
-            let frozen = scratch_batch_body.split().freeze();
-            drained += claimed_count;
-
-            // tx.try_send — matches drainer's cached binding.tx.try_send.
-            if tx.try_send(frozen).is_err() {
-                break;
-            }
-
-            if claimed_count < max_items as usize {
-                break;
+        // Flush remaining partial batch.
+        if !batch_seqs.is_empty() {
+            let entries: Vec<DrainEntry<'_>> = (0..batch_seqs.len())
+                .map(|i| DrainEntry {
+                    seq: batch_seqs[i],
+                    subject: &batch_subjects[i],
+                    payload: &batch_payloads[i],
+                    subject_hash: batch_hashes[i],
+                })
+                .collect();
+            build_rep_batch(&mut body, 1, 1, &entries);
+            let frozen = body.split().freeze();
+            while write_tx.try_send(frozen.clone()).is_err() {
+                std::thread::park_timeout(std::time::Duration::from_micros(50));
             }
         }
 
-        if !fed_this_cycle && !any_delivered {
+        drop(guard);
+        cursor = end - 1;
+
+        if cursor >= total_expected {
             break;
         }
     }
+}
+
+/// Client reader for drain — parses RepBatch frames, counts entries.
+fn client_read_drain(mut reader: TcpStream, expected: usize) -> usize {
+    let mut buf = [0u8; 256 * 1024];
+    let mut ring = Vec::with_capacity(512 * 1024);
+    let mut count = 0usize;
+
+    while count < expected {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        ring.extend_from_slice(&buf[..n]);
+
+        // Parse complete RepBatch frames from ring.
+        loop {
+            if ring.len() < ENVELOPE_SIZE {
+                break;
+            }
+            let msg_len = u32::from_le_bytes([
+                ring[8], ring[9], ring[10], ring[11],
+            ]) as usize;
+            let total = ENVELOPE_SIZE + msg_len;
+            if ring.len() < total {
+                break;
+            }
+
+            // Parse entry count from RepBatchFixed.
+            let batch_body = &ring[ENVELOPE_SIZE..total];
+            if batch_body.len() >= REP_BATCH_FIXED_SIZE {
+                let entry_count =
+                    u16::from_le_bytes([batch_body[4], batch_body[5]]) as usize;
+                count += entry_count;
+            }
+
+            ring.drain(..total);
+        }
+    }
+    count
+}
+
+fn scenario_drain(total_msgs: usize) {
+    let payload = vec![0x42u8; PAYLOAD_SIZE];
+
+    // Pre-populate store.
+    let store: Arc<Mutex<Box<dyn Store>>> =
+        Arc::new(Mutex::new(Box::new(MemoryStore::new())));
+    {
+        let mut guard = store.lock().unwrap();
+        // Batch append for speed — same as publish does.
+        let entries_per_batch = BATCH_SIZE as usize;
+        let batches = total_msgs / entries_per_batch;
+        let remainder = total_msgs % entries_per_batch;
+        let refs: Vec<EntryRef<'_>> = (0..entries_per_batch)
+            .map(|_| EntryRef {
+                stream_id: 1,
+                subject: SUBJECT,
+                payload: &payload,
+                flags: 0,
+            })
+            .collect();
+        for _ in 0..batches {
+            guard.append_batch(&refs, 0).unwrap();
+        }
+        if remainder > 0 {
+            let refs: Vec<EntryRef<'_>> = (0..remainder)
+                .map(|_| EntryRef {
+                    stream_id: 1,
+                    subject: SUBJECT,
+                    payload: &payload,
+                    flags: 0,
+                })
+                .collect();
+            guard.append_batch(&refs, 0).unwrap();
+        }
+    }
+
+    // TCP pair.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_stream = TcpStream::connect(addr).unwrap();
+    client_stream.set_nodelay(true).unwrap();
+    let (server_stream, _) = listener.accept().unwrap();
+    server_stream.set_nodelay(true).unwrap();
+
+    let gate_open = Arc::new(AtomicBool::new(false));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap();
+
+    let (write_tx, write_rx) = mpsc::channel::<Bytes>(WRITE_BUFFER_CAP);
+
+    // Server write_loop on tokio.
+    let server_std_clone = server_stream.try_clone().unwrap();
+    let server_tokio = rt.block_on(async {
+        tokio::net::TcpStream::from_std(server_std_clone).unwrap()
+    });
+    let (_server_read_half, server_write_half) = server_tokio.into_split();
+
+    let write_handle = std::thread::spawn(move || {
+        rt.block_on(server_write_loop(server_write_half, write_rx));
+    });
+
+    // Client reader.
+    let reader_handle = std::thread::spawn(move || {
+        client_read_drain(client_stream, total_msgs)
+    });
+
+    // Drain thread.
+    let store_clone = Arc::clone(&store);
+    let gate_clone = Arc::clone(&gate_open);
+    let drain_handle = std::thread::spawn(move || {
+        drain_thread(store_clone, write_tx, gate_clone, total_msgs as u64);
+    });
+
+    // ── Timed section: open the gate ────────────────────────────────────
+    let t0 = Instant::now();
+    gate_open.store(true, Ordering::Release);
+    drain_handle.thread().unpark();
+
+    // Wait for drain to finish and channel to close.
+    drain_handle.join().unwrap();
+    // write_tx dropped → write_loop exits → TCP closed → client reader exits.
+    let received = reader_handle.join().unwrap();
     let elapsed = t0.elapsed();
+    write_handle.join().unwrap();
 
-    // Close channel and wait for consumer drain.
-    drop(tx);
-    let received = consumer_thread.join().unwrap();
-
-    assert_eq!(drained, total_msgs);
-    assert_eq!(received, total_msgs);
-    let bytes = total_msgs * (PAYLOAD_SIZE + subject.len());
+    let bytes = total_msgs * (PAYLOAD_SIZE + SUBJECT.len());
     let mb = bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0;
     println!(
-        "    drain                   {} ({} msg/s, {:.0} MB/s)",
-        fmt_ms(elapsed),
-        fmt_rate(total_msgs, elapsed),
-        mb,
+        "    {total:>7}k  {time:>10}  {rate:>10} msg/s  {mb:>8.0} MB/s  (received={received})",
+        total = total_msgs / 1000,
+        time = fmt_dur(elapsed),
+        rate = fmt_rate(total_msgs, elapsed),
+        mb = mb,
+        received = received,
     );
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ── Main ────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Drain isolated bench — publish vs drain, exactly as production");
+    println!("Isolated bench — publish + ideal drain, full path with TCP");
     println!(
-        "payload={}B, publish_batch={}, claim_batch={}, max_feed_per_cycle={}",
-        PAYLOAD_SIZE, PUBLISH_BATCH, CLAIM_BATCH, MAX_FEED_PER_CYCLE
+        "payload={}B, subject={}B, pub_batch={}, drain_batch={}, max_feed={}, write_buf={}",
+        PAYLOAD_SIZE,
+        SUBJECT.len(),
+        BATCH_SIZE,
+        DRAIN_BATCH,
+        MAX_FEED,
+        WRITE_BUFFER_CAP,
     );
-    println!("{}", "=".repeat(80));
+    println!("{}", "=".repeat(90));
 
-    for &msgs in &[100_000, 500_000, 1_000_000, 5_000_000] {
-        println!("\n--- {}k messages ---", msgs / 1000);
-        println!("  Scenario 1: PUBLISH");
+    println!("\n  PUBLISH (client → TCP → store → RepOk → TCP → client)");
+    println!("    {:>7}   {:>10}  {:>14}  {:>8}", "msgs", "time", "throughput", "bandwidth");
+    println!("    {}", "-".repeat(80));
+    for &msgs in &[10_000, 100_000, 500_000, 1_000_000] {
         scenario_publish(msgs);
-        println!("  Scenario 2: DRAIN");
+    }
+
+    println!("\n  DRAIN IDEAL (store → batch RepBatch → channel → TCP → client)");
+    println!("    {:>7}   {:>10}  {:>14}  {:>8}", "msgs", "time", "throughput", "bandwidth");
+    println!("    {}", "-".repeat(80));
+    for &msgs in &[10_000, 100_000, 500_000, 1_000_000] {
         scenario_drain(msgs);
     }
 }

@@ -1,31 +1,27 @@
 //! Shard commands — owned types that cross the mpsc channel boundary.
 //!
-//! Rule: engine types travel as-is (Vec<FanoutEntry>, Vec<ClaimedEntry>).
-//! Never define owned mirror types. Only own data that must cross the channel.
+//! Rule: engine types travel as-is. Only own data that must cross the channel.
 
-use arbitro_engine_v2::batch::{AckEntry, ClaimedEntry, DrainReport, NackEntry};
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
 
-use arbitro_proto::wire::publish::PublishView;
 use bytes::Bytes;
 use tokio::sync::oneshot;
+
+// Re-export engine AckEntry for use in ack/nack commands.
+pub use arbitro_engine_v2::AckEntry;
 
 // ── Shard command enum ──────────────────────────────────────────────────────
 
 /// Commands dispatched to a shard worker via mpsc channel.
+///
+/// Publish is NOT here — it goes directly to the store from the
+/// dispatch layer, bypassing the shard worker entirely.
 pub enum ShardCommand {
     // Hot path
-    Publish(PublishCmd),
     PublishAccumulate(PublishCmd),
     Ack(AckCmd),
     Nack(NackCmd),
-
-    /// Test-only direct claim probe — bypasses the gate-driven drainer to let
-    /// integration tests inspect engine state. NOT used on the production wire
-    /// path (clients receive deliveries via `RepBatch` frames driven by the
-    /// drainer in `handle_drain_deliver`).
-    Claim(ClaimCmd),
 
     // Subscription management
     Subscribe(SubscribeCmd),
@@ -43,7 +39,7 @@ pub enum ShardCommand {
     OpenConnection(OpenConnectionCmd),
     DrainConnection(DrainConnectionCmd),
 
-    // Bind
+    // Bind (subscribe a subscription to a connection)
     Bind(BindCmd),
 
     // Admin
@@ -54,9 +50,6 @@ pub enum ShardCommand {
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),
     StoreInfo(StoreInfoCmd),
-
-    // Recovery
-    SeedStores(SeedStoresCmd),
 
     // System
     Shutdown,
@@ -82,7 +75,7 @@ impl PublishEntryOwned {
     /// Build an owned entry from a wire view, sharing the underlying frame
     /// buffer via `Bytes::slice_ref` (zero-copy — refcount on the same Arc).
     #[inline]
-    pub fn from_wire(view: &PublishView<'_>, frame: &Bytes) -> Self {
+    pub fn from_wire(view: &arbitro_proto::wire::publish::PublishView<'_>, frame: &Bytes) -> Self {
         Self {
             subject: frame.slice_ref(view.subject()),
             payload: frame.slice_ref(view.payload()),
@@ -90,11 +83,10 @@ impl PublishEntryOwned {
     }
 }
 
-/// Acknowledge messages. Engine AckEntry directly — no conversion needed.
+/// Acknowledge messages. Uses engine's AckEntry (stream_id + seq).
 pub struct AckCmd {
     pub consumer_id: ConsumerId,
     pub entries: Vec<AckEntry>,
-    pub now: Timestamp,
     pub reply: oneshot::Sender<AckReply>,
 }
 
@@ -104,11 +96,10 @@ pub struct AckReply {
     pub rejected: u32,
 }
 
-/// Negative acknowledge (requeue). Engine NackEntry directly.
+/// Negative acknowledge (requeue). Same entry type as ack.
 pub struct NackCmd {
     pub consumer_id: ConsumerId,
-    pub entries: Vec<NackEntry>,
-    pub now: Timestamp,
+    pub entries: Vec<AckEntry>,
     pub reply: oneshot::Sender<NackReply>,
 }
 
@@ -116,17 +107,6 @@ pub struct NackCmd {
 pub struct NackReply {
     pub requeued: u32,
     pub not_found: u32,
-}
-
-/// Test-only claim probe. Returns owned `ClaimedEntry`s — copies engine scratch
-/// out so the caller can inspect them after the shard releases its borrow.
-pub struct ClaimCmd {
-    pub queue_id: QueueId,
-    pub connection_id: ConnectionId,
-    pub consumer_id: ConsumerId,
-    pub max_items: u16,
-    pub now: Timestamp,
-    pub reply: oneshot::Sender<Vec<ClaimedEntry>>,
 }
 
 // ── Subscription management ─────────────────────────────────────────────────
@@ -137,33 +117,27 @@ pub struct SubscribeCmd {
     pub consumer_config: ConsumerConfig,
     pub subscription_config: SubscriptionConfig,
     pub connection_id: ConnectionId,
-    pub now: Timestamp,
     pub reply: oneshot::Sender<bool>,
 }
 
-/// Unsubscribe: drain subscription.
+/// Unsubscribe: retire bindings for this subscription.
 pub struct UnsubscribeCmd {
     pub subscription_id: SubscriptionId,
-    pub mode: DrainMode,
-    pub now: Timestamp,
-    pub reply: oneshot::Sender<DrainReport>,
+    pub reply: oneshot::Sender<bool>,
 }
 
 // ── Stream management ───────────────────────────────────────────────────────
 
 pub struct CreateStreamCmd {
     pub config: StreamConfig,
-    pub journal_kind: u8,
     pub reply: oneshot::Sender<bool>,
 }
 
 pub struct DeleteStreamCmd {
     pub stream_id: StreamId,
-    pub mode: DrainMode,
-    /// When true, delete on-disk store data (segment files).
-    /// False during recovery replay — the store reflects the final state.
+    /// When true, purge on-disk data. False during recovery replay.
     pub purge_disk: bool,
-    pub reply: oneshot::Sender<DrainReport>,
+    pub reply: oneshot::Sender<bool>,
 }
 
 // ── Consumer management ─────────────────────────────────────────────────────
@@ -177,8 +151,7 @@ pub struct CreateConsumerCmd {
 
 pub struct DeleteConsumerCmd {
     pub consumer_id: ConsumerId,
-    pub mode: DrainMode,
-    pub reply: oneshot::Sender<DrainReport>,
+    pub reply: oneshot::Sender<bool>,
 }
 
 // ── Query ──────────────────────────────────────────────────────────────
@@ -196,6 +169,11 @@ pub struct ListConsumersCmd {
     pub reply: oneshot::Sender<ListConsumersReply>,
 }
 
+/// Each entry is (consumer_id, stream_id, queue_id, paused).
+pub struct ListConsumersReply {
+    pub consumers: Vec<(u32, u32, u32, bool)>,
+}
+
 pub struct StoreInfoCmd {
     pub stream_id: StreamId,
     pub reply: oneshot::Sender<StoreInfoReply>,
@@ -206,25 +184,17 @@ pub struct StoreInfoReply {
     pub bytes: u64,
 }
 
-/// Each entry is (consumer_id, stream_id, queue_id, paused).
-pub struct ListConsumersReply {
-    pub consumers: Vec<(u32, u32, u32, bool)>,
-}
-
 // ── Connection lifecycle ────────────────────────────────────────────────────
 
 pub struct OpenConnectionCmd {
     pub connection_id: ConnectionId,
     pub node_id: NodeId,
-    pub now: Timestamp,
     pub reply: oneshot::Sender<()>,
 }
 
 pub struct DrainConnectionCmd {
     pub connection_id: ConnectionId,
-    pub mode: DrainMode,
-    pub now: Timestamp,
-    pub reply: oneshot::Sender<DrainReport>,
+    pub reply: oneshot::Sender<()>,
 }
 
 // ── Bind ────────────────────────────────────────────────────────────────────
@@ -232,7 +202,6 @@ pub struct DrainConnectionCmd {
 pub struct BindCmd {
     pub connection_id: ConnectionId,
     pub subscription_id: SubscriptionId,
-    pub now: Timestamp,
     pub reply: oneshot::Sender<()>,
 }
 
@@ -246,11 +215,4 @@ pub struct PauseConsumerCmd {
 pub struct ResumeConsumerCmd {
     pub consumer_id: ConsumerId,
     pub reply: oneshot::Sender<bool>,
-}
-
-// ── Recovery ───────────────────────────────────────────────────────────────────
-
-/// Seed engine queues from stores that have existing messages (recovery).
-pub struct SeedStoresCmd {
-    pub reply: oneshot::Sender<u64>,
 }

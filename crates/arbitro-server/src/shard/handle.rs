@@ -4,13 +4,18 @@
 //! and awaits the oneshot reply. Backpressure if channel is full.
 
 use std::fmt;
+use std::sync::Arc;
 
-use arbitro_engine_v2::batch::{AckEntry, ClaimedEntry, DrainReport, NackEntry};
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
+use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::common::Gate;
+use crate::common::reply::send_rep_ok;
 use crate::shard::command::*;
+use crate::shard::router::SharedStore;
+use crate::transport::ConnectionRegistry;
 
 /// Async handle to a shard worker.
 #[derive(Clone)]
@@ -18,11 +23,31 @@ pub struct ShardHandle {
     shard_id: u32,
     tx: mpsc::Sender<ShardCommand>,
     shard_thread: std::thread::Thread,
+    /// Shared store — publish writes directly, bypassing the shard worker.
+    store: SharedStore,
+    /// Shared gate — publish notifies drain after store append.
+    gate: Arc<Gate>,
+    /// Connection registry — publish replies directly to the client.
+    registry: ConnectionRegistry,
 }
 
 impl ShardHandle {
-    pub fn new(shard_id: u32, tx: mpsc::Sender<ShardCommand>, shard_thread: std::thread::Thread) -> Self {
-        Self { shard_id, tx, shard_thread }
+    pub fn new(
+        shard_id: u32,
+        tx: mpsc::Sender<ShardCommand>,
+        shard_thread: std::thread::Thread,
+        store: SharedStore,
+        gate: Arc<Gate>,
+        registry: ConnectionRegistry,
+    ) -> Self {
+        Self {
+            shard_id,
+            tx,
+            shard_thread,
+            store,
+            gate,
+            registry,
+        }
     }
 
     pub fn shard_id(&self) -> u32 {
@@ -31,7 +56,9 @@ impl ShardHandle {
 
     // ── Hot path ────────────────────────────────────────────────────────
 
-    /// Fire & forget — shard replies directly via ConnectionRegistry.
+    /// Fire & forget — writes directly to the shared store, signals gate.
+    /// Does NOT go through the shard worker. Publish and drain are
+    /// independent services connected only by store and gate.
     pub async fn publish(
         &self,
         stream_id: StreamId,
@@ -39,16 +66,35 @@ impl ShardHandle {
         env_seq: u32,
         entries: Vec<PublishEntryOwned>,
     ) -> Result<(), SendError> {
-        self.send(ShardCommand::Publish(PublishCmd {
-            stream_id,
-            conn_id,
-            env_seq,
-            entries,
-        })).await
+        let store_entries: Vec<EntryRef<'_>> = entries
+            .iter()
+            .map(|e| EntryRef {
+                stream_id: stream_id.raw(),
+                subject: &e.subject,
+                payload: &e.payload,
+                flags: 0,
+            })
+            .collect();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let first_seq = self
+            .store
+            .lock()
+            .unwrap()
+            .append_batch(&store_entries, now_ms)
+            .map_err(|_| SendError::SHARD_DOWN)?;
+
+        send_rep_ok(&self.registry, conn_id, env_seq, first_seq);
+        self.gate.release();
+        self.shard_thread.unpark();
+        Ok(())
     }
 
-    /// Fire & forget — shard accumulates entries, flushes with append_batch after
-    /// 5ms deadline or 1024-entry threshold, replies directly via ConnectionRegistry.
+    /// Fire & forget — shard accumulates entries, flushes with append_batch.
     pub async fn publish_accumulate(
         &self,
         stream_id: StreamId,
@@ -61,61 +107,37 @@ impl ShardHandle {
             conn_id,
             env_seq,
             entries,
-        })).await
+        }))
+        .await
     }
 
     pub async fn ack(
         &self,
         consumer_id: ConsumerId,
         entries: Vec<AckEntry>,
-        now: Timestamp,
     ) -> Result<AckReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Ack(AckCmd {
             consumer_id,
             entries,
-            now,
             reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    /// Test-only direct claim probe. Production delivery flows through the
-    /// drainer (`handle_drain_deliver`) and `RepBatch` frames — this bypass
-    /// exists so integration tests can inspect engine state synchronously.
-    pub async fn claim(
-        &self,
-        queue_id: QueueId,
-        connection_id: ConnectionId,
-        consumer_id: ConsumerId,
-        max_items: u16,
-        now: Timestamp,
-    ) -> Result<Vec<ClaimedEntry>, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::Claim(ClaimCmd {
-            queue_id,
-            connection_id,
-            consumer_id,
-            max_items,
-            now,
-            reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     pub async fn nack(
         &self,
         consumer_id: ConsumerId,
-        entries: Vec<NackEntry>,
-        now: Timestamp,
+        entries: Vec<AckEntry>,
     ) -> Result<NackReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Nack(NackCmd {
             consumer_id,
             entries,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
@@ -127,7 +149,6 @@ impl ShardHandle {
         consumer_config: ConsumerConfig,
         subscription_config: SubscriptionConfig,
         connection_id: ConnectionId,
-        now: Timestamp,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Subscribe(SubscribeCmd {
@@ -135,25 +156,22 @@ impl ShardHandle {
             consumer_config,
             subscription_config,
             connection_id,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     pub async fn unsubscribe(
         &self,
         subscription_id: SubscriptionId,
-        mode: DrainMode,
-        now: Timestamp,
-    ) -> Result<DrainReport, SendError> {
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Unsubscribe(UnsubscribeCmd {
             subscription_id,
-            mode,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
@@ -162,30 +180,28 @@ impl ShardHandle {
     pub async fn create_stream(
         &self,
         config: StreamConfig,
-        journal_kind: u8,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::CreateStream(CreateStreamCmd {
             config,
-            journal_kind,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     pub async fn delete_stream(
         &self,
         stream_id: StreamId,
-        mode: DrainMode,
         purge_disk: bool,
-    ) -> Result<DrainReport, SendError> {
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DeleteStream(DeleteStreamCmd {
             stream_id,
-            mode,
             purge_disk,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
@@ -201,48 +217,21 @@ impl ShardHandle {
             config,
             max_subject_inflights,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     pub async fn delete_consumer(
         &self,
         consumer_id: ConsumerId,
-        mode: DrainMode,
-    ) -> Result<DrainReport, SendError> {
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DeleteConsumer(DeleteConsumerCmd {
             consumer_id,
-            mode,
             reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    // ── Query ───────────────────────────────────────────────────────────
-
-    pub async fn list_streams(&self) -> Result<ListStreamsReply, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::ListStreams(ListStreamsCmd {
-            reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    pub async fn list_consumers(&self) -> Result<ListConsumersReply, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::ListConsumers(ListConsumersCmd {
-            reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    pub async fn store_info(&self, stream_id: StreamId) -> Result<StoreInfoReply, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::StoreInfo(StoreInfoCmd {
-            stream_id,
-            reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
@@ -252,31 +241,27 @@ impl ShardHandle {
         &self,
         connection_id: ConnectionId,
         node_id: NodeId,
-        now: Timestamp,
     ) -> Result<(), SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::OpenConnection(OpenConnectionCmd {
             connection_id,
             node_id,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     pub async fn drain_connection(
         &self,
         connection_id: ConnectionId,
-        mode: DrainMode,
-        now: Timestamp,
-    ) -> Result<DrainReport, SendError> {
+    ) -> Result<(), SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DrainConnection(DrainConnectionCmd {
             connection_id,
-            mode,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
@@ -286,57 +271,105 @@ impl ShardHandle {
         &self,
         connection_id: ConnectionId,
         subscription_id: SubscriptionId,
-        now: Timestamp,
     ) -> Result<(), SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Bind(BindCmd {
             connection_id,
             subscription_id,
-            now,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    // ── Query ───────────────────────────────────────────────────────────
+
+    pub async fn list_streams(
+        &self,
+    ) -> Result<ListStreamsReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::ListStreams(ListStreamsCmd {
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    pub async fn list_consumers(
+        &self,
+    ) -> Result<ListConsumersReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::ListConsumers(ListConsumersCmd {
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    pub async fn store_info(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<StoreInfoReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::StoreInfo(StoreInfoCmd {
+            stream_id,
+            reply: tx,
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     // ── Admin ───────────────────────────────────────────────────────────
 
-    pub async fn pause_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
+    pub async fn pause_consumer(
+        &self,
+        consumer_id: ConsumerId,
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::PauseConsumer(PauseConsumerCmd {
             consumer_id,
             reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn resume_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
+    pub async fn resume_consumer(
+        &self,
+        consumer_id: ConsumerId,
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::ResumeConsumer(ResumeConsumerCmd {
             consumer_id,
             reply: tx,
-        })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    // ── Recovery ────────────────────────────────────────────────────────
-
-    /// Seed engine queues from stores with existing data (recovery path).
-    /// Returns total number of messages seeded.
-    pub async fn seed_stores(&self) -> Result<u64, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::SeedStores(SeedStoresCmd {
-            reply: tx,
-        })).await?;
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     // ── Internal ────────────────────────────────────────────────────────
 
-    pub async fn send(&self, cmd: ShardCommand) -> Result<(), SendError> {
-        crate::lifecycle_trace!("07_handle_send_enter", 0, 0, "frame_loop");
-        self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)?;
+    pub async fn send(
+        &self,
+        cmd: ShardCommand,
+    ) -> Result<(), SendError> {
+        crate::lifecycle_trace!(
+            "07_handle_send_enter",
+            0,
+            0,
+            "frame_loop"
+        );
+        self.tx
+            .send(cmd)
+            .await
+            .map_err(|_| SendError::SHARD_DOWN)?;
         self.shard_thread.unpark();
-        crate::lifecycle_trace!("08_handle_send_done", 0, 0, "frame_loop");
+        crate::lifecycle_trace!(
+            "08_handle_send_done",
+            0,
+            0,
+            "frame_loop"
+        );
         Ok(())
     }
 

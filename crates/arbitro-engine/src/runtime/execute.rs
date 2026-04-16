@@ -1,91 +1,145 @@
 //! Kernel dispatch — apply a `Command` to the engine state.
 //!
 //! Level 7. The single hot-path entry point that the shard drainer and
-//! inbound translator call. Every mutation of engine state on the
-//! Command-based path flows through here.
-//!
-//! **W3.1 scope (parallel to legacy API):** this function exists so that
-//! the `Command` vocabulary is live and callable, and metrics counters
-//! advance on each variant. Actual state mutation (publish / ack / fanout
-//! wiring) is still performed by the legacy `on_publish` / `on_ack` /
-//! `drain_fanout` paths — the new drainer (Fase 2) will wire execute to
-//! the existing internals. Until then, `execute` is **observational**
-//! only: it touches metrics and nothing else. This keeps the server
-//! compiling unchanged while the new vocabulary lands.
+//! inbound translator call. Every mutation of engine state flows through
+//! here. Returns `DeltaEvents` so the worker can react (re-arm gate,
+//! clean up tx handles, etc.).
 //!
 //! Rule compliance:
-//! - No allocations: every variant is a `fetch_add` + maybe a `match`.
 //! - `Ordering::Relaxed` — metrics have no ordering deps.
 //! - `&mut EngineContext` respects the single-writer invariant.
 
 use std::sync::atomic::Ordering;
 
+use crate::catalog::Pending;
 use crate::command::{Command, DropReason};
 use crate::context::EngineContext;
+use crate::events::DeltaEvents;
 
-/// Dispatch a single command.
+/// Dispatch a single command. Returns events for the worker.
 ///
-/// Hot path. Must be branch-predictable and alloc-free.
+/// Hot path. Must be branch-predictable and alloc-free at steady state.
 #[inline]
-pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) {
+pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
+    let events = DeltaEvents::default();
     let m = &ctx.metrics;
+
     match *cmd {
-        Command::Fanout {
-            consumers,
-            entries,
+        Command::Delivered {
+            binding_id,
+            ref entries,
             ..
         } => {
-            // Count entries × consumers as "fanout notified" for parity
-            // with the legacy `publish_fanout_notified` counter. When the
-            // drainer lands in Fase 2 this becomes the authoritative
-            // increment site.
-            let total = (consumers.len() as u64).saturating_mul(entries.len() as u64);
-            m.publish_fanout_notified.fetch_add(total, Ordering::Relaxed);
             m.claim_entries_delivered
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
+
+            // Get binding metadata before mutating.
+            let meta = ctx
+                .catalog
+                .binding(binding_id)
+                .map(|b| (b.consumer_id.raw(), b.queue_id.raw(), b.fire_and_forget));
+
+            if let Some((consumer_raw, queue_raw, fire_and_forget)) = meta {
+                // Fire-and-forget bindings (AckPolicy::None) skip inflight
+                // tracking and pending list — acks never arrive, so the
+                // Vec would grow unbounded (500k × 16B = 8MB) causing
+                // cache pollution and realloc spikes. retire_binding is
+                // a correct no-op when pending is empty and inflight = 0.
+                if !fire_and_forget {
+                    for entry in entries.iter() {
+                        ctx.inflight
+                            .inc_pending(entry.subject_hash, consumer_raw, queue_raw);
+                    }
+                    if let Some(binding) = ctx.catalog.binding_mut(binding_id) {
+                        for entry in entries.iter() {
+                            binding.pending.push(Pending {
+                                seq: entry.seq,
+                                subject_hash: entry.subject_hash,
+                                _pad: 0,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
-        Command::Queue { .. } => {
-            m.claim_entries_delivered.fetch_add(1, Ordering::Relaxed);
-            m.publish_queues_pushed.fetch_add(1, Ordering::Relaxed);
-        }
-
-        Command::Ack { entries } => {
+        Command::Ack {
+            consumer_id,
+            ref entries,
+        } => {
             m.ack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
+
+            // Find bindings for this consumer and release matching pendings.
+            let binding_ids: Vec<_> = ctx.catalog.bindings_for_consumer(consumer_id).to_vec();
+            for bid in binding_ids {
+                if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                    let queue_raw = binding.queue_id.raw();
+                    for ack in entries.iter() {
+                        if let Some(pos) =
+                            binding.pending.iter().position(|p| p.seq == ack.seq)
+                        {
+                            let pending = binding.pending.swap_remove(pos);
+                            ctx.inflight.dec_pending(
+                                pending.subject_hash,
+                                consumer_id.raw(),
+                                queue_raw,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
-        Command::Nack { entries } => {
+        Command::Nack {
+            consumer_id,
+            ref entries,
+        } => {
             m.nack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
+
+            // Release inflight — redelivery handled by drain.
+            let binding_ids: Vec<_> = ctx.catalog.bindings_for_consumer(consumer_id).to_vec();
+            for bid in binding_ids {
+                if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                    let queue_raw = binding.queue_id.raw();
+                    for ack in entries.iter() {
+                        if let Some(pos) =
+                            binding.pending.iter().position(|p| p.seq == ack.seq)
+                        {
+                            let pending = binding.pending.swap_remove(pos);
+                            ctx.inflight.dec_pending(
+                                pending.subject_hash,
+                                consumer_id.raw(),
+                                queue_raw,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
-        Command::RepOk { entries, .. } => {
+        Command::PublishAccepted { .. } => {
             m.publish_entries_accepted
-                .fetch_add(entries.len() as u64, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Command::Tombstone { reason, .. } => match reason {
-            // Expired / Tombstoned / NoSubscribers all fold into the
-            // existing `publish_no_match` counter for now. A dedicated
-            // drop-reason trio will land with the new metrics block in
-            // W6, alongside the full drainer migration.
-            DropReason::Expired
-            | DropReason::Tombstoned
-            | DropReason::NoSubscribers => {
+            DropReason::Expired | DropReason::Tombstoned | DropReason::NoSubscribers => {
                 m.publish_no_match.fetch_add(1, Ordering::Relaxed);
             }
         },
     }
+
+    events
 }
 
 /// Dispatch a slice of commands in order.
-///
-/// Thin wrapper — kept as a named entry point so the drainer can call
-/// `runtime::execute::apply_batch` symmetrically with `apply`.
 #[inline]
-pub fn apply_batch(ctx: &mut EngineContext, cmds: &[Command<'_>]) {
+pub fn apply_batch(ctx: &mut EngineContext, cmds: &[Command<'_>]) -> DeltaEvents {
+    let mut events = DeltaEvents::default();
     for cmd in cmds {
-        apply(ctx, cmd);
+        events.merge(apply(ctx, cmd));
     }
+    events
 }

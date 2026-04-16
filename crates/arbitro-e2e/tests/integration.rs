@@ -5,23 +5,15 @@
 
 use std::time::Duration;
 
-use arbitro_engine_v2::batch::{AckEntry, NackEntry};
+use arbitro_engine_v2::AckEntry;
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_proto::action::Action;
+use arbitro_proto::wire::delivery::DELIVERY_ENTRY_HEADER_SIZE;
 use arbitro_proto::wire::envelope::ENVELOPE_SIZE;
 use arbitro_server::config::Config;
 use arbitro_server::router::Server;
 use arbitro_server::transport::ConnectionRegistry;
-
-fn now() -> Timestamp {
-    Timestamp::new(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-    )
-}
 
 /// Spawn a 2-shard server with a ConnectionRegistry for testing.
 fn test_server() -> (Server, ConnectionRegistry) {
@@ -44,7 +36,6 @@ async fn test_create_stream() {
                 id: StreamId(1),
                 name: b"orders".to_vec(),
             },
-            0, // memory store
         )
         .await
         .unwrap();
@@ -64,7 +55,6 @@ async fn test_create_consumer() {
                 id: StreamId(1),
                 name: b"orders".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -94,7 +84,7 @@ async fn test_open_connection() {
     let shard = server.shard(0);
 
     shard
-        .open_connection(ConnectionId(100), NodeId(1), now())
+        .open_connection(ConnectionId(100), NodeId(1))
         .await
         .unwrap();
 
@@ -107,7 +97,7 @@ async fn test_subscribe_bind() {
     let shard = server.shard(0);
 
     shard
-        .open_connection(ConnectionId(100), NodeId(1), now())
+        .open_connection(ConnectionId(100), NodeId(1))
         .await
         .unwrap();
 
@@ -132,7 +122,6 @@ async fn test_subscribe_bind() {
                 filters: vec![],
             },
             ConnectionId(100),
-            now(),
         )
         .await
         .unwrap();
@@ -147,19 +136,17 @@ async fn test_subscribe_bind() {
 async fn test_publish_ack_cycle() {
     let (server, registry) = test_server();
     let shard = server.shard(0);
-    let ts = now();
 
     // Register a fake connection so the shard can send RepOk
-    let (conn_id, mut _rx) = registry.register();
+    let (conn_id, mut rx) = registry.register();
 
-    // Setup: stream + consumer + subscription + connection + bind
+    // Setup: stream + consumer + subscription + connection
     shard
         .create_stream(
             StreamConfig {
                 id: StreamId(1),
                 name: b"orders".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -180,7 +167,7 @@ async fn test_publish_ack_cycle() {
         .unwrap();
 
     shard
-        .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+        .open_connection(ConnectionId(conn_id), NodeId(1))
         .await
         .unwrap();
 
@@ -205,7 +192,6 @@ async fn test_publish_ack_cycle() {
                 filters: vec![],
             },
             ConnectionId(conn_id),
-            ts,
         )
         .await
         .unwrap();
@@ -223,19 +209,34 @@ async fn test_publish_ack_cycle() {
         .await
         .unwrap();
 
-    // Give shard a moment to process
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Wait for shard to auto-deliver via Gate
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Claim all
-    let claimed = shard
-        .claim(QueueId(1), ConnectionId(conn_id), ConsumerId(1), 256, ts)
-        .await
-        .unwrap();
+    // Drain rx to find delivered seqs
+    let mut delivered_seqs = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        let action = u16::from_le_bytes([frame[0], frame[1]]);
+        if action == Action::RepBatch.as_u16() {
+            let body_start = ENVELOPE_SIZE;
+            let count = u16::from_le_bytes([frame[body_start + 4], frame[body_start + 5]]) as u32;
+            let mut off = body_start + 8;
+            for _ in 0..count {
+                let seq = u64::from_le_bytes([
+                    frame[off], frame[off+1], frame[off+2], frame[off+3],
+                    frame[off+4], frame[off+5], frame[off+6], frame[off+7],
+                ]);
+                delivered_seqs.push(seq);
+                let subj_len = u16::from_le_bytes([frame[off+8], frame[off+9]]) as usize;
+                let data_len = u32::from_le_bytes([frame[off+10], frame[off+11], frame[off+12], frame[off+13]]) as usize;
+                off += DELIVERY_ENTRY_HEADER_SIZE + data_len;
+            }
+        }
+    }
 
-    // Ack all
-    let ack_entries: Vec<AckEntry> = claimed.iter().map(|e| AckEntry { seq: e.seq }).collect();
+    // Ack all delivered
+    let ack_entries: Vec<AckEntry> = delivered_seqs.iter().map(|&seq| AckEntry { stream_id: StreamId(1), seq }).collect();
     let count = ack_entries.len() as u32;
-    let ack_reply = shard.ack(ConsumerId(1), ack_entries, ts).await.unwrap();
+    let ack_reply = shard.ack(ConsumerId(1), ack_entries).await.unwrap();
     assert_eq!(ack_reply.accepted + ack_reply.rejected, count);
 
     server.shutdown();
@@ -254,7 +255,6 @@ async fn test_publish_batch() {
                 id: StreamId(1),
                 name: b"batch".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -279,7 +279,6 @@ async fn test_publish_batch() {
 async fn test_fanout_delivery() {
     let (server, _registry) = test_server();
     let shard = server.shard(0);
-    let ts = now();
 
     shard
         .create_stream(
@@ -287,7 +286,6 @@ async fn test_fanout_delivery() {
                 id: StreamId(1),
                 name: b"fanout".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -309,7 +307,7 @@ async fn test_fanout_delivery() {
             .unwrap();
 
         shard
-            .open_connection(ConnectionId(i as u64), NodeId(1), ts)
+            .open_connection(ConnectionId(i as u64), NodeId(1))
             .await
             .unwrap();
 
@@ -334,13 +332,12 @@ async fn test_fanout_delivery() {
                     filters: vec![],
                 },
                 ConnectionId(i as u64),
-                ts,
             )
             .await
             .unwrap();
     }
 
-    // Consumers are set up — fanout happens at claim time, not publish time
+    // Consumers are set up — fanout happens at drain time
     server.shutdown();
 }
 
@@ -350,7 +347,6 @@ async fn test_fanout_delivery() {
 async fn test_nack_redelivery() {
     let (server, registry) = test_server();
     let shard = server.shard(0);
-    let ts = now();
 
     let (conn_id, mut rx) = registry.register();
 
@@ -360,7 +356,6 @@ async fn test_nack_redelivery() {
                 id: StreamId(1),
                 name: b"nack_test".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -381,7 +376,7 @@ async fn test_nack_redelivery() {
         .unwrap();
 
     shard
-        .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+        .open_connection(ConnectionId(conn_id), NodeId(1))
         .await
         .unwrap();
 
@@ -406,7 +401,6 @@ async fn test_nack_redelivery() {
                 filters: vec![],
             },
             ConnectionId(conn_id),
-            ts,
         )
         .await
         .unwrap();
@@ -420,44 +414,36 @@ async fn test_nack_redelivery() {
         .await
         .unwrap();
 
-    // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
+    // Wait for shard to auto-deliver via Gate
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Drain the auto-delivered frames from connection rx to get the seq.
-    // Frames: RepOk (publish reply) + RepBatch (auto-delivered).
-    // RepBatch body: [4 consumer_id][2 count][2 pad][8 seq][...].
+    // Drain the auto-delivered frames to get the seq.
     let mut delivered_seq = None;
     while let Ok(frame) = rx.try_recv() {
         let action = u16::from_le_bytes([frame[0], frame[1]]);
         if action == Action::RepBatch.as_u16() {
             let off = ENVELOPE_SIZE + 8;
             let seq = u64::from_le_bytes([
-                frame[off],
-                frame[off + 1],
-                frame[off + 2],
-                frame[off + 3],
-                frame[off + 4],
-                frame[off + 5],
-                frame[off + 6],
-                frame[off + 7],
+                frame[off], frame[off+1], frame[off+2], frame[off+3],
+                frame[off+4], frame[off+5], frame[off+6], frame[off+7],
             ]);
             delivered_seq = Some(seq);
         }
     }
     let seq = delivered_seq.expect("should have received auto-delivered message");
 
-    // Nack — should requeue the auto-delivered message
-    let nack_entries = vec![NackEntry {
+    // Nack — should release inflight, drain re-delivers
+    let nack_entries = vec![AckEntry {
+        stream_id: StreamId(1),
         seq,
-        retry_at: None,
     }];
-    let nack = shard.nack(ConsumerId(1), nack_entries, ts).await.unwrap();
+    let nack = shard.nack(ConsumerId(1), nack_entries).await.unwrap();
     assert_eq!(nack.requeued, 1);
 
-    // Wait for re-delivery via Gate (nack → gate.release → drain_deliver)
+    // Wait for re-delivery via Gate
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Verify re-delivery arrived on the connection (auto-delivered by Gate)
+    // Verify re-delivery arrived on the connection
     let mut redelivered = false;
     while let Ok(frame) = rx.try_recv() {
         let action = u16::from_le_bytes([frame[0], frame[1]]);
@@ -479,7 +465,6 @@ async fn test_nack_redelivery() {
 async fn test_disconnect_releases_pending() {
     let (server, registry) = test_server();
     let shard = server.shard(0);
-    let ts = now();
 
     let (conn_id, _rx) = registry.register();
 
@@ -489,7 +474,6 @@ async fn test_disconnect_releases_pending() {
                 id: StreamId(1),
                 name: b"disc_test".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -510,7 +494,7 @@ async fn test_disconnect_releases_pending() {
         .unwrap();
 
     shard
-        .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+        .open_connection(ConnectionId(conn_id), NodeId(1))
         .await
         .unwrap();
 
@@ -535,7 +519,6 @@ async fn test_disconnect_releases_pending() {
                 filters: vec![],
             },
             ConnectionId(conn_id),
-            ts,
         )
         .await
         .unwrap();
@@ -552,41 +535,28 @@ async fn test_disconnect_releases_pending() {
         .await
         .unwrap();
 
-    // Wait for shard to auto-deliver via Gate (publish → gate.release → drain_deliver)
-    // Messages become inflight automatically — no explicit claim needed
+    // Wait for shard to auto-deliver via Gate
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Disconnect — all inflight (auto-delivered) should be requeued
-    let drain = shard
-        .drain_connection(ConnectionId(conn_id), DrainMode::ReleaseAndRequeue, ts)
+    // Disconnect — all inflight should be released via retire_binding
+    shard
+        .drain_connection(ConnectionId(conn_id))
         .await
         .unwrap();
 
-    assert!(
-        drain.pending_requeued > 0,
-        "pending should be requeued on disconnect"
-    );
-
-    // Reconnect and re-claim
+    // Reconnect with new connection
     shard
-        .open_connection(ConnectionId(200), NodeId(1), ts)
+        .open_connection(ConnectionId(200), NodeId(1))
         .await
         .unwrap();
 
     shard
-        .bind(ConnectionId(200), SubscriptionId(1), ts)
+        .bind(ConnectionId(200), SubscriptionId(1))
         .await
         .unwrap();
 
-    let reclaimed = shard
-        .claim(QueueId(1), ConnectionId(200), ConsumerId(1), 256, ts)
-        .await
-        .unwrap();
-
-    assert!(
-        !reclaimed.is_empty(),
-        "messages should be reclaimable after disconnect"
-    );
+    // After reconnect + bind, drain should re-deliver on next cycle
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     server.shutdown();
 }
@@ -604,7 +574,6 @@ async fn test_pause_resume_consumer() {
                 id: StreamId(1),
                 name: b"pause_test".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -664,7 +633,6 @@ async fn test_graceful_shutdown() {
                 id: StreamId(1),
                 name: b"shutdown_test".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -678,7 +646,6 @@ async fn test_graceful_shutdown() {
                 id: StreamId(2),
                 name: b"after_shutdown".to_vec(),
             },
-            0,
         )
         .await;
     assert!(result.is_err(), "commands after shutdown should fail");
@@ -690,9 +657,6 @@ async fn test_graceful_shutdown() {
 async fn test_list_streams() {
     let (server, _registry) = test_server();
 
-    // Use small sequential stream IDs — the engine catalog indexes
-    // match_tables by stream_id.0 directly, so hash-derived IDs blow up
-    // memory. Names stay distinct so list_streams content is still meaningful.
     let names: &[&[u8]] = &[b"orders", b"payments", b"events"];
     for (i, name) in names.iter().enumerate() {
         let stream_id = StreamId((i + 1) as u32);
@@ -703,7 +667,6 @@ async fn test_list_streams() {
                     id: stream_id,
                     name: name.to_vec(),
                 },
-                0,
             )
             .await
             .unwrap();
@@ -743,7 +706,6 @@ async fn test_list_streams_empty() {
 #[tokio::test]
 async fn test_end_to_end_publish_deliver_ack() {
     let (server, registry) = test_server();
-    let ts = now();
 
     // 1. Register a fake TCP connection — gives us a write channel
     let (conn_id, mut rx) = registry.register();
@@ -751,18 +713,17 @@ async fn test_end_to_end_publish_deliver_ack() {
 
     // 2. Open connection in engine
     shard
-        .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+        .open_connection(ConnectionId(conn_id), NodeId(1))
         .await
         .unwrap();
 
-    // 3. Create stream (with memory store)
+    // 3. Create stream
     shard
         .create_stream(
             StreamConfig {
                 id: StreamId(1),
                 name: b"orders".to_vec(),
             },
-            0,
         )
         .await
         .unwrap();
@@ -789,7 +750,6 @@ async fn test_end_to_end_publish_deliver_ack() {
                 filters: vec![],
             },
             ConnectionId(conn_id),
-            ts,
         )
         .await
         .unwrap();
@@ -827,10 +787,8 @@ async fn test_end_to_end_publish_deliver_ack() {
     // 6. Wait for shard thread to drain-deliver (gate auto-releases on publish)
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 7. Receive RepBatch frames — drainer batches all entries into one frame.
-    //    RepBatch body: [4 consumer_id][2 count][2 pad][entries...]
-    //    Entry: [8 seq][2 subj_len][4 data_len][subject][payload]
-    let mut delivered_count = 0u32;
+    // 7. Receive RepBatch frames
+    let mut delivered_seqs = Vec::new();
     loop {
         match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
             Ok(Some(frame)) => {
@@ -839,33 +797,23 @@ async fn test_end_to_end_publish_deliver_ack() {
                     let body_start = ENVELOPE_SIZE;
                     let count =
                         u16::from_le_bytes([frame[body_start + 4], frame[body_start + 5]]) as u32;
-                    delivered_count += count;
 
-                    // Walk entries and verify subject of the first one.
                     let mut off = body_start + 8;
                     for _ in 0..count {
                         let seq = u64::from_le_bytes([
-                            frame[off],
-                            frame[off + 1],
-                            frame[off + 2],
-                            frame[off + 3],
-                            frame[off + 4],
-                            frame[off + 5],
-                            frame[off + 6],
-                            frame[off + 7],
+                            frame[off], frame[off+1], frame[off+2], frame[off+3],
+                            frame[off+4], frame[off+5], frame[off+6], frame[off+7],
                         ]);
                         assert!(seq > 0, "seq should be positive");
                         let subj_len =
                             u16::from_le_bytes([frame[off + 8], frame[off + 9]]) as usize;
                         let data_len = u32::from_le_bytes([
-                            frame[off + 10],
-                            frame[off + 11],
-                            frame[off + 12],
-                            frame[off + 13],
+                            frame[off + 10], frame[off + 11], frame[off + 12], frame[off + 13],
                         ]) as usize;
-                        let subject = &frame[off + 14..off + 14 + subj_len];
+                        let subject = &frame[off + DELIVERY_ENTRY_HEADER_SIZE..off + DELIVERY_ENTRY_HEADER_SIZE + subj_len];
                         assert_eq!(subject, b"orders_new");
-                        off += 14 + data_len;
+                        delivered_seqs.push(seq);
+                        off += DELIVERY_ENTRY_HEADER_SIZE + data_len;
                     }
                 }
             }
@@ -873,18 +821,11 @@ async fn test_end_to_end_publish_deliver_ack() {
         }
     }
 
-    assert_eq!(delivered_count, 10, "should deliver all 10 messages");
+    assert_eq!(delivered_seqs.len(), 10, "should deliver all 10 messages");
 
-    // 8. Ack all — claim first to get pending_ids
-    let _claimed = shard
-        .claim(QueueId(1), ConnectionId(conn_id), ConsumerId(1), 256, ts)
-        .await
-        .unwrap();
-
-    // All messages were already claimed by drain_deliver, so explicit claim returns 0
-    // Ack the sequences we received in deliver frames (seq 1..=10)
-    let ack_entries: Vec<AckEntry> = (1..=10u64).map(|seq| AckEntry { seq }).collect();
-    let ack_reply = shard.ack(ConsumerId(1), ack_entries, ts).await.unwrap();
+    // 8. Ack all delivered sequences
+    let ack_entries: Vec<AckEntry> = delivered_seqs.iter().map(|&seq| AckEntry { stream_id: StreamId(1), seq }).collect();
+    let ack_reply = shard.ack(ConsumerId(1), ack_entries).await.unwrap();
     assert_eq!(
         ack_reply.accepted + ack_reply.rejected,
         10,
@@ -904,12 +845,11 @@ async fn test_gate_auto_delivery_smoke() {
     let overall = tokio::time::timeout(Duration::from_secs(2), async {
         let (server, registry) = test_server();
         let shard = server.shard(0);
-        let ts = now();
 
         let (conn_id, mut rx) = registry.register();
 
         shard
-            .open_connection(ConnectionId(conn_id), NodeId(1), ts)
+            .open_connection(ConnectionId(conn_id), NodeId(1))
             .await
             .unwrap();
 
@@ -919,7 +859,6 @@ async fn test_gate_auto_delivery_smoke() {
                     id: StreamId(1),
                     name: b"gate_smoke".to_vec(),
                 },
-                0,
             )
             .await
             .unwrap();
@@ -945,7 +884,6 @@ async fn test_gate_auto_delivery_smoke() {
                     filters: vec![],
                 },
                 ConnectionId(conn_id),
-                ts,
             )
             .await
             .unwrap();
@@ -987,10 +925,11 @@ async fn test_gate_auto_delivery_smoke() {
             // Ack all so inflight is freed for next round
             let ack_entries: Vec<AckEntry> = (1..=5u64)
                 .map(|i| AckEntry {
+                    stream_id: StreamId(1),
                     seq: round as u64 * 5 + i,
                 })
                 .collect();
-            shard.ack(ConsumerId(1), ack_entries, ts).await.unwrap();
+            shard.ack(ConsumerId(1), ack_entries).await.unwrap();
         }
 
         server.shutdown();
@@ -999,4 +938,289 @@ async fn test_gate_auto_delivery_smoke() {
     overall
         .await
         .expect("test_gate_auto_delivery_smoke hung — Gate is blocked");
+}
+
+// ── Replay: publish-first, subscribe-later ─────────────────────────────────
+
+/// Replay scenario: messages are published BEFORE any subscriber exists.
+/// After subscribing, the drain must rewind the cursor and deliver all
+/// historical messages. Exercises the `cursor = 0` rewind in
+/// `handle_subscribe` and the `more_pending` continuation when the store
+/// has more entries than `max_feed`.
+#[tokio::test]
+async fn test_replay_publish_then_subscribe() {
+    let overall = tokio::time::timeout(Duration::from_secs(3), async {
+        let (server, registry) = test_server();
+        let shard = server.shard(0);
+
+        // 1. Create stream (no subscriber yet)
+        shard
+            .create_stream(StreamConfig {
+                id: StreamId(1),
+                name: b"replay".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        // 2. Publish 500 messages — intentionally > max_feed (256) to
+        //    exercise the multi-batch drain path.
+        let entries: Vec<_> = (0..500u64)
+            .map(|i| arbitro_server::command::PublishEntryOwned {
+                subject: bytes::Bytes::from_static(b"replay.evt"),
+                payload: bytes::Bytes::from(format!("r-{i}").into_bytes()),
+            })
+            .collect();
+
+        // Need a connection for publish reply, but nobody is subscribed yet.
+        let (pub_conn, mut pub_rx) = registry.register();
+        shard
+            .open_connection(ConnectionId(pub_conn), NodeId(1))
+            .await
+            .unwrap();
+
+        shard
+            .publish(StreamId(1), pub_conn, 1, entries)
+            .await
+            .unwrap();
+
+        // Drain the RepOk from publish
+        let _ = tokio::time::timeout(Duration::from_millis(100), pub_rx.recv()).await;
+
+        // 3. Now subscribe — this should rewind cursor to 0
+        let (sub_conn, mut sub_rx) = registry.register();
+        shard
+            .open_connection(ConnectionId(sub_conn), NodeId(1))
+            .await
+            .unwrap();
+
+        shard
+            .subscribe(
+                StreamConfig {
+                    id: StreamId(1),
+                    name: b"replay".to_vec(),
+                },
+                ConsumerConfig {
+                    id: ConsumerId(1),
+                    queue_id: QueueId(1),
+                    stream_id: StreamId(1),
+                    durable: true,
+                    ack_policy: AckPolicy::Explicit,
+                    max_inflight: 1000,
+                },
+                SubscriptionConfig {
+                    id: SubscriptionId(1),
+                    stream_id: StreamId(1),
+                    consumer_id: ConsumerId(1),
+                    filters: vec![],
+                },
+                ConnectionId(sub_conn),
+            )
+            .await
+            .unwrap();
+
+        // 4. Collect all delivered messages — may arrive across multiple
+        //    drain cycles (500 / 256 = 2 cycles minimum).
+        let mut delivered_seqs = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), sub_rx.recv()).await {
+                Ok(Some(frame)) => {
+                    let action = u16::from_le_bytes([frame[0], frame[1]]);
+                    if action == Action::RepBatch.as_u16() {
+                        let body_start = ENVELOPE_SIZE;
+                        let count = u16::from_le_bytes([
+                            frame[body_start + 4],
+                            frame[body_start + 5],
+                        ]) as u32;
+
+                        let mut off = body_start + 8;
+                        for _ in 0..count {
+                            let seq = u64::from_le_bytes([
+                                frame[off],
+                                frame[off + 1],
+                                frame[off + 2],
+                                frame[off + 3],
+                                frame[off + 4],
+                                frame[off + 5],
+                                frame[off + 6],
+                                frame[off + 7],
+                            ]);
+                            let data_len = u32::from_le_bytes([
+                                frame[off + 10],
+                                frame[off + 11],
+                                frame[off + 12],
+                                frame[off + 13],
+                            ]) as usize;
+                            delivered_seqs.push(seq);
+                            off += DELIVERY_ENTRY_HEADER_SIZE + data_len;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            delivered_seqs.len(),
+            500,
+            "replay must deliver all 500 historical messages, got {}",
+            delivered_seqs.len()
+        );
+
+        // Verify monotonic ordering
+        for w in delivered_seqs.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "seqs must be strictly monotonic: {} >= {}",
+                w[0],
+                w[1]
+            );
+        }
+
+        server.shutdown();
+    })
+    .await
+    .expect("test_replay_publish_then_subscribe hung — drain stuck");
+}
+
+// ── Lifecycle trace ─────────────────────────────────────────────────────────
+
+/// Full publish → deliver → ack cycle with lifecycle_trace enabled.
+/// Prints per-stage timing so you can see the cost of each step.
+/// Run with: cargo test -p arbitro-e2e --test integration --features lifecycle_trace
+///           trace_publish_deliver_ack -- --nocapture
+#[tokio::test]
+#[cfg(feature = "lifecycle_trace")]
+async fn trace_publish_deliver_ack() {
+    arbitro_server::lifecycle_trace::enable();
+
+    let (server, registry) = test_server();
+    let shard = server.shard(0);
+    let (conn_id, mut rx) = registry.register();
+
+    shard
+        .open_connection(ConnectionId(conn_id), NodeId(1))
+        .await
+        .unwrap();
+
+    shard
+        .create_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"traced".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    shard
+        .subscribe(
+            StreamConfig {
+                id: StreamId(1),
+                name: b"traced".to_vec(),
+            },
+            ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+            },
+            SubscriptionConfig {
+                id: SubscriptionId(1),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            },
+            ConnectionId(conn_id),
+        )
+        .await
+        .unwrap();
+
+    // Publish 5 messages
+    let entries: Vec<_> = (0..5u64)
+        .map(|i| arbitro_server::command::PublishEntryOwned {
+            subject: bytes::Bytes::from_static(b"traced.order"),
+            payload: bytes::Bytes::from(format!("msg-{i}").into_bytes()),
+        })
+        .collect();
+
+    shard
+        .publish(StreamId(1), conn_id, 1, entries)
+        .await
+        .unwrap();
+
+    // Wait for delivery
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Drain delivered frames
+    let mut delivered_seqs = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        let action = u16::from_le_bytes([frame[0], frame[1]]);
+        if action == Action::RepBatch.as_u16() {
+            let body_start = ENVELOPE_SIZE;
+            let count =
+                u16::from_le_bytes([frame[body_start + 4], frame[body_start + 5]]);
+            let mut off = body_start + 8;
+            for _ in 0..count {
+                let seq = u64::from_le_bytes([
+                    frame[off], frame[off+1], frame[off+2], frame[off+3],
+                    frame[off+4], frame[off+5], frame[off+6], frame[off+7],
+                ]);
+                let data_len = u32::from_le_bytes([
+                    frame[off+10], frame[off+11], frame[off+12], frame[off+13],
+                ]) as usize;
+                delivered_seqs.push(seq);
+                off += DELIVERY_ENTRY_HEADER_SIZE + data_len;
+            }
+        }
+    }
+
+    assert_eq!(delivered_seqs.len(), 5, "should deliver all 5 messages");
+
+    // Ack all
+    let ack_entries: Vec<AckEntry> = delivered_seqs
+        .iter()
+        .map(|&seq| AckEntry {
+            stream_id: StreamId(1),
+            seq,
+        })
+        .collect();
+    shard.ack(ConsumerId(1), ack_entries).await.unwrap();
+
+    // Small delay for ack processing
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    arbitro_server::lifecycle_trace::disable();
+
+    // Print trace
+    let events = arbitro_server::lifecycle_trace::take();
+    if events.is_empty() {
+        eprintln!("\n  (no trace events — build with --features lifecycle_trace)\n");
+    } else {
+        let t0 = events[0].at;
+        eprintln!("\n{:-<72}", "");
+        eprintln!("  LIFECYCLE TRACE — publish(5) → deliver → ack");
+        eprintln!("{:-<72}", "");
+        let mut prev = t0;
+        for e in &events {
+            let abs = e.at.duration_since(t0);
+            let delta = e.at.duration_since(prev);
+            eprintln!(
+                "  {:>10.3}µs  (+{:>8.3}µs)  {:<32} conn={} seq={}",
+                abs.as_nanos() as f64 / 1000.0,
+                delta.as_nanos() as f64 / 1000.0,
+                e.label,
+                e.conn_id,
+                e.seq,
+            );
+            prev = e.at;
+        }
+        eprintln!(
+            "{:-<72}\n  Total: {:.3}µs across {} events\n",
+            "",
+            events.last().unwrap().at.duration_since(t0).as_nanos() as f64 / 1000.0,
+            events.len()
+        );
+    }
+
+    server.shutdown();
 }

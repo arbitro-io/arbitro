@@ -11,10 +11,10 @@ pub struct AckAction {
 }
 const _: () = assert!(core::mem::size_of::<AckAction>() == 16);
 
-/// 8B fixed — Batch ack header. Followed by N × u64 sequences.
+/// 8B fixed — Batch ack header. Followed by N × `BatchAckEntry`.
 ///
 /// ```text
-/// [4 consumer_id][2 count][2 pad] [8 seq_0][8 seq_1]...
+/// [4 consumer_id][2 count][2 pad] [entry_0][entry_1]...
 /// ```
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
@@ -24,6 +24,24 @@ pub struct BatchAckFixed {
     pub _pad: U16,
 }
 const _: () = assert!(core::mem::size_of::<BatchAckFixed>() == 8);
+
+/// 16B — Per-entry payload inside a `BatchAck`.
+///
+/// ```text
+/// [8 seq][4 subject_hash][4 pad]
+/// ```
+/// `subject_hash` is the FNV-1a u32 echoed from the `DeliveryEntryHeader`
+/// the client originally received. It lets the server decrement
+/// `max_subject_inflight` credits in O(1) arithmetic without any lookup.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
+#[repr(C)]
+pub struct BatchAckEntry {
+    pub seq: U64,
+    pub subject_hash: U32,
+    pub _pad: U32,
+}
+pub const BATCH_ACK_ENTRY_SIZE: usize = core::mem::size_of::<BatchAckEntry>();
+const _: () = assert!(BATCH_ACK_ENTRY_SIZE == 16);
 
 /// 16B — Negative ack (request redelivery).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
@@ -76,21 +94,25 @@ pub struct RepBatchFixed {
 pub const REP_BATCH_FIXED_SIZE: usize = core::mem::size_of::<RepBatchFixed>();
 const _: () = assert!(REP_BATCH_FIXED_SIZE == 8);
 
-/// 14B — Per-entry header inside a RepBatch.
+/// 18B — Per-entry header inside a RepBatch.
 ///
 /// ```text
-/// [8 seq][2 subj_len][4 data_len]
+/// [8 seq][2 subj_len][4 data_len][4 subject_hash]
 /// ```
-/// data_len = subj_len + payload_len (total variable bytes after this header).
+/// * `data_len` = subj_len + payload_len (total variable bytes after this header).
+/// * `subject_hash` = FNV-1a u32 of the subject bytes. Client echoes this
+///   back in the ack frame so the server performs O(1) credit arithmetic
+///   on ack without touching the store.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct DeliveryEntryHeader {
     pub seq: U64,
     pub subj_len: U16,
     pub data_len: U32,
+    pub subject_hash: U32,
 }
 pub const DELIVERY_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<DeliveryEntryHeader>();
-const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 14);
+const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 18);
 
 // ── Lazy views ──────────────────────────────────────────────────────────────
 
@@ -195,36 +217,34 @@ impl<'a> BatchAckView<'a> {
     #[inline(always)]
     pub fn count(&self) -> u16 { self.fixed().count.get() }
 
-    /// Iterator over the acked sequences.
+    /// Iterator over the acked entries, yielding `(seq, subject_hash)`.
     #[inline]
-    pub fn sequences(&self) -> BatchAckSeqIter<'a> {
+    pub fn entries(&self) -> BatchAckEntryIter<'a> {
         let count = self.count() as usize;
         let start = core::mem::size_of::<BatchAckFixed>();
-        BatchAckSeqIter { buf: self.buf, offset: start, remaining: count }
+        BatchAckEntryIter { buf: self.buf, offset: start, remaining: count }
     }
 }
 
-pub struct BatchAckSeqIter<'a> {
+pub struct BatchAckEntryIter<'a> {
     buf: &'a [u8],
     offset: usize,
     remaining: usize,
 }
 
-impl<'a> Iterator for BatchAckSeqIter<'a> {
-    type Item = u64;
+impl<'a> Iterator for BatchAckEntryIter<'a> {
+    type Item = (u64, u32);
 
     #[inline(always)]
-    fn next(&mut self) -> Option<u64> {
+    fn next(&mut self) -> Option<(u64, u32)> {
         if self.remaining == 0 { return None; }
         self.remaining -= 1;
-        let seq = u64::from_le_bytes([
-            self.buf[self.offset],     self.buf[self.offset + 1],
-            self.buf[self.offset + 2], self.buf[self.offset + 3],
-            self.buf[self.offset + 4], self.buf[self.offset + 5],
-            self.buf[self.offset + 6], self.buf[self.offset + 7],
-        ]);
-        self.offset += 8;
-        Some(seq)
+        let entry = BatchAckEntry::ref_from_bytes(
+            &self.buf[self.offset..self.offset + BATCH_ACK_ENTRY_SIZE]
+        ).unwrap();
+        let out = (entry.seq.get(), entry.subject_hash.get());
+        self.offset += BATCH_ACK_ENTRY_SIZE;
+        Some(out)
     }
 
     #[inline(always)]
@@ -276,6 +296,7 @@ pub struct RepBatchEntryIter<'a> {
 
 pub struct RepBatchEntry<'a> {
     pub seq: u64,
+    pub subject_hash: u32,
     pub subject: &'a [u8],
     pub payload: &'a [u8],
 }
@@ -294,6 +315,7 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let seq = header.seq.get();
         let subj_len = header.subj_len.get() as usize;
         let data_len = header.data_len.get() as usize;
+        let subject_hash = header.subject_hash.get();
         self.offset += DELIVERY_ENTRY_HEADER_SIZE;
 
         let subject = &self.buf[self.offset..self.offset + subj_len];
@@ -301,6 +323,6 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let payload = &self.buf[self.offset + subj_len..self.offset + subj_len + payload_len];
         self.offset += data_len;
 
-        Some(RepBatchEntry { seq, subject, payload })
+        Some(RepBatchEntry { seq, subject_hash, subject, payload })
     }
 }

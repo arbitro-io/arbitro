@@ -10,7 +10,7 @@
 //! IN PLACE (zerocopy cast, not a copy). `send_parts` does exactly ONE
 //! alloc+copy into the Bytes for the mpsc channel. No intermediate `[u8; N]`.
 
-use arbitro_engine_v2::batch::{AckEntry, NackEntry};
+use arbitro_engine_v2::AckEntry;
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_proto::action::Action;
@@ -26,7 +26,7 @@ use bytes::{Bytes, BytesMut};
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::U64;
 
-use crate::common::reply::{send_error, send_rep_ok, timestamp_now};
+use crate::common::reply::{send_error, send_rep_ok};
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::command::PublishEntryOwned;
 use crate::shard::router::ShardRouter;
@@ -55,7 +55,7 @@ pub async fn dispatch_frame(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish => dispatch_publish(conn_id, stream_id, env_seq, &frame, server, registry).await,
+        Action::Publish => dispatch_publish(conn_id, stream_id, env_seq, &frame, server, registry),
         Action::PublishAccumulate => dispatch_publish_accumulate(conn_id, stream_id, env_seq, &frame, server, registry).await,
         Action::Ack => dispatch_ack(stream_id, body, server).await,
         Action::AckSync => dispatch_ack_sync(conn_id, stream_id, env_seq, body, server, registry).await,
@@ -119,8 +119,10 @@ fn translate_stream_silent(server: &ShardRouter, wire_stream: u32) -> Option<Str
     server.names().stream_seq(wire_stream)
 }
 
-/// Fire & forget — shard validates, stores, and replies directly.
-async fn dispatch_publish(
+/// Fire & forget — writes directly to the shared store, signals gate.
+/// Does NOT go through the shard worker — publish and drain are
+/// independent services connected only by store (data) and gate (notification).
+fn dispatch_publish(
     conn_id: u64,
     stream_id: u32,
     env_seq: u32,
@@ -133,18 +135,47 @@ async fn dispatch_publish(
         Some(s) => s,
         None => return,
     };
-    let shard = server.shard_for(seq_stream);
     let body = &frame[ENVELOPE_SIZE..];
     let entries: Vec<PublishEntryOwned> = BatchIter::new(body)
         .map(|view| PublishEntryOwned::from_wire(&view, frame))
         .collect();
     crate::lifecycle_trace!("06_wire_parsed", conn_id, entries.len() as u64, "frame_loop");
 
-    // Shard handles: validate stream → store.append → RepOk + gate.release
-    if shard.publish(seq_stream, conn_id, env_seq, entries).await.is_err() {
-        send_error(registry, conn_id, env_seq, ErrorCode::InternalError);
-    }
-    crate::lifecycle_trace!("18_dispatch_publish_returned", conn_id, 0, "frame_loop");
+    // Build store entries — zero-copy refs into owned Bytes.
+    let store_entries: Vec<arbitro_store::EntryRef<'_>> = entries
+        .iter()
+        .map(|e| arbitro_store::EntryRef {
+            stream_id: seq_stream.raw(),
+            subject: &e.subject,
+            payload: &e.payload,
+            flags: 0,
+        })
+        .collect();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    crate::lifecycle_trace!("11_pub_store_append_start", conn_id, 0, "frame_loop");
+
+    let shared_store = server.store_for(seq_stream);
+    let first_seq = match shared_store.lock().unwrap().append_batch(&store_entries, now_ms) {
+        Ok(seq) => seq,
+        Err(_) => {
+            send_error(registry, conn_id, env_seq, ErrorCode::StreamFull);
+            return;
+        }
+    };
+
+    crate::lifecycle_trace!("12_pub_store_append_done", conn_id, first_seq, "frame_loop");
+
+    send_rep_ok(registry, conn_id, env_seq, first_seq);
+    crate::lifecycle_trace!("13_pub_rep_ok_sent", conn_id, first_seq, "frame_loop");
+
+    // Notify drain — gate is the ONLY connection between publish and drain.
+    server.gate_for(seq_stream).release();
+    crate::lifecycle_trace!("14_pub_gate_released", conn_id, first_seq, "frame_loop");
 }
 
 /// PublishAccumulate — shard accumulates entries, flushes after deadline/threshold.
@@ -180,9 +211,8 @@ async fn dispatch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
     };
     let view = AckView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
     let _ = shard
-        .ack(ConsumerId(view.consumer_id()), vec![AckEntry { seq: view.sequence() }], now)
+        .ack(ConsumerId(view.consumer_id()), vec![AckEntry { stream_id: seq_stream, seq: view.sequence() }])
         .await;
     crate::lifecycle_trace!("a18_dispatch_ack_returned", 0, 0, "frame_loop");
 }
@@ -194,9 +224,8 @@ async fn dispatch_nack(stream_id: u32, body: &[u8], server: &ShardRouter) {
     };
     let view = NackView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
     let _ = shard
-        .nack(ConsumerId(view.consumer_id()), vec![NackEntry { seq: view.sequence(), retry_at: None }], now)
+        .nack(ConsumerId(view.consumer_id()), vec![AckEntry { stream_id: seq_stream, seq: view.sequence() }])
         .await;
 }
 
@@ -214,9 +243,8 @@ async fn dispatch_ack_sync(
     };
     let view = AckView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
     match shard
-        .ack(ConsumerId(view.consumer_id()), vec![AckEntry { seq: view.sequence() }], now)
+        .ack(ConsumerId(view.consumer_id()), vec![AckEntry { stream_id: seq_stream, seq: view.sequence() }])
         .await
     {
         Ok(reply) => send_rep_ok(registry, conn_id, env_seq, reply.accepted as u64),
@@ -231,9 +259,8 @@ async fn dispatch_batch_ack(stream_id: u32, body: &[u8], server: &ShardRouter) {
     };
     let view = BatchAckView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
-    let entries: Vec<AckEntry> = view.sequences().map(|seq| AckEntry { seq }).collect();
-    let _ = shard.ack(ConsumerId(view.consumer_id()), entries, now).await;
+    let entries: Vec<AckEntry> = view.entries().map(|(seq, _hash)| AckEntry { stream_id: seq_stream, seq }).collect();
+    let _ = shard.ack(ConsumerId(view.consumer_id()), entries).await;
 }
 
 async fn dispatch_batch_ack_sync(
@@ -250,9 +277,8 @@ async fn dispatch_batch_ack_sync(
     };
     let view = BatchAckView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
-    let entries: Vec<AckEntry> = view.sequences().map(|seq| AckEntry { seq }).collect();
-    match shard.ack(ConsumerId(view.consumer_id()), entries, now).await {
+    let entries: Vec<AckEntry> = view.entries().map(|(seq, _hash)| AckEntry { stream_id: seq_stream, seq }).collect();
+    match shard.ack(ConsumerId(view.consumer_id()), entries).await {
         Ok(reply) => send_rep_ok(registry, conn_id, env_seq, reply.accepted as u64),
         Err(_) => send_error(registry, conn_id, env_seq, ErrorCode::InternalError),
     }
@@ -275,7 +301,6 @@ async fn dispatch_subscribe(
     let view = SubscribeView::new(body);
     let shard = server.shard_for(seq_stream);
     let consumer_id = view.consumer_id();
-    let now = timestamp_now();
 
     let subject = view.subject().to_vec();
     // The Subscribe wire body carries no group, so we cannot re-derive
@@ -319,7 +344,6 @@ async fn dispatch_subscribe(
                 },
             },
             ConnectionId(conn_id),
-            now,
         )
         .await;
 
@@ -343,13 +367,10 @@ async fn dispatch_unsubscribe(
     };
     let view = UnsubscribeView::new(body);
     let shard = server.shard_for(seq_stream);
-    let now = timestamp_now();
 
     match shard
         .unsubscribe(
             SubscriptionId(view.consumer_id()),
-            DrainMode::ReleaseAndRequeue,
-            now,
         )
         .await
     {
@@ -383,7 +404,6 @@ async fn dispatch_create_stream(
                 id: seq_stream,
                 name: name.to_vec(),
             },
-            view.journal_kind(),
         )
         .await
     {
@@ -424,7 +444,7 @@ async fn dispatch_delete_stream(
     let shard = server.shard_for(seq_stream);
 
     match shard
-        .delete_stream(seq_stream, DrainMode::ReleaseAndRequeue, true)
+        .delete_stream(seq_stream, true)
         .await
     {
         Ok(_) => {
@@ -611,7 +631,7 @@ async fn dispatch_delete_consumer(
     let shard = server.shard_for(seq_stream);
 
     match shard
-        .delete_consumer(ConsumerId(view.consumer_id()), DrainMode::ReleaseAndRequeue)
+        .delete_consumer(ConsumerId(view.consumer_id()))
         .await
     {
         Ok(_) => {
@@ -636,11 +656,10 @@ async fn dispatch_connect(
     registry: &ConnectionRegistry,
 ) {
     let _view = ConnectView::new(body);
-    let now = timestamp_now();
 
     for i in 0..server.shard_count() {
         let shard = server.shard(i);
-        let _ = shard.open_connection(ConnectionId(conn_id), NodeId(1), now).await;
+        let _ = shard.open_connection(ConnectionId(conn_id), NodeId(1)).await;
     }
 
     // Structs on stack, as_bytes() gives &[u8] pointing to them — no copy
@@ -659,12 +678,10 @@ async fn dispatch_disconnect(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let now = timestamp_now();
-
     for i in 0..server.shard_count() {
         let shard = server.shard(i);
         let _ = shard
-            .drain_connection(ConnectionId(conn_id), DrainMode::ReleaseAndRequeue, now)
+            .drain_connection(ConnectionId(conn_id))
             .await;
     }
 

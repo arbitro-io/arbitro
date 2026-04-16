@@ -15,6 +15,9 @@ arbitro-server = { path = "../arbitro-server" }
 arbitro-client = { path = "../arbitro-client" }
 tempfile       = { workspace = true }
 
+[features]
+lifecycle_trace = ["arbitro-server/lifecycle_trace"]
+
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,22 +1,21 @@
-//! CatalogApi — define what exists: streams, consumers, subscriptions.
+//! Catalog — entity lifecycle, match tables, binding management, demand.
 //!
 //! Level 5 — depends on Level 0-4.
 //!
-//! The catalog manages the logical plane: creating, finding, and removing
-//! streams, consumers, and subscriptions. It updates the match table,
-//! graph, and edges when entities are added or removed.
+//! Stores streams, consumers, subscriptions, and bindings directly — no
+//! external graph or edge dependency. Bindings use 3 secondary indices
+//! (`by_stream`, `by_consumer`, `by_connection`) for O(1) retire lookups.
 
 pub mod match_table;
 
 use std::collections::HashMap;
+
 use crate::error::{EngineError, EngineResult};
+use crate::events::DeltaEvents;
 use crate::types::*;
-use crate::graph::GraphStore;
-use crate::graph::node::*;
-use crate::edge::BuiltinEdges;
 use match_table::{MatchEntry, MatchTable};
 
-// ── Config types (input to catalog operations) ───────────────────────────────
+// ── Config types (input to catalog operations) ──────────────────────────────
 
 /// Configuration for creating a stream.
 #[derive(Debug, Clone)]
@@ -46,37 +45,116 @@ pub struct SubscriptionConfig {
     pub filters: Vec<Vec<u8>>,
 }
 
-// ── Catalog ──────────────────────────────────────────────────────────────────
+// ── Stored entities ─────────────────────────────────────────────────────────
 
-/// The catalog: manages entity lifecycle and match table consistency.
+/// Stream metadata.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    pub name: Vec<u8>,
+}
+
+/// Consumer metadata — stored directly in the catalog.
+#[derive(Debug, Clone)]
+pub struct ConsumerInfo {
+    pub stream_id: StreamId,
+    pub queue_id: QueueId,
+    pub max_inflight: u32,
+    pub paused: bool,
+    pub ack_policy: AckPolicy,
+    pub durable: bool,
+}
+
+/// Subscription metadata.
+#[derive(Debug, Clone)]
+pub struct SubscriptionInfo {
+    pub stream_id: StreamId,
+    pub consumer_id: ConsumerId,
+    pub filters: Vec<Vec<u8>>,
+}
+
+/// Pending delivery awaiting ack. Stored inline in `Binding`.
+///
+/// 16 bytes — `#[repr(C)]` for zerocopy compatibility.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct Pending {
+    pub seq: u64,
+    pub subject_hash: u32,
+    pub _pad: u32,
+}
+const _: () = assert!(core::mem::size_of::<Pending>() == 16);
+
+/// Active binding — subscription × connection. Per-binding pending
+/// tracking replaces the legacy global `PendingNode` slab.
+#[derive(Debug, Clone)]
+pub struct Binding {
+    pub binding_id: BindingId,
+    pub stream_id: StreamId,
+    pub consumer_id: ConsumerId,
+    pub connection_id: ConnectionId,
+    pub subscription_id: SubscriptionId,
+    pub queue_id: QueueId,
+    pub max_inflight: u32,
+    pub paused: bool,
+    pub fire_and_forget: bool,
+    /// In-flight messages awaiting ack. Inline in the binding —
+    /// `Vec<Pending>` for now, `SmallVec<[Pending; 4]>` once dep lands.
+    pub pending: Vec<Pending>,
+}
+
+/// Recipient resolved by `resolve_recipients` — ready for dispatch.
+#[derive(Debug, Clone, Copy)]
+pub struct Recipient {
+    pub binding_id: BindingId,
+    pub consumer_id: ConsumerId,
+    pub connection_id: ConnectionId,
+    pub subscription_id: SubscriptionId,
+    pub queue_id: QueueId,
+}
+
+// ── Catalog ─────────────────────────────────────────────────────────────────
+
+/// The catalog: entity lifecycle, match tables, bindings, demand tracking.
 pub struct Catalog {
-    /// Per-stream match tables. Dense `Vec<Option<MatchTable>>` indexed by
-    /// raw `stream_id`. `StreamId` is assigned monotonically and bounded
-    /// (typically <100), so a Vec with direct indexing beats a HashMap on
-    /// the hot path: one load + null-check vs hash + bucket walk.
-    /// See `performance.md` §11 (slab/array over HashMap on hot paths).
-    match_tables: Vec<Option<MatchTable>>,
+    // Entity storage — direct HashMap, no graph indirection.
+    streams: HashMap<StreamId, StreamInfo, ahash::RandomState>,
+    consumers: HashMap<ConsumerId, ConsumerInfo, ahash::RandomState>,
+    subscriptions: HashMap<SubscriptionId, SubscriptionInfo, ahash::RandomState>,
 
-    /// Map from domain IDs to slab keys.
-    stream_keys: HashMap<StreamId, SlabKey, ahash::RandomState>,
-    consumer_keys: HashMap<ConsumerId, SlabKey, ahash::RandomState>,
-    subscription_keys: HashMap<SubscriptionId, SlabKey, ahash::RandomState>,
-    queue_keys: HashMap<QueueId, SlabKey, ahash::RandomState>,
+    // Bindings with 3 secondary indices.
+    bindings: HashMap<BindingId, Binding, ahash::RandomState>,
+    by_stream: HashMap<StreamId, Vec<BindingId>, ahash::RandomState>,
+    by_consumer: HashMap<ConsumerId, Vec<BindingId>, ahash::RandomState>,
+    by_connection: HashMap<ConnectionId, Vec<BindingId>, ahash::RandomState>,
+    next_binding_id: u32,
+
+    // Connection tracking.
+    connections: HashMap<ConnectionId, NodeId, ahash::RandomState>,
+
+    // Demand counters: streams with ≥1 active binding.
+    demand: HashMap<StreamId, u32, ahash::RandomState>,
+
+    // Per-stream match tables.
+    match_tables: Vec<Option<MatchTable>>,
 }
 
 impl Catalog {
     pub fn new() -> Self {
         Self {
+            streams: HashMap::with_hasher(ahash::RandomState::new()),
+            consumers: HashMap::with_hasher(ahash::RandomState::new()),
+            subscriptions: HashMap::with_hasher(ahash::RandomState::new()),
+            bindings: HashMap::with_hasher(ahash::RandomState::new()),
+            by_stream: HashMap::with_hasher(ahash::RandomState::new()),
+            by_consumer: HashMap::with_hasher(ahash::RandomState::new()),
+            by_connection: HashMap::with_hasher(ahash::RandomState::new()),
+            next_binding_id: 1,
+            connections: HashMap::with_hasher(ahash::RandomState::new()),
+            demand: HashMap::with_hasher(ahash::RandomState::new()),
             match_tables: Vec::with_capacity(16),
-            stream_keys: HashMap::with_hasher(ahash::RandomState::new()),
-            consumer_keys: HashMap::with_hasher(ahash::RandomState::new()),
-            subscription_keys: HashMap::with_hasher(ahash::RandomState::new()),
-            queue_keys: HashMap::with_hasher(ahash::RandomState::new()),
         }
     }
 
-    /// Grow `match_tables` so it can hold `stream_id`. Grows in chunks of
-    /// 4 past the requested index to amortize resizes during startup.
     #[inline(always)]
     fn ensure_match_table_slot(&mut self, stream_id: StreamId) {
         let idx = stream_id.0 as usize;
@@ -85,207 +163,168 @@ impl Catalog {
         }
     }
 
-    // ── Stream ───────────────────────────────────────────────────────────
+    // ── Demand ──────────────────────────────────────────────────────────
+
+    /// Any stream has ≥1 active binding.
+    #[inline]
+    pub fn has_any_demand(&self) -> bool {
+        !self.demand.is_empty()
+    }
+
+    /// This stream has ≥1 active binding.
+    #[inline]
+    pub fn has_demand(&self, stream_id: StreamId) -> bool {
+        self.demand.get(&stream_id).copied().unwrap_or(0) > 0
+    }
+
+    fn inc_demand(&mut self, stream_id: StreamId, events: &mut DeltaEvents) {
+        let count = self.demand.entry(stream_id).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            events.demand_became_available.push(stream_id);
+        }
+    }
+
+    fn dec_demand(&mut self, stream_id: StreamId, events: &mut DeltaEvents) {
+        if let Some(count) = self.demand.get_mut(&stream_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.demand.remove(&stream_id);
+                events.demand_became_idle.push(stream_id);
+            }
+        }
+    }
+
+    // ── Stream ──────────────────────────────────────────────────────────
 
     /// Create or ensure a stream exists. Idempotent.
-    pub fn ensure_stream(
-        &mut self,
-        graph: &mut GraphStore,
-        config: StreamConfig,
-    ) -> EngineResult<SlabKey> {
-        if let Some(&key) = self.stream_keys.get(&config.id) {
-            return Ok(key);
+    pub fn ensure_stream(&mut self, config: StreamConfig) -> EngineResult<()> {
+        if self.streams.contains_key(&config.id) {
+            return Ok(());
         }
-
-        let node = StreamNode {
-            stream_id: config.id,
-            name: config.name,
-        };
-        let key = graph.insert_stream(node);
-        self.stream_keys.insert(config.id, key);
+        self.streams
+            .insert(config.id, StreamInfo { name: config.name });
         self.ensure_match_table_slot(config.id);
         let slot = &mut self.match_tables[config.id.0 as usize];
         if slot.is_none() {
             *slot = Some(MatchTable::new());
         }
-        Ok(key)
+        Ok(())
     }
 
-    /// Remove a stream from the catalog. Returns the graph key for removal.
-    pub fn remove_stream(
-        &mut self,
-        graph: &mut GraphStore,
-        id: StreamId,
-    ) -> EngineResult<()> {
-        let key = self.stream_keys.remove(&id)
-            .ok_or_else(EngineError::stream_not_found)?;
+    /// Remove a stream. Does NOT cascade bindings — caller must retire
+    /// bindings first via `retire_bindings_for_stream`.
+    pub fn remove_stream_entity(&mut self, id: StreamId) -> EngineResult<()> {
+        if self.streams.remove(&id).is_none() {
+            return Err(EngineError::stream_not_found());
+        }
         if let Some(slot) = self.match_tables.get_mut(id.0 as usize) {
             *slot = None;
         }
-        let _ = graph.remove_stream(key);
         Ok(())
     }
 
-    /// Get the slab key for a stream.
+    /// Stream exists?
     #[inline]
-    pub fn stream_key(&self, id: StreamId) -> EngineResult<SlabKey> {
-        self.stream_keys.get(&id).copied()
-            .ok_or_else(EngineError::stream_not_found)
+    pub fn stream_exists(&self, id: StreamId) -> bool {
+        self.streams.contains_key(&id)
     }
 
-    // ── Queue ────────────────────────────────────────────────────────────
-
-    /// Ensure a queue exists. Created implicitly when a consumer references it.
-    fn ensure_queue(
-        &mut self,
-        graph: &mut GraphStore,
-        queue_id: QueueId,
-        stream_id: StreamId,
-    ) -> SlabKey {
-        if let Some(&key) = self.queue_keys.get(&queue_id) {
-            return key;
-        }
-
-        let node = QueueNode {
-            queue_id,
-            stream_id,
-            paused: false,
-        };
-        let key = graph.insert_queue(node);
-        self.queue_keys.insert(queue_id, key);
-        key
-    }
-
-    /// Remove a queue from the catalog and graph.
-    /// Call drain_queue() first to release pending messages and ready state.
-    /// Only call when no consumers reference this queue.
-    pub fn remove_queue(
-        &mut self,
-        graph: &mut GraphStore,
-        queue_id: QueueId,
-    ) -> EngineResult<()> {
-        let key = self.queue_keys.remove(&queue_id)
-            .ok_or_else(EngineError::queue_not_found)?;
-        let _ = graph.remove_queue(key);
-        Ok(())
-    }
-
-    // ── Consumer ─────────────────────────────────────────────────────────
+    // ── Consumer ────────────────────────────────────────────────────────
 
     /// Create or ensure a consumer exists. Idempotent.
-    pub fn ensure_consumer(
-        &mut self,
-        graph: &mut GraphStore,
-        edges: &mut BuiltinEdges,
-        config: ConsumerConfig,
-    ) -> EngineResult<SlabKey> {
-        // Verify stream exists
-        let _ = self.stream_key(config.stream_id)?;
-
-        if let Some(&key) = self.consumer_keys.get(&config.id) {
-            return Ok(key);
+    pub fn ensure_consumer(&mut self, config: ConsumerConfig) -> EngineResult<()> {
+        if !self.streams.contains_key(&config.stream_id) {
+            return Err(EngineError::stream_not_found());
         }
-
-        // Ensure queue
-        self.ensure_queue(graph, config.queue_id, config.stream_id);
-
-        let node = ConsumerNode {
-            consumer_id: config.id,
-            queue_id: config.queue_id,
-            stream_id: config.stream_id,
-            durable: config.durable,
-            ack_policy: config.ack_policy,
-            max_inflight: config.max_inflight,
-            paused: false,
-        };
-        let key = graph.insert_consumer(node);
-        self.consumer_keys.insert(config.id, key);
-
-        // Register in edge indexes
-        edges.consumers_by_queue.insert(&config.queue_id, key);
-        edges.consumers_by_stream.insert(&config.stream_id, key);
-
-        Ok(key)
-    }
-
-    /// Remove a consumer from the catalog, graph, and edge indexes.
-    /// Also removes all subscriptions owned by this consumer.
-    /// Call drain_consumer() first to release pending messages and bindings.
-    pub fn remove_consumer(
-        &mut self,
-        graph: &mut GraphStore,
-        edges: &mut BuiltinEdges,
-        id: ConsumerId,
-    ) -> EngineResult<()> {
-        let key = self.consumer_keys.remove(&id)
-            .ok_or_else(EngineError::consumer_not_found)?;
-
-        // Remove subscriptions owned by this consumer
-        let sub_keys = edges.subscriptions_by_consumer.take(&id);
-        for sub_key in sub_keys {
-            if let Ok(sub_node) = graph.remove_subscription(sub_key) {
-                self.subscription_keys.remove(&sub_node.subscription_id);
-                edges.subscriptions_by_stream.remove(&sub_node.stream_id, &sub_key);
-                // Clean match table entries for this subscription
-                if let Some(mt) = self.match_tables
-                    .get_mut(sub_node.stream_id.0 as usize)
-                    .and_then(|s| s.as_mut())
-                {
-                    mt.remove_subscription(sub_node.subscription_id);
-                }
-            }
+        if self.consumers.contains_key(&config.id) {
+            return Ok(());
         }
-
-        // Remove consumer from graph
-        let node = graph.remove_consumer(key)?;
-
-        // Clean up consumer edge indexes
-        edges.consumers_by_queue.remove(&node.queue_id, &key);
-        edges.consumers_by_stream.remove(&node.stream_id, &key);
-
+        self.consumers.insert(
+            config.id,
+            ConsumerInfo {
+                stream_id: config.stream_id,
+                queue_id: config.queue_id,
+                max_inflight: config.max_inflight,
+                paused: false,
+                ack_policy: config.ack_policy,
+                durable: config.durable,
+            },
+        );
         Ok(())
     }
 
-    /// Get the slab key for a consumer.
-    #[inline]
-    pub fn consumer_key(&self, id: ConsumerId) -> EngineResult<SlabKey> {
-        self.consumer_keys.get(&id).copied()
-            .ok_or_else(EngineError::consumer_not_found)
+    /// Remove a consumer entity. Does NOT cascade — caller retires
+    /// bindings and subscriptions first.
+    pub fn remove_consumer_entity(&mut self, id: ConsumerId) -> EngineResult<()> {
+        self.consumers
+            .remove(&id)
+            .ok_or_else(EngineError::consumer_not_found)?;
+        Ok(())
     }
 
-    // ── Subscription ─────────────────────────────────────────────────────
+    /// Get consumer info.
+    #[inline]
+    pub fn consumer(&self, id: ConsumerId) -> Option<&ConsumerInfo> {
+        self.consumers.get(&id)
+    }
+
+    /// Is the consumer paused?
+    #[inline]
+    pub fn is_paused(&self, id: ConsumerId) -> bool {
+        self.consumers
+            .get(&id)
+            .map(|c| c.paused)
+            .unwrap_or(false)
+    }
+
+    /// Pause a consumer.
+    pub fn pause_consumer(&mut self, id: ConsumerId) -> bool {
+        if let Some(info) = self.consumers.get_mut(&id) {
+            info.paused = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Resume a consumer.
+    pub fn resume_consumer(&mut self, id: ConsumerId) -> bool {
+        if let Some(info) = self.consumers.get_mut(&id) {
+            info.paused = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    // ── Subscription ────────────────────────────────────────────────────
 
     /// Create or ensure a subscription exists. Updates match table.
-    pub fn ensure_subscription(
-        &mut self,
-        graph: &mut GraphStore,
-        edges: &mut BuiltinEdges,
-        config: SubscriptionConfig,
-    ) -> EngineResult<SlabKey> {
-        // Verify parent entities
-        let _ = self.stream_key(config.stream_id)?;
-        let consumer_key = self.consumer_key(config.consumer_id)?;
-        let consumer = graph.get_consumer(consumer_key)?;
+    pub fn ensure_subscription(&mut self, config: SubscriptionConfig) -> EngineResult<()> {
+        if !self.streams.contains_key(&config.stream_id) {
+            return Err(EngineError::stream_not_found());
+        }
+        let consumer = self
+            .consumers
+            .get(&config.consumer_id)
+            .ok_or_else(EngineError::consumer_not_found)?;
         let queue_id = consumer.queue_id;
 
-        if let Some(&key) = self.subscription_keys.get(&config.id) {
-            return Ok(key);
+        if self.subscriptions.contains_key(&config.id) {
+            return Ok(());
         }
 
-        let node = SubscriptionNode {
-            subscription_id: config.id,
-            stream_id: config.stream_id,
-            consumer_id: config.consumer_id,
-            filters: config.filters.clone(),
-        };
-        let key = graph.insert_subscription(node);
-        self.subscription_keys.insert(config.id, key);
+        self.subscriptions.insert(
+            config.id,
+            SubscriptionInfo {
+                stream_id: config.stream_id,
+                consumer_id: config.consumer_id,
+                filters: config.filters.clone(),
+            },
+        );
 
-        // Register in edge indexes
-        edges.subscriptions_by_consumer.insert(&config.consumer_id, key);
-        edges.subscriptions_by_stream.insert(&config.stream_id, key);
-
-        // Update match table
+        // Update match table.
         let match_entry = MatchEntry {
             consumer_id: config.consumer_id,
             queue_id,
@@ -300,38 +339,29 @@ impl Catalog {
             mt.add_catch_all(match_entry);
         } else {
             for filter in &config.filters {
-                // If filter contains wildcards, add as pattern
                 if filter.contains(&b'*') || filter.contains(&b'>') {
                     mt.add_pattern(filter.clone(), match_entry);
                 } else {
-                    // Exact filter — compute hash and add direct mapping
                     let hash = fnv1a_32(filter);
                     mt.add_exact(hash, match_entry);
                 }
             }
         }
 
-        Ok(key)
+        Ok(())
     }
 
-    /// Remove a single subscription from the catalog, graph, edges, and match table.
-    /// Call drain_subscription() first to release pending messages and bindings.
-    pub fn remove_subscription(
-        &mut self,
-        graph: &mut GraphStore,
-        edges: &mut BuiltinEdges,
-        id: SubscriptionId,
-    ) -> EngineResult<()> {
-        let key = self.subscription_keys.remove(&id)
+    /// Remove a subscription and clean match table. Does NOT cascade
+    /// bindings — caller retires bindings first.
+    pub fn remove_subscription_entity(&mut self, id: SubscriptionId) -> EngineResult<()> {
+        let info = self
+            .subscriptions
+            .remove(&id)
             .ok_or_else(EngineError::subscription_not_found)?;
 
-        let node = graph.remove_subscription(key)?;
-
-        edges.subscriptions_by_consumer.remove(&node.consumer_id, &key);
-        edges.subscriptions_by_stream.remove(&node.stream_id, &key);
-
-        if let Some(mt) = self.match_tables
-            .get_mut(node.stream_id.0 as usize)
+        if let Some(mt) = self
+            .match_tables
+            .get_mut(info.stream_id.0 as usize)
             .and_then(|s| s.as_mut())
         {
             mt.remove_subscription(id);
@@ -340,26 +370,166 @@ impl Catalog {
         Ok(())
     }
 
-    /// Get the slab key for a subscription.
+    /// Subscription IDs owned by a consumer.
+    pub fn subscriptions_for_consumer(&self, consumer_id: ConsumerId) -> Vec<SubscriptionId> {
+        self.subscriptions
+            .iter()
+            .filter(|(_, s)| s.consumer_id == consumer_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    // ── Connection ──────────────────────────────────────────────────────
+
+    /// Register a new connection.
+    pub fn open_connection(&mut self, connection_id: ConnectionId, node_id: NodeId) {
+        self.connections.insert(connection_id, node_id);
+    }
+
+    /// Remove connection from tracking. Does NOT cascade bindings —
+    /// caller retires them first.
+    pub fn remove_connection_entity(&mut self, connection_id: ConnectionId) {
+        self.connections.remove(&connection_id);
+    }
+
+    // ── Binding (subscribe/unsubscribe) ─────────────────────────────────
+
+    /// Create a binding: connect a subscription to a connection. Updates
+    /// match table with the connection_id and increments demand.
+    pub fn subscribe(
+        &mut self,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+        events: &mut DeltaEvents,
+    ) -> EngineResult<BindingId> {
+        let sub = self
+            .subscriptions
+            .get(&subscription_id)
+            .ok_or_else(EngineError::subscription_not_found)?;
+        let consumer = self
+            .consumers
+            .get(&sub.consumer_id)
+            .ok_or_else(EngineError::consumer_not_found)?;
+
+        let binding_id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+
+        let stream_id = sub.stream_id;
+        let consumer_id = sub.consumer_id;
+
+        let binding = Binding {
+            binding_id,
+            stream_id,
+            consumer_id,
+            connection_id,
+            subscription_id,
+            queue_id: consumer.queue_id,
+            max_inflight: consumer.max_inflight,
+            paused: consumer.paused,
+            fire_and_forget: consumer.ack_policy == AckPolicy::None,
+            pending: Vec::new(),
+        };
+
+        self.bindings.insert(binding_id, binding);
+        self.by_stream
+            .entry(stream_id)
+            .or_default()
+            .push(binding_id);
+        self.by_consumer
+            .entry(consumer_id)
+            .or_default()
+            .push(binding_id);
+        self.by_connection
+            .entry(connection_id)
+            .or_default()
+            .push(binding_id);
+
+        // Precompute connection_id in match entries.
+        self.bind_subscription_connection(stream_id, subscription_id, connection_id);
+
+        // Increment demand.
+        self.inc_demand(stream_id, events);
+
+        Ok(binding_id)
+    }
+
+    /// Retire a single binding. Removes from all indices, cleans match
+    /// table, decrements demand. Returns the binding data (including
+    /// pending entries) so the caller can release inflight credits.
+    ///
+    /// This is the `retire_binding` primitive from the plan — shared by
+    /// `delete_stream`, `delete_consumer`, `mark_connection_dead`.
+    pub fn retire_binding(
+        &mut self,
+        binding_id: BindingId,
+        events: &mut DeltaEvents,
+    ) -> Option<Binding> {
+        let binding = self.bindings.remove(&binding_id)?;
+
+        // Remove from secondary indices.
+        if let Some(v) = self.by_stream.get_mut(&binding.stream_id) {
+            v.retain(|b| *b != binding_id);
+        }
+        if let Some(v) = self.by_consumer.get_mut(&binding.consumer_id) {
+            v.retain(|b| *b != binding_id);
+        }
+        if let Some(v) = self.by_connection.get_mut(&binding.connection_id) {
+            v.retain(|b| *b != binding_id);
+        }
+
+        // Unbind from match table.
+        self.unbind_subscription_connection(binding.stream_id, binding.subscription_id);
+
+        // Decrement demand.
+        self.dec_demand(binding.stream_id, events);
+
+        events.bindings_retired.push(binding_id);
+
+        Some(binding)
+    }
+
+    // ── Binding access ──────────────────────────────────────────────────
+
+    /// Get binding by ID.
     #[inline]
-    pub fn subscription_key(&self, id: SubscriptionId) -> EngineResult<SlabKey> {
-        self.subscription_keys.get(&id).copied()
-            .ok_or_else(EngineError::subscription_not_found)
+    pub fn binding(&self, id: BindingId) -> Option<&Binding> {
+        self.bindings.get(&id)
     }
 
-    // ── Listing ──────────────────────────────────────────────────────────
-
-    /// Return all known stream IDs. Management path.
-    pub fn stream_ids(&self) -> Vec<StreamId> {
-        self.stream_keys.keys().copied().collect()
+    /// Get mutable binding by ID.
+    #[inline]
+    pub fn binding_mut(&mut self, id: BindingId) -> Option<&mut Binding> {
+        self.bindings.get_mut(&id)
     }
 
-    /// Return all known consumer IDs. Management path.
-    pub fn consumer_ids(&self) -> Vec<ConsumerId> {
-        self.consumer_keys.keys().copied().collect()
+    /// Binding IDs on a stream.
+    #[inline]
+    pub fn bindings_for_stream(&self, stream_id: StreamId) -> &[BindingId] {
+        self.by_stream
+            .get(&stream_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
-    // ── Match table access ───────────────────────────────────────────────
+    /// Binding IDs for a consumer.
+    #[inline]
+    pub fn bindings_for_consumer(&self, consumer_id: ConsumerId) -> &[BindingId] {
+        self.by_consumer
+            .get(&consumer_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Binding IDs on a connection.
+    #[inline]
+    pub fn bindings_for_connection(&self, connection_id: ConnectionId) -> &[BindingId] {
+        self.by_connection
+            .get(&connection_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    // ── Match table access ──────────────────────────────────────────────
 
     /// Get the match table for a stream. O(1) — direct Vec index.
     #[inline]
@@ -367,14 +537,13 @@ impl Catalog {
         self.match_tables.get(stream_id.0 as usize)?.as_ref()
     }
 
-    /// Get a mutable match table for pattern resolution. O(1) — direct Vec index.
+    /// Get a mutable match table. O(1).
     #[inline]
     pub fn match_table_mut(&mut self, stream_id: StreamId) -> Option<&mut MatchTable> {
         self.match_tables.get_mut(stream_id.0 as usize)?.as_mut()
     }
 
     /// Precompute connection_id in match entries for a subscription.
-    /// Called by bind. Management path — O(subjects + catch_all).
     pub fn bind_subscription_connection(
         &mut self,
         stream_id: StreamId,
@@ -387,7 +556,6 @@ impl Catalog {
     }
 
     /// Clear connection_id in match entries for a subscription.
-    /// Called by unbind. Management path.
     pub fn unbind_subscription_connection(
         &mut self,
         stream_id: StreamId,
@@ -398,14 +566,16 @@ impl Catalog {
         }
     }
 
-    /// Set max inflight per subject by pattern on a stream. Management path.
+    /// Set max inflight per subject by pattern on a stream.
     pub fn set_max_subject_inflight(
         &mut self,
         stream_id: StreamId,
         pattern: &[u8],
         max_inflight: u32,
     ) -> EngineResult<()> {
-        let _ = self.stream_key(stream_id)?;
+        if !self.streams.contains_key(&stream_id) {
+            return Err(EngineError::stream_not_found());
+        }
         self.ensure_match_table_slot(stream_id);
         let mt = self.match_tables[stream_id.0 as usize]
             .get_or_insert_with(MatchTable::new);
@@ -416,14 +586,13 @@ impl Catalog {
     /// Get the max inflight for a concrete subject hash. O(1).
     #[inline]
     pub fn max_subject_inflight(&self, stream_id: StreamId, subject_hash: u32) -> Option<u32> {
-        self.match_tables.get(stream_id.0 as usize)?
+        self.match_tables
+            .get(stream_id.0 as usize)?
             .as_ref()?
             .max_subject_inflight(subject_hash)
     }
 
-    /// Fast-path: does ANY subject on this stream have an inflight limit?
-    /// Called once per claim batch; when false the hot loop skips all
-    /// subject-limit HashMap lookups (~10-15 ns/msg).
+    /// Does any subject on this stream have an inflight limit?
     #[inline(always)]
     pub fn stream_has_subject_limits(&self, stream_id: StreamId) -> bool {
         self.match_tables
@@ -432,10 +601,40 @@ impl Catalog {
             .map(|mt| mt.has_subject_limits())
             .unwrap_or(false)
     }
+
+    // ── Listing ─────────────────────────────────────────────────────────
+
+    /// All stream IDs.
+    pub fn stream_ids(&self) -> Vec<StreamId> {
+        self.streams.keys().copied().collect()
+    }
+
+    /// All consumer IDs.
+    pub fn consumer_ids(&self) -> Vec<ConsumerId> {
+        self.consumers.keys().copied().collect()
+    }
+
+    /// List all streams with names.
+    pub fn list_streams(&self) -> Vec<(StreamId, Vec<u8>)> {
+        self.streams
+            .iter()
+            .map(|(id, info)| (*id, info.name.clone()))
+            .collect()
+    }
+
+    /// List all consumers.
+    pub fn list_consumers(&self) -> Vec<(ConsumerId, StreamId, QueueId, bool)> {
+        self.consumers
+            .iter()
+            .map(|(id, info)| (*id, info.stream_id, info.queue_id, info.paused))
+            .collect()
+    }
 }
 
 impl Default for Catalog {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── FNV-1a hash (inline, branch-free) ───────────────────────────────────────
@@ -456,35 +655,29 @@ pub fn fnv1a_32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    fn setup() -> (Catalog, GraphStore, BuiltinEdges) {
-        let catalog = Catalog::new();
-        let graph = GraphStore::new();
-        let edges = BuiltinEdges::new();
-        (catalog, graph, edges)
-    }
-
     #[test]
     fn ensure_stream_idempotent() {
-        let (mut cat, mut graph, _) = setup();
-        let k1 = cat.ensure_stream(&mut graph, StreamConfig {
+        let mut cat = Catalog::new();
+        cat.ensure_stream(StreamConfig {
             id: StreamId(1),
             name: b"orders".to_vec(),
-        }).unwrap();
-        let k2 = cat.ensure_stream(&mut graph, StreamConfig {
+        })
+        .unwrap();
+        cat.ensure_stream(StreamConfig {
             id: StreamId(1),
             name: b"orders".to_vec(),
-        }).unwrap();
-        assert_eq!(k1, k2);
+        })
+        .unwrap();
+        assert!(cat.stream_exists(StreamId(1)));
     }
 
     #[test]
     fn ensure_consumer_requires_stream() {
-        let (mut cat, mut graph, mut edges) = setup();
-
-        let result = cat.ensure_consumer(&mut graph, &mut edges, ConsumerConfig {
+        let mut cat = Catalog::new();
+        let result = cat.ensure_consumer(ConsumerConfig {
             id: ConsumerId(1),
             queue_id: QueueId(10),
-            stream_id: StreamId(999), // doesn't exist
+            stream_id: StreamId(999),
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 1000,
@@ -494,63 +687,145 @@ mod tests {
 
     #[test]
     fn full_catalog_lifecycle() {
-        let (mut cat, mut graph, mut edges) = setup();
+        let mut cat = Catalog::new();
 
-        // Create stream
-        cat.ensure_stream(&mut graph, StreamConfig {
-            id: StreamId(1), name: b"messages".to_vec(),
-        }).unwrap();
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"messages".to_vec(),
+        })
+        .unwrap();
 
-        // Create consumer
-        cat.ensure_consumer(&mut graph, &mut edges, ConsumerConfig {
+        cat.ensure_consumer(ConsumerConfig {
             id: ConsumerId(10),
             queue_id: QueueId(100),
             stream_id: StreamId(1),
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 10_000,
-        }).unwrap();
+        })
+        .unwrap();
 
-        // Create subscription with filters
-        cat.ensure_subscription(&mut graph, &mut edges, SubscriptionConfig {
+        cat.ensure_subscription(SubscriptionConfig {
             id: SubscriptionId(20),
             stream_id: StreamId(1),
             consumer_id: ConsumerId(10),
             filters: vec![b"message.meta.>".to_vec(), b"message.qr.>".to_vec()],
-        }).unwrap();
+        })
+        .unwrap();
 
-        // Match table has pattern entries
         let mt = cat.match_table(StreamId(1)).unwrap();
         assert_eq!(mt.pattern_count(), 2);
-
-        // Resolve a subject
-        let mt = cat.match_table_mut(StreamId(1)).unwrap();
-        mt.resolve_patterns(fnv1a_32(b"message.meta.123"), b"message.meta.123");
-        let result = mt.lookup(fnv1a_32(b"message.meta.123"));
-        assert_eq!(result.count(), 1);
     }
 
     #[test]
     fn catch_all_subscription() {
-        let (mut cat, mut graph, mut edges) = setup();
+        let mut cat = Catalog::new();
 
-        cat.ensure_stream(&mut graph, StreamConfig {
-            id: StreamId(1), name: b"all".to_vec(),
-        }).unwrap();
-        cat.ensure_consumer(&mut graph, &mut edges, ConsumerConfig {
-            id: ConsumerId(1), queue_id: QueueId(1), stream_id: StreamId(1),
-            durable: true, ack_policy: AckPolicy::Explicit, max_inflight: 100,
-        }).unwrap();
-        cat.ensure_subscription(&mut graph, &mut edges, SubscriptionConfig {
-            id: SubscriptionId(1), stream_id: StreamId(1), consumer_id: ConsumerId(1),
-            filters: vec![], // no filters = catch-all
-        }).unwrap();
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"all".to_vec(),
+        })
+        .unwrap();
+        cat.ensure_consumer(ConsumerConfig {
+            id: ConsumerId(1),
+            queue_id: QueueId(1),
+            stream_id: StreamId(1),
+            durable: true,
+            ack_policy: AckPolicy::Explicit,
+            max_inflight: 100,
+        })
+        .unwrap();
+        cat.ensure_subscription(SubscriptionConfig {
+            id: SubscriptionId(1),
+            stream_id: StreamId(1),
+            consumer_id: ConsumerId(1),
+            filters: vec![],
+        })
+        .unwrap();
 
         let mt = cat.match_table(StreamId(1)).unwrap();
         assert_eq!(mt.catch_all_count(), 1);
-        // Any subject matches
         let result = mt.lookup(0xABCD);
         assert_eq!(result.count(), 1);
+    }
+
+    #[test]
+    fn subscribe_creates_binding_and_demand() {
+        let mut cat = Catalog::new();
+        let mut events = DeltaEvents::default();
+
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"s".to_vec(),
+        })
+        .unwrap();
+        cat.ensure_consumer(ConsumerConfig {
+            id: ConsumerId(1),
+            queue_id: QueueId(1),
+            stream_id: StreamId(1),
+            durable: true,
+            ack_policy: AckPolicy::Explicit,
+            max_inflight: 100,
+        })
+        .unwrap();
+        cat.ensure_subscription(SubscriptionConfig {
+            id: SubscriptionId(1),
+            stream_id: StreamId(1),
+            consumer_id: ConsumerId(1),
+            filters: vec![],
+        })
+        .unwrap();
+        cat.open_connection(ConnectionId(42), NodeId(1));
+
+        let bid = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut events)
+            .unwrap();
+
+        assert!(cat.has_demand(StreamId(1)));
+        assert!(cat.has_any_demand());
+        assert!(cat.binding(bid).is_some());
+        assert_eq!(events.demand_became_available.len(), 1);
+    }
+
+    #[test]
+    fn retire_binding_decrements_demand() {
+        let mut cat = Catalog::new();
+        let mut events = DeltaEvents::default();
+
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"s".to_vec(),
+        })
+        .unwrap();
+        cat.ensure_consumer(ConsumerConfig {
+            id: ConsumerId(1),
+            queue_id: QueueId(1),
+            stream_id: StreamId(1),
+            durable: true,
+            ack_policy: AckPolicy::Explicit,
+            max_inflight: 100,
+        })
+        .unwrap();
+        cat.ensure_subscription(SubscriptionConfig {
+            id: SubscriptionId(1),
+            stream_id: StreamId(1),
+            consumer_id: ConsumerId(1),
+            filters: vec![],
+        })
+        .unwrap();
+        cat.open_connection(ConnectionId(42), NodeId(1));
+
+        let bid = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut events)
+            .unwrap();
+        assert!(cat.has_demand(StreamId(1)));
+
+        events = DeltaEvents::default();
+        let retired = cat.retire_binding(bid, &mut events);
+        assert!(retired.is_some());
+        assert!(!cat.has_demand(StreamId(1)));
+        assert_eq!(events.demand_became_idle.len(), 1);
+        assert_eq!(events.bindings_retired.len(), 1);
     }
 
     #[test]

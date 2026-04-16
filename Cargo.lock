@@ -89,7 +89,6 @@ dependencies = [
  "ahash",
  "bytes",
  "criterion",
- "tokio",
  "zerocopy",
 ]
 

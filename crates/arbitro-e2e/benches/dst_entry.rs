@@ -117,8 +117,10 @@ fn populate_store(wk: &Workload) -> MemoryStore {
         store
             .append(
                 EntryRef {
+                    stream_id: 0,
                     subject,
                     payload: &big_payload[..sz],
+                    flags: 0,
                 },
                 1_700_000_000_000,
             )

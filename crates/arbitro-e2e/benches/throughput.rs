@@ -120,6 +120,7 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn cpu_time_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -129,6 +130,11 @@ fn cpu_time_ns() -> u64 {
         libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts);
     }
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cpu_time_ns() -> u64 {
+    0
 }
 
 // ── Infrastructure ──────────────────────────────────────────────
@@ -347,15 +353,14 @@ async fn run_replay(
                     break;
                 }
                 count += 1;
-                if count % 50_000 == 0 {
+                let log_interval = if expected <= 1_000 { 100 } else { 50_000 };
+                if count % log_interval == 0 {
                     let dt = last_log.elapsed().as_millis();
-                    // eprintln!(
-                    //     "[bench replay iter={}] recv progress={} dt={}ms ({} msg/s)",
-                    //     iter,
-                    //     count,
-                    //     dt,
-                    //     if dt > 0 { 50_000_000 / dt } else { 0 },
-                    // );
+                    let batch = log_interval as u128;
+                    eprintln!(
+                        "[replay iter={iter}] progress={count}/{expected} dt={dt}ms ({} msg/s)",
+                        if dt > 0 { batch * 1000 / dt } else { 0 },
+                    );
                     last_log = Instant::now();
                 }
             }

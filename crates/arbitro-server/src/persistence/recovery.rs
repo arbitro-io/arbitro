@@ -5,15 +5,15 @@
 //! Since `MetadataApplier::apply` is sync, commands are buffered and
 //! flushed with `flush().await` after replay completes.
 
+use crate::shard::router::ShardRouter;
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_proto::metadata::{
-    MetadataApplier, MetadataCommandView,
-    CMD_CREATE_STREAM, CMD_DELETE_STREAM, CMD_CREATE_CONSUMER, CMD_DELETE_CONSUMER,
+    MetadataApplier, MetadataCommandView, CMD_CREATE_CONSUMER, CMD_CREATE_STREAM,
+    CMD_DELETE_CONSUMER, CMD_DELETE_STREAM,
 };
 use arbitro_proto::wire::manager::CreateConsumerView;
 use arbitro_proto::wire::stream::CreateStreamView;
-use crate::shard::router::ShardRouter;
 
 /// A buffered command for async replay.
 enum ReplayCommand {
@@ -47,7 +47,10 @@ pub struct ReplayApplier {
 
 impl ReplayApplier {
     pub fn new(server: ShardRouter) -> Self {
-        Self { server, commands: Vec::new() }
+        Self {
+            server,
+            commands: Vec::new(),
+        }
     }
 
     /// Dispatch all buffered commands to shards. Must be called after replay.
@@ -59,25 +62,40 @@ impl ReplayApplier {
 
         for cmd in self.commands.drain(..) {
             match cmd {
-                ReplayCommand::CreateStream { stream_id, config, journal_kind } => {
+                ReplayCommand::CreateStream {
+                    stream_id,
+                    config,
+                    journal_kind,
+                } => {
                     let shard = self.server.shard_for(stream_id);
-                    match shard.create_stream(config, journal_kind).await {
+                    let _ = journal_kind; // no longer needed — single store per shard
+                    match shard.create_stream(config).await {
                         Ok(true) => {
                             streams_recovered += 1;
                             tracing::debug!(?stream_id, "replayed CreateStream");
                         }
-                        Ok(false) => tracing::debug!(?stream_id, "CreateStream already exists (idempotent)"),
-                        Err(e) => tracing::error!(?stream_id, error = %e, "replay CreateStream failed"),
+                        Ok(false) => {
+                            tracing::debug!(?stream_id, "CreateStream already exists (idempotent)")
+                        }
+                        Err(e) => {
+                            tracing::error!(?stream_id, error = %e, "replay CreateStream failed")
+                        }
                     }
                 }
                 ReplayCommand::DeleteStream { stream_id } => {
                     let shard = self.server.shard_for(stream_id);
-                    match shard.delete_stream(stream_id, DrainMode::ReleaseAndRequeue, false).await {
+                    match shard.delete_stream(stream_id, false).await {
                         Ok(_) => tracing::debug!(?stream_id, "replayed DeleteStream"),
-                        Err(e) => tracing::error!(?stream_id, error = %e, "replay DeleteStream failed"),
+                        Err(e) => {
+                            tracing::error!(?stream_id, error = %e, "replay DeleteStream failed")
+                        }
                     }
                 }
-                ReplayCommand::CreateConsumer { stream_id, config, max_subject_inflights } => {
+                ReplayCommand::CreateConsumer {
+                    stream_id,
+                    config,
+                    max_subject_inflights,
+                } => {
                     let consumer_id = config.id;
                     let shard = self.server.shard_for(stream_id);
                     match shard.create_consumer(config, max_subject_inflights).await {
@@ -85,15 +103,25 @@ impl ReplayApplier {
                             consumers_recovered += 1;
                             tracing::debug!(?consumer_id, "replayed CreateConsumer");
                         }
-                        Ok(false) => tracing::debug!(?consumer_id, "CreateConsumer already exists (idempotent)"),
-                        Err(e) => tracing::error!(?consumer_id, error = %e, "replay CreateConsumer failed"),
+                        Ok(false) => tracing::debug!(
+                            ?consumer_id,
+                            "CreateConsumer already exists (idempotent)"
+                        ),
+                        Err(e) => {
+                            tracing::error!(?consumer_id, error = %e, "replay CreateConsumer failed")
+                        }
                     }
                 }
-                ReplayCommand::DeleteConsumer { stream_id, consumer_id } => {
+                ReplayCommand::DeleteConsumer {
+                    stream_id,
+                    consumer_id,
+                } => {
                     let shard = self.server.shard_for(stream_id);
-                    match shard.delete_consumer(consumer_id, DrainMode::ReleaseAndRequeue).await {
+                    match shard.delete_consumer(consumer_id).await {
                         Ok(_) => tracing::debug!(?consumer_id, "replayed DeleteConsumer"),
-                        Err(e) => tracing::error!(?consumer_id, error = %e, "replay DeleteConsumer failed"),
+                        Err(e) => {
+                            tracing::error!(?consumer_id, error = %e, "replay DeleteConsumer failed")
+                        }
                     }
                 }
             }
@@ -169,7 +197,8 @@ impl MetadataApplier for ReplayApplier {
                     }
                 };
                 self.server.names().remove_stream(wire_id);
-                self.commands.push(ReplayCommand::DeleteStream { stream_id });
+                self.commands
+                    .push(ReplayCommand::DeleteStream { stream_id });
             }
             CMD_CREATE_CONSUMER => {
                 let cv = CreateConsumerView::new(view.body());
@@ -186,7 +215,9 @@ impl MetadataApplier for ReplayApplier {
                 // matches the pre-restart one for any group sharing.
                 let group = cv.group();
                 let queue_id = self.server.names().get_or_create_queue(stream_id, group);
-                self.server.names().set_consumer_queue(consumer_id, queue_id);
+                self.server
+                    .names()
+                    .set_consumer_queue(consumer_id, queue_id);
 
                 let ack_policy = match cv.ack_policy() {
                     0 => AckPolicy::None,
@@ -206,7 +237,11 @@ impl MetadataApplier for ReplayApplier {
                         stream_id,
                         durable: true,
                         ack_policy,
-                        max_inflight: if cv.max_inflight() == 0 { u32::MAX } else { cv.max_inflight() as u32 },
+                        max_inflight: if cv.max_inflight() == 0 {
+                            u32::MAX
+                        } else {
+                            cv.max_inflight() as u32
+                        },
                     },
                     max_subject_inflights,
                 });
@@ -227,7 +262,10 @@ impl MetadataApplier for ReplayApplier {
                 });
             }
             _ => {
-                tracing::warn!(cmd_type = view.command_type(), "unknown metadata command type during replay");
+                tracing::warn!(
+                    cmd_type = view.command_type(),
+                    "unknown metadata command type during replay"
+                );
             }
         }
     }

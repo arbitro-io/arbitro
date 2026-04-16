@@ -1,19 +1,10 @@
-//! Runtime operations — all hot-path processing.
+//! Runtime operations — hot-path + cold-path processing.
 //!
 //! Level 7 — depends on everything below.
 //!
-//! Each submodule handles one operation type:
-//! - `publish`: dedup → match → enqueue ready
-//! - `claim`: pop ready → build PendingNode → register edges
-//! - `ack`: release_pending protocol (core primitive)
-//! - `bind`: subscription ↔ connection edge management
-//! - `drain`: connection, subscription, consumer, queue, node
+//! Simplified from the legacy 8-module runtime:
+//! - `execute`: Command dispatch → DeltaEvents (hot path).
+//! - `retire`: Shared binding retirement primitive (cold path).
 
-pub mod ack;
-pub mod publish;
-pub mod claim;
-pub mod bind;
-pub mod drain;
 pub mod execute;
-pub mod group_ops;
-pub mod seed;
+pub mod retire;

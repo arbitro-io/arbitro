@@ -1,17 +1,17 @@
 //! shard/ — single-threaded per-shard worker and its supporting types.
 //!
 //! * `command` — owned command types crossing the mpsc boundary.
+//! * `drain` — reactive linear-walk drain cycle (replaces legacy
+//!   claim-based drainer).
 //! * `handle` — async `ShardHandle` (tx + unpark).
+//! * `handlers` — command handler implementations (publish, ack, admin).
 //! * `router` — `ShardRouter` spawns shard threads and routes by stream_id.
 //! * `worker` — `ShardWorker` struct + run loop + dispatch.
-//! * `roles/` — one file per role (publisher, accumulator, acker, drainer,
-//!   seeder, admin). Each file adds `impl ShardWorker { ... }` with the
-//!   handlers owned by that role (see `.agent/rules/roles.md`).
 
 pub mod command;
-pub mod drainer_v2;
+pub mod drain;
 pub mod handle;
-pub mod roles;
+pub mod handlers;
 pub mod router;
 pub mod worker;
 
