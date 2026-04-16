@@ -363,7 +363,6 @@ impl ShardHandle {
             .send(cmd)
             .await
             .map_err(|_| SendError::SHARD_DOWN)?;
-        self.shard_thread.unpark();
         crate::lifecycle_trace!(
             "08_handle_send_done",
             0,

@@ -1,35 +1,37 @@
-//! Shard worker — owns an `ArbitroEngine` and a single store on a
-//! dedicated OS thread.
+//! Shard workers — drain thread + command thread, **zero Mutex**.
 //!
-//! Single store per shard (stream-agnostic). One cursor `u64` tracks
-//! drain progress. No async, no locks — pure `&mut engine` on its
-//! own thread.
+//! **Drain thread** (`drain-N`) — pure dedicated loop:
+//! ```text
+//! loop {
+//!     gate.acquire();
+//!     while gate.is_open() { drain_cycle(); }
+//! }
+//! ```
+//! Reads `SharedCounters` (atomics) + `SnapshotSwap<DrainSnapshot>` (Arc).
+//! Never touches the engine. Never blocks.
 //!
-//! **Loop structure** — two-phase design that isolates drain from overhead:
+//! **Command thread** (`cmd-N`) — owns `ArbitroEngine` exclusively:
+//! subscribe, ack, nack, pause, accumulator, admin. Mutates engine with
+//! `&mut self`. Updates `SharedCounters` atomically. Swaps `DrainSnapshot`
+//! on structural changes (subscribe/unsubscribe/bind).
 //!
-//! 1. **DRAIN PHASE** — tight `while gate.is_open()` inner loop.
-//!    `drain_cycle` runs back-to-back with ZERO overhead between cycles.
-//!    Exits only when gate locks (nothing to deliver) or cursor stalls
-//!    (downstream backpressure).
-//!
-//! 2. **IDLE PHASE** — reached only after drain exits.
-//!    Commands, accumulator flush, shutdown check, park.
-//!    All management overhead lives here, never in the drain path.
-//!
-//! Handlers live in sibling `handlers.rs`. Drain logic in `drain.rs`.
+//! **Zero Mutex between threads.** Drain and commands run fully in parallel.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arbitro_engine_v2::types::*;
-use arbitro_engine_v2::{ArbitroEngine, DeltaEvents};
+use arbitro_engine_v2::ArbitroEngine;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::router::SharedStore;
+use crate::shard::shared::{
+    DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap,
+};
 use crate::transport::ConnectionRegistry;
 
 // ── Cross-handler private types ──────────────────────────────────────────────
@@ -38,23 +40,16 @@ use crate::transport::ConnectionRegistry;
 ///
 /// Created by `handle_subscribe` / `handle_bind`, iterated by
 /// `drain::drain_cycle`, filtered on unsubscribe / delete.
-pub(super) struct ActiveBinding {
+pub struct ActiveBinding {
     pub(super) binding_id: BindingId,
     pub(super) connection_id: ConnectionId,
     pub(super) consumer_id: ConsumerId,
     pub(super) stream_id: StreamId,
-    /// Configured `max_inflight` cached at subscribe time. The drain hot
-    /// loop passes this to `engine.consumer_has_capacity()` (~3 ns) instead
-    /// of re-reading the catalog (~20 ns). Updated only on resubscribe.
+    pub(super) queue_id: QueueId,
+    /// Configured `max_inflight` cached at subscribe time.
     pub(super) max_inflight: u32,
-    /// `AckPolicy::None` — skip inflight tracking and capacity checks in
-    /// the drain hot path. Eliminates ~23 ns/msg (Vec read + comparison +
-    /// inflight inc + pending push) that serve no purpose without acks.
+    /// `AckPolicy::None` — skip inflight tracking and capacity checks.
     pub(super) fire_and_forget: bool,
-    /// Cached from `engine.is_paused()` — avoids HashMap lookup per entry
-    /// in the drain inner loop (~10 ns → ~1 ns). Updated by
-    /// `handle_pause_consumer` / `handle_resume_consumer`.
-    pub(super) paused: bool,
     /// Cached write-channel sender — cloned once from the registry at
     /// subscribe time (~26 ns). The drain uses `tx.try_send()` (~3 ns)
     /// for delivery, bypassing the registry Mutex entirely on the hot path.
@@ -65,11 +60,8 @@ pub(super) struct ActiveBinding {
 
 /// Flusher configuration — controls when accumulated entries are flushed.
 pub(super) struct FlusherConfig {
-    /// Flush immediately when accumulated entry count reaches this.
     pub(super) max_size: usize,
-    /// Flush immediately when accumulated bytes (subject + payload) reach this.
     pub(super) max_bytes: usize,
-    /// Milliseconds of silence after last entry before flushing.
     pub(super) interval_ms: u64,
 }
 
@@ -77,7 +69,7 @@ impl Default for FlusherConfig {
     fn default() -> Self {
         Self {
             max_size: 1024,
-            max_bytes: 4 * 1024 * 1024, // 4 MB
+            max_bytes: 4 * 1024 * 1024,
             interval_ms: 5,
         }
     }
@@ -97,116 +89,54 @@ pub(super) struct StreamAccum {
     pub(super) bytes: usize,
 }
 
-// ── Shard worker ─────────────────────────────────────────────────────────────
+// ── Drain worker ────────────────────────────────────────────────────────────
 
-/// A shard worker that exclusively owns an `ArbitroEngine` and a single
-/// stream-agnostic store.
+/// Pure drain thread — gate.acquire → drain_cycle → loop.
+/// Nothing else runs here. No commands, no engine, no Mutex.
 ///
-/// All fields are `pub(super)` so sibling handler/drain modules can extend the
-/// worker while respecting crate privacy.
-pub struct ShardWorker {
-    pub(super) engine: ArbitroEngine,
-    /// Shared store — publish writes (from dispatch), drain reads.
+/// Reads atomics (`SharedCounters`) and snapshots (`SnapshotSwap`)
+/// for all decisions. After delivery, increments atomic inflight and
+/// pushes notifications to the command thread via lock-free channel.
+pub struct DrainWorker {
+    pub(super) counters: Arc<SharedCounters>,
+    pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
     pub(super) store: SharedStore,
-    /// Drain cursor — the last seq processed. Drain walks from cursor+1.
-    pub(super) cursor: u64,
-    /// Lowest seq that was skipped during drain (capacity/subject/paused).
-    /// On ack/nack the cursor rewinds here so skipped entries get revisited.
-    pub(super) rewind_cursor: Option<u64>,
-    pub(super) rx: mpsc::Receiver<ShardCommand>,
     pub(super) gate: Arc<Gate>,
-    pub(super) registry: ConnectionRegistry,
-    /// Active bindings — iterated when gate is open to deliver.
-    pub(super) bindings: Vec<ActiveBinding>,
-    /// Data directory for disk-backed stores. None = memory only.
-    pub(super) data_dir: Option<String>,
-    /// Pre-allocated scratch buffers for the drain hot path — zero
-    /// steady-state allocations after warmup.
-    pub(super) drain_scratch: super::drain::DrainScratch,
-    // Flusher for PublishAccumulate — batches individual publishes
-    pub(super) flusher_config: FlusherConfig,
-    pub(super) accum_streams: HashMap<StreamId, StreamAccum>,
-    /// Deadline = last entry arrival + interval_ms. None = timer stopped.
-    pub(super) accum_deadline: Option<Instant>,
-    pub(super) accum_total: usize,
-    pub(super) accum_bytes: usize,
-    /// Shared name registry for engine-seq → client-wire id translation.
     pub(super) names: Arc<crate::common::NameRegistry>,
-    /// Drain configuration — max_feed, max_age, etc.
     pub(super) drain_config: super::drain::DrainConfig,
+    pub(super) drain_scratch: super::drain::DrainScratch,
+    pub(super) running: Arc<std::sync::atomic::AtomicBool>,
+    /// Notifications to command thread (deliveries + dead connections).
+    pub(super) notify_tx: mpsc::Sender<DrainNotification>,
 }
 
-impl ShardWorker {
-    /// Create a new shard worker.
-    pub fn new(
-        engine: ArbitroEngine,
-        store: SharedStore,
-        rx: mpsc::Receiver<ShardCommand>,
-        gate: Arc<Gate>,
-        registry: ConnectionRegistry,
-        data_dir: Option<String>,
-        names: Arc<crate::common::NameRegistry>,
-        max_feed_per_cycle: usize,
-        drain_batch_size: u16,
-    ) -> Self {
-        Self {
-            engine,
-            store,
-            cursor: 0,
-            rewind_cursor: None,
-            rx,
-            gate,
-            registry,
-            bindings: Vec::new(),
-            data_dir,
-            drain_scratch: super::drain::DrainScratch::new(),
-            flusher_config: FlusherConfig::default(),
-            accum_streams: HashMap::new(),
-            accum_deadline: None,
-            accum_total: 0,
-            accum_bytes: 0,
-            names,
-            drain_config: super::drain::DrainConfig {
-                max_feed: max_feed_per_cycle,
-                max_age_ms: 0, // 0 = no expiration (default)
-                batch_size: drain_batch_size,
-            },
-        }
-    }
-
-    /// Run the shard loop — two-phase: drain then idle.
-    ///
-    /// **Drain phase**: tight `while gate.is_open()` loop that runs
-    /// `drain_cycle` back-to-back with zero overhead between cycles.
-    /// Exits only when gate locks or cursor stalls on backpressure.
-    ///
-    /// **Idle phase**: process commands, flush accumulator, check
-    /// shutdown, park. All management overhead lives here.
+impl DrainWorker {
+    /// Pure drain loop — nothing else runs on this thread.
     pub fn run(mut self) {
         self.gate.set_worker(std::thread::current());
 
-        // ── Store init ────────────────────────────────────────────────────
+        // ── Store init ───────────────────────────────────────────────────
         {
-            let mut guard = self.store.lock().unwrap();
-            if let Err(e) = guard.init() {
+            let mut store_guard = self.store.lock().unwrap();
+            if let Err(e) = store_guard.init() {
                 tracing::error!(error = ?e, "store init failed");
             }
-            // Recover cursor from store — drain starts after existing data.
-            let info = guard.info();
+            let info = store_guard.info();
             if info.last_seq > 0 {
-                self.cursor = info.last_seq;
+                self.counters.set_cursor(info.last_seq);
             }
         }
 
-        'outer: loop {
-            // ═══════════════════════════════════════════════════════════
-            // DRAIN PHASE — tight inner loop, absolutely nothing else.
-            // Runs drain_cycle back-to-back while gate is open and the
-            // cursor makes progress. Zero overhead between cycles.
-            // ═══════════════════════════════════════════════════════════
+        loop {
+            self.gate.acquire();
+
+            if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
             while self.gate.is_open() {
                 crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
-                // Syscall only when TTL is enabled (max_age_ms > 0).
+
                 let now_ms = if self.drain_config.max_age_ms > 0 {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -215,108 +145,210 @@ impl ShardWorker {
                 } else {
                     0
                 };
-                let prev_cursor = self.cursor;
-                let delta = {
-                    let guard = self.store.lock().unwrap();
+
+                // Load snapshot — Arc clone (~3ns), no lock on engine.
+                let snap = self.snapshot.load();
+                let prev_cursor = self.counters.cursor();
+
+                // Check for rewind signal from command thread.
+                if let Some(rw) = self.counters.take_rewind() {
+                    let cur = self.counters.cursor();
+                    if rw > 0 && rw - 1 < cur {
+                        self.counters.set_cursor(rw - 1);
+                    }
+                }
+
+                {
+                    let store_guard = self.store.lock().unwrap();
                     super::drain::drain_cycle(
-                        &mut self.engine,
-                        &**guard,
-                        &mut self.cursor,
-                        &mut self.rewind_cursor,
-                        &self.bindings,
+                        &self.counters,
+                        &snap,
+                        &**store_guard,
                         &self.gate,
                         &self.names,
                         &self.drain_config,
                         &mut self.drain_scratch,
+                        &self.notify_tx,
                         now_ms,
-                    )
-                };
-                self.apply_delta(delta);
+                    );
+                }
+
+                let stalled = self.counters.cursor() == prev_cursor;
 
                 // Backpressure: cursor didn't advance → downstream full.
-                // Yield 50µs so the TCP writer thread gets CPU time to
-                // drain the channel. Without this, the shard thread
-                // busy-loops (drain → idle → gate.is_open() → drain)
-                // competing for CPU and starving the writer.
-                //
-                // Why 50µs: writer coalesces ~64 frames per write_vectored.
-                // At ~1µs/syscall, 50µs ≈ 3200 frames drained. Enough to
-                // unblock without excessive latency.
-                if self.cursor == prev_cursor && self.gate.is_open() {
+                if stalled && self.gate.is_open() {
                     std::thread::park_timeout(
                         std::time::Duration::from_micros(50),
                     );
                     break;
                 }
             }
+        }
+    }
+}
 
-            // ═══════════════════════════════════════════════════════════
-            // IDLE PHASE — reached only when drain has no work (gate
-            // locked) or stalled on backpressure. All overhead lives
-            // here, never inside the drain loop.
-            // ═══════════════════════════════════════════════════════════
+// ── Command worker ──────────────────────────────────────────────────────────
 
-            // Drain all pending commands (non-blocking).
-            while let Ok(cmd) = self.rx.try_recv() {
-                crate::lifecycle_trace!("09_worker_try_recv", 0, 0, "shard");
-                match cmd {
-                    ShardCommand::Shutdown => break 'outer,
-                    cmd => self.dispatch_command(cmd),
-                }
-            }
+/// Command task — owns `ArbitroEngine` exclusively. No Mutex.
+///
+/// Processes all ShardCommands as a tokio::spawn task. After engine
+/// mutations, updates `SharedCounters` atomically and swaps
+/// `DrainSnapshot` for structural changes.
+pub struct CommandWorker {
+    /// Engine — owned exclusively. `&mut self`, no sharing, no lock.
+    pub(super) engine: ArbitroEngine,
+    /// Atomic counters shared with drain.
+    pub(super) counters: Arc<SharedCounters>,
+    /// Structural snapshot shared with drain.
+    pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
+    pub(super) store: SharedStore,
+    pub(super) gate: Arc<Gate>,
+    pub(super) registry: ConnectionRegistry,
+    pub(super) names: Arc<crate::common::NameRegistry>,
+    pub(super) rx: mpsc::Receiver<ShardCommand>,
+    /// Notifications from drain thread (deliveries + dead connections).
+    pub(super) notify_rx: mpsc::Receiver<DrainNotification>,
+    pub(super) running: Arc<std::sync::atomic::AtomicBool>,
+    // Accumulator
+    pub(super) flusher_config: FlusherConfig,
+    pub(super) accum_streams: HashMap<StreamId, StreamAccum>,
+    pub(super) accum_deadline: Option<Instant>,
+    pub(super) accum_total: usize,
+    pub(super) accum_bytes: usize,
+    pub(super) drain_config_batch_size: u16,
+    /// Local bindings list — command thread's copy. Cloned into
+    /// `DrainSnapshot` on structural changes.
+    pub(super) bindings: Vec<ActiveBinding>,
+}
 
-            // Flush accumulator if thresholds met.
+impl CommandWorker {
+    /// Async command loop — runs as a `tokio::spawn` task.
+    pub async fn run(mut self) {
+        loop {
+            // Process any pending drain notifications first (non-blocking).
+            self.drain_notifications();
+
             if self.accum_total > 0 {
-                let force = self.accum_total >= self.flusher_config.max_size
-                    || self.accum_bytes >= self.flusher_config.max_bytes;
-                let expired = self
-                    .accum_deadline
-                    .is_some_and(|d| Instant::now() >= d);
-                if force || expired {
-                    self.flush_accumulator();
-                }
-            }
+                let timeout = self.accum_deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_millis(
+                        self.flusher_config.interval_ms,
+                    ));
 
-            // If gate opened during command processing (e.g. subscribe
-            // triggered demand_became_available) → re-enter drain now.
-            if self.gate.is_open() {
-                continue;
-            }
-
-            // Truly idle — park until woken by gate.release() or command.
-            if self.rx.is_empty() {
-                if let Some(deadline) = self.accum_deadline {
-                    let remaining =
-                        deadline.saturating_duration_since(Instant::now());
-                    if !remaining.is_zero() {
-                        std::thread::park_timeout(remaining);
+                tokio::select! {
+                    cmd = self.rx.recv() => {
+                        match cmd {
+                            Some(cmd) => {
+                                if self.handle_or_shutdown(cmd) {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
                     }
-                } else {
-                    self.gate.acquire();
+                    notif = self.notify_rx.recv() => {
+                        if let Some(n) = notif {
+                            self.handle_notification(n);
+                        }
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        self.flush_accumulator();
+                    }
+                }
+            } else {
+                tokio::select! {
+                    cmd = self.rx.recv() => {
+                        match cmd {
+                            Some(cmd) => {
+                                if self.handle_or_shutdown(cmd) {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
+                    }
+                    notif = self.notify_rx.recv() => {
+                        if let Some(n) = notif {
+                            self.handle_notification(n);
+                        }
+                    }
                 }
             }
         }
+    }
 
-        // ── Flush remaining accumulated entries before shutdown ───────────
-        self.flush_accumulator();
+    /// Process drain notifications (non-blocking batch drain).
+    pub(super) fn drain_notifications(&mut self) {
+        while let Ok(n) = self.notify_rx.try_recv() {
+            self.handle_notification(n);
+        }
+    }
 
-        // ── Store shutdown ────────────────────────────────────────────────
-        if let Err(e) = self.store.lock().unwrap().shutdown() {
-            tracing::error!(error = ?e, "store shutdown failed");
+    /// Handle a single drain notification.
+    fn handle_notification(&mut self, notif: DrainNotification) {
+        match notif {
+            DrainNotification::Delivered {
+                binding_id,
+                entries,
+                ..
+            } => {
+                // Update engine's pending list for future ack/retire.
+                use arbitro_engine_v2::command::Command;
+                let stream_id = self
+                    .engine
+                    .ctx()
+                    .catalog
+                    .binding(binding_id)
+                    .map(|b| b.stream_id)
+                    .unwrap_or(StreamId(0));
+                let _ = self.engine.execute(&Command::Delivered {
+                    stream_id,
+                    binding_id,
+                    entries: &entries,
+                });
+            }
+            DrainNotification::ConnectionDead(conn_id) => {
+                let delta = self.engine.mark_connection_dead(conn_id);
+                self.apply_delta_and_sync(&delta);
+            }
+        }
+    }
+
+    /// Returns `true` if shutdown was requested.
+    fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
+        if matches!(cmd, ShardCommand::Shutdown) {
+            self.flush_accumulator();
+            if let Err(e) = self.store.lock().unwrap().shutdown() {
+                tracing::error!(error = ?e, "store shutdown failed");
+            }
+            self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.gate.release();
+            return true;
+        }
+        self.dispatch_command(cmd);
+        false
+    }
+
+    pub(super) fn check_accumulator_flush(&mut self) {
+        if self.accum_total == 0 {
+            return;
+        }
+        let force = self.accum_total >= self.flusher_config.max_size
+            || self.accum_bytes >= self.flusher_config.max_bytes;
+        let expired = self
+            .accum_deadline
+            .is_some_and(|d| Instant::now() >= d);
+        if force || expired {
+            self.flush_accumulator();
         }
     }
 
     /// Dispatch a single command to its handler.
-    ///
-    /// Publish is NOT here — it goes directly to the store from the
-    /// dispatch layer, bypassing the drain thread entirely.
     fn dispatch_command(&mut self, cmd: ShardCommand) {
         match cmd {
-            // Hot path
             ShardCommand::PublishAccumulate(cmd) => self.handle_publish_accumulate(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
-            // Admin / cold path
             ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),
             ShardCommand::Unsubscribe(cmd) => self.handle_unsubscribe(cmd),
             ShardCommand::CreateStream(cmd) => self.handle_create_stream(cmd),
@@ -331,18 +363,62 @@ impl ShardWorker {
             ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
             ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
             ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
-            ShardCommand::Shutdown => {} // handled in run loop
+            ShardCommand::Shutdown => {}
         }
     }
 
-    /// React to engine events. Called after any mutation that returns
-    /// `DeltaEvents`.
-    pub(super) fn apply_delta(&mut self, delta: DeltaEvents) {
+    // ── Snapshot sync ──────────────────────────────────────────────────
+
+    /// Apply engine delta events and sync shared state.
+    /// Called after engine mutations that may retire bindings.
+    pub(super) fn apply_delta_and_sync(&mut self, delta: &arbitro_engine_v2::DeltaEvents) {
         if !delta.demand_became_available.is_empty() {
             self.gate.release();
         }
-        for binding_id in &delta.bindings_retired {
-            self.bindings.retain(|b| b.binding_id != *binding_id);
+        // Demand atomics are already updated by subscribe/unsubscribe handlers.
+        // DeltaEvents demand_became_available/idle are informational only here.
+        // Remove retired bindings
+        for &bid in &delta.bindings_retired {
+            self.bindings.retain(|b| b.binding_id != bid);
         }
+        if !delta.bindings_retired.is_empty() {
+            self.rebuild_and_swap_snapshot();
+        }
+    }
+
+    /// Rebuild the drain snapshot from current bindings + engine match tables
+    /// and swap it into the shared SnapshotSwap.
+    pub(super) fn rebuild_and_swap_snapshot(&self) {
+        let mut binding_index = HashMap::with_capacity(self.bindings.len());
+        // We need to clone bindings for the snapshot because drain holds Arc
+        // while we might modify our local copy later.
+        let snap_bindings: Vec<ActiveBinding> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                binding_index.insert((b.consumer_id.0, b.connection_id.0), i);
+                ActiveBinding {
+                    binding_id: b.binding_id,
+                    connection_id: b.connection_id,
+                    consumer_id: b.consumer_id,
+                    stream_id: b.stream_id,
+                    queue_id: b.queue_id,
+                    max_inflight: b.max_inflight,
+                    fire_and_forget: b.fire_and_forget,
+                    tx: b.tx.clone(),
+                }
+            })
+            .collect();
+
+        // Clone match tables from engine catalog.
+        let catalog = &self.engine.ctx().catalog;
+        let match_tables = catalog.clone_match_tables();
+
+        self.snapshot.store(DrainSnapshot {
+            bindings: snap_bindings,
+            binding_index,
+            match_tables,
+        });
     }
 }

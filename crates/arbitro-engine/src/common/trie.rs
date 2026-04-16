@@ -24,6 +24,7 @@ pub struct TrieNode {
 }
 
 /// Arena-based subject trie. All nodes in a contiguous `Vec`.
+#[derive(Clone)]
 pub struct SubjectTrie {
     nodes: Vec<TrieNode>,
 }

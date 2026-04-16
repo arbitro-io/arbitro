@@ -1,8 +1,8 @@
-//! Shard command handlers — all cold-path management ops + hot-path
-//! ack/nack/publish.
+//! Shard command handlers — all commands processed on the command thread.
 //!
-//! Each handler is an `impl ShardWorker` method, called from
-//! `dispatch_command` in `worker.rs`.
+//! The command thread **owns** the engine (`&mut self`). No Mutex.
+//! After engine mutations, handlers update `SharedCounters` atomically
+//! and swap `DrainSnapshot` for structural changes.
 
 use std::time::Duration;
 
@@ -14,13 +14,9 @@ use tokio::sync::mpsc;
 
 use crate::common::reply::{send_error, send_rep_ok};
 use crate::shard::command::*;
-use crate::shard::worker::{AccumCaller, ActiveBinding, ShardWorker, StreamAccum};
+use crate::shard::worker::{AccumCaller, ActiveBinding, CommandWorker, StreamAccum};
 
-impl ShardWorker {
-    // NOTE: handle_publish is NOT here — publish goes directly to the
-    // store from the dispatch layer. Publish and drain are independent
-    // services connected only by store (data) and gate (notification).
-
+impl CommandWorker {
     // ── Hot path — accumulator ──────────────────────────────────────────
 
     pub(in crate::shard) fn handle_publish_accumulate(
@@ -64,11 +60,12 @@ impl ShardWorker {
         self.accum_total += entry_count as usize;
         self.accum_bytes += entry_bytes;
 
-        // Reset timer on every new entry.
         let interval =
             Duration::from_millis(self.flusher_config.interval_ms);
         self.accum_deadline =
             Some(std::time::Instant::now() + interval);
+
+        self.check_accumulator_flush();
     }
 
     pub(in crate::shard) fn flush_accumulator(&mut self) {
@@ -133,7 +130,6 @@ impl ShardWorker {
             }
         }
 
-        // Stop timer — no data pending.
         self.accum_deadline = None;
         self.accum_total = 0;
         self.accum_bytes = 0;
@@ -149,6 +145,9 @@ impl ShardWorker {
             "shard"
         );
 
+        // Process pending drain notifications first so pending list is current.
+        self.drain_notifications();
+
         let delta = self.engine.execute(&Command::Ack {
             consumer_id: cmd.consumer_id,
             entries: &cmd.entries,
@@ -162,14 +161,20 @@ impl ShardWorker {
             "shard"
         );
 
-        if accepted > 0 {
-            // Rewind cursor so drain revisits entries that were skipped
-            // due to capacity/subject limits that are now freed.
-            if let Some(rw) = self.rewind_cursor.take() {
-                if rw > 0 {
-                    self.cursor = rw - 1;
-                }
+        // Decrement atomic inflight counters.
+        // The engine already decremented its internal counters via execute().
+        // Now sync the shared atomics so drain sees freed capacity.
+        if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
+            let queue_id = consumer.queue_id;
+            for _ in 0..accepted {
+                self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
             }
+        }
+
+        if accepted > 0 {
+            // Release gate so drain re-checks from current cursor.
+            // Cursor already stopped at lowest_skipped in drain_cycle,
+            // so freed capacity will be used on the next cycle.
             self.gate.release();
             crate::lifecycle_trace!(
                 "a13_acker_gate_released",
@@ -179,7 +184,8 @@ impl ShardWorker {
             );
         }
 
-        self.apply_delta(delta);
+        // Handle delta (demand changes, binding retirements).
+        self.apply_delta_and_sync(&delta);
 
         let _ = cmd.reply.send(AckReply {
             accepted,
@@ -189,30 +195,42 @@ impl ShardWorker {
     }
 
     pub(in crate::shard) fn handle_nack(&mut self, cmd: NackCmd) {
+        // Process pending drain notifications first.
+        self.drain_notifications();
+
         let delta = self.engine.execute(&Command::Nack {
             consumer_id: cmd.consumer_id,
             entries: &cmd.entries,
         });
 
         let requeued = cmd.entries.len() as u32;
-        self.apply_delta(delta);
+
+        // Decrement atomic inflight counters (nack releases inflight too).
+        if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
+            let queue_id = consumer.queue_id;
+            for _ in 0..requeued {
+                self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+            }
+        }
+
+        self.apply_delta_and_sync(&delta);
+
+        if requeued > 0 {
+            // Rewind cursor to re-scan nacked entries.
+            // Set cursor directly (nack wants immediate re-scan, not signal).
+            let min_seq = cmd.entries.iter().map(|e| e.seq).min().unwrap_or(0);
+            if min_seq > 0 {
+                let cur = self.counters.cursor();
+                self.counters.set_cursor(cur.min(min_seq - 1));
+            }
+            self.counters.clear_rewind();
+            self.gate.release();
+        }
 
         let _ = cmd.reply.send(NackReply {
             requeued,
             not_found: 0,
         });
-
-        // Rewind cursor so drain re-scans the nacked entries.
-        if requeued > 0 {
-            // Rewind to the lowest nacked seq.
-            let min_seq = cmd.entries.iter().map(|e| e.seq).min().unwrap_or(0);
-            if min_seq > 0 {
-                self.cursor = self.cursor.min(min_seq - 1);
-            }
-            // Also consume any pending rewind (nack trumps skip-rewind).
-            self.rewind_cursor = None;
-            self.gate.release();
-        }
     }
 
     // ── Admin — subscribe / unsubscribe ─────────────────────────────────
@@ -223,7 +241,6 @@ impl ShardWorker {
     ) {
         let connection_id = cmd.connection_id;
         let consumer_id = cmd.consumer_config.id;
-        let subscription_id = cmd.subscription_config.id;
 
         let stream_ok =
             self.engine.create_stream(cmd.stream_config).is_ok();
@@ -237,26 +254,25 @@ impl ShardWorker {
             .is_ok();
 
         if stream_ok && consumer_ok && sub_ok {
+            let subscription_id = SubscriptionId(consumer_id.0);
             let (result, events) =
                 self.engine.subscribe(connection_id, subscription_id);
 
             if let Ok(binding_id) = result {
-                // Cache hot-path data for the drainer.
                 let consumer = self.engine.consumer(consumer_id);
 
                 let max_inflight = consumer
                     .map(|c| c.max_inflight)
                     .unwrap_or(u32::MAX);
-
                 let stream_id = consumer
                     .map(|c| c.stream_id)
                     .unwrap_or(StreamId(0));
-
+                let queue_id = consumer
+                    .map(|c| c.queue_id)
+                    .unwrap_or(QueueId(0));
                 let fire_and_forget = consumer
                     .map(|c| c.ack_policy == AckPolicy::None)
                     .unwrap_or(false);
-
-                let paused = self.engine.is_paused(consumer_id);
 
                 let tx = self
                     .registry
@@ -271,21 +287,33 @@ impl ShardWorker {
                     connection_id,
                     consumer_id,
                     stream_id,
+                    queue_id,
                     max_inflight,
                     fire_and_forget,
-                    paused,
                     tx,
                 });
+
+                // Increment demand atomic (but DON'T release gate yet).
+                self.counters.inc_demand(stream_id.raw());
             }
 
-            self.apply_delta(events);
+            // Apply delta (bindings_retired cleanup).
+            // NOTE: gate.release() inside apply_delta_and_sync is safe because
+            // we rebuild snapshot below before returning.
+            let had_demand_event = !events.demand_became_available.is_empty();
+            for &bid in &events.bindings_retired {
+                self.bindings.retain(|b| b.binding_id != bid);
+            }
 
-            // Rewind cursor to 0 so the drain delivers historical
-            // messages to the new subscriber. Without this, messages
-            // published before the subscribe would never be delivered
-            // because the cursor has already advanced past them.
-            self.cursor = 0;
-            self.rewind_cursor = None;
+            // Rewind cursor BEFORE snapshot swap — drain must see cursor=0.
+            self.counters.set_cursor(0);
+            self.counters.clear_rewind();
+
+            // Rebuild snapshot BEFORE gate release — drain must see new binding.
+            self.rebuild_and_swap_snapshot();
+
+            // LAST: release gate — everything is ready.
+            self.gate.release();
         }
 
         let _ =
@@ -296,21 +324,22 @@ impl ShardWorker {
         &mut self,
         cmd: UnsubscribeCmd,
     ) {
-        // Find bindings for this subscription's consumer and retire them.
-        // Convention: SubscriptionId.0 == ConsumerId.0
         let consumer_id = ConsumerId(cmd.subscription_id.0);
         let binding_ids: Vec<_> = self
             .bindings
             .iter()
             .filter(|b| b.consumer_id == consumer_id)
-            .map(|b| b.binding_id)
+            .map(|b| (b.binding_id, b.stream_id))
             .collect();
 
-        for bid in binding_ids {
+        for (bid, stream_id) in binding_ids {
             let events = self.engine.unsubscribe(bid);
-            self.apply_delta(events);
+            // Decrement demand.
+            self.counters.dec_demand(stream_id.raw());
+            self.apply_delta_and_sync(&events);
         }
 
+        self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(true);
     }
 
@@ -321,6 +350,9 @@ impl ShardWorker {
         cmd: CreateStreamCmd,
     ) {
         let ok = self.engine.create_stream(cmd.config).is_ok();
+        if ok {
+            self.rebuild_and_swap_snapshot();
+        }
         let _ = cmd.reply.send(ok);
     }
 
@@ -328,10 +360,19 @@ impl ShardWorker {
         &mut self,
         cmd: DeleteStreamCmd,
     ) {
+        // Decrement demand for all bindings on this stream.
+        let stream_binding_count = self
+            .bindings
+            .iter()
+            .filter(|b| b.stream_id == cmd.stream_id)
+            .count();
+        for _ in 0..stream_binding_count {
+            self.counters.dec_demand(cmd.stream_id.raw());
+        }
+
         let events = self.engine.delete_stream(cmd.stream_id);
-        self.apply_delta(events);
-        // Single store — entries for this stream remain but are skipped
-        // by has_demand() returning false. No store removal needed.
+        self.apply_delta_and_sync(&events);
+        self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(true);
     }
 
@@ -357,8 +398,20 @@ impl ShardWorker {
         &mut self,
         cmd: DeleteConsumerCmd,
     ) {
+        // Decrement demand for all bindings of this consumer.
+        let consumer_bindings: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|b| b.consumer_id == cmd.consumer_id)
+            .map(|b| b.stream_id)
+            .collect();
+        for stream_id in consumer_bindings {
+            self.counters.dec_demand(stream_id.raw());
+        }
+
         let events = self.engine.delete_consumer(cmd.consumer_id);
-        self.apply_delta(events);
+        self.apply_delta_and_sync(&events);
+        self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(true);
     }
 
@@ -377,9 +430,21 @@ impl ShardWorker {
         &mut self,
         cmd: DrainConnectionCmd,
     ) {
+        // Decrement demand for all bindings of this connection.
+        let conn_bindings: Vec<_> = self
+            .bindings
+            .iter()
+            .filter(|b| b.connection_id == cmd.connection_id)
+            .map(|b| b.stream_id)
+            .collect();
+        for stream_id in conn_bindings {
+            self.counters.dec_demand(stream_id.raw());
+        }
+
         let events =
             self.engine.mark_connection_dead(cmd.connection_id);
-        self.apply_delta(events);
+        self.apply_delta_and_sync(&events);
+        self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(());
     }
 
@@ -391,7 +456,6 @@ impl ShardWorker {
             .subscribe(cmd.connection_id, cmd.subscription_id);
 
         if let Ok(binding_id) = result {
-            // SubscriptionId.0 == ConsumerId.0 by convention.
             let consumer_id = ConsumerId(cmd.subscription_id.0);
             let consumer = self.engine.consumer(consumer_id);
 
@@ -401,10 +465,12 @@ impl ShardWorker {
             let stream_id = consumer
                 .map(|c| c.stream_id)
                 .unwrap_or(StreamId(0));
+            let queue_id = consumer
+                .map(|c| c.queue_id)
+                .unwrap_or(QueueId(0));
             let fire_and_forget = consumer
                 .map(|c| c.ack_policy == AckPolicy::None)
                 .unwrap_or(false);
-            let paused = self.engine.is_paused(consumer_id);
 
             let tx = self
                 .registry
@@ -419,19 +485,30 @@ impl ShardWorker {
                 connection_id: cmd.connection_id,
                 consumer_id,
                 stream_id,
+                queue_id,
                 max_inflight,
                 fire_and_forget,
-                paused,
                 tx,
             });
 
-            // Rewind cursor so drain delivers pending messages to the
-            // newly-bound connection.
-            self.cursor = 0;
-            self.rewind_cursor = None;
+            // Increment demand (but don't release gate yet).
+            self.counters.inc_demand(stream_id.raw());
+
+            // Rewind cursor BEFORE snapshot.
+            self.counters.set_cursor(0);
+            self.counters.clear_rewind();
         }
 
-        self.apply_delta(events);
+        // Retire any bindings from delta.
+        for &bid in &events.bindings_retired {
+            self.bindings.retain(|b| b.binding_id != bid);
+        }
+
+        // Rebuild snapshot BEFORE gate release.
+        self.rebuild_and_swap_snapshot();
+
+        // LAST: release gate.
+        self.gate.release();
         let _ = cmd.reply.send(());
     }
 
@@ -469,7 +546,6 @@ impl ShardWorker {
         &mut self,
         cmd: StoreInfoCmd,
     ) {
-        // Single store — return aggregate stats regardless of stream_id.
         let info = self.store.lock().unwrap().info();
         let _ = cmd.reply.send(StoreInfoReply {
             messages: info.messages,
@@ -485,12 +561,7 @@ impl ShardWorker {
     ) {
         let ok = self.engine.pause_consumer(cmd.consumer_id);
         if ok {
-            // Sync cached flag so drain skips without HashMap lookup.
-            for b in &mut self.bindings {
-                if b.consumer_id == cmd.consumer_id {
-                    b.paused = true;
-                }
-            }
+            self.counters.set_paused(cmd.consumer_id.0, true);
         }
         let _ = cmd.reply.send(ok);
     }
@@ -501,12 +572,7 @@ impl ShardWorker {
     ) {
         let ok = self.engine.resume_consumer(cmd.consumer_id);
         if ok {
-            for b in &mut self.bindings {
-                if b.consumer_id == cmd.consumer_id {
-                    b.paused = false;
-                }
-            }
-            // Wake drain — unpaused consumer may have pending work.
+            self.counters.set_paused(cmd.consumer_id.0, false);
             self.gate.release();
         }
         let _ = cmd.reply.send(ok);

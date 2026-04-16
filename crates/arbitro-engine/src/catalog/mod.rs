@@ -543,6 +543,11 @@ impl Catalog {
         self.match_tables.get_mut(stream_id.0 as usize)?.as_mut()
     }
 
+    /// Clone all match tables. Used by command thread to build DrainSnapshot.
+    pub fn clone_match_tables(&self) -> Vec<Option<MatchTable>> {
+        self.match_tables.clone()
+    }
+
     /// Precompute connection_id in match entries for a subscription.
     pub fn bind_subscription_connection(
         &mut self,

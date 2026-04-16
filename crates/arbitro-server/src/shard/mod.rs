@@ -1,20 +1,21 @@
-//! shard/ — single-threaded per-shard worker and its supporting types.
+//! shard/ — drain thread + command thread per shard, **zero Mutex**.
 //!
 //! * `command` — owned command types crossing the mpsc boundary.
-//! * `drain` — reactive linear-walk drain cycle (replaces legacy
-//!   claim-based drainer).
+//! * `drain` — reactive linear-walk drain cycle (atomics + snapshot).
 //! * `handle` — async `ShardHandle` (tx + unpark).
-//! * `handlers` — command handler implementations (publish, ack, admin).
+//! * `handlers` — command handler implementations (ack, subscribe, admin).
 //! * `router` — `ShardRouter` spawns shard threads and routes by stream_id.
-//! * `worker` — `ShardWorker` struct + run loop + dispatch.
+//! * `shared` — lock-free shared state (SharedCounters, SnapshotSwap).
+//! * `worker` — `DrainWorker` (pure drain) + `CommandWorker` (owns engine).
 
 pub mod command;
 pub mod drain;
 pub mod handle;
 pub mod handlers;
 pub mod router;
+pub mod shared;
 pub mod worker;
 
 pub use handle::ShardHandle;
 pub use router::ShardRouter;
-pub use worker::ShardWorker;
+pub use worker::{CommandWorker, DrainWorker};

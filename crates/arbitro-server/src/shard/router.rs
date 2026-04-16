@@ -1,11 +1,14 @@
 //! ShardRouter — spawn shard workers, route commands by stream_id.
 //!
-//! Each shard has two independent services connected only by store + gate:
+//! Each shard has THREE independent services:
 //! - **Publish**: dispatch layer writes directly to the store, signals gate.
-//! - **Drain**: shard worker reads from store, delivers via engine oracle.
-//! They do not know each other.
+//! - **Drain**: dedicated OS thread reads from store, delivers via atomics.
+//! - **Commands**: tokio task processes ack/nack/subscribe/admin.
+//!
+//! **Zero Mutex between drain and commands.** Shared state is atomics +
+//! ArcSwap snapshots.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arbitro_engine_v2::types::StreamId;
 use arbitro_engine_v2::ArbitroEngine;
@@ -15,30 +18,24 @@ use tokio::sync::mpsc;
 use crate::common::{Gate, NameRegistry};
 use crate::config::Config;
 use crate::shard::handle::ShardHandle;
-use crate::shard::worker::ShardWorker;
+use crate::shard::shared::{DrainSnapshot, SharedCounters, SnapshotSwap};
+use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
 use crate::transport::ConnectionRegistry;
 
 /// Shared store handle — publish writes, drain reads.
-pub type SharedStore = Arc<Mutex<Box<dyn arbitro_store::Store>>>;
+pub type SharedStore = Arc<std::sync::Mutex<Box<dyn arbitro_store::Store>>>;
 
 /// Routes commands to the correct shard worker by stream_id.
-/// Clone-friendly — backed by Arc.
 #[derive(Clone)]
 pub struct ShardRouter {
     shards: Arc<[ShardHandle]>,
-    /// Per-shard shared store — publish writes, drain reads.
     stores: Arc<[SharedStore]>,
-    /// Per-shard gate — publish signals, drain consumes.
     gates: Arc<[Arc<Gate>]>,
-    /// Server-wide name → small-int registry. Required because the engine
-    /// catalog uses `StreamId` and `ConsumerId` as direct `Vec` indices, so
-    /// the server cannot derive them by hashing names. See
-    /// `common::name_registry` for full rationale.
     names: Arc<NameRegistry>,
 }
 
 impl ShardRouter {
-    /// Spawn N shard workers on dedicated OS threads.
+    /// Spawn N shard workers. Per shard: one drain OS thread + one command tokio task.
     pub fn spawn(config: &Config, registry: &ConnectionRegistry) -> Self {
         let shard_count = config.shard_count;
         let channel_capacity = config.channel_capacity;
@@ -53,7 +50,6 @@ impl ShardRouter {
             let engine = ArbitroEngine::new();
             let gate = Arc::new(Gate::new());
 
-            // Single store per shard — stream-agnostic.
             let store: Box<dyn arbitro_store::Store> = match &config.data_dir {
                 Some(dir) => {
                     let path = std::path::Path::new(dir)
@@ -63,34 +59,73 @@ impl ShardRouter {
                 }
                 None => Box::new(MemoryStore::new()),
             };
-            let shared_store: SharedStore = Arc::new(Mutex::new(store));
+            let shared_store: SharedStore = Arc::new(std::sync::Mutex::new(store));
 
-            let worker = ShardWorker::new(
+            // Shared atomics — zero Mutex, zero contention.
+            let counters = Arc::new(SharedCounters::new());
+
+            // Snapshot for drain — updated by command thread on structural changes.
+            let snapshot = Arc::new(SnapshotSwap::new(DrainSnapshot::empty()));
+
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+            // Notification channel: drain → command (deliveries + dead connections).
+            let (notify_tx, notify_rx) = mpsc::channel(8192);
+
+            // ── Drain thread — pure: gate.acquire → drain_cycle ──────
+            let drain_worker = DrainWorker {
+                counters: Arc::clone(&counters),
+                snapshot: Arc::clone(&snapshot),
+                store: Arc::clone(&shared_store),
+                gate: Arc::clone(&gate),
+                names: Arc::clone(&names),
+                drain_config: super::drain::DrainConfig {
+                    max_feed: config.max_feed_per_cycle,
+                    max_age_ms: 0,
+                    batch_size: config.drain_batch_size,
+                },
+                drain_scratch: super::drain::DrainScratch::new(),
+                running: Arc::clone(&running),
+                notify_tx,
+            };
+
+            let drain_handle = std::thread::Builder::new()
+                .name(format!("drain-{id}"))
+                .spawn(move || drain_worker.run())
+                .expect("failed to spawn drain thread");
+
+            let drain_thread = drain_handle.thread().clone();
+
+            // ── Command task — tokio::spawn, owns engine ────────────
+            let cmd_worker = CommandWorker {
                 engine,
-                Arc::clone(&shared_store),
+                counters: Arc::clone(&counters),
+                snapshot: Arc::clone(&snapshot),
+                store: Arc::clone(&shared_store),
+                gate: Arc::clone(&gate),
+                registry: registry.clone(),
+                names: Arc::clone(&names),
                 rx,
-                Arc::clone(&gate),
-                registry.clone(),
-                config.data_dir.clone(),
-                Arc::clone(&names),
-                config.max_feed_per_cycle,
-                config.drain_batch_size,
-            );
+                notify_rx,
+                running: Arc::clone(&running),
+                flusher_config: FlusherConfig::default(),
+                accum_streams: std::collections::HashMap::new(),
+                accum_deadline: None,
+                accum_total: 0,
+                accum_bytes: 0,
+                drain_config_batch_size: config.drain_batch_size,
+                bindings: Vec::new(),
+            };
+
+            tokio::spawn(cmd_worker.run());
 
             stores.push(Arc::clone(&shared_store));
             gates.push(Arc::clone(&gate));
 
-            // Named thread — mandatory per concurrency.md
-            let join_handle = std::thread::Builder::new()
-                .name(format!("shard-{id}"))
-                .spawn(move || worker.run())
-                .expect("failed to spawn shard thread");
-
-            let shard_thread = join_handle.thread().clone();
             handles.push(ShardHandle::new(
                 id as u32,
                 tx,
-                shard_thread,
+                drain_thread,
                 Arc::clone(&shared_store),
                 Arc::clone(&gate),
                 registry.clone(),
@@ -105,47 +140,39 @@ impl ShardRouter {
         }
     }
 
-    /// Shared name → small-int registry.
     #[inline]
     pub fn names(&self) -> &Arc<NameRegistry> {
         &self.names
     }
 
-    /// Shared store for a stream — used by publish (dispatch layer).
     #[inline]
     pub fn store_for(&self, stream_id: StreamId) -> &SharedStore {
         let idx = stream_id.raw() as usize % self.stores.len();
         &self.stores[idx]
     }
 
-    /// Shared gate for a stream — used by publish to notify drain.
     #[inline]
     pub fn gate_for(&self, stream_id: StreamId) -> &Arc<Gate> {
         let idx = stream_id.raw() as usize % self.gates.len();
         &self.gates[idx]
     }
 
-    /// Route to the shard that owns this stream.
-    /// Deterministic: stream_id.raw() % shard_count.
     #[inline]
     pub fn shard_for(&self, stream_id: StreamId) -> &ShardHandle {
         let idx = stream_id.raw() as usize % self.shards.len();
         &self.shards[idx]
     }
 
-    /// Get shard by index.
     #[inline]
     pub fn shard(&self, index: usize) -> &ShardHandle {
         &self.shards[index]
     }
 
-    /// Number of shards.
     #[inline]
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    /// Graceful shutdown — send Shutdown to all shards.
     pub fn shutdown(&self) {
         for shard in self.shards.iter() {
             shard.send_shutdown();

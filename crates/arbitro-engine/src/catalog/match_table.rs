@@ -31,6 +31,7 @@ pub struct MatchEntry {
 ///
 /// Built incrementally when subscriptions are added/removed.
 /// Lookup at publish time is O(1) hash + iterate matched consumers (typically 1-3).
+#[derive(Clone)]
 pub struct MatchTable {
     /// Exact subject_hash → matched consumers.
     exact: HashMap<u32, Vec<MatchEntry>, ahash::RandomState>,
@@ -172,6 +173,27 @@ impl MatchTable {
         });
 
         self.resolved_subjects.insert(subject_hash, true);
+    }
+
+    /// Resolve patterns for a subject without mutating self.
+    /// Used by the drain thread which reads a snapshot.
+    /// Results are collected into `out` — caller should cache.
+    pub fn resolve_patterns_readonly(
+        &self,
+        subject_hash: u32,
+        subject: &[u8],
+        out: &mut Vec<MatchEntry>,
+    ) {
+        if self.resolved_subjects.contains_key(&subject_hash) {
+            return;
+        }
+        let pattern_entries = &self.pattern_entries;
+        self.pattern_trie.find_matches(subject, |idx| {
+            let entry = &pattern_entries[idx as usize];
+            if !out.contains(entry) {
+                out.push(*entry);
+            }
+        });
     }
 
     // ── Subject limits ────────────────────────────────────────────────────
