@@ -1,8 +1,8 @@
-use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::thread;
 use arbitro_client::Client;
-use arbitro_proto::config::{DeliverMode, DeliverPolicy, AckPolicy, ConsumerConfig, StreamConfig};
+use arbitro_proto::config::StreamConfig;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  [Manager] Stream '{}' created.", stream_name);
 
     // 3. Spawn 2 Workers (Both using the same group name)
-    println!("  [Manager] Spawning 2 workers joining group '{}'...", group_name);
+    println!(
+        "  [Manager] Spawning 2 workers joining group '{}'...",
+        group_name
+    );
     let mut w1 = Command::new("./endurance_client")
         .env("ARBITRO_ADDR", server_addr)
         .env("ARBITRO_ROLE", "consumer")
@@ -60,7 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subject = b"queue.work";
     for i in 0..10000 {
         let payload = format!("msg-{}", i);
-        client.publish(stream_name.as_bytes(), subject, payload.as_bytes()).await?;
+        client
+            .publish(stream_name.as_bytes(), subject, payload.as_bytes())
+            .await?;
     }
     println!("  [Manager] Production finished.");
 
@@ -90,15 +95,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("SUCCESS: Load balancing verified!");
     } else {
         println!("FAILURE: Distribution unbalanced or incomplete.");
-        println!("\nDEBUG: Worker 1 Output (last 5 lines):\n{}", last_lines(&s1, 5));
-        println!("\nDEBUG: Worker 2 Output (last 5 lines):\n{}", last_lines(&s2, 5));
+        println!(
+            "\nDEBUG: Worker 1 Output (last 5 lines):\n{}",
+            last_lines(&s1, 5)
+        );
+        println!(
+            "\nDEBUG: Worker 2 Output (last 5 lines):\n{}",
+            last_lines(&s2, 5)
+        );
     }
 
     Ok(())
 }
 
 fn last_lines(s: &str, n: usize) -> String {
-    s.lines().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    s.lines()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_count(output: &str) -> u64 {
