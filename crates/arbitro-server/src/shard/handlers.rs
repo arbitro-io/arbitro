@@ -170,6 +170,7 @@ impl CommandWorker {
                 self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
             }
         }
+        // Subject inflight decremented by apply_delta_and_sync below.
 
         if accepted > 0 {
             // Release gate so drain re-checks from current cursor.
@@ -212,6 +213,7 @@ impl CommandWorker {
                 self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
             }
         }
+        // Subject inflight decremented by apply_delta_and_sync below.
 
         self.apply_delta_and_sync(&delta);
 

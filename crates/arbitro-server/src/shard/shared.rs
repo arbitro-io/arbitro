@@ -23,6 +23,11 @@ use crate::shard::worker::ActiveBinding;
 /// Indices beyond this panic — resize if needed for huge deployments.
 const SLOT_COUNT: usize = 4096;
 
+/// Bucket count for subject inflight tracking. subject_hash % SUBJECT_SLOTS.
+/// Collisions are conservative (over-count = fewer deliveries, never over-limit).
+/// 16384 buckets × 4 bytes = 64KB — fits L1 cache.
+const SUBJECT_SLOTS: usize = 16384;
+
 /// Sentinel value for "no rewind requested".
 const NO_REWIND: u64 = u64::MAX;
 
@@ -43,6 +48,9 @@ pub struct SharedCounters {
     total_demand: AtomicU32,
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
+    /// Subject inflight buckets. Index = subject_hash % SUBJECT_SLOTS.
+    /// Collisions conservative: over-count → early pause, never over-limit.
+    subject: Box<[AtomicU32]>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -64,12 +72,19 @@ impl SharedCounters {
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         };
+        let mk_subject = || -> Box<[AtomicU32]> {
+            (0..SUBJECT_SLOTS)
+                .map(|_| AtomicU32::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        };
         Self {
             consumer: mk_u32(),
             queue: mk_u32(),
             demand: mk_u32(),
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
+            subject: mk_subject(),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
         }
@@ -110,6 +125,31 @@ impl SharedCounters {
     #[inline]
     pub fn consumer_has_capacity(&self, consumer_id: u32, max_inflight: u32) -> bool {
         self.consumer_inflight(consumer_id) < max_inflight
+    }
+
+    // ── Subject inflight (drain: add, ack: sub) ─────────────────────
+
+    #[inline]
+    fn subject_slot(subject_hash: u32) -> usize {
+        subject_hash as usize % SUBJECT_SLOTS
+    }
+
+    /// Increment subject inflight after delivery. Called by drain.
+    #[inline]
+    pub fn inc_subject(&self, subject_hash: u32) {
+        self.subject[Self::subject_slot(subject_hash)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement subject inflight after ack. Called by command thread.
+    #[inline]
+    pub fn dec_subject(&self, subject_hash: u32) {
+        self.subject[Self::subject_slot(subject_hash)].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Check if subject has room for more inflight messages.
+    #[inline]
+    pub fn subject_has_room(&self, subject_hash: u32, max: u32) -> bool {
+        self.subject[Self::subject_slot(subject_hash)].load(Ordering::Relaxed) < max
     }
 
     // ── Demand (subscribe: add, unsubscribe: sub) ────────────────────

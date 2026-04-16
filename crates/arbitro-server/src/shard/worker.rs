@@ -375,6 +375,10 @@ impl CommandWorker {
         if !delta.demand_became_available.is_empty() {
             self.gate.release();
         }
+        // Decrement subject inflight for acked/retired pendings.
+        for &sh in &delta.subject_hashes_acked {
+            self.counters.dec_subject(sh);
+        }
         // Demand atomics are already updated by subscribe/unsubscribe handlers.
         // DeltaEvents demand_became_available/idle are informational only here.
         // Remove retired bindings

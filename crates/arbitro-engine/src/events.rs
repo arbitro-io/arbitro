@@ -22,6 +22,9 @@ pub struct DeltaEvents {
     /// Bindings retired by `delete_stream`, `delete_consumer`, or
     /// `mark_connection_dead`.
     pub bindings_retired: Vec<BindingId>,
+    /// Subject hashes whose inflight was decremented by ack.
+    /// Used by the handler to sync `SharedCounters::dec_subject`.
+    pub subject_hashes_acked: Vec<u32>,
 }
 
 impl DeltaEvents {
@@ -32,6 +35,7 @@ impl DeltaEvents {
             .extend(other.demand_became_available);
         self.demand_became_idle.extend(other.demand_became_idle);
         self.bindings_retired.extend(other.bindings_retired);
+        self.subject_hashes_acked.extend(other.subject_hashes_acked);
     }
 
     /// True if no events were emitted.
@@ -40,6 +44,7 @@ impl DeltaEvents {
         self.demand_became_available.is_empty()
             && self.demand_became_idle.is_empty()
             && self.bindings_retired.is_empty()
+            && self.subject_hashes_acked.is_empty()
     }
 }
 

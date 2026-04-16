@@ -235,6 +235,32 @@ impl MatchTable {
         self.max_subject_inflights.get(&subject_hash).copied()
     }
 
+    /// Resolve wildcard subject limits without mutating self.
+    /// Used by drain thread on a snapshot. Returns the min limit found,
+    /// or None if no wildcard patterns match.
+    pub fn resolve_subject_limit_readonly(
+        &self,
+        subject_hash: u32,
+        subject: &[u8],
+    ) -> Option<u32> {
+        // Already resolved (literal or previous resolve_patterns call)?
+        if let Some(&limit) = self.max_subject_inflights.get(&subject_hash) {
+            return Some(limit);
+        }
+        // Walk limit trie for wildcard patterns.
+        if self.limit_patterns.is_empty() {
+            return None;
+        }
+        let limit_values = &self.limit_values;
+        let mut min_limit: Option<u32> = None;
+        self.limit_trie.find_matches(subject, |idx| {
+            let max_inflight = limit_values[idx as usize];
+            let entry = min_limit.get_or_insert(u32::MAX);
+            *entry = (*entry).min(max_inflight);
+        });
+        min_limit
+    }
+
     /// Fast-path: does ANY subject on this stream have an inflight limit?
     /// The claim hot loop checks this once per batch and skips
     /// `max_subject_inflight` HashMap lookups entirely when false.

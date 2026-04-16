@@ -79,6 +79,8 @@ pub(in crate::shard) struct DrainScratch {
     pending: PendingBatch,
     /// Local pattern resolution cache. Avoids mutating shared match table.
     resolve_cache: std::collections::HashMap<(u32, u32), Vec<MatchEntry>>,
+    /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
+    subject_limit_cache: std::collections::HashMap<(u32, u32), Option<u32>>,
 }
 
 impl DrainScratch {
@@ -90,6 +92,7 @@ impl DrainScratch {
             dead_connections: Vec::with_capacity(4),
             pending: PendingBatch::new(),
             resolve_cache: std::collections::HashMap::with_capacity(64),
+            subject_limit_cache: std::collections::HashMap::with_capacity(64),
         }
     }
 }
@@ -240,8 +243,25 @@ fn process_drain_entry(
         }
     }
 
-    // Subject room check — skip for now (subject tracking is optional).
-    // TODO: add atomic subject inflight when track_subject is enabled.
+    // Subject inflight check — resolve limit and check atomic counter.
+    if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
+        if mt.has_subject_limits() {
+            let cache_key = (stream_id.raw(), subject_hash);
+            let limit = scratch
+                .subject_limit_cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
+                });
+            if let Some(max) = *limit {
+                if !counters.subject_has_room(subject_hash, max) {
+                    *more_pending = true;
+                    track_skipped(lowest_skipped, entry.seq);
+                    return;
+                }
+            }
+        }
+    }
 
     // Collect match entries into scratch.
     scratch.matches.clear();
@@ -476,12 +496,12 @@ fn flush_pending_batch(
 
             // Increment atomic inflight counters.
             if !binding.fire_and_forget {
-                let count = pending.delivered.len() as u32;
-                for _ in 0..count {
+                for de in &pending.delivered {
                     counters.inc_inflight(
                         binding.consumer_id.0,
                         binding.queue_id.0,
                     );
+                    counters.inc_subject(de.subject_hash);
                 }
             }
 

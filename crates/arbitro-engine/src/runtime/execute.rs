@@ -21,7 +21,7 @@ use crate::events::DeltaEvents;
 /// Hot path. Must be branch-predictable and alloc-free at steady state.
 #[inline]
 pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
-    let events = DeltaEvents::default();
+    let mut events = DeltaEvents::default();
     let m = &ctx.metrics;
 
     match *cmd {
@@ -80,6 +80,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             binding.pending.iter().position(|p| p.seq == ack.seq)
                         {
                             let pending = binding.pending.swap_remove(pos);
+                            events.subject_hashes_acked.push(pending.subject_hash);
                             ctx.inflight.dec_pending(
                                 pending.subject_hash,
                                 consumer_id.raw(),
@@ -108,6 +109,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             binding.pending.iter().position(|p| p.seq == ack.seq)
                         {
                             let pending = binding.pending.swap_remove(pos);
+                            events.subject_hashes_acked.push(pending.subject_hash);
                             ctx.inflight.dec_pending(
                                 pending.subject_hash,
                                 consumer_id.raw(),
