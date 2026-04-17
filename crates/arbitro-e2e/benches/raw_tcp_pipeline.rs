@@ -220,7 +220,6 @@ fn encode_frame_into(scratch: &mut Vec<u8>, batch: usize, seq: &mut u64) {
     scratch.extend_from_slice(env.as_bytes());
 
     let rep = RepBatchFixed {
-        consumer_id: U32::new(42),
         count: U16::new(batch as u16),
         _pad: U16::new(0),
     };
@@ -231,9 +230,11 @@ fn encode_frame_into(scratch: &mut Vec<u8>, batch: usize, seq: &mut u64) {
 
     for _ in 0..batch {
         let hdr = DeliveryEntryHeader {
+            consumer_id: U32::new(42),
             seq: U64::new(*seq),
             subj_len: U16::new(SUBJECT.len() as u16),
             data_len: U32::new(data_len as u32),
+            subject_hash: U32::new(0),
         };
         scratch.extend_from_slice(hdr.as_bytes());
         scratch.extend_from_slice(SUBJECT);

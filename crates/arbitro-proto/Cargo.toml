@@ -8,3 +8,7 @@ license.workspace = true
 zerocopy = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+
+[[bench]]
+name = "rep_batch"
+harness = false

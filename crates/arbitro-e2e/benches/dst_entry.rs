@@ -216,7 +216,6 @@ fn scene_frame_bytesmut_prod(store: &MemoryStore) -> (Duration, u64) {
         scratch.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
         scratch.extend_from_slice(
             RepBatchFixed {
-                consumer_id: U32::new(1),
                 count: U16::new(count),
                 _pad: U16::new(0),
             }
@@ -229,9 +228,11 @@ fn scene_frame_bytesmut_prod(store: &MemoryStore) -> (Duration, u64) {
                 let subj_len = e.subject.len();
                 let data_len = subj_len + e.payload.len();
                 let header = DeliveryEntryHeader {
+                    consumer_id: U32::new(1),
                     seq: U64::new(e.seq),
                     subj_len: U16::new(subj_len as u16),
                     data_len: U32::new(data_len as u32),
+                    subject_hash: U32::new(0),
                 };
                 body.extend_from_slice(header.as_bytes());
                 body.extend_from_slice(e.subject);

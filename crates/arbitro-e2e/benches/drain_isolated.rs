@@ -345,7 +345,6 @@ fn build_rep_batch(
     // RepBatchFixed header.
     body.extend_from_slice(
         RepBatchFixed {
-            consumer_id: U32::new(consumer_id),
             count: U16::new(entries.len() as u16),
             _pad: U16::new(0),
         }
@@ -357,6 +356,7 @@ fn build_rep_batch(
         let data_len = subj_len + e.payload.len();
         body.extend_from_slice(
             DeliveryEntryHeader {
+                consumer_id: U32::new(consumer_id),
                 seq: U64::new(e.seq),
                 subj_len: U16::new(subj_len as u16),
                 data_len: U32::new(data_len as u32),
@@ -511,7 +511,7 @@ fn client_read_drain(mut reader: TcpStream, expected: usize) -> usize {
             let batch_body = &ring[ENVELOPE_SIZE..total];
             if batch_body.len() >= REP_BATCH_FIXED_SIZE {
                 let entry_count =
-                    u16::from_le_bytes([batch_body[4], batch_body[5]]) as usize;
+                    u16::from_le_bytes([batch_body[0], batch_body[1]]) as usize;
                 count += entry_count;
             }
 

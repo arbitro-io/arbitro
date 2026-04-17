@@ -34,7 +34,6 @@ fn build_frame(count: usize, payload_size: usize) -> Bytes {
     );
     body.extend_from_slice(
         RepBatchFixed {
-            consumer_id: U32::new(1),
             count: U16::new(count as u16),
             _pad: U16::new(0),
         }
@@ -42,9 +41,11 @@ fn build_frame(count: usize, payload_size: usize) -> Bytes {
     );
     for seq in 0..count {
         let header = DeliveryEntryHeader {
+            consumer_id: U32::new(1),
             seq: U64::new(seq as u64),
             subj_len: U16::new(subj_len as u16),
             data_len: U32::new(data_len as u32),
+            subject_hash: U32::new(0),
         };
         body.extend_from_slice(header.as_bytes());
         body.extend_from_slice(subject);

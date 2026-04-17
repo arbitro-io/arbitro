@@ -87,12 +87,11 @@ const _: () = assert!(core::mem::size_of::<RepErrorAction>() == 16);
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct RepBatchFixed {
-    pub consumer_id: U32,
     pub count: U16,
     pub _pad: U16,
 }
 pub const REP_BATCH_FIXED_SIZE: usize = core::mem::size_of::<RepBatchFixed>();
-const _: () = assert!(REP_BATCH_FIXED_SIZE == 8);
+const _: () = assert!(REP_BATCH_FIXED_SIZE == 4);
 
 /// 18B — Per-entry header inside a RepBatch.
 ///
@@ -106,13 +105,14 @@ const _: () = assert!(REP_BATCH_FIXED_SIZE == 8);
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct DeliveryEntryHeader {
+    pub consumer_id: U32,
     pub seq: U64,
     pub subj_len: U16,
     pub data_len: U32,
     pub subject_hash: U32,
 }
 pub const DELIVERY_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<DeliveryEntryHeader>();
-const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 18);
+const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 22);
 
 // ── Lazy views ──────────────────────────────────────────────────────────────
 
@@ -272,9 +272,6 @@ impl<'a> RepBatchView<'a> {
     }
 
     #[inline(always)]
-    pub fn consumer_id(&self) -> u32 { self.fixed().consumer_id.get() }
-
-    #[inline(always)]
     pub fn count(&self) -> u16 { self.fixed().count.get() }
 
     /// Iterator over delivered entries.
@@ -295,6 +292,7 @@ pub struct RepBatchEntryIter<'a> {
 }
 
 pub struct RepBatchEntry<'a> {
+    pub consumer_id: u32,
     pub seq: u64,
     pub subject_hash: u32,
     pub subject: &'a [u8],
@@ -312,6 +310,7 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let header = DeliveryEntryHeader::ref_from_bytes(
             &self.buf[self.offset..self.offset + DELIVERY_ENTRY_HEADER_SIZE]
         ).unwrap();
+        let consumer_id = header.consumer_id.get();
         let seq = header.seq.get();
         let subj_len = header.subj_len.get() as usize;
         let data_len = header.data_len.get() as usize;
@@ -323,6 +322,6 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let payload = &self.buf[self.offset + subj_len..self.offset + subj_len + payload_len];
         self.offset += data_len;
 
-        Some(RepBatchEntry { seq, subject_hash, subject, payload })
+        Some(RepBatchEntry { consumer_id, seq, subject_hash, subject, payload })
     }
 }

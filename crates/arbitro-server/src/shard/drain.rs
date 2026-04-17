@@ -43,18 +43,31 @@ pub(in crate::shard) struct DrainConfig {
 
 // ── Pending batch ───────────────────────────────────────────────────────────
 
+/// Per-entry metadata tracked alongside the wire body.
+struct PendingDelivery {
+    entry: DeliveredEntry,
+    binding_idx: usize,
+    consumer_id: u32,
+    queue_id: u32,
+    fire_and_forget: bool,
+}
+
 struct PendingBatch {
-    binding_idx: Option<usize>,
+    /// Connection index — all entries in a batch target the same connection.
+    connection_id: Option<ConnectionId>,
+    /// Index of any binding on this connection (for tx handle).
+    tx_binding_idx: Option<usize>,
     count: u16,
     first_seq: u64,
     stream_id: StreamId,
-    delivered: Vec<DeliveredEntry>,
+    delivered: Vec<PendingDelivery>,
 }
 
 impl PendingBatch {
     fn new() -> Self {
         Self {
-            binding_idx: None,
+            connection_id: None,
+            tx_binding_idx: None,
             count: 0,
             first_seq: 0,
             stream_id: StreamId(0),
@@ -63,7 +76,8 @@ impl PendingBatch {
     }
 
     fn reset(&mut self) {
-        self.binding_idx = None;
+        self.connection_id = None;
+        self.tx_binding_idx = None;
         self.count = 0;
         self.delivered.clear();
     }
@@ -362,10 +376,10 @@ fn dispatch_recipients(
             continue;
         }
 
-        // ── Batch accumulation ─────────────────────────────────────────
+        // ── Batch accumulation (grouped by connection) ────────────────
 
-        if let Some(prev_idx) = pending.binding_idx {
-            if prev_idx != binding_idx {
+        if let Some(prev_conn) = pending.connection_id {
+            if prev_conn != connection_id {
                 flush_pending_batch(
                     counters, body, pending, bindings, names,
                     notify_tx, more_pending, lowest_skipped,
@@ -378,18 +392,18 @@ fn dispatch_recipients(
             }
         }
 
-        if pending.binding_idx.is_none() {
+        if pending.connection_id.is_none() {
             body.clear();
             body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
             body.extend_from_slice(
                 RepBatchFixed {
-                    consumer_id: U32::new(consumer_id.0),
                     count: U16::new(0),
                     _pad: U16::new(0),
                 }
                 .as_bytes(),
             );
-            pending.binding_idx = Some(binding_idx);
+            pending.connection_id = Some(connection_id);
+            pending.tx_binding_idx = Some(binding_idx);
             pending.count = 0;
             pending.first_seq = entry.seq;
             pending.stream_id = stream_id;
@@ -400,6 +414,7 @@ fn dispatch_recipients(
         let data_len = subj_len + entry.payload.len();
         body.extend_from_slice(
             DeliveryEntryHeader {
+                consumer_id: U32::new(consumer_id.0),
                 seq: U64::new(entry.seq),
                 subj_len: U16::new(subj_len as u16),
                 data_len: U32::new(data_len as u32),
@@ -411,16 +426,24 @@ fn dispatch_recipients(
         body.extend_from_slice(entry.payload);
 
         pending.count += 1;
-        pending.delivered.push(DeliveredEntry {
-            seq: entry.seq,
-            subject_hash,
-            _pad: 0,
+        pending.delivered.push(PendingDelivery {
+            entry: DeliveredEntry {
+                seq: entry.seq,
+                subject_hash,
+                _pad: 0,
+            },
+            binding_idx,
+            consumer_id: consumer_id.0,
+            queue_id: queue_id.0,
+            fire_and_forget: binding.fire_and_forget,
         });
 
         served_queues.push(queue_id);
 
-        let effective_limit = if binding.fire_and_forget { batch_size } else { 1 };
-        if pending.count >= effective_limit {
+        // Flush only when batch reaches max size (fire-and-forget accumulation).
+        // For ack consumers, flush happens AFTER all recipients of this entry
+        // are processed — see below.
+        if pending.count >= batch_size {
             flush_pending_batch(
                 counters, body, pending, bindings, names,
                 notify_tx, more_pending, lowest_skipped,
@@ -430,6 +453,19 @@ fn dispatch_recipients(
                 return;
             }
         }
+    }
+
+    // After all recipients for this entry: flush if any ack-mode entry was added.
+    // This keeps latency low for explicit-ack consumers while still grouping
+    // all recipients of the same store entry into one frame.
+    if pending.count > 0
+        && pending.delivered.iter().any(|d| !d.fire_and_forget)
+    {
+        flush_pending_batch(
+            counters, body, pending, bindings, names,
+            notify_tx, more_pending, lowest_skipped,
+            channel_full, dead_connections,
+        );
     }
 }
 
@@ -447,7 +483,7 @@ fn flush_pending_batch(
     channel_full: &mut bool,
     dead_connections: &mut Vec<ConnectionId>,
 ) {
-    let binding_idx = match pending.binding_idx {
+    let tx_binding_idx = match pending.tx_binding_idx {
         Some(idx) => idx,
         None => return,
     };
@@ -456,11 +492,12 @@ fn flush_pending_batch(
         return;
     }
 
-    let binding = &bindings[binding_idx];
+    let tx_binding = &bindings[tx_binding_idx];
     let stream_id = pending.stream_id;
+    let connection_id = pending.connection_id.unwrap_or(ConnectionId(0));
 
-    // Patch RepBatchFixed count.
-    let count_offset = ENVELOPE_SIZE + 4;
+    // Patch RepBatchFixed count (offset 0 in fixed header, right after envelope).
+    let count_offset = ENVELOPE_SIZE;
     body[count_offset..count_offset + 2]
         .copy_from_slice(&pending.count.to_le_bytes());
 
@@ -479,39 +516,35 @@ fn flush_pending_batch(
 
     crate::lifecycle_trace!(
         "29_frame_built",
-        binding.connection_id.0,
+        connection_id.0,
         pending.count as u64,
         "shard"
     );
 
     let frozen = body.split().freeze();
-    match binding.tx.try_send(frozen) {
+    match tx_binding.tx.try_send(frozen) {
         Ok(()) => {
             crate::lifecycle_trace!(
                 "30_send_bytes_done",
-                binding.connection_id.0,
+                connection_id.0,
                 pending.count as u64,
                 "shard"
             );
 
-            // Increment atomic inflight counters.
-            if !binding.fire_and_forget {
-                for de in &pending.delivered {
-                    counters.inc_inflight(
-                        binding.consumer_id.0,
-                        binding.queue_id.0,
-                    );
-                    counters.inc_subject(de.subject_hash);
+            // Increment atomic inflight counters (per-entry metadata).
+            for pd in &pending.delivered {
+                if !pd.fire_and_forget {
+                    counters.inc_inflight(pd.consumer_id, pd.queue_id);
+                    counters.inc_subject(pd.entry.subject_hash);
                 }
             }
 
-            // Notify command thread of delivery (for pending maintenance).
-            let _ = notify_tx.try_send(DrainNotification::Delivered {
-                binding_id: binding.binding_id,
-                consumer_id: binding.consumer_id,
-                queue_id: binding.queue_id,
-                entries: std::mem::take(&mut pending.delivered),
-            });
+            // Notify command thread — group by binding_id.
+            notify_delivered_grouped(
+                notify_tx,
+                bindings,
+                &mut pending.delivered,
+            );
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             *more_pending = true;
@@ -519,11 +552,54 @@ fn flush_pending_batch(
             track_skipped(lowest_skipped, pending.first_seq);
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            dead_connections.push(binding.connection_id);
+            dead_connections.push(connection_id);
         }
     }
 
     pending.reset();
+}
+
+/// Group delivered entries by binding_id and send one notification per binding.
+fn notify_delivered_grouped(
+    notify_tx: &mpsc::Sender<DrainNotification>,
+    bindings: &[ActiveBinding],
+    delivered: &mut Vec<PendingDelivery>,
+) {
+    // Fast path: all entries belong to the same binding.
+    if let Some(first) = delivered.first() {
+        let first_idx = first.binding_idx;
+        if delivered.iter().all(|d| d.binding_idx == first_idx) {
+            let binding = &bindings[first_idx];
+            let entries: Vec<DeliveredEntry> = delivered.iter().map(|d| d.entry).collect();
+            let _ = notify_tx.try_send(DrainNotification::Delivered {
+                binding_id: binding.binding_id,
+                consumer_id: binding.consumer_id,
+                queue_id: binding.queue_id,
+                entries,
+            });
+            return;
+        }
+    }
+
+    // Slow path: mixed bindings — group and send one notification each.
+    // Sort by binding_idx to group contiguous runs.
+    delivered.sort_unstable_by_key(|d| d.binding_idx);
+    let mut i = 0;
+    while i < delivered.len() {
+        let idx = delivered[i].binding_idx;
+        let mut entries = Vec::new();
+        while i < delivered.len() && delivered[i].binding_idx == idx {
+            entries.push(delivered[i].entry);
+            i += 1;
+        }
+        let binding = &bindings[idx];
+        let _ = notify_tx.try_send(DrainNotification::Delivered {
+            binding_id: binding.binding_id,
+            consumer_id: binding.consumer_id,
+            queue_id: binding.queue_id,
+            entries,
+        });
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

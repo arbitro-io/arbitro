@@ -398,27 +398,30 @@ impl Inner {
         }
     }
 
-    /// RepBatch frame: batch of delivered entries for a consumer.
-    /// Body format: [8B RepBatchFixed][N × (14B entry_header + subject + payload)]
+    /// RepBatch frame: batch of delivered entries (may contain mixed consumers).
+    /// Body format: [4B RepBatchFixed][N × (22B entry_header + subject + payload)]
     fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
-        let consumer_id = view.consumer_id();
         let subs = self.subscriptions.read().unwrap();
         let ack_tx = self.ack_tx.read().unwrap().clone();
 
-        let entries = match subs.get(&stream_id).and_then(|m| m.get(&consumer_id)) {
-            Some(e) => e,
+        let by_consumer = match subs.get(&stream_id) {
+            Some(m) => m,
             None => return,
         };
 
         for entry in view.entries() {
-            for &(_, ref sub) in entries {
+            let targets = match by_consumer.get(&entry.consumer_id) {
+                Some(t) => t,
+                None => continue,
+            };
+            for &(_, ref sub) in targets {
                 if sub.matches(entry.subject) {
                     let msg = Message {
                         seq: entry.seq,
                         subject: Box::from(entry.subject),
                         payload: Bytes::copy_from_slice(entry.payload),
-                        consumer_id,
+                        consumer_id: entry.consumer_id,
                         stream_id,
                         ack_tx: ack_tx.clone(),
                         inner: Arc::clone(self),

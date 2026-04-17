@@ -66,7 +66,7 @@ mod tests {
     fn validate_sizes() {
         assert_eq!(size_of::<BatchHeader>(), 16 + 2);
         assert_eq!(size_of::<PublishHeader>(), 16 + 2 + 12);
-        assert_eq!(size_of::<DeliverBatchHeader>(), 16 + 8); 
+        assert_eq!(size_of::<DeliverBatchHeader>(), 16 + 4);
         assert_eq!(size_of::<RepOkHeader>(), 16 + 16); 
         assert_eq!(size_of::<RepErrorHeader>(), 16 + 16); 
     }
