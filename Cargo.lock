@@ -105,6 +105,7 @@ dependencies = [
 name = "arbitro-server"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arbitro-client",
  "arbitro-common",
  "arbitro-engine",

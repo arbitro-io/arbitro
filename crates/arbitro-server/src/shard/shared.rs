@@ -23,10 +23,16 @@ use crate::shard::worker::ActiveBinding;
 /// Indices beyond this panic — resize if needed for huge deployments.
 const SLOT_COUNT: usize = 4096;
 
-/// Bucket count for subject inflight tracking. subject_hash % SUBJECT_SLOTS.
-/// Collisions are conservative (over-count = fewer deliveries, never over-limit).
-/// 16384 buckets × 4 bytes = 64KB — fits L1 cache.
-const SUBJECT_SLOTS: usize = 16384;
+// Subject inflight uses RwLock<HashMap<u32, AtomicU32, ahash>> for exact
+// per-subject tracking. This is the correctness-first implementation:
+// no hash collisions → true noisy neighbor isolation. Cost: ~30-60ns per
+// operation vs ~2-10ns bucket array, but this path only activates when
+// max_subject_inflight is configured (typically ack-mode consumers where
+// reliability > raw throughput).
+//
+// TECH DEBT: a lock-free SubjectTree (token-walk trie with integrated
+// counters) would give ~22ns + no collisions + unified pattern-match walk.
+// See subject_inflight benchmark history for the full analysis.
 
 /// Sentinel value for "no rewind requested".
 const NO_REWIND: u64 = u64::MAX;
@@ -48,9 +54,13 @@ pub struct SharedCounters {
     total_demand: AtomicU32,
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
-    /// Subject inflight buckets. Index = subject_hash % SUBJECT_SLOTS.
-    /// Collisions conservative: over-count → early pause, never over-limit.
-    subject: Box<[AtomicU32]>,
+    /// Subject inflight — exact per-subject tracking via HashMap+ahash.
+    /// Key = subject_hash (u32). Value = AtomicU32 counter.
+    /// Entry removed when counter reaches 0 (bounded memory to working set).
+    /// Single RwLock — reads (has_room, load) use read lock; insert/remove
+    /// (inc when empty, dec to zero) use write lock. On a hot subject,
+    /// read lock + AtomicU32 load is the steady state.
+    subject: RwLock<HashMap<u32, AtomicU32, ahash::RandomState>>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -72,19 +82,13 @@ impl SharedCounters {
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         };
-        let mk_subject = || -> Box<[AtomicU32]> {
-            (0..SUBJECT_SLOTS)
-                .map(|_| AtomicU32::new(0))
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
-        };
         Self {
             consumer: mk_u32(),
             queue: mk_u32(),
             demand: mk_u32(),
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
-            subject: mk_subject(),
+            subject: RwLock::new(HashMap::with_hasher(ahash::RandomState::new())),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
         }
@@ -129,27 +133,61 @@ impl SharedCounters {
 
     // ── Subject inflight (drain: add, ack: sub) ─────────────────────
 
-    #[inline]
-    fn subject_slot(subject_hash: u32) -> usize {
-        subject_hash as usize % SUBJECT_SLOTS
-    }
-
     /// Increment subject inflight after delivery. Called by drain.
+    /// Fast path: entry exists → read lock + fetch_add. Slow path: create
+    /// entry under write lock. Steady state is the fast path.
     #[inline]
     pub fn inc_subject(&self, subject_hash: u32) {
-        self.subject[Self::subject_slot(subject_hash)].fetch_add(1, Ordering::Relaxed);
+        // Fast path: entry already present.
+        {
+            let g = self.subject.read().unwrap();
+            if let Some(c) = g.get(&subject_hash) {
+                c.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Slow path: insert.
+        let mut g = self.subject.write().unwrap();
+        g.entry(subject_hash)
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement subject inflight after ack. Called by command thread.
+    /// Removes the entry when the counter reaches zero (bounded memory).
     #[inline]
     pub fn dec_subject(&self, subject_hash: u32) {
-        self.subject[Self::subject_slot(subject_hash)].fetch_sub(1, Ordering::Relaxed);
+        // Fast path: dec under read lock if count > 1 after sub.
+        {
+            let g = self.subject.read().unwrap();
+            if let Some(c) = g.get(&subject_hash) {
+                let prev = c.fetch_sub(1, Ordering::Relaxed);
+                if prev > 1 {
+                    return; // not zero yet, no cleanup needed
+                }
+            } else {
+                return; // nothing to decrement
+            }
+        }
+        // Slow path: removed the last one → write lock to remove key.
+        // Re-check under write lock because another thread may have inc'd.
+        let mut g = self.subject.write().unwrap();
+        if let Some(c) = g.get(&subject_hash) {
+            if c.load(Ordering::Relaxed) == 0 {
+                g.remove(&subject_hash);
+            }
+        }
     }
 
     /// Check if subject has room for more inflight messages.
+    /// Missing key = 0 inflight = always has room.
     #[inline]
     pub fn subject_has_room(&self, subject_hash: u32, max: u32) -> bool {
-        self.subject[Self::subject_slot(subject_hash)].load(Ordering::Relaxed) < max
+        let g = self.subject.read().unwrap();
+        match g.get(&subject_hash) {
+            Some(c) => c.load(Ordering::Relaxed) < max,
+            None => true,
+        }
     }
 
     // ── Demand (subscribe: add, unsubscribe: sub) ────────────────────

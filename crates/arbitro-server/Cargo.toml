@@ -31,6 +31,7 @@ tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes             = { workspace = true }
 zerocopy          = { workspace = true }
+ahash             = "0.8"
 
 [dev-dependencies]
 arbitro-client = { path = "../arbitro-client" }
