@@ -55,28 +55,5 @@ name    = "queue"
 harness = false
 
 [[bench]]
-name    = "channel_overhead"
+name    = "match_table"
 harness = false
-
-[[bench]]
-name    = "drain_isolated"
-harness = false
-
-[[bench]]
-name    = "capacity_check"
-harness = false
-
-[[bench]]
-name    = "fanout_lookup"
-harness = false
-
-[[bench]]
-name    = "dst_entry"
-harness = false
-
-[[bench]]
-name    = "raw_tcp_pipeline"
-harness = false
-
-
- 

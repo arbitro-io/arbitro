@@ -4,9 +4,9 @@
 //! Also measures exact vs catch-all vs pattern matching.
 
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId, black_box};
-use arbitro_engine::catalog::match_table::{MatchTable, MatchEntry};
-use arbitro_engine::catalog::fnv1a_32;
-use arbitro_engine::types::*;
+use arbitro_engine_v2::catalog::match_table::{MatchTable, MatchEntry};
+use arbitro_engine_v2::catalog::fnv1a_32;
+use arbitro_engine_v2::types::*;
 
 fn build_table_exact(num_consumers: u32) -> MatchTable {
     let mut mt = MatchTable::default();
