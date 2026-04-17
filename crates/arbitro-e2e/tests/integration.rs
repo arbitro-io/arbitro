@@ -325,6 +325,235 @@ async fn test_gate_auto_delivery_smoke() {
     }
 }
 
+// ── Connection grouping (same connection, multiple consumers) ───────────
+
+/// Fanout on a single connection — 3 consumers with different groups on the
+/// same client. The drain should group all deliveries into one frame per
+/// store entry (connection-based batching). Each consumer receives all msgs.
+#[tokio::test]
+async fn test_fanout_same_connection() {
+    let addr = start_server().await;
+    let client = connect(&addr).await;
+
+    client
+        .create_stream(&StreamConfig::new(b"fsc", b">").build())
+        .await
+        .unwrap();
+
+    let mut subs = Vec::new();
+    for i in 0..3u32 {
+        let name = format!("fsc-{i}");
+        let group = format!("fsc-grp-{i}");
+        let consumer = client
+            .create_consumer(
+                &ConsumerConfig::new(name.as_bytes(), b"fsc")
+                    .group(group.as_bytes())
+                    .ack_policy(AckPolicy::Explicit)
+                    .max_inflight(100)
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        subs.push(consumer.subscribe(None).await.unwrap());
+    }
+
+    // Publish 10 messages
+    for i in 0..10u32 {
+        client
+            .publish(b"fsc", b"fsc.evt", &i.to_le_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Each consumer should receive all 10 (fanout, different groups)
+    for (idx, sub) in subs.iter_mut().enumerate() {
+        let mut count = 0u32;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+                Ok(Some(msg)) => {
+                    msg.ack();
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(count, 10, "fanout consumer {idx} should get 10, got {count}");
+    }
+}
+
+/// Queue on a single connection — 2 consumers with same default group on the
+/// same client. Messages distributed, total = published count, no duplicates.
+#[tokio::test]
+async fn test_queue_same_connection() {
+    let addr = start_server().await;
+    let client = connect(&addr).await;
+
+    client
+        .create_stream(&StreamConfig::new(b"qsc", b">").build())
+        .await
+        .unwrap();
+
+    let c1 = client
+        .create_consumer(
+            &ConsumerConfig::new(b"qsc-w1", b"qsc")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(100)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let c2 = client
+        .create_consumer(
+            &ConsumerConfig::new(b"qsc-w2", b"qsc")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(100)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let mut sub1 = c1.subscribe(None).await.unwrap();
+    let mut sub2 = c2.subscribe(None).await.unwrap();
+
+    for i in 0..10u32 {
+        client
+            .publish(b"qsc", b"qsc.job", &i.to_le_bytes())
+            .await
+            .unwrap();
+    }
+
+    let mut count1 = 0u32;
+    let mut count2 = 0u32;
+    let mut seqs = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+    loop {
+        if count1 + count2 >= 10 {
+            break;
+        }
+        tokio::select! {
+            result = sub1.next() => {
+                if let Some(msg) = result {
+                    seqs.insert(msg.seq);
+                    msg.ack();
+                    count1 += 1;
+                }
+            }
+            result = sub2.next() => {
+                if let Some(msg) = result {
+                    seqs.insert(msg.seq);
+                    msg.ack();
+                    count2 += 1;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => { break; }
+        }
+    }
+
+    let total = count1 + count2;
+    assert_eq!(total, 10, "queue total should be 10, got {count1}+{count2}={total}");
+    assert_eq!(seqs.len(), 10, "no duplicates: unique seqs={}", seqs.len());
+}
+
+/// Fanout with subject filters on a single connection — verifies the
+/// per-entry consumer_id routing works when the client dispatches entries
+/// from a mixed-consumer frame.
+#[tokio::test]
+async fn test_fanout_filtered_same_connection() {
+    let addr = start_server().await;
+    let client = connect(&addr).await;
+
+    client
+        .create_stream(&StreamConfig::new(b"ffsc", b">").build())
+        .await
+        .unwrap();
+
+    // Consumer A: orders.* only
+    let ca = client
+        .create_consumer(
+            &ConsumerConfig::new(b"ffsc-a", b"ffsc")
+                .group(b"ga")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(100)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut sub_a = ca.subscribe(Some(b"orders.*")).await.unwrap();
+
+    // Consumer B: payments.* only
+    let cb = client
+        .create_consumer(
+            &ConsumerConfig::new(b"ffsc-b", b"ffsc")
+                .group(b"gb")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(100)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut sub_b = cb.subscribe(Some(b"payments.*")).await.unwrap();
+
+    // Consumer C: catch-all
+    let cc = client
+        .create_consumer(
+            &ConsumerConfig::new(b"ffsc-c", b"ffsc")
+                .group(b"gc")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(100)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut sub_c = cc.subscribe(Some(b">")).await.unwrap();
+
+    // Publish 3 orders + 2 payments = 5 total
+    for i in 0..3u32 {
+        let subj = format!("orders.{i}");
+        client.publish(b"ffsc", subj.as_bytes(), b"o").await.unwrap();
+    }
+    for i in 0..2u32 {
+        let subj = format!("payments.{i}");
+        client.publish(b"ffsc", subj.as_bytes(), b"p").await.unwrap();
+    }
+
+    // A: 3 orders
+    let mut count_a = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub_a.next()).await {
+            Ok(Some(msg)) => { msg.ack(); count_a += 1; }
+            _ => break,
+        }
+    }
+    assert_eq!(count_a, 3, "A (orders.*) should get 3, got {count_a}");
+
+    // B: 2 payments
+    let mut count_b = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub_b.next()).await {
+            Ok(Some(msg)) => { msg.ack(); count_b += 1; }
+            _ => break,
+        }
+    }
+    assert_eq!(count_b, 2, "B (payments.*) should get 2, got {count_b}");
+
+    // C: all 5
+    let mut count_c = 0u32;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub_c.next()).await {
+            Ok(Some(msg)) => { msg.ack(); count_c += 1; }
+            _ => break,
+        }
+    }
+    assert_eq!(count_c, 5, "C (>) should get 5, got {count_c}");
+}
+
 // ── Graceful shutdown ───────────────────────────────────────────────────
 
 #[tokio::test]
