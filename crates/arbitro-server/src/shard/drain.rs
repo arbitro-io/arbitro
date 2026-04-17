@@ -6,14 +6,18 @@
 //! After successful delivery, it increments atomic inflight counters and
 //! pushes notifications to the command thread via a lock-free channel.
 //!
-//! **Batching**: entries going to the same binding are accumulated into
-//! multi-entry RepBatch frames (default 256 entries/frame).
+//! **Batching model**: during the walk, entries are accumulated into a
+//! `HashMap<(ConnectionId, StreamId), Bucket>` local to the cycle. Every
+//! recipient of an entry appends to the bucket of its connection. At the
+//! end of the walk, a single flush phase iterates the buckets and emits
+//! one frame per bucket. No mid-walk flush on connection change.
 //!
 //! lifecycle_trace stage-ids preserved from legacy drainer:
 //! - 21_drainer_enter, 25_drain_loop_start, 27_store_get_loop_start,
 //!   29_frame_built, 30_send_bytes_done, 33_drainer_exit_released,
 //!   33_drainer_exit_locked
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::fnv1a_32;
@@ -41,7 +45,7 @@ pub(in crate::shard) struct DrainConfig {
     pub batch_size: u16,
 }
 
-// ── Pending batch ───────────────────────────────────────────────────────────
+// ── Per-delivery metadata ───────────────────────────────────────────────────
 
 /// Per-entry metadata tracked alongside the wire body.
 struct PendingDelivery {
@@ -52,61 +56,65 @@ struct PendingDelivery {
     fire_and_forget: bool,
 }
 
-struct PendingBatch {
-    /// Connection index — all entries in a batch target the same connection.
-    connection_id: Option<ConnectionId>,
-    /// Index of any binding on this connection (for tx handle).
-    tx_binding_idx: Option<usize>,
+// ── Per-connection bucket ───────────────────────────────────────────────────
+
+/// One bucket per (connection, stream) active in the current cycle.
+/// All entries sent to the same connection are accumulated here and
+/// emitted as a single `RepBatch` frame at the end of the cycle.
+struct Bucket {
+    body: BytesMut,
     count: u16,
     first_seq: u64,
     stream_id: StreamId,
+    /// Index of any binding on this connection — used to obtain the tx handle.
+    tx_binding_idx: usize,
     delivered: Vec<PendingDelivery>,
 }
 
-impl PendingBatch {
-    fn new() -> Self {
+impl Bucket {
+    fn new(tx_binding_idx: usize, stream_id: StreamId, first_seq: u64) -> Self {
+        let mut body = BytesMut::with_capacity(64 * 1024);
+        // Envelope placeholder — patched at flush time.
+        body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+        // RepBatchFixed — count patched at flush time.
+        body.extend_from_slice(
+            RepBatchFixed {
+                count: U16::new(0),
+                _pad: U16::new(0),
+            }
+            .as_bytes(),
+        );
         Self {
-            connection_id: None,
-            tx_binding_idx: None,
+            body,
             count: 0,
-            first_seq: 0,
-            stream_id: StreamId(0),
+            first_seq,
+            stream_id,
+            tx_binding_idx,
             delivered: Vec::with_capacity(256),
         }
-    }
-
-    fn reset(&mut self) {
-        self.connection_id = None;
-        self.tx_binding_idx = None;
-        self.count = 0;
-        self.delivered.clear();
     }
 }
 
 // ── Scratch buffers ─────────────────────────────────────────────────────────
 
 pub(in crate::shard) struct DrainScratch {
-    body: BytesMut,
     matches: Vec<MatchEntry>,
     served_queues: Vec<QueueId>,
     dead_connections: Vec<ConnectionId>,
-    pending: PendingBatch,
     /// Local pattern resolution cache. Avoids mutating shared match table.
-    resolve_cache: std::collections::HashMap<(u32, u32), Vec<MatchEntry>>,
+    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>>,
     /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
-    subject_limit_cache: std::collections::HashMap<(u32, u32), Option<u32>>,
+    subject_limit_cache: HashMap<(u32, u32), Option<u32>>,
 }
 
 impl DrainScratch {
     pub(in crate::shard) fn new() -> Self {
         Self {
-            body: BytesMut::with_capacity(64 * 1024),
             matches: Vec::with_capacity(16),
             served_queues: Vec::with_capacity(8),
             dead_connections: Vec::with_capacity(4),
-            pending: PendingBatch::new(),
-            resolve_cache: std::collections::HashMap::with_capacity(64),
-            subject_limit_cache: std::collections::HashMap::with_capacity(64),
+            resolve_cache: HashMap::with_capacity(64),
+            subject_limit_cache: HashMap::with_capacity(64),
         }
     }
 }
@@ -147,41 +155,52 @@ pub(in crate::shard) fn drain_cycle(
     let mut lowest_skipped: Option<u64> = None;
 
     scratch.dead_connections.clear();
-    scratch.pending.reset();
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
-    let mut channel_full = false;
-    let batch_size = cfg.batch_size;
+    // Per-cycle accumulator: one bucket per (conn, stream) that received
+    // at least one entry during this walk.
+    let mut batches: HashMap<(u64, u32), Bucket> = HashMap::with_capacity(8);
 
+    // Per-cycle inflight deltas — counters are only incremented in phase 2
+    // (on flush), so during the walk we must account for pending appends
+    // locally to honor `max_inflight` and `max_subject_inflight` limits.
+    let mut local_inflight: HashMap<u32, u32> = HashMap::new();
+    let mut local_subject: HashMap<u32, u32> = HashMap::new();
+
+    // Phase 1 — walk the store, accumulate into per-connection buckets.
     store
         .for_each(start, end, &mut |entry| {
-            if channel_full {
-                track_skipped(&mut lowest_skipped, entry.seq);
-                return;
-            }
             process_drain_entry(
-                counters, snap, entry, scratch, names,
-                now_ms, cfg.max_age_ms, batch_size, notify_tx,
-                &mut more_pending, &mut lowest_skipped,
-                &mut channel_full,
+                counters,
+                snap,
+                entry,
+                scratch,
+                &mut batches,
+                &mut local_inflight,
+                &mut local_subject,
+                now_ms,
+                cfg.max_age_ms,
+                &mut more_pending,
+                &mut lowest_skipped,
             );
         })
         .ok();
 
-    // Flush remaining partial batch.
-    flush_pending_batch(
-        counters,
-        &mut scratch.body,
-        &mut scratch.pending,
-        &snap.bindings,
-        names,
-        notify_tx,
-        &mut more_pending,
-        &mut lowest_skipped,
-        &mut channel_full,
-        &mut scratch.dead_connections,
-    );
+    // Phase 2 — flush every non-empty bucket. One frame per bucket.
+    for ((conn_raw, _stream_raw), bucket) in batches.drain() {
+        flush_bucket(
+            counters,
+            bucket,
+            ConnectionId(conn_raw),
+            &snap.bindings,
+            names,
+            notify_tx,
+            &mut more_pending,
+            &mut lowest_skipped,
+            &mut scratch.dead_connections,
+        );
+    }
 
     // Cursor advances to last fully-processed entry.
     let new_cursor = lowest_skipped.map_or(end - 1, |ls| ls.saturating_sub(1));
@@ -212,14 +231,13 @@ fn process_drain_entry(
     snap: &DrainSnapshot,
     entry: &arbitro_store::Entry<'_>,
     scratch: &mut DrainScratch,
-    names: &Arc<crate::common::NameRegistry>,
+    batches: &mut HashMap<(u64, u32), Bucket>,
+    local_inflight: &mut HashMap<u32, u32>,
+    local_subject: &mut HashMap<u32, u32>,
     now_ms: u64,
     max_age_ms: u64,
-    batch_size: u16,
-    notify_tx: &mpsc::Sender<DrainNotification>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
-    channel_full: &mut bool,
 ) {
     let stream_id = StreamId(entry.stream_id);
 
@@ -242,14 +260,10 @@ fn process_drain_entry(
     // Resolve patterns from local cache (no engine mutation needed).
     let stream_raw = stream_id.raw() as usize;
     if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
-        // Check if subject is already resolved in the match table.
-        // If not, resolve from trie and cache locally.
         let lookup = mt.lookup(subject_hash);
         if lookup.is_empty() {
-            // Check local resolve cache.
             let cache_key = (stream_id.raw(), subject_hash);
             if !scratch.resolve_cache.contains_key(&cache_key) {
-                // Resolve from trie — read-only on the snapshot.
                 let mut resolved = Vec::new();
                 mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
                 scratch.resolve_cache.insert(cache_key, resolved);
@@ -268,7 +282,11 @@ fn process_drain_entry(
                     mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
                 });
             if let Some(max) = *limit {
-                if !counters.subject_has_room(subject_hash, max) {
+                let pending = local_subject.get(&subject_hash).copied().unwrap_or(0);
+                // Effective cap check: atomic + pending-in-this-cycle >= max.
+                if pending >= max
+                    || !counters.subject_has_room(subject_hash, max - pending)
+                {
                     *more_pending = true;
                     track_skipped(lowest_skipped, entry.seq);
                     return;
@@ -282,7 +300,6 @@ fn process_drain_entry(
     if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
         let lookup = mt.lookup(subject_hash);
         scratch.matches.extend(lookup.iter());
-        // Also add locally resolved entries.
         let cache_key = (stream_id.raw(), subject_hash);
         if let Some(resolved) = scratch.resolve_cache.get(&cache_key) {
             scratch.matches.extend(resolved.iter());
@@ -301,10 +318,18 @@ fn process_drain_entry(
     );
 
     dispatch_recipients(
-        counters, entry, stream_id, subject_hash, scratch,
-        &snap.bindings, &snap.binding_index, names,
-        batch_size, notify_tx,
-        more_pending, lowest_skipped, channel_full,
+        counters,
+        entry,
+        stream_id,
+        subject_hash,
+        scratch,
+        batches,
+        local_inflight,
+        local_subject,
+        &snap.bindings,
+        &snap.binding_index,
+        more_pending,
+        lowest_skipped,
     );
 }
 
@@ -316,21 +341,18 @@ fn dispatch_recipients(
     stream_id: StreamId,
     subject_hash: u32,
     scratch: &mut DrainScratch,
+    batches: &mut HashMap<(u64, u32), Bucket>,
+    local_inflight: &mut HashMap<u32, u32>,
+    local_subject: &mut HashMap<u32, u32>,
     bindings: &[ActiveBinding],
-    binding_index: &std::collections::HashMap<(u32, u64), usize>,
-    names: &Arc<crate::common::NameRegistry>,
-    batch_size: u16,
-    notify_tx: &mpsc::Sender<DrainNotification>,
+    binding_index: &HashMap<(u32, u64), usize>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
-    channel_full: &mut bool,
 ) {
     let DrainScratch {
-        body,
         matches,
         served_queues,
         dead_connections,
-        pending,
         ..
     } = scratch;
 
@@ -346,7 +368,8 @@ fn dispatch_recipients(
             continue;
         }
 
-        if served_queues.contains(&queue_id) {
+        // Queue dedup: one entry per queue within the match set of this entry.
+        if queue_id != QueueId(0) && served_queues.contains(&queue_id) {
             continue;
         }
 
@@ -360,59 +383,38 @@ fn dispatch_recipients(
         };
         let binding = &bindings[binding_idx];
 
-        // Paused check — atomic read, immediate effect.
+        // Paused check — atomic read.
         if counters.is_paused(consumer_id.0) {
             *more_pending = true;
             track_skipped(lowest_skipped, entry.seq);
             continue;
         }
 
-        // Capacity check — atomic read.
-        if !binding.fire_and_forget
-            && !counters.consumer_has_capacity(consumer_id.0, binding.max_inflight)
-        {
-            *more_pending = true;
-            track_skipped(lowest_skipped, entry.seq);
-            continue;
-        }
-
-        // ── Batch accumulation (grouped by connection) ────────────────
-
-        if let Some(prev_conn) = pending.connection_id {
-            if prev_conn != connection_id {
-                flush_pending_batch(
-                    counters, body, pending, bindings, names,
-                    notify_tx, more_pending, lowest_skipped,
-                    channel_full, dead_connections,
-                );
-                if *channel_full {
-                    track_skipped(lowest_skipped, entry.seq);
-                    return;
-                }
+        // Capacity check — atomic read + pending-in-this-cycle local delta.
+        if !binding.fire_and_forget {
+            let pending = local_inflight.get(&consumer_id.0).copied().unwrap_or(0);
+            if pending >= binding.max_inflight
+                || !counters.consumer_has_capacity(
+                    consumer_id.0,
+                    binding.max_inflight - pending,
+                )
+            {
+                *more_pending = true;
+                track_skipped(lowest_skipped, entry.seq);
+                continue;
             }
         }
 
-        if pending.connection_id.is_none() {
-            body.clear();
-            body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-            body.extend_from_slice(
-                RepBatchFixed {
-                    count: U16::new(0),
-                    _pad: U16::new(0),
-                }
-                .as_bytes(),
-            );
-            pending.connection_id = Some(connection_id);
-            pending.tx_binding_idx = Some(binding_idx);
-            pending.count = 0;
-            pending.first_seq = entry.seq;
-            pending.stream_id = stream_id;
-            pending.delivered.clear();
-        }
+        // ── Append to this connection's bucket (or create it) ────────────
+
+        let key = (connection_id.0, stream_id.raw());
+        let bucket = batches
+            .entry(key)
+            .or_insert_with(|| Bucket::new(binding_idx, stream_id, entry.seq));
 
         let subj_len = entry.subject.len();
         let data_len = subj_len + entry.payload.len();
-        body.extend_from_slice(
+        bucket.body.extend_from_slice(
             DeliveryEntryHeader {
                 consumer_id: U32::new(consumer_id.0),
                 seq: U64::new(entry.seq),
@@ -422,11 +424,11 @@ fn dispatch_recipients(
             }
             .as_bytes(),
         );
-        body.extend_from_slice(entry.subject);
-        body.extend_from_slice(entry.payload);
+        bucket.body.extend_from_slice(entry.subject);
+        bucket.body.extend_from_slice(entry.payload);
 
-        pending.count += 1;
-        pending.delivered.push(PendingDelivery {
+        bucket.count += 1;
+        bucket.delivered.push(PendingDelivery {
             entry: DeliveredEntry {
                 seq: entry.seq,
                 subject_hash,
@@ -438,71 +440,48 @@ fn dispatch_recipients(
             fire_and_forget: binding.fire_and_forget,
         });
 
-        served_queues.push(queue_id);
-
-        // Flush only when batch reaches max size (fire-and-forget accumulation).
-        // For ack consumers, flush happens AFTER all recipients of this entry
-        // are processed — see below.
-        if pending.count >= batch_size {
-            flush_pending_batch(
-                counters, body, pending, bindings, names,
-                notify_tx, more_pending, lowest_skipped,
-                channel_full, dead_connections,
-            );
-            if *channel_full {
-                return;
-            }
+        // Track pending inflight for subsequent capacity/subject checks in
+        // this same cycle. Atomic counters are incremented in phase 2.
+        if !binding.fire_and_forget {
+            *local_inflight.entry(consumer_id.0).or_insert(0) += 1;
+            *local_subject.entry(subject_hash).or_insert(0) += 1;
         }
-    }
 
-    // After all recipients for this entry: flush if any ack-mode entry was added.
-    // This keeps latency low for explicit-ack consumers while still grouping
-    // all recipients of the same store entry into one frame.
-    if pending.count > 0
-        && pending.delivered.iter().any(|d| !d.fire_and_forget)
-    {
-        flush_pending_batch(
-            counters, body, pending, bindings, names,
-            notify_tx, more_pending, lowest_skipped,
-            channel_full, dead_connections,
-        );
+        if queue_id != QueueId(0) {
+            served_queues.push(queue_id);
+        }
     }
 }
 
-// ── Batch flush ─────────────────────────────────────────────────────────────
+// ── Bucket flush ────────────────────────────────────────────────────────────
 
-fn flush_pending_batch(
+/// Flush a single bucket: patch headers, try_send, notify command thread.
+/// Consumes the bucket — called only once per bucket at end of cycle.
+fn flush_bucket(
     counters: &SharedCounters,
-    body: &mut BytesMut,
-    pending: &mut PendingBatch,
+    mut bucket: Bucket,
+    connection_id: ConnectionId,
     bindings: &[ActiveBinding],
     names: &Arc<crate::common::NameRegistry>,
     notify_tx: &mpsc::Sender<DrainNotification>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
-    channel_full: &mut bool,
     dead_connections: &mut Vec<ConnectionId>,
 ) {
-    let tx_binding_idx = match pending.tx_binding_idx {
-        Some(idx) => idx,
-        None => return,
-    };
-    if pending.count == 0 {
-        pending.reset();
+    if bucket.count == 0 {
         return;
     }
 
-    let tx_binding = &bindings[tx_binding_idx];
-    let stream_id = pending.stream_id;
-    let connection_id = pending.connection_id.unwrap_or(ConnectionId(0));
+    let tx_binding = &bindings[bucket.tx_binding_idx];
+    let stream_id = bucket.stream_id;
 
     // Patch RepBatchFixed count (offset 0 in fixed header, right after envelope).
     let count_offset = ENVELOPE_SIZE;
-    body[count_offset..count_offset + 2]
-        .copy_from_slice(&pending.count.to_le_bytes());
+    bucket.body[count_offset..count_offset + 2]
+        .copy_from_slice(&bucket.count.to_le_bytes());
 
     // Patch envelope.
-    let body_len = body.len() - ENVELOPE_SIZE;
+    let body_len = bucket.body.len() - ENVELOPE_SIZE;
     let wire_stream_id = names
         .stream_wire(stream_id)
         .unwrap_or_else(|| stream_id.raw());
@@ -512,27 +491,27 @@ fn flush_pending_batch(
         body_len as u32,
         0,
     );
-    body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
+    bucket.body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
 
     crate::lifecycle_trace!(
         "29_frame_built",
         connection_id.0,
-        pending.count as u64,
+        bucket.count as u64,
         "shard"
     );
 
-    let frozen = body.split().freeze();
+    let frozen = bucket.body.split().freeze();
     match tx_binding.tx.try_send(frozen) {
         Ok(()) => {
             crate::lifecycle_trace!(
                 "30_send_bytes_done",
                 connection_id.0,
-                pending.count as u64,
+                bucket.count as u64,
                 "shard"
             );
 
             // Increment atomic inflight counters (per-entry metadata).
-            for pd in &pending.delivered {
+            for pd in &bucket.delivered {
                 if !pd.fire_and_forget {
                     counters.inc_inflight(pd.consumer_id, pd.queue_id);
                     counters.inc_subject(pd.entry.subject_hash);
@@ -540,23 +519,16 @@ fn flush_pending_batch(
             }
 
             // Notify command thread — group by binding_id.
-            notify_delivered_grouped(
-                notify_tx,
-                bindings,
-                &mut pending.delivered,
-            );
+            notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             *more_pending = true;
-            *channel_full = true;
-            track_skipped(lowest_skipped, pending.first_seq);
+            track_skipped(lowest_skipped, bucket.first_seq);
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             dead_connections.push(connection_id);
         }
     }
-
-    pending.reset();
 }
 
 /// Group delivered entries by binding_id and send one notification per binding.
@@ -582,7 +554,6 @@ fn notify_delivered_grouped(
     }
 
     // Slow path: mixed bindings — group and send one notification each.
-    // Sort by binding_idx to group contiguous runs.
     delivered.sort_unstable_by_key(|d| d.binding_idx);
     let mut i = 0;
     while i < delivered.len() {
