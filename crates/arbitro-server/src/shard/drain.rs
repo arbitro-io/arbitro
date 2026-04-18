@@ -139,6 +139,12 @@ pub(in crate::shard) struct DrainScratch {
     /// Active bucket keys this cycle: `(conn_raw, stream_raw, bucket_idx)`.
     /// Linear scan; typical cycle has very few active conns.
     active_buckets: Vec<(u64, u32, usize)>,
+
+    /// Per-cycle inflight deltas: `(consumer_id, pending)`. Linear scan;
+    /// matches the "no HashMap on inner deliver loop" rule.
+    local_inflight: Vec<(u32, u32)>,
+    /// Per-cycle subject deltas: `(subject_hash, pending)`.
+    local_subject: Vec<(u32, u32)>,
 }
 
 impl DrainScratch {
@@ -151,6 +157,8 @@ impl DrainScratch {
             subject_limit_cache: HashMap::with_capacity(64),
             buckets: Vec::with_capacity(16),
             active_buckets: Vec::with_capacity(16),
+            local_inflight: Vec::with_capacity(8),
+            local_subject: Vec::with_capacity(8),
         }
     }
 
@@ -183,6 +191,29 @@ impl DrainScratch {
         self.active_buckets.push((conn_id, stream_id.raw(), idx));
         idx
     }
+}
+
+// ── Linear-scan helpers for per-cycle deltas ────────────────────────────────
+
+#[inline]
+fn local_delta_get(list: &[(u32, u32)], key: u32) -> u32 {
+    for &(k, v) in list.iter() {
+        if k == key {
+            return v;
+        }
+    }
+    0
+}
+
+#[inline]
+fn local_delta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
+    for e in list.iter_mut() {
+        if e.0 == key {
+            e.1 += 1;
+            return;
+        }
+    }
+    list.push((key, 1));
 }
 
 // ── Drain cycle (entry point) ───────────────────────────────────────────────
@@ -222,14 +253,10 @@ pub(in crate::shard) fn drain_cycle(
 
     scratch.dead_connections.clear();
     scratch.active_buckets.clear();
+    scratch.local_inflight.clear();
+    scratch.local_subject.clear();
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
-
-    // Per-cycle inflight deltas — counters are only incremented in phase 2
-    // (on flush), so during the walk we must account for pending appends
-    // locally to honor `max_inflight` and `max_subject_inflight` limits.
-    let mut local_inflight: HashMap<u32, u32> = HashMap::new();
-    let mut local_subject: HashMap<u32, u32> = HashMap::new();
 
     // Phase 1 — walk the store, accumulate into per-connection buckets.
     store
@@ -239,8 +266,6 @@ pub(in crate::shard) fn drain_cycle(
                 snap,
                 entry,
                 scratch,
-                &mut local_inflight,
-                &mut local_subject,
                 now_ms,
                 cfg.max_age_ms,
                 &mut more_pending,
@@ -296,8 +321,6 @@ fn process_drain_entry(
     snap: &DrainSnapshot,
     entry: &arbitro_store::Entry<'_>,
     scratch: &mut DrainScratch,
-    local_inflight: &mut HashMap<u32, u32>,
-    local_subject: &mut HashMap<u32, u32>,
     now_ms: u64,
     max_age_ms: u64,
     more_pending: &mut bool,
@@ -346,7 +369,7 @@ fn process_drain_entry(
                     mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
                 });
             if let Some(max) = *limit {
-                let pending = local_subject.get(&subject_hash).copied().unwrap_or(0);
+                let pending = local_delta_get(&scratch.local_subject, subject_hash);
                 // Effective cap check: atomic + pending-in-this-cycle >= max.
                 if pending >= max
                     || !counters.subject_has_room(subject_hash, max - pending)
@@ -387,8 +410,6 @@ fn process_drain_entry(
         stream_id,
         subject_hash,
         scratch,
-        local_inflight,
-        local_subject,
         &snap.bindings,
         &snap.binding_index,
         more_pending,
@@ -404,8 +425,6 @@ fn dispatch_recipients(
     stream_id: StreamId,
     subject_hash: u32,
     scratch: &mut DrainScratch,
-    local_inflight: &mut HashMap<u32, u32>,
-    local_subject: &mut HashMap<u32, u32>,
     bindings: &[ActiveBinding],
     binding_index: &[BindingIndexEntry],
     more_pending: &mut bool,
@@ -448,7 +467,7 @@ fn dispatch_recipients(
 
         // Capacity check — atomic read + pending-in-this-cycle local delta.
         if !binding.fire_and_forget {
-            let pending = local_inflight.get(&consumer_id.0).copied().unwrap_or(0);
+            let pending = local_delta_get(&scratch.local_inflight, consumer_id.0);
             if pending >= binding.max_inflight
                 || !counters.consumer_has_capacity(
                     consumer_id.0,
@@ -520,8 +539,8 @@ fn dispatch_recipients(
         // Track pending inflight for subsequent capacity/subject checks in
         // this same cycle. Atomic counters are incremented in phase 2.
         if !fire_and_forget {
-            *local_inflight.entry(consumer_id.0).or_insert(0) += 1;
-            *local_subject.entry(subject_hash).or_insert(0) += 1;
+            local_delta_inc(&mut scratch.local_inflight, consumer_id.0);
+            local_delta_inc(&mut scratch.local_subject, subject_hash);
         }
 
         if queue_id != QueueId(0) {
