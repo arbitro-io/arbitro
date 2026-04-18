@@ -230,6 +230,7 @@ struct StageStats {
     fetch: Duration,        // for_each in batches of max_feed (3 hot fields)
     fetch_single: Duration, // Store::get called once per seq (no batching)
     fetch_all: Duration,    // for_each reading EVERY field of the Entry
+    drain_logic: Duration,  // fetch + match + atomics + group — no encode/tcp
     encode: Duration, // differential: fetch_encode - fetch
     send: Duration,
     recv: Duration,
@@ -728,6 +729,137 @@ fn build_frame(store: &dyn Store, from: u64, to: u64) -> (Bytes, usize) {
     (body.freeze(), count as usize)
 }
 
+// ── Drain-logic simulation ──────────────────────────────────────────────────
+//
+// Simulates the full drain path except encode/TCP:
+//   store.for_each(batches of max_feed)
+//     → match: N recipients per entry
+//     → per-recipient atomic checks:
+//         * subject_has_room   (AtomicU32 load < max)
+//         * is_paused          (AtomicBool load)
+//         * consumer_has_capacity (AtomicU32 load < max_inflight)
+//     → on success: inc counters (fetch_add)
+//     → append to per-connection bucket (linear scan, no HashMap in loop)
+//
+// Matches drain.rs semantics but without building the RepBatch frame or
+// touching the TCP layer — pure CPU logic + atomic ops.
+
+const SIM_CONNS: usize = 3;
+const SIM_MAX_INFLIGHT: u32 = u32::MAX; // effectively disabled — matches fire-and-forget
+const SIM_MAX_SUBJECT: u32 = u32::MAX;
+
+struct SimBinding {
+    connection_id: u64,
+    consumer_id: u32,
+    queue_id: u32,
+    max_inflight: u32,
+    inflight: std::sync::atomic::AtomicU32,
+    paused: std::sync::atomic::AtomicBool,
+}
+
+fn simulate_drain_logic(store: &dyn Store, total_msgs: u64, max_feed: usize) -> Duration {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    let last_seq = store.info().last_seq;
+
+    // Setup (outside the timer): one binding per simulated connection.
+    // In real drain, match_table.lookup(subject_hash) returns these; we
+    // hardcode them as "every entry matches all N bindings", which is the
+    // fanout worst case.
+    let bindings: Vec<SimBinding> = (0..SIM_CONNS)
+        .map(|i| SimBinding {
+            connection_id: (i + 1) as u64,
+            consumer_id: (i + 1) as u32,
+            queue_id: 0, // fanout — no queue dedup
+            max_inflight: SIM_MAX_INFLIGHT,
+            inflight: AtomicU32::new(0),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        })
+        .collect();
+
+    // Single global subject_inflight atomic — simulates the RwLock-guarded
+    // HashMap<subject_hash, AtomicU32> of the real drain (fast-path: we
+    // read an atomic; we elide the read-lock for simplicity).
+    let subject_inflight = AtomicU32::new(0);
+
+    // Per-cycle buckets: (conn_id, Vec<seq>). Linear scan to find the
+    // right bucket for a given conn — no HashMap in the inner loop.
+    let mut buckets: Vec<(u64, Vec<u64>)> = Vec::with_capacity(SIM_CONNS);
+
+    let mut cursor = 0u64;
+    let mut total_appended = 0u64;
+    let t0 = Instant::now();
+
+    while cursor < last_seq {
+        let from = cursor + 1;
+        let to = (from + max_feed as u64).min(last_seq + 1);
+
+        store
+            .for_each(from, to, &mut |entry| {
+                // Subject gating: one atomic load + compare.
+                if subject_inflight.load(Relaxed) >= SIM_MAX_SUBJECT {
+                    return;
+                }
+
+                // For every binding that "matches" this entry (all, for
+                // fanout simulation), run the per-recipient checks.
+                for binding in &bindings {
+                    // is_paused: 1 atomic load.
+                    if binding.paused.load(Relaxed) {
+                        continue;
+                    }
+                    // consumer_has_capacity: 1 atomic load + compare.
+                    if binding.inflight.load(Relaxed) >= binding.max_inflight {
+                        continue;
+                    }
+
+                    // Reserve: 2 fetch_adds (consumer + subject).
+                    binding.inflight.fetch_add(1, Relaxed);
+                    subject_inflight.fetch_add(1, Relaxed);
+
+                    // Group by conn: linear scan (typical N=3-8, faster
+                    // than a hash lookup at this scale).
+                    let mut found = None;
+                    for (idx, (c, _)) in buckets.iter().enumerate() {
+                        if *c == binding.connection_id {
+                            found = Some(idx);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(idx) => buckets[idx].1.push(entry.seq),
+                        None => {
+                            let mut v = Vec::with_capacity(max_feed);
+                            v.push(entry.seq);
+                            buckets.push((binding.connection_id, v));
+                        }
+                    }
+                    total_appended += 1;
+                }
+            })
+            .unwrap();
+
+        // End of cycle: simulate the "flush" by clearing buckets.
+        // Real drain would encode + send here. We just clear.
+        for (_, v) in &mut buckets {
+            v.clear();
+        }
+
+        cursor = to - 1;
+    }
+
+    let elapsed = t0.elapsed();
+
+    // Expected: total_msgs × SIM_CONNS appends (each entry went to N bindings).
+    assert_eq!(
+        total_appended,
+        total_msgs * SIM_CONNS as u64,
+        "drain-logic append count mismatch"
+    );
+
+    elapsed
+}
+
 /// Measure each pipeline stage in isolation:
 ///   fetch → encode → send → recv → decode
 /// All stages act on the same `total_msgs` entries; frames built in the
@@ -821,6 +953,16 @@ async fn run_stage_measurements(
     }
     let fetch_all_elapsed = t_fetch_all.elapsed();
     assert_eq!(fetched_all, total_msgs, "fetch-all count mismatch");
+
+    // ── Stage 1d: drain-logic — simulates the FULL drain path except
+    //    encode and TCP: fetch + match + atomics (subject_has_room,
+    //    consumer_has_capacity, is_paused) + inc counters + group into
+    //    per-connection buckets (linear-scan lookup to honour the
+    //    "no HashMap in inner deliver loop" hot-path rule).
+    //
+    //    The intent is to answer the question: "how much of the drain
+    //    budget is spent on pure logic, independent of the wire layer?"
+    let drain_logic_elapsed = simulate_drain_logic(&*store, total_msgs, max_feed);
 
     // ── Stage 2: fetch+encode — build frames in BytesMut ────────────────
     let t1 = Instant::now();
@@ -993,6 +1135,7 @@ async fn run_stage_measurements(
         fetch: fetch_elapsed,
         fetch_single: fetch_single_elapsed,
         fetch_all: fetch_all_elapsed,
+        drain_logic: drain_logic_elapsed,
         encode: encode_pure,
         send: send_elapsed,
         recv: recv_elapsed,
@@ -1108,6 +1251,12 @@ async fn run_for_kind(
             mode: "pipeline/fetch-all",
             total_msgs,
             elapsed: stages.fetch_all,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/drain-logic",
+            total_msgs,
+            elapsed: stages.drain_logic,
         },
         RunResult {
             label: label.into(),
