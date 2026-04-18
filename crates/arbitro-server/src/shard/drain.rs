@@ -524,21 +524,24 @@ fn dispatch_recipients(
         }
 
         bucket.count += 1;
-        bucket.delivered.push(PendingDelivery {
-            entry: DeliveredEntry {
-                seq: entry.seq,
-                subject_hash,
-                _pad: 0,
-            },
-            binding_idx,
-            consumer_id: consumer_id.0,
-            queue_id: queue_id.0,
-            fire_and_forget,
-        });
 
-        // Track pending inflight for subsequent capacity/subject checks in
-        // this same cycle. Atomic counters are incremented in phase 2.
+        // Only track `PendingDelivery` for entries that actually need ack
+        // bookkeeping. Fire-and-forget deliveries never produce acks, so
+        // storing their metadata is pure memory pressure (32 B × N) and
+        // branch overhead in the flush loop. Skip the push entirely —
+        // `bucket.count` already carries the wire count for header patch.
         if !fire_and_forget {
+            bucket.delivered.push(PendingDelivery {
+                entry: DeliveredEntry {
+                    seq: entry.seq,
+                    subject_hash,
+                    _pad: 0,
+                },
+                binding_idx,
+                consumer_id: consumer_id.0,
+                queue_id: queue_id.0,
+                fire_and_forget: false,
+            });
             local_delta_inc(&mut scratch.local_inflight, consumer_id.0);
             local_delta_inc(&mut scratch.local_subject, subject_hash);
         }
@@ -608,16 +611,21 @@ fn flush_bucket(
                 "shard"
             );
 
-            // Increment atomic inflight counters (per-entry metadata).
+            // Increment atomic inflight counters for ack-mode deliveries.
+            // `bucket.delivered` only contains non-fire-and-forget entries
+            // (gated at push time), so no per-entry branch is needed here.
             for pd in &bucket.delivered {
-                if !pd.fire_and_forget {
-                    counters.inc_inflight(pd.consumer_id, pd.queue_id);
-                    counters.inc_subject(pd.entry.subject_hash);
-                }
+                counters.inc_inflight(pd.consumer_id, pd.queue_id);
+                counters.inc_subject(pd.entry.subject_hash);
             }
 
-            // Notify command thread — group by binding_id.
-            notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
+            // Notify command thread — only if there are actual ack-mode
+            // entries. `bucket.delivered` is empty when every recipient
+            // was fire-and-forget, so the allocation + channel send is
+            // elided entirely for the pub/sub default path.
+            if !bucket.delivered.is_empty() {
+                notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
+            }
 
             // Body is empty after split(); clear bookkeeping and return
             // the bucket to the pool.
