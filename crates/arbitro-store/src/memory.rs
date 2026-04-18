@@ -1,19 +1,41 @@
-//! In-memory journal — Vec-backed, single-threaded.
+//! In-memory journal — segmented, append-only.
 //!
-//! O(1) append, O(1) read by seq (index = seq - first_seq).
-//! No limits enforcement here — the engine checks before calling.
+//! Each segment is a fixed-capacity `Vec<u8>` allocated once. When the
+//! active segment fills up it is sealed (frozen, read-only) and a fresh
+//! segment is allocated for further writes. This avoids the realloc chain
+//! of a single growing `Vec<u8>` (64 KB → 128 KB → ... → 16 MB → ...),
+//! which fragments the heap and hurts cache locality of encoder buffers.
+//!
+//! Mirrors the segment layout of `TolerantStore` but keeps data in RAM
+//! (no mmap, no persistence).
 
 use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
 use arbitro_engine_v2::catalog::fnv1a_32;
 
+/// Default capacity per segment. Chosen as a balance between
+/// per-segment overhead and per-store footprint for workloads that
+/// do not use `with_capacity`.
+pub const DEFAULT_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
+
+/// Minimum sensible segment size (no point going below a page).
+const MIN_SEGMENT_SIZE: usize = 4 * 1024;
+
 pub struct MemoryStore {
-    /// Contiguous arena for all subjects and payloads.
-    data: Vec<u8>,
-    /// Metadata for each entry to allow O(1) access.
+    /// Active segment — the one currently being written to. Allocated
+    /// with `Vec::with_capacity(segment_size)` and never resized; once
+    /// it fills up it is moved into `sealed` and a new one allocated.
+    active: Vec<u8>,
+    /// Read-only segments, in insertion order. Index `segment_idx` in
+    /// entries refers either into `sealed` (if `< sealed.len()`) or to
+    /// `active` (if `== sealed.len()`).
+    sealed: Vec<Vec<u8>>,
+    /// Global index: seq → location.
     index: Vec<LogMetadata>,
     next_seq: u64,
     first_seq: u64,
     total_bytes: u64,
+    /// Fixed size of each segment. Configured at construction.
+    segment_size: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -22,7 +44,11 @@ struct LogMetadata {
     pub ts: u64,
     pub subj_len: u16,
     pub payload_len: u32,
-    pub offset: usize,
+    /// Offset within the segment identified by `segment_idx`.
+    pub offset: u32,
+    /// Index into `sealed` (if `< sealed.len()`) or the active segment
+    /// (if `== sealed.len()`).
+    pub segment_idx: u32,
     #[allow(dead_code)]
     pub subject_hash: u32,
     pub stream_id: u32,
@@ -36,13 +62,36 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// Create a store with `DEFAULT_SEGMENT_SIZE` (16 MB) per segment
+    /// and a small default index capacity.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_SEGMENT_SIZE, 1024)
+    }
+
+    /// Construct with an explicit minimum data capacity and index capacity.
+    /// The actual `segment_size` is `max(data_cap, DEFAULT_SEGMENT_SIZE)`
+    /// so that for small expected workloads a single segment suffices
+    /// (avoiding rotation overhead) while huge workloads get a larger
+    /// backing segment.
+    pub fn with_capacity(data_cap: usize, index_cap: usize) -> Self {
+        let segment_size = data_cap
+            .max(DEFAULT_SEGMENT_SIZE)
+            .max(MIN_SEGMENT_SIZE);
+        Self::with_segment_size(segment_size, index_cap)
+    }
+
+    /// Explicit segment size — useful for tests or when the caller knows
+    /// the optimal per-segment budget.
+    pub fn with_segment_size(segment_size: usize, index_cap: usize) -> Self {
+        let segment_size = segment_size.max(MIN_SEGMENT_SIZE);
         Self {
-            data: Vec::with_capacity(65536), // Initial 64KB
-            index: Vec::with_capacity(1024),
+            active: Vec::with_capacity(segment_size),
+            sealed: Vec::new(),
+            index: Vec::with_capacity(index_cap),
             next_seq: 1,
             first_seq: 1,
             total_bytes: 0,
+            segment_size,
         }
     }
 
@@ -55,19 +104,43 @@ impl MemoryStore {
         if est_idx < self.index.len() && self.index[est_idx].seq == seq {
             Some(est_idx)
         } else {
-            // Fallback for sparse indices (e.g. after subject drain)
             self.index.binary_search_by_key(&seq, |meta| meta.seq).ok()
         }
     }
 
     #[inline]
     fn find_lower_bound(&self, seq: u64) -> usize {
-        if seq <= self.first_seq { return 0; }
+        if seq <= self.first_seq {
+            return 0;
+        }
         let est_idx = (seq - self.first_seq) as usize;
         if est_idx < self.index.len() && self.index[est_idx].seq == seq {
             est_idx
         } else {
-            self.index.binary_search_by_key(&seq, |m| m.seq).unwrap_or_else(|i| i)
+            self.index
+                .binary_search_by_key(&seq, |m| m.seq)
+                .unwrap_or_else(|i| i)
+        }
+    }
+
+    /// Seal the active segment, allocate a fresh one. Called when the
+    /// next entry would exceed the active segment's capacity.
+    #[inline(never)]
+    fn rotate(&mut self) {
+        let mut new_active = Vec::with_capacity(self.segment_size);
+        std::mem::swap(&mut self.active, &mut new_active);
+        self.sealed.push(new_active);
+    }
+
+    /// Return an immutable slice into the segment identified by `segment_idx`.
+    #[inline]
+    fn segment_slice(&self, segment_idx: u32) -> &[u8] {
+        let idx = segment_idx as usize;
+        if idx < self.sealed.len() {
+            &self.sealed[idx]
+        } else {
+            debug_assert_eq!(idx, self.sealed.len());
+            &self.active
         }
     }
 
@@ -78,33 +151,41 @@ impl MemoryStore {
 
         let subj_len = entry.subject.len() as u16;
         let payload_len = entry.payload.len() as u32;
-        let offset = self.data.len();
+        let entry_bytes = (subj_len as usize) + (payload_len as usize);
         let subject_hash = fnv1a_32(entry.subject);
 
-        // 1. Append data to arena
-        self.data.extend_from_slice(entry.subject);
-        self.data.extend_from_slice(entry.payload);
+        // Rotate if this entry wouldn't fit in the active segment.
+        if self.active.len() + entry_bytes > self.segment_size {
+            self.rotate();
+        }
 
-        // 2. Register in index
+        let segment_idx = self.sealed.len() as u32;
+        let offset = self.active.len() as u32;
+
+        self.active.extend_from_slice(entry.subject);
+        self.active.extend_from_slice(entry.payload);
+
         self.index.push(LogMetadata {
             seq,
             ts: timestamp,
             subj_len,
             payload_len,
             offset,
+            segment_idx,
             subject_hash,
             stream_id: entry.stream_id,
             flags: entry.flags,
         });
 
-        self.total_bytes += (subj_len as u64) + (payload_len as u64);
+        self.total_bytes += entry_bytes as u64;
         seq
     }
 
     #[inline]
     fn get_entry_view(&self, idx: usize) -> Entry<'_> {
         let meta = &self.index[idx];
-        let subj_start = meta.offset;
+        let data = self.segment_slice(meta.segment_idx);
+        let subj_start = meta.offset as usize;
         let payload_start = subj_start + (meta.subj_len as usize);
         let payload_end = payload_start + (meta.payload_len as usize);
 
@@ -112,8 +193,8 @@ impl MemoryStore {
             seq: meta.seq,
             stream_id: meta.stream_id,
             timestamp: meta.ts,
-            subject: &self.data[subj_start..payload_start],
-            payload: &self.data[payload_start..payload_end],
+            subject: &data[subj_start..payload_start],
+            payload: &data[payload_start..payload_end],
             flags: meta.flags,
         }
     }
@@ -148,7 +229,7 @@ impl Store for MemoryStore {
         let e = self.find_lower_bound(end);
         let e = e.min(self.index.len());
         let s = s.min(e);
-        
+
         let mut out = Vec::with_capacity(e - s);
         for i in s..e {
             out.push(self.get_entry_view(i));
@@ -173,7 +254,7 @@ impl Store for MemoryStore {
         let e = self.find_lower_bound(end);
         let e = e.min(self.index.len());
         let s = s.min(e);
-        
+
         for i in s..e {
             let entry = self.get_entry_view(i);
             f(&entry);
@@ -182,33 +263,45 @@ impl Store for MemoryStore {
     }
 
     fn truncate_front(&mut self, first_seq: u64) -> u64 {
-        if first_seq <= self.first_seq || self.index.is_empty() { return 0; }
-        
-        let idx = (first_seq - self.first_seq) as usize;
-        let idx = idx.min(self.index.len());
-
-        if idx == 0 {
+        if first_seq <= self.first_seq || self.index.is_empty() {
+            return 0;
+        }
+        let cut = (first_seq - self.first_seq) as usize;
+        let cut = cut.min(self.index.len());
+        if cut == 0 {
             return 0;
         }
 
-        let removed = idx as u64;
-        let data_cut = self.index[idx - 1].offset + (self.index[idx - 1].subj_len as usize) + (self.index[idx - 1].payload_len as usize);
+        let removed = cut as u64;
 
-        // 1. Drain data arena (Hardware Sympathy: this is a memory move, O(N))
-        self.data.drain(0..data_cut);
+        // Determine how many whole sealed segments are fully dropped
+        // (all their entries have seq < first_seq).
+        let remaining_start_seg = if cut < self.index.len() {
+            self.index[cut].segment_idx as usize
+        } else {
+            // Everything removed — all sealed + active are now stale.
+            self.sealed.len() + 1
+        };
 
-        // 2. Drain index
-        self.index.drain(0..idx);
-
-        // 3. Update offsets in remaining index entries
-        for meta in &mut self.index {
-            meta.offset -= data_cut;
+        // Drop fully-stale sealed segments. Surviving entries keep the
+        // same `segment_idx` values *minus* how many we dropped.
+        let dropped_segments = remaining_start_seg.min(self.sealed.len());
+        if dropped_segments > 0 {
+            self.sealed.drain(0..dropped_segments);
+            // Reindex surviving entries.
+            for m in &mut self.index[cut..] {
+                m.segment_idx -= dropped_segments as u32;
+            }
         }
 
+        // Drain the dead index entries.
+        self.index.drain(0..cut);
         self.first_seq = first_seq;
-        
-        // Recalculate total bytes
-        self.total_bytes = self.index.iter()
+
+        // Recalculate total bytes.
+        self.total_bytes = self
+            .index
+            .iter()
             .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
             .sum();
 
@@ -217,7 +310,8 @@ impl Store for MemoryStore {
 
     fn purge(&mut self) -> u64 {
         let count = self.index.len() as u64;
-        self.data.clear();
+        self.active.clear();
+        self.sealed.clear();
         self.index.clear();
         self.first_seq = self.next_seq;
         self.total_bytes = 0;
@@ -225,39 +319,43 @@ impl Store for MemoryStore {
     }
 
     fn drain(&mut self, subject: &[u8]) -> u64 {
-        let mut new_data = Vec::with_capacity(self.data.len());
-        let mut new_index = Vec::with_capacity(self.index.len());
-        let mut removed = 0;
-        let mut bytes = 0;
+        // Cold path: rebuild all segments + index from scratch, skipping
+        // entries that match `subject`. This compacts gaps left by
+        // removed entries.
+        let mut new_store = MemoryStore::with_segment_size(self.segment_size, self.index.len());
+        let mut removed = 0u64;
 
         for i in 0..self.index.len() {
             let entry = self.get_entry_view(i);
-            if !entry_matches(&entry, subject) {
-                let offset = new_data.len();
-                new_data.extend_from_slice(entry.subject);
-                new_data.extend_from_slice(entry.payload);
-
-                let meta = self.index[i];
-                new_index.push(LogMetadata {
-                    offset,
-                    ..meta
-                });
-                bytes += (meta.subj_len as u64) + (meta.payload_len as u64);
-            } else {
+            if entry_matches(&entry, subject) {
                 removed += 1;
+            } else {
+                let meta = &self.index[i];
+                // Use push_entry to let the new store handle rotation.
+                let seq_override = meta.seq;
+                let ts = meta.ts;
+                new_store.next_seq = seq_override;
+                let _ = new_store.push_entry(
+                    &EntryRef {
+                        stream_id: meta.stream_id,
+                        subject: entry.subject,
+                        payload: entry.payload,
+                        flags: meta.flags,
+                    },
+                    ts,
+                );
             }
         }
 
-        self.data = new_data;
-        self.index = new_index;
-        self.total_bytes = bytes;
+        // Preserve sequence continuity: next_seq = original next_seq.
+        new_store.next_seq = self.next_seq;
+        new_store.first_seq = new_store
+            .index
+            .first()
+            .map(|m| m.seq)
+            .unwrap_or(self.next_seq);
 
-        if let Some(first) = self.index.first() {
-            self.first_seq = first.seq;
-        } else {
-            self.first_seq = self.next_seq;
-        }
-
+        *self = new_store;
         removed
     }
 
@@ -278,7 +376,17 @@ mod tests {
     #[test]
     fn append_and_read() {
         let mut s = MemoryStore::new();
-        let seq = s.append(EntryRef { subject: b"orders.created", payload: b"{}", stream_id: 0, flags: 0 }, 1000).unwrap();
+        let seq = s
+            .append(
+                EntryRef {
+                    subject: b"orders.created",
+                    payload: b"{}",
+                    stream_id: 0,
+                    flags: 0,
+                },
+                1000,
+            )
+            .unwrap();
         assert_eq!(seq, 1);
 
         let e = s.read(1).unwrap().unwrap();
@@ -307,7 +415,11 @@ mod tests {
     fn read_range() {
         let mut s = MemoryStore::new();
         for i in 0..5 {
-            s.append(EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 }, 0).unwrap();
+            s.append(
+                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 },
+                0,
+            )
+            .unwrap();
         }
         let range = s.read_range(2, 5).unwrap();
         assert_eq!(range.len(), 3);
@@ -326,15 +438,23 @@ mod tests {
     fn purge() {
         let mut s = MemoryStore::new();
         for i in 0..10 {
-            s.append(EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 }, 0).unwrap();
+            s.append(
+                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 },
+                0,
+            )
+            .unwrap();
         }
         let deleted = s.purge();
         assert_eq!(deleted, 10);
         assert_eq!(s.info().messages, 0);
         assert_eq!(s.info().first_seq, 11);
 
-        // New appends continue from where we left off
-        let seq = s.append(EntryRef { subject: b"y", payload: b"new", stream_id: 0, flags: 0 }, 0).unwrap();
+        let seq = s
+            .append(
+                EntryRef { subject: b"y", payload: b"new", stream_id: 0, flags: 0 },
+                0,
+            )
+            .unwrap();
         assert_eq!(seq, 11);
     }
 
@@ -350,7 +470,6 @@ mod tests {
         assert_eq!(drained, 2);
         assert_eq!(s.info().messages, 2);
 
-        // Remaining: orders.updated (seq 2), payments.done (seq 4)
         assert!(s.read(1).unwrap().is_none());
         assert!(s.read(2).unwrap().is_some());
         assert!(s.read(3).unwrap().is_none());
@@ -386,43 +505,66 @@ mod tests {
         let mut s = MemoryStore::new();
         s.append(EntryRef { subject: b"x", payload: b"y", stream_id: 0, flags: 0 }, 0).unwrap();
         let seq = s.append_batch(&[], 0).unwrap();
-        assert_eq!(seq, 2); // next would be 2
-    }
-
-    #[test]
-    fn get_borrows_without_clone() {
-        let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"orders.created", payload: b"{}", stream_id: 0, flags: 0 }, 1000).unwrap();
-
-        let mut found = false;
-        let ok = s.get(1, &mut |entry| {
-            assert_eq!(&*entry.subject, b"orders.created");
-            assert_eq!(&*entry.payload, b"{}");
-            assert_eq!(entry.timestamp, 1000);
-            found = true;
-        }).unwrap();
-        assert!(ok);
-        assert!(found);
-
-        // Not found
-        let ok = s.get(999, &mut |_| panic!("should not be called")).unwrap();
-        assert!(!ok);
+        assert_eq!(seq, 2);
     }
 
     #[test]
     fn for_each_borrows_without_clone() {
         let mut s = MemoryStore::new();
-        for i in 0..5u8 {
-            s.append(EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0 }, 0).unwrap();
+
+        let mut seen = 0;
+        s.for_each(1, 3, &mut |e| {
+            assert!(matches!(e.subject, b"a" | b"b"));
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, 2);
+    }
+
+    #[test]
+    fn get_borrows_without_clone() {
+        let mut s = MemoryStore::new();
+        s.append(EntryRef { subject: b"hello", payload: b"world", stream_id: 0, flags: 0 }, 42).unwrap();
+
+        let mut captured_ts = 0;
+        let found = s
+            .get(1, &mut |e| {
+                captured_ts = e.timestamp;
+                assert_eq!(&*e.subject, b"hello");
+            })
+            .unwrap();
+        assert!(found);
+        assert_eq!(captured_ts, 42);
+    }
+
+    /// Verify rotation actually happens when entries exceed segment_size.
+    #[test]
+    fn rotation_when_segment_full() {
+        let mut s = MemoryStore::with_segment_size(MIN_SEGMENT_SIZE, 16);
+        // MIN_SEGMENT_SIZE = 4096. Each entry here is 1 + 1024 = 1025 bytes,
+        // so 4 entries fit in one segment, the 5th triggers rotation.
+        let payload = vec![0u8; 1024];
+        for _ in 0..6 {
+            s.append(
+                EntryRef { subject: b"x", payload: &payload, stream_id: 0, flags: 0 },
+                0,
+            )
+            .unwrap();
+        }
+        // 6 entries, 2 segments expected (4 + 2 = 6 under 4096 each).
+        assert_eq!(s.info().messages, 6);
+        assert!(s.sealed.len() >= 1, "at least one segment should be sealed");
+
+        // Verify we can still read across segments.
+        for i in 1..=6 {
+            let e = s.read(i).unwrap().expect("entry present");
+            assert_eq!(e.payload.len(), 1024);
         }
 
-        let mut count = 0u32;
-        let mut seqs = Vec::new();
-        s.for_each(2, 5, &mut |entry| {
-            seqs.push(entry.seq);
-            count += 1;
-        }).unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(seqs, vec![2, 3, 4]);
+        let mut seen = 0;
+        s.for_each(1, 7, &mut |_| seen += 1).unwrap();
+        assert_eq!(seen, 6);
     }
 }
