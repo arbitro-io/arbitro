@@ -73,29 +73,53 @@ struct Bucket {
     /// Index of any binding on this connection — used to obtain the tx handle.
     tx_binding_idx: usize,
     delivered: Vec<PendingDelivery>,
+    /// Pool lifecycle flag. True while the bucket participates in the
+    /// in-progress cycle; false when it is idle in the pool.
+    in_use: bool,
 }
 
 impl Bucket {
-    fn new(tx_binding_idx: usize, stream_id: StreamId, first_seq: u64) -> Self {
-        let mut body = BytesMut::with_capacity(64 * 1024);
-        // Envelope placeholder — patched at flush time.
-        body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-        // RepBatchFixed — count patched at flush time.
-        body.extend_from_slice(
+    /// Fresh bucket — only called when the pool needs to grow.
+    fn new_blank() -> Self {
+        Self {
+            body: BytesMut::with_capacity(64 * 1024),
+            count: 0,
+            first_seq: 0,
+            stream_id: StreamId(0),
+            tx_binding_idx: 0,
+            delivered: Vec::with_capacity(256),
+            in_use: false,
+        }
+    }
+
+    /// Prepare a pooled bucket for a new active use. Body is unconditionally
+    /// cleared defensively — never trusts prior state.
+    fn activate(&mut self, tx_binding_idx: usize, stream_id: StreamId, first_seq: u64) {
+        self.body.clear();
+        self.body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
+        self.body.extend_from_slice(
             RepBatchFixed {
                 count: U16::new(0),
                 _pad: U16::new(0),
             }
             .as_bytes(),
         );
-        Self {
-            body,
-            count: 0,
-            first_seq,
-            stream_id,
-            tx_binding_idx,
-            delivered: Vec::with_capacity(256),
-        }
+        self.count = 0;
+        self.first_seq = first_seq;
+        self.stream_id = stream_id;
+        self.tx_binding_idx = tx_binding_idx;
+        self.delivered.clear();
+        self.in_use = true;
+    }
+
+    /// Release the bucket back to the pool. Called after every flush path
+    /// (Ok, Full, Closed, empty) — the `in_use` invariant is: at the end
+    /// of a cycle, no bucket has `in_use = true`.
+    fn release(&mut self) {
+        self.body.clear();
+        self.count = 0;
+        self.delivered.clear();
+        self.in_use = false;
     }
 }
 
@@ -109,6 +133,12 @@ pub(in crate::shard) struct DrainScratch {
     resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>>,
     /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
     subject_limit_cache: HashMap<(u32, u32), Option<u32>>,
+
+    /// Bucket pool — never shrinks. Grown lazily by `acquire_bucket`.
+    buckets: Vec<Bucket>,
+    /// Active bucket keys this cycle: `(conn_raw, stream_raw, bucket_idx)`.
+    /// Linear scan; typical cycle has very few active conns.
+    active_buckets: Vec<(u64, u32, usize)>,
 }
 
 impl DrainScratch {
@@ -119,7 +149,39 @@ impl DrainScratch {
             dead_connections: Vec::with_capacity(4),
             resolve_cache: HashMap::with_capacity(64),
             subject_limit_cache: HashMap::with_capacity(64),
+            buckets: Vec::with_capacity(16),
+            active_buckets: Vec::with_capacity(16),
         }
+    }
+
+    /// Return the index into `self.buckets` for the given `(conn, stream)`.
+    /// Reuses a pooled idle bucket if available; grows the pool by one
+    /// otherwise. The bucket is activated (cleared + header placeholders)
+    /// before return so the caller can append immediately.
+    fn acquire_bucket(
+        &mut self,
+        conn_id: u64,
+        stream_id: StreamId,
+        tx_binding_idx: usize,
+        first_seq: u64,
+    ) -> usize {
+        // Fast path: already active this cycle.
+        for &(c, s, idx) in self.active_buckets.iter() {
+            if c == conn_id && s == stream_id.raw() {
+                return idx;
+            }
+        }
+        // Find an idle bucket in the pool.
+        let idx = match self.buckets.iter().position(|b| !b.in_use) {
+            Some(i) => i,
+            None => {
+                self.buckets.push(Bucket::new_blank());
+                self.buckets.len() - 1
+            }
+        };
+        self.buckets[idx].activate(tx_binding_idx, stream_id, first_seq);
+        self.active_buckets.push((conn_id, stream_id.raw(), idx));
+        idx
     }
 }
 
@@ -159,12 +221,9 @@ pub(in crate::shard) fn drain_cycle(
     let mut lowest_skipped: Option<u64> = None;
 
     scratch.dead_connections.clear();
+    scratch.active_buckets.clear();
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
-
-    // Per-cycle accumulator: one bucket per (conn, stream) that received
-    // at least one entry during this walk.
-    let mut batches: HashMap<(u64, u32), Bucket> = HashMap::with_capacity(8);
 
     // Per-cycle inflight deltas — counters are only incremented in phase 2
     // (on flush), so during the walk we must account for pending appends
@@ -180,7 +239,6 @@ pub(in crate::shard) fn drain_cycle(
                 snap,
                 entry,
                 scratch,
-                &mut batches,
                 &mut local_inflight,
                 &mut local_subject,
                 now_ms,
@@ -191,11 +249,14 @@ pub(in crate::shard) fn drain_cycle(
         })
         .ok();
 
-    // Phase 2 — flush every non-empty bucket. One frame per bucket.
-    for ((conn_raw, _stream_raw), bucket) in batches.drain() {
+    // Phase 2 — flush every active bucket. The pool's `in_use` flag is
+    // cleared inside `flush_bucket` on every path (Ok/Full/Closed/empty).
+    let active_count = scratch.active_buckets.len();
+    for i in 0..active_count {
+        let (conn_raw, _stream_raw, bucket_idx) = scratch.active_buckets[i];
         flush_bucket(
             counters,
-            bucket,
+            &mut scratch.buckets[bucket_idx],
             ConnectionId(conn_raw),
             &snap.bindings,
             names,
@@ -235,7 +296,6 @@ fn process_drain_entry(
     snap: &DrainSnapshot,
     entry: &arbitro_store::Entry<'_>,
     scratch: &mut DrainScratch,
-    batches: &mut HashMap<(u64, u32), Bucket>,
     local_inflight: &mut HashMap<u32, u32>,
     local_subject: &mut HashMap<u32, u32>,
     now_ms: u64,
@@ -327,7 +387,6 @@ fn process_drain_entry(
         stream_id,
         subject_hash,
         scratch,
-        batches,
         local_inflight,
         local_subject,
         &snap.bindings,
@@ -345,7 +404,6 @@ fn dispatch_recipients(
     stream_id: StreamId,
     subject_hash: u32,
     scratch: &mut DrainScratch,
-    batches: &mut HashMap<(u64, u32), Bucket>,
     local_inflight: &mut HashMap<u32, u32>,
     local_subject: &mut HashMap<u32, u32>,
     bindings: &[ActiveBinding],
@@ -353,17 +411,10 @@ fn dispatch_recipients(
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {
-    let DrainScratch {
-        matches,
-        served_queues,
-        dead_connections,
-        ..
-    } = scratch;
+    scratch.served_queues.clear();
 
-    served_queues.clear();
-
-    for i in 0..matches.len() {
-        let me = matches[i];
+    for i in 0..scratch.matches.len() {
+        let me = scratch.matches[i];
         let consumer_id = me.consumer_id;
         let connection_id = me.connection_id;
         let queue_id = me.queue_id;
@@ -373,11 +424,11 @@ fn dispatch_recipients(
         }
 
         // Queue dedup: one entry per queue within the match set of this entry.
-        if queue_id != QueueId(0) && served_queues.contains(&queue_id) {
+        if queue_id != QueueId(0) && scratch.served_queues.contains(&queue_id) {
             continue;
         }
 
-        if dead_connections.contains(&connection_id) {
+        if scratch.dead_connections.contains(&connection_id) {
             continue;
         }
 
@@ -410,12 +461,16 @@ fn dispatch_recipients(
             }
         }
 
-        // ── Append to this connection's bucket (or create it) ────────────
+        // ── Append to this connection's bucket (from pool) ────────────────
 
-        let key = (connection_id.0, stream_id.raw());
-        let bucket = batches
-            .entry(key)
-            .or_insert_with(|| Bucket::new(binding_idx, stream_id, entry.seq));
+        let fire_and_forget = binding.fire_and_forget;
+        let bucket_idx = scratch.acquire_bucket(
+            connection_id.0,
+            stream_id,
+            binding_idx,
+            entry.seq,
+        );
+        let bucket = &mut scratch.buckets[bucket_idx];
 
         let subj_len = entry.subject.len();
         let data_len = subj_len + entry.payload.len();
@@ -459,18 +514,18 @@ fn dispatch_recipients(
             binding_idx,
             consumer_id: consumer_id.0,
             queue_id: queue_id.0,
-            fire_and_forget: binding.fire_and_forget,
+            fire_and_forget,
         });
 
         // Track pending inflight for subsequent capacity/subject checks in
         // this same cycle. Atomic counters are incremented in phase 2.
-        if !binding.fire_and_forget {
+        if !fire_and_forget {
             *local_inflight.entry(consumer_id.0).or_insert(0) += 1;
             *local_subject.entry(subject_hash).or_insert(0) += 1;
         }
 
         if queue_id != QueueId(0) {
-            served_queues.push(queue_id);
+            scratch.served_queues.push(queue_id);
         }
     }
 }
@@ -478,10 +533,11 @@ fn dispatch_recipients(
 // ── Bucket flush ────────────────────────────────────────────────────────────
 
 /// Flush a single bucket: patch headers, try_send, notify command thread.
-/// Consumes the bucket — called only once per bucket at end of cycle.
+/// Marks the bucket as idle in the pool on every exit path so the next
+/// cycle can reuse it via `acquire_bucket`.
 fn flush_bucket(
     counters: &SharedCounters,
-    mut bucket: Bucket,
+    bucket: &mut Bucket,
     connection_id: ConnectionId,
     bindings: &[ActiveBinding],
     names: &Arc<crate::common::NameRegistry>,
@@ -491,6 +547,7 @@ fn flush_bucket(
     dead_connections: &mut Vec<ConnectionId>,
 ) {
     if bucket.count == 0 {
+        bucket.release();
         return;
     }
 
@@ -542,13 +599,21 @@ fn flush_bucket(
 
             // Notify command thread — group by binding_id.
             notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
+
+            // Body is empty after split(); clear bookkeeping and return
+            // the bucket to the pool.
+            bucket.release();
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
             *more_pending = true;
             track_skipped(lowest_skipped, bucket.first_seq);
+            // Data dropped; cursor rewinds to first_seq. Release the
+            // bucket so the next cycle can reuse it.
+            bucket.release();
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             dead_connections.push(connection_id);
+            bucket.release();
         }
     }
 }
