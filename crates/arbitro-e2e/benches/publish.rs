@@ -231,6 +231,28 @@ struct StageStats {
     fetch_single: Duration, // Store::get called once per seq (no batching)
     fetch_all: Duration,    // for_each reading EVERY field of the Entry
     drain_logic: Duration,  // fetch + match + atomics + group — no encode/tcp
+    /// Concurrent append + for_each on the same store guarded by std::sync::Mutex.
+    concurrent_mutex: Duration,
+    /// Concurrent append + for_each guarded by std::sync::RwLock (drain reads).
+    concurrent_rwlock: Duration,
+    /// Single-threaded interleaved append + for_each — no lock at all.
+    single_thread: Duration,
+    /// Drain-only (replay scenario) — store pre-filled, then pure walks
+    /// under `std::sync::Mutex`. NO concurrent publisher — measures the
+    /// raw cost of the lock in absence of contention.
+    drain_only_mutex: Duration,
+    /// Same walks but on the store directly without any lock.
+    drain_only_no_lock: Duration,
+    /// TCP passthrough, pure bytes, with 0 channels (single task does
+    /// read + write on two sockets). Baseline: pure TCP cost.
+    tcp_zero_channels: Duration,
+    /// TCP passthrough with 1 channel (reader task → channel → writer task).
+    /// Models the server's "input only" path.
+    tcp_one_channel: Duration,
+    /// TCP passthrough with 2 channels (reader → channel → processor →
+    /// channel → writer). Models the server's full path (input + output
+    /// channels, drain between them).
+    tcp_two_channels: Duration,
     encode: Duration, // differential: fetch_encode - fetch
     send: Duration,
     recv: Duration,
@@ -731,30 +753,48 @@ fn build_frame(store: &dyn Store, from: u64, to: u64) -> (Bytes, usize) {
 
 // ── Drain-logic simulation ──────────────────────────────────────────────────
 //
-// Simulates the full drain path except encode/TCP:
-//   store.for_each(batches of max_feed)
-//     → match: N recipients per entry
-//     → per-recipient atomic checks:
-//         * subject_has_room   (AtomicU32 load < max)
-//         * is_paused          (AtomicBool load)
-//         * consumer_has_capacity (AtomicU32 load < max_inflight)
-//     → on success: inc counters (fetch_add)
-//     → append to per-connection bucket (linear scan, no HashMap in loop)
+// Mirrors `drain.rs` semantics as closely as possible without building the
+// RepBatch frame or touching the TCP layer. The goal is to measure the
+// pure CPU + atomic cost of the drain's decision path so optimisations
+// can be attributed correctly.
 //
-// Matches drain.rs semantics but without building the RepBatch frame or
-// touching the TCP layer — pure CPU logic + atomic ops.
+// Faithfulness to drain.rs:
+//
+//   - `fire_and_forget` gates all inflight atomics. When true, the real
+//     drain skips:
+//        * the `consumer_has_capacity` atomic load (drain.rs:394)
+//        * the `local_inflight` pending delta (drain.rs:445)
+//        * the `inflight.fetch_add` + `subject.fetch_add` on flush (L515)
+//
+//   - `has_subject_limits` gates subject_has_room. Absent limit = skip
+//     the atomic load (drain.rs:287).
+//
+//   - `is_paused` is always checked (1 atomic load, cheap).
+//
+//   - Bucket lookup is a linear scan over active keys (3-8 typical),
+//     matching the hot-path rule "no HashMap lookup on inner loop".
+//
+//   - Atomic increments happen once per bucket AT FLUSH TIME, not per
+//     recipient during the walk (real drain batches them — drain.rs:514).
 
 const SIM_CONNS: usize = 3;
-const SIM_MAX_INFLIGHT: u32 = u32::MAX; // effectively disabled — matches fire-and-forget
-const SIM_MAX_SUBJECT: u32 = u32::MAX;
 
 struct SimBinding {
     connection_id: u64,
     consumer_id: u32,
+    #[allow(dead_code)]
     queue_id: u32,
     max_inflight: u32,
+    fire_and_forget: bool,
     inflight: std::sync::atomic::AtomicU32,
     paused: std::sync::atomic::AtomicBool,
+}
+
+struct SimDelivered {
+    seq: u64,
+    consumer_id: u32,
+    fire_and_forget: bool,
+    subject_hash: u32,
 }
 
 fn simulate_drain_logic(store: &dyn Store, total_msgs: u64, max_feed: usize) -> Duration {
@@ -762,29 +802,62 @@ fn simulate_drain_logic(store: &dyn Store, total_msgs: u64, max_feed: usize) -> 
 
     let last_seq = store.info().last_seq;
 
+    // Env-configurable knobs so a single binary can exercise both workload
+    // classes (fire-and-forget fanout vs. ack-based consumers).
+    let fire_and_forget = std::env::var("BENCH_SIM_FAF")
+        .ok()
+        .and_then(|s| s.parse::<bool>().ok())
+        .unwrap_or(true);
+    let has_subject_limit = std::env::var("BENCH_SIM_SUBJECT_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<bool>().ok())
+        .unwrap_or(false);
+    let max_inflight_cfg = std::env::var("BENCH_SIM_MAX_INFLIGHT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(u32::MAX);
+
     // Setup (outside the timer): one binding per simulated connection.
-    // In real drain, match_table.lookup(subject_hash) returns these; we
-    // hardcode them as "every entry matches all N bindings", which is the
-    // fanout worst case.
     let bindings: Vec<SimBinding> = (0..SIM_CONNS)
         .map(|i| SimBinding {
             connection_id: (i + 1) as u64,
             consumer_id: (i + 1) as u32,
             queue_id: 0, // fanout — no queue dedup
-            max_inflight: SIM_MAX_INFLIGHT,
+            max_inflight: max_inflight_cfg,
+            fire_and_forget,
             inflight: AtomicU32::new(0),
             paused: std::sync::atomic::AtomicBool::new(false),
         })
         .collect();
 
-    // Single global subject_inflight atomic — simulates the RwLock-guarded
-    // HashMap<subject_hash, AtomicU32> of the real drain (fast-path: we
-    // read an atomic; we elide the read-lock for simplicity).
     let subject_inflight = AtomicU32::new(0);
+    let max_subject: u32 = u32::MAX;
 
-    // Per-cycle buckets: (conn_id, Vec<seq>). Linear scan to find the
-    // right bucket for a given conn — no HashMap in the inner loop.
-    let mut buckets: Vec<(u64, Vec<u64>)> = Vec::with_capacity(SIM_CONNS);
+    // Per-cycle scratch (re-used every cycle, matches DrainScratch).
+    let mut buckets: Vec<(u64, Vec<SimDelivered>)> = Vec::with_capacity(SIM_CONNS);
+    let mut local_inflight: Vec<(u32, u32)> = Vec::with_capacity(SIM_CONNS);
+    let mut local_subject: Vec<(u32, u32)> = Vec::with_capacity(8);
+
+    // Linear-scan helpers — same pattern as drain.rs.
+    #[inline]
+    fn ldelta_get(list: &[(u32, u32)], key: u32) -> u32 {
+        for &(k, v) in list {
+            if k == key {
+                return v;
+            }
+        }
+        0
+    }
+    #[inline]
+    fn ldelta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
+        for e in list.iter_mut() {
+            if e.0 == key {
+                e.1 += 1;
+                return;
+            }
+        }
+        list.push((key, 1));
+    }
 
     let mut cursor = 0u64;
     let mut total_appended = 0u64;
@@ -794,55 +867,102 @@ fn simulate_drain_logic(store: &dyn Store, total_msgs: u64, max_feed: usize) -> 
         let from = cursor + 1;
         let to = (from + max_feed as u64).min(last_seq + 1);
 
+        // Reset per-cycle scratch.
+        for (_, v) in &mut buckets {
+            v.clear();
+        }
+        local_inflight.clear();
+        local_subject.clear();
+
         store
             .for_each(from, to, &mut |entry| {
-                // Subject gating: one atomic load + compare.
-                if subject_inflight.load(Relaxed) >= SIM_MAX_SUBJECT {
-                    return;
+                // Per-entry subject_hash. In real drain workloads there
+                // are typically <16 distinct subjects during a cycle —
+                // bucketing keeps local_subject small and the linear
+                // scan cheap. Simulating 4 distinct subjects reflects
+                // a realistic fanout pattern.
+                let subject_hash = (entry.seq % 4) as u32;
+
+                // Subject gating — only when limits are configured.
+                if has_subject_limit {
+                    let pending = ldelta_get(&local_subject, subject_hash);
+                    if pending >= max_subject
+                        || subject_inflight.load(Relaxed) + pending >= max_subject
+                    {
+                        return;
+                    }
                 }
 
-                // For every binding that "matches" this entry (all, for
-                // fanout simulation), run the per-recipient checks.
+                // Per-recipient dispatch.
                 for binding in &bindings {
-                    // is_paused: 1 atomic load.
+                    // is_paused — always checked (1 atomic load).
                     if binding.paused.load(Relaxed) {
                         continue;
                     }
-                    // consumer_has_capacity: 1 atomic load + compare.
-                    if binding.inflight.load(Relaxed) >= binding.max_inflight {
-                        continue;
+
+                    // consumer_has_capacity — gated by fire_and_forget.
+                    if !binding.fire_and_forget {
+                        let pending = ldelta_get(&local_inflight, binding.consumer_id);
+                        if pending >= binding.max_inflight
+                            || binding.inflight.load(Relaxed) + pending
+                                >= binding.max_inflight
+                        {
+                            continue;
+                        }
                     }
 
-                    // Reserve: 2 fetch_adds (consumer + subject).
-                    binding.inflight.fetch_add(1, Relaxed);
-                    subject_inflight.fetch_add(1, Relaxed);
-
-                    // Group by conn: linear scan (typical N=3-8, faster
-                    // than a hash lookup at this scale).
-                    let mut found = None;
+                    // Group by conn: linear scan.
+                    let mut bucket_idx = None;
                     for (idx, (c, _)) in buckets.iter().enumerate() {
                         if *c == binding.connection_id {
-                            found = Some(idx);
+                            bucket_idx = Some(idx);
                             break;
                         }
                     }
-                    match found {
-                        Some(idx) => buckets[idx].1.push(entry.seq),
+                    let idx = match bucket_idx {
+                        Some(i) => i,
                         None => {
-                            let mut v = Vec::with_capacity(max_feed);
-                            v.push(entry.seq);
-                            buckets.push((binding.connection_id, v));
+                            buckets
+                                .push((binding.connection_id, Vec::with_capacity(max_feed)));
+                            buckets.len() - 1
+                        }
+                    };
+
+                    buckets[idx].1.push(SimDelivered {
+                        seq: entry.seq,
+                        consumer_id: binding.consumer_id,
+                        fire_and_forget: binding.fire_and_forget,
+                        subject_hash,
+                    });
+
+                    // Pending delta — only when NOT fire-and-forget.
+                    if !binding.fire_and_forget {
+                        ldelta_inc(&mut local_inflight, binding.consumer_id);
+                        if has_subject_limit {
+                            ldelta_inc(&mut local_subject, subject_hash);
                         }
                     }
+
                     total_appended += 1;
                 }
             })
             .unwrap();
 
-        // End of cycle: simulate the "flush" by clearing buckets.
-        // Real drain would encode + send here. We just clear.
-        for (_, v) in &mut buckets {
-            v.clear();
+        // ── Flush phase: matches drain.rs:514–519 ────────────────────────
+        // Real drain patches envelope, try_send, then inc atomics. We skip
+        // the wire work and only do the inc — which is gated by
+        // fire_and_forget exactly like the real drain.
+        for (_, delivered) in &buckets {
+            for d in delivered {
+                if !d.fire_and_forget {
+                    bindings[(d.consumer_id - 1) as usize]
+                        .inflight
+                        .fetch_add(1, Relaxed);
+                    if has_subject_limit {
+                        subject_inflight.fetch_add(1, Relaxed);
+                    }
+                }
+            }
         }
 
         cursor = to - 1;
@@ -850,12 +970,404 @@ fn simulate_drain_logic(store: &dyn Store, total_msgs: u64, max_feed: usize) -> 
 
     let elapsed = t0.elapsed();
 
-    // Expected: total_msgs × SIM_CONNS appends (each entry went to N bindings).
     assert_eq!(
         total_appended,
         total_msgs * SIM_CONNS as u64,
         "drain-logic append count mismatch"
     );
+
+    elapsed
+}
+
+// ── Lock-contention microbenchmarks ─────────────────────────────────────────
+//
+// The real drain guards its Store behind `Arc<Mutex<Box<dyn Store>>>`. The
+// drain task and the command task hold the lock for every operation, which
+// means every `append_batch` and every `for_each` contend for the same lock.
+// These three stages measure the cost of that contention.
+//
+// Shared setup: `total_msgs` publish + the drain must observe all of them.
+// The store is pre-allocated with `with_segment_size` so the arena never
+// grows during the benchmark (factoring out alloc jitter).
+
+/// Two concurrent OS threads behind `std::sync::Mutex<Store>`: one appends,
+/// one drains. Both pay the lock cost on every operation. Uses
+/// `std::thread::spawn` because `std::sync::MutexGuard` is not Send across
+/// async await points — but the server's actual architecture is the same
+/// (std::Mutex guarded by tokio tasks that carefully scope guards).
+fn bench_concurrent_mutex(total: u64, payload: &[u8]) -> Duration {
+    use std::sync::Mutex;
+    let store: Arc<Mutex<MemoryStore>> = Arc::new(Mutex::new(MemoryStore::with_segment_size(
+        16 * 1024 * 1024,
+        total as usize,
+    )));
+    let subject: &'static [u8] = b"bench.lock";
+    let payload_vec = payload.to_vec();
+
+    let start = Instant::now();
+
+    let pub_store = store.clone();
+    let pub_payload = payload_vec.clone();
+    let pub_handle = std::thread::spawn(move || {
+        for i in 0..total {
+            let mut s = pub_store.lock().unwrap();
+            s.append(
+                EntryRef {
+                    stream_id: 1,
+                    subject,
+                    payload: &pub_payload,
+                    flags: 0,
+                },
+                i,
+            )
+            .unwrap();
+        }
+    });
+
+    let drn_store = store.clone();
+    let drn_handle = std::thread::spawn(move || {
+        let mut seen = 0u64;
+        let mut cursor = 0u64;
+        while seen < total {
+            let s = drn_store.lock().unwrap();
+            let last = s.info().last_seq;
+            if last > cursor {
+                s.for_each(cursor + 1, last + 1, &mut |_| {
+                    seen += 1;
+                })
+                .unwrap();
+                cursor = last;
+            }
+            drop(s);
+            std::thread::yield_now();
+        }
+    });
+
+    let _ = pub_handle.join();
+    let _ = drn_handle.join();
+    start.elapsed()
+}
+
+/// Same as above but with `RwLock` — drain uses `read()`, publish `write()`.
+fn bench_concurrent_rwlock(total: u64, payload: &[u8]) -> Duration {
+    use std::sync::RwLock;
+    let store: Arc<RwLock<MemoryStore>> = Arc::new(RwLock::new(MemoryStore::with_segment_size(
+        16 * 1024 * 1024,
+        total as usize,
+    )));
+    let subject: &'static [u8] = b"bench.lock";
+    let payload_vec = payload.to_vec();
+
+    let start = Instant::now();
+
+    let pub_store = store.clone();
+    let pub_payload = payload_vec.clone();
+    let pub_handle = std::thread::spawn(move || {
+        for i in 0..total {
+            let mut s = pub_store.write().unwrap();
+            s.append(
+                EntryRef {
+                    stream_id: 1,
+                    subject,
+                    payload: &pub_payload,
+                    flags: 0,
+                },
+                i,
+            )
+            .unwrap();
+        }
+    });
+
+    let drn_store = store.clone();
+    let drn_handle = std::thread::spawn(move || {
+        let mut seen = 0u64;
+        let mut cursor = 0u64;
+        while seen < total {
+            let s = drn_store.read().unwrap();
+            let last = s.info().last_seq;
+            if last > cursor {
+                s.for_each(cursor + 1, last + 1, &mut |_| {
+                    seen += 1;
+                })
+                .unwrap();
+                cursor = last;
+            }
+            drop(s);
+            std::thread::yield_now();
+        }
+    });
+
+    let _ = pub_handle.join();
+    let _ = drn_handle.join();
+    start.elapsed()
+}
+
+/// Single-threaded: one task interleaves append chunks with for_each.
+/// Zero locks, no contention.
+fn bench_single_thread(total: u64, payload: &[u8]) -> Duration {
+    let mut store =
+        MemoryStore::with_segment_size(16 * 1024 * 1024, total as usize);
+    let subject: &'static [u8] = b"bench.lock";
+    const CHUNK: u64 = 256;
+
+    let start = Instant::now();
+    let mut seen = 0u64;
+    let mut cursor = 0u64;
+    while seen < total {
+        let publish_to = (cursor + CHUNK).min(total);
+        for i in cursor..publish_to {
+            store
+                .append(
+                    EntryRef {
+                        stream_id: 1,
+                        subject,
+                        payload,
+                        flags: 0,
+                    },
+                    i,
+                )
+                .unwrap();
+        }
+        let last = store.info().last_seq;
+        store
+            .for_each(cursor + 1, last + 1, &mut |_| {
+                seen += 1;
+            })
+            .unwrap();
+        cursor = last;
+    }
+    start.elapsed()
+}
+
+/// Drain-only replay scenario: store is pre-filled, then the drain walks
+/// the whole log in chunks of `max_feed`. Guarded by `std::sync::Mutex`
+/// — but NO concurrent publisher, so any cost here is purely the lock
+/// fast-path overhead (CAS + cache line touch), not contention.
+fn bench_drain_only_mutex(total: u64, max_feed: usize, payload: &[u8]) -> Duration {
+    use std::sync::Mutex;
+    // Pre-fill (NOT timed).
+    let subject: &'static [u8] = b"bench.drain";
+    let mut raw = MemoryStore::with_segment_size(16 * 1024 * 1024, total as usize);
+    for i in 0..total {
+        raw.append(
+            EntryRef {
+                stream_id: 1,
+                subject,
+                payload,
+                flags: 0,
+            },
+            i,
+        )
+        .unwrap();
+    }
+    let store: Arc<Mutex<MemoryStore>> = Arc::new(Mutex::new(raw));
+    let last_seq = store.lock().unwrap().info().last_seq;
+
+    // Timed: walk through the whole log in `max_feed` chunks, acquiring
+    // the Mutex once per chunk (matches the real drain pattern).
+    let start = Instant::now();
+    let mut cursor = 0u64;
+    let mut seen = 0u64;
+    while cursor < last_seq {
+        let from = cursor + 1;
+        let to = (from + max_feed as u64).min(last_seq + 1);
+        let s = store.lock().unwrap();
+        s.for_each(from, to, &mut |entry| {
+            std::hint::black_box(entry.seq);
+            std::hint::black_box(entry.subject.as_ptr());
+            seen += 1;
+        })
+        .unwrap();
+        drop(s);
+        cursor = to - 1;
+    }
+    assert_eq!(seen, total, "drain-only-mutex count mismatch");
+    start.elapsed()
+}
+
+/// Same replay but with the store as a plain `&mut` (no lock at all).
+fn bench_drain_only_no_lock(total: u64, max_feed: usize, payload: &[u8]) -> Duration {
+    let subject: &'static [u8] = b"bench.drain";
+    let mut store = MemoryStore::with_segment_size(16 * 1024 * 1024, total as usize);
+    for i in 0..total {
+        store
+            .append(
+                EntryRef {
+                    stream_id: 1,
+                    subject,
+                    payload,
+                    flags: 0,
+                },
+                i,
+            )
+            .unwrap();
+    }
+    let last_seq = store.info().last_seq;
+
+    let start = Instant::now();
+    let mut cursor = 0u64;
+    let mut seen = 0u64;
+    while cursor < last_seq {
+        let from = cursor + 1;
+        let to = (from + max_feed as u64).min(last_seq + 1);
+        store
+            .for_each(from, to, &mut |entry| {
+                std::hint::black_box(entry.seq);
+                std::hint::black_box(entry.subject.as_ptr());
+                seen += 1;
+            })
+            .unwrap();
+        cursor = to - 1;
+    }
+    assert_eq!(seen, total, "drain-only-no-lock count mismatch");
+    start.elapsed()
+}
+
+// ── TCP channel-cost microbenchmarks ────────────────────────────────────────
+//
+// All three variants shuttle `total_bytes` of raw bytes between two TCP
+// sockets in the same process (loopback). The only difference is how many
+// tokio mpsc channels sit between the reader and the writer:
+//
+//   0 channels — one task does read_exact + write_all inline
+//   1 channel  — reader task → channel → writer task  (server "input-only" style)
+//   2 channels — reader → channel → processor → channel → writer (server full path)
+//
+// Input: pure bytes (`vec![0u8; chunk]`), no framing. This isolates the
+// per-byte cost of crossing channel boundaries from any wire parsing.
+
+const TCP_CHUNK: usize = 64 * 1024;          // 64 KB per read — closer to wire size
+const TCP_CHANNEL_CAP: usize = 1024;
+const TCP_READ_BUF_CAP: usize = 1024 * 1024; // 1 MB ring for the reader — zero realloc
+
+/// Bind on loopback and spawn a task that immediately accepts a client.
+/// Returns `(addr, accept_handle)`.
+async fn spawn_accept_once() -> (std::net::SocketAddr, tokio::task::JoinHandle<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+    (addr, handle)
+}
+
+/// Run a TCP passthrough test with `num_channels` tokio mpsc channels
+/// between the socket read and the socket write paths.
+async fn bench_tcp_passthrough(total_bytes: usize, num_channels: u8) -> Duration {
+    let (sender_server_addr, sender_accept) = spawn_accept_once().await;
+    let (receiver_server_addr, receiver_accept) = spawn_accept_once().await;
+
+    // Client A — pumps `total_bytes` into the server.
+    let sender_client_task = tokio::spawn(async move {
+        let mut sock = TcpStream::connect(sender_server_addr).await.unwrap();
+        let chunk = vec![0u8; TCP_CHUNK];
+        let mut sent = 0;
+        while sent < total_bytes {
+            let n = std::cmp::min(TCP_CHUNK, total_bytes - sent);
+            sock.write_all(&chunk[..n]).await.unwrap();
+            sent += n;
+        }
+        sock.shutdown().await.ok();
+    });
+
+    // Client B — drains what the server forwards to it.
+    let receiver_client_task = tokio::spawn(async move {
+        let mut sock = TcpStream::connect(receiver_server_addr).await.unwrap();
+        let mut buf = vec![0u8; TCP_CHUNK];
+        let mut recvd = 0usize;
+        while recvd < total_bytes {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            recvd += n;
+        }
+        recvd
+    });
+
+    // Server sockets (in from Client A, out to Client B).
+    let sender_sock = sender_accept.await.unwrap();
+    let receiver_sock = receiver_accept.await.unwrap();
+    let (mut sender_read, _) = sender_sock.into_split();
+    let (_, mut receiver_write) = receiver_sock.into_split();
+
+    // Start the clock AFTER setup — measures only the transfer.
+    let start = Instant::now();
+
+    match num_channels {
+        0 => {
+            // Single task: read + write inline using a reused buffer.
+            // Zero allocations after the initial vec.
+            let mut buf = vec![0u8; TCP_CHUNK];
+            loop {
+                let n = sender_read.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                receiver_write.write_all(&buf[..n]).await.unwrap();
+            }
+        }
+        1 => {
+            // reader task → channel → writer (here).
+            // Sends `Bytes` (Arc-backed, 3ns clone) instead of `Vec<u8>`
+            // (fresh alloc + memcpy per chunk). Uses `read_buf` into a
+            // single BytesMut ring and `split_to` for zero-copy chunking.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(TCP_CHANNEL_CAP);
+            let reader = tokio::spawn(async move {
+                let mut body = BytesMut::with_capacity(TCP_READ_BUF_CAP);
+                loop {
+                    if body.capacity() - body.len() < TCP_CHUNK {
+                        body.reserve(TCP_READ_BUF_CAP);
+                    }
+                    let n = sender_read.read_buf(&mut body).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = body.split_to(n).freeze();
+                    tx.send(chunk).await.unwrap();
+                }
+            });
+            while let Some(chunk) = rx.recv().await {
+                receiver_write.write_all(&chunk).await.unwrap();
+            }
+            reader.await.unwrap();
+        }
+        2 => {
+            // reader → channel A → processor → channel B → writer.
+            let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<Bytes>(TCP_CHANNEL_CAP);
+            let (tx_b, mut rx_b) = tokio::sync::mpsc::channel::<Bytes>(TCP_CHANNEL_CAP);
+            let reader = tokio::spawn(async move {
+                let mut body = BytesMut::with_capacity(TCP_READ_BUF_CAP);
+                loop {
+                    if body.capacity() - body.len() < TCP_CHUNK {
+                        body.reserve(TCP_READ_BUF_CAP);
+                    }
+                    let n = sender_read.read_buf(&mut body).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = body.split_to(n).freeze();
+                    tx_a.send(chunk).await.unwrap();
+                }
+            });
+            let processor = tokio::spawn(async move {
+                while let Some(chunk) = rx_a.recv().await {
+                    tx_b.send(chunk).await.unwrap();
+                }
+            });
+            while let Some(chunk) = rx_b.recv().await {
+                receiver_write.write_all(&chunk).await.unwrap();
+            }
+            reader.await.unwrap();
+            processor.await.unwrap();
+        }
+        _ => panic!("unsupported num_channels: {num_channels}"),
+    }
+
+    receiver_write.shutdown().await.ok();
+    let elapsed = start.elapsed();
+
+    // Wait for clients to finish (their shutdowns).
+    let _ = sender_client_task.await;
+    let _ = receiver_client_task.await;
 
     elapsed
 }
@@ -963,6 +1475,20 @@ async fn run_stage_measurements(
     //    The intent is to answer the question: "how much of the drain
     //    budget is spent on pure logic, independent of the wire layer?"
     let drain_logic_elapsed = simulate_drain_logic(&*store, total_msgs, max_feed);
+
+    // ── Stage 1e/f/g: lock-contention microbenchmarks (publish+drain). ───
+    let concurrent_mutex_elapsed = bench_concurrent_mutex(total_msgs, payload);
+    let concurrent_rwlock_elapsed = bench_concurrent_rwlock(total_msgs, payload);
+    let single_thread_elapsed = bench_single_thread(total_msgs, payload);
+    let drain_only_mutex_elapsed = bench_drain_only_mutex(total_msgs, max_feed, payload);
+    let drain_only_no_lock_elapsed = bench_drain_only_no_lock(total_msgs, max_feed, payload);
+
+    // ── TCP channel-cost microbenchmarks ─────────────────────────────────
+    // Use total bytes ≈ total_msgs × payload size to match the wire volume.
+    let tcp_total_bytes = (total_msgs as usize) * (payload.len() + 32);
+    let tcp_zero_channels_elapsed = bench_tcp_passthrough(tcp_total_bytes, 0).await;
+    let tcp_one_channel_elapsed = bench_tcp_passthrough(tcp_total_bytes, 1).await;
+    let tcp_two_channels_elapsed = bench_tcp_passthrough(tcp_total_bytes, 2).await;
 
     // ── Stage 2: fetch+encode — build frames in BytesMut ────────────────
     let t1 = Instant::now();
@@ -1136,6 +1662,14 @@ async fn run_stage_measurements(
         fetch_single: fetch_single_elapsed,
         fetch_all: fetch_all_elapsed,
         drain_logic: drain_logic_elapsed,
+        concurrent_mutex: concurrent_mutex_elapsed,
+        concurrent_rwlock: concurrent_rwlock_elapsed,
+        single_thread: single_thread_elapsed,
+        drain_only_mutex: drain_only_mutex_elapsed,
+        drain_only_no_lock: drain_only_no_lock_elapsed,
+        tcp_zero_channels: tcp_zero_channels_elapsed,
+        tcp_one_channel: tcp_one_channel_elapsed,
+        tcp_two_channels: tcp_two_channels_elapsed,
         encode: encode_pure,
         send: send_elapsed,
         recv: recv_elapsed,
@@ -1257,6 +1791,54 @@ async fn run_for_kind(
             mode: "pipeline/drain-logic",
             total_msgs,
             elapsed: stages.drain_logic,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/concurrent-mutex",
+            total_msgs,
+            elapsed: stages.concurrent_mutex,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/concurrent-rwlock",
+            total_msgs,
+            elapsed: stages.concurrent_rwlock,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/single-thread",
+            total_msgs,
+            elapsed: stages.single_thread,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/drain-only-mutex",
+            total_msgs,
+            elapsed: stages.drain_only_mutex,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/drain-only-no-lock",
+            total_msgs,
+            elapsed: stages.drain_only_no_lock,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/tcp-0-channels",
+            total_msgs,
+            elapsed: stages.tcp_zero_channels,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/tcp-1-channel",
+            total_msgs,
+            elapsed: stages.tcp_one_channel,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/tcp-2-channels",
+            total_msgs,
+            elapsed: stages.tcp_two_channels,
         },
         RunResult {
             label: label.into(),
