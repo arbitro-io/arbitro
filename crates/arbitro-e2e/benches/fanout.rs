@@ -1,6 +1,11 @@
 //! Benchmark: Multi-client High-Density Fanout & Filtering Stress Test.
 //!
-//! Density:
+//! Runs two scenarios back-to-back:
+//!   1. **pub/sub** — subscribe first, publish afterwards (live fanout).
+//!   2. **replay**  — publish first, subscribe afterwards with
+//!                    `DeliverPolicy::All` (historical replay).
+//!
+//! Density in each scenario:
 //! - 3 Clients (Connections)
 //! - 20 Subscriptions per Client (Total: 60)
 //! - Mixed Filters: Direct, Wildcard, Global, and Non-Matching.
@@ -10,7 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitro_client::Client;
-use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverMode, StreamConfig};
+use arbitro_proto::config::{
+    AckPolicy, ConsumerConfig, DeliverMode, DeliverPolicy, StreamConfig,
+};
 use arbitro_server::{ArbitroServer, Config};
 
 const NUM_CLIENTS: usize = 3;
@@ -46,8 +53,27 @@ async fn create_test_server() -> String {
 
 #[tokio::main]
 async fn main() {
+    let mut total_failures = 0;
+
+    println!("\n╔══════════════════════════════════════════════╗");
+    println!("║ Scenario 1: pub/sub (subscribe → publish)   ║");
+    println!("╚══════════════════════════════════════════════╝");
+    total_failures += run_pub_sub().await;
+
+    println!("\n╔══════════════════════════════════════════════╗");
+    println!("║ Scenario 2: replay (publish → subscribe)    ║");
+    println!("╚══════════════════════════════════════════════╝");
+    total_failures += run_replay().await;
+
+    if total_failures > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// Scenario 1 — subscribe first, then publish. Live fanout path.
+async fn run_pub_sub() -> usize {
     let addr = create_test_server().await;
-    let stream_name = b"high_density_fanout";
+    let stream_name = b"fanout_live";
 
     let setup_client = Client::connect(&addr).await.unwrap();
     setup_client
@@ -55,32 +81,87 @@ async fn main() {
         .await
         .unwrap();
 
+    let (stats, _tasks) = subscribe_all(&addr, stream_name, DeliverPolicy::New).await;
+
+    // Give subs a moment to propagate before bursting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let start = Instant::now();
+    println!("Bursting 300,000 messages across 3 subjects...");
+    let payload = vec![0u8; 64];
+    publish_all(&setup_client, stream_name, &payload).await;
+
+    println!("Waiting for delivery...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let elapsed = start.elapsed();
+
+    report(&stats, elapsed, "pub/sub")
+}
+
+/// Scenario 2 — publish first, then subscribe with `DeliverPolicy::All`.
+/// Replay path — late subscribers receive historical entries from seq=1.
+async fn run_replay() -> usize {
+    let addr = create_test_server().await;
+    let stream_name = b"fanout_replay";
+
+    let setup_client = Client::connect(&addr).await.unwrap();
+    setup_client
+        .create_stream(&StreamConfig::new(stream_name, b">").build())
+        .await
+        .unwrap();
+
+    // ── Publish first ──────────────────────────────────────────────────
+    println!("Publishing 300,000 messages BEFORE any subscription...");
+    let payload = vec![0u8; 64];
+    let pub_start = Instant::now();
+    publish_all(&setup_client, stream_name, &payload).await;
+    println!("Published in {:?}", pub_start.elapsed());
+
+    // ── Subscribe later with DeliverPolicy::All (triggers replay) ──────
+    let subscribe_start = Instant::now();
+    let (stats, _tasks) = subscribe_all(&addr, stream_name, DeliverPolicy::All).await;
+    println!("All subs registered in {:?}", subscribe_start.elapsed());
+
+    println!("Waiting for replay delivery...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let elapsed = subscribe_start.elapsed();
+
+    report(&stats, elapsed, "replay")
+}
+
+/// Create 3 clients × 20 subs with the given `DeliverPolicy`. Returns the
+/// stats collectors + handles to keep subs alive.
+async fn subscribe_all(
+    addr: &str,
+    stream_name: &[u8],
+    policy: DeliverPolicy,
+) -> (Vec<Arc<SubStats>>, Vec<arbitro_client::subscription::CallbackHandle>) {
     let mut stats = Vec::new();
     let mut tasks = Vec::new();
 
     println!(
-        "Scaling: {} clients * {} subs = {} total subscriptions...",
+        "Subscribing: {} clients × {} subs = {} total (policy={policy:?})",
         NUM_CLIENTS,
         SUBS_PER_CLIENT,
         NUM_CLIENTS * SUBS_PER_CLIENT
     );
 
     for c_idx in 0..NUM_CLIENTS {
-        let client = Client::connect(&addr).await.unwrap();
+        let client = Client::connect(addr).await.unwrap();
         let ccfg = ConsumerConfig::new(format!("c{}", c_idx).as_bytes(), stream_name)
             .deliver_mode(DeliverMode::Fanout)
+            .deliver_policy(policy)
             .ack_policy(AckPolicy::None)
             .build()
             .unwrap();
         let consumer = client.create_consumer(&ccfg).await.unwrap();
 
         for s_idx in 0..SUBS_PER_CLIENT {
-            // Interleave 4 types of filters per client
             let (filter, expected) = match s_idx % 4 {
-                0 => ("iot.1.status", MSG_PER_TYPE),     // Group A: Direct (1M)
-                1 => ("iot.*.status", MSG_PER_TYPE * 2), // Group B: Wildcard (2M)
-                2 => (">", MSG_PER_TYPE * 3),            // Group C: Global (3M)
-                _ => ("ignore.me", 0),                   // Group D: No Match (0)
+                0 => ("iot.1.status", MSG_PER_TYPE),
+                1 => ("iot.*.status", MSG_PER_TYPE * 2),
+                2 => (">", MSG_PER_TYPE * 3),
+                _ => ("ignore.me", 0),
             };
 
             let sub_stat = Arc::new(SubStats {
@@ -102,82 +183,16 @@ async fn main() {
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let start = Instant::now();
-    let payload = vec![0u8; 64];
+    (stats, tasks)
+}
+
+/// Publish all three subject groups. Shared between both scenarios so the
+/// message mix is identical.
+async fn publish_all(client: &Client, stream: &[u8], payload: &[u8]) {
     let batch_size = 1000;
-
-    println!("Bursting 3,000,000 messages across 3 types...");
-    publish_burst(
-        &setup_client,
-        stream_name,
-        b"iot.1.status",
-        &payload,
-        batch_size,
-    )
-    .await; // 1M
-    publish_burst(
-        &setup_client,
-        stream_name,
-        b"iot.2.status",
-        &payload,
-        batch_size,
-    )
-    .await; // 1M
-    publish_burst(
-        &setup_client,
-        stream_name,
-        b"other.logs",
-        &payload,
-        batch_size,
-    )
-    .await; // 1M
-
-    println!("Waiting for delivery (High Density Delivery)...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let elapsed = start.elapsed();
-
-    // REPORT
-    println!("\n+----------+--------------------+----------------+----------------+------------+");
-    println!("| Sub ID   | Filter             | Received       | Expected       | Status     |");
-    println!("+----------+--------------------+----------------+----------------+------------+");
-    let mut total_received = 0;
-    let mut failures = 0;
-
-    for (i, s) in stats.iter().enumerate() {
-        let count = s.count.load(Relaxed);
-        total_received += count;
-        let is_ok = count == s.expected;
-        if !is_ok {
-            failures += 1;
-        }
-
-        // Only show first 8 and last 4 if list is long, but always check all
-        if i < 8 || i > stats.len() - 5 {
-            let status = if is_ok { "OK" } else { "FAIL" };
-            println!(
-                "| {:<8} | {:<18} | {:<14} | {:<14} | {:<10} |",
-                s.id, s.filter, count, s.expected, status
-            );
-        } else if i == 8 {
-            println!(
-                "| ...      | ...                | ...            | ...            | ...        |"
-            );
-        }
-    }
-
-    println!("+----------+--------------------+----------------+----------------+------------+");
-    println!("Total Logical Deliveries: {}", total_received);
-    println!("Total Failures: {}/{}", failures, stats.len());
-    println!(
-        "Overall Throughput: {:.2} msg/s",
-        total_received as f64 / elapsed.as_secs_f64()
-    );
-    println!("Total Elapsed: {:?}", elapsed);
-
-    if failures > 0 {
-        std::process::exit(1);
-    }
+    publish_burst(client, stream, b"iot.1.status", payload, batch_size).await;
+    publish_burst(client, stream, b"iot.2.status", payload, batch_size).await;
+    publish_burst(client, stream, b"other.logs", payload, batch_size).await;
 }
 
 async fn publish_burst(
@@ -194,4 +209,47 @@ async fn publish_burst(
         }
         client.publish_batch(stream, &entries).await.unwrap();
     }
+}
+
+/// Print a results table and return the number of failures.
+fn report(stats: &[Arc<SubStats>], elapsed: Duration, label: &str) -> usize {
+    println!("\n[{label}] Results:");
+    println!("+----------+--------------------+----------------+----------------+------------+");
+    println!("| Sub ID   | Filter             | Received       | Expected       | Status     |");
+    println!("+----------+--------------------+----------------+----------------+------------+");
+
+    let mut total_received = 0u64;
+    let mut failures = 0;
+
+    for (i, s) in stats.iter().enumerate() {
+        let count = s.count.load(Relaxed);
+        total_received += count;
+        let is_ok = count == s.expected;
+        if !is_ok {
+            failures += 1;
+        }
+
+        if i < 8 || i > stats.len() - 5 {
+            let status = if is_ok { "OK" } else { "FAIL" };
+            println!(
+                "| {:<8} | {:<18} | {:<14} | {:<14} | {:<10} |",
+                s.id, s.filter, count, s.expected, status
+            );
+        } else if i == 8 {
+            println!(
+                "| ...      | ...                | ...            | ...            | ...        |"
+            );
+        }
+    }
+
+    println!("+----------+--------------------+----------------+----------------+------------+");
+    println!("[{label}] Total Logical Deliveries: {}", total_received);
+    println!("[{label}] Total Failures: {}/{}", failures, stats.len());
+    println!(
+        "[{label}] Overall Throughput: {:.2} msg/s",
+        total_received as f64 / elapsed.as_secs_f64()
+    );
+    println!("[{label}] Total Elapsed: {:?}", elapsed);
+
+    failures
 }

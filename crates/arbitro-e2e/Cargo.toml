@@ -43,6 +43,10 @@ name    = "fanout"
 harness = false
 
 [[bench]]
+name    = "publish"
+harness = false
+
+[[bench]]
 name    = "chaos"
 harness = false
 
