@@ -255,6 +255,13 @@ pub(in crate::shard) fn drain_cycle(
     scratch.active_buckets.clear();
     scratch.local_inflight.clear();
     scratch.local_subject.clear();
+    // Pattern and subject-limit caches must be flushed every cycle —
+    // they hold entries resolved against the match_table snapshot, and
+    // the snapshot may have changed since the last cycle (subscribe /
+    // unsubscribe rebuilds it). Keeping stale entries silently drops
+    // late-binding fanout subscribers during replay.
+    scratch.resolve_cache.clear();
+    scratch.subject_limit_cache.clear();
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
