@@ -66,6 +66,7 @@ name = "arbitro-e2e"
 version = "0.1.0"
 dependencies = [
  "arbitro-client",
+ "arbitro-common",
  "arbitro-engine",
  "arbitro-proto",
  "arbitro-server",
@@ -74,8 +75,10 @@ dependencies = [
  "bytes",
  "criterion",
  "crossbeam-channel",
+ "crossbeam-utils",
  "flume",
  "libc",
+ "parking_lot",
  "tempfile",
  "tokio",
  "tokio-uring",

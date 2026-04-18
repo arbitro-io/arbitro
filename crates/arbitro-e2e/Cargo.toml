@@ -13,6 +13,7 @@ arbitro-engine-v2 = { workspace = true }
 arbitro-store  = { path = "../arbitro-store" }
 arbitro-server = { path = "../arbitro-server" }
 arbitro-client = { path = "../arbitro-client" }
+arbitro-common = { path = "../arbitro-common" }
 tempfile       = { workspace = true }
 
 [features]
@@ -25,6 +26,8 @@ crossbeam-channel = "0.5"
 flume = "0.11"
 atomic-wait = "1"
 libc = "0.2"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
 
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -39,19 +42,7 @@ name    = "limits"
 harness = false
 
 [[bench]]
-name    = "fanout"
-harness = false
-
-[[bench]]
 name    = "publish"
-harness = false
-
-[[bench]]
-name    = "chaos"
-harness = false
-
-[[bench]]
-name    = "endurance"
 harness = false
 
 [[bench]]
@@ -59,5 +50,5 @@ name    = "queue"
 harness = false
 
 [[bench]]
-name    = "match_table"
+name    = "gate_notify"
 harness = false
