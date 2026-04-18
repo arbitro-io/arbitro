@@ -410,8 +410,37 @@ impl Store for TolerantStore {
         };
         let end = end.min(self.index.len());
         let start = start.min(end);
+
+        // Cache the active-segment id once. The `sealed_segments.len()` value
+        // can't change during this read-only walk (we hold `&self`).
+        let active_seg_id = self.sealed_segments.len() as u32;
+        let active_slice: Option<&[u8]> = self
+            .active_mmap
+            .as_ref()
+            .map(|m| &m[..]);
+
         for i in start..end {
-            self.get(self.index[i].seq, f)?;
+            let m = &self.index[i];
+            let data: &[u8] = if m.segment_idx == active_seg_id {
+                match active_slice {
+                    Some(s) => s,
+                    None => return Err(StoreError::NotFound),
+                }
+            } else {
+                &self.sealed_segments[m.segment_idx as usize][..]
+            };
+            let sub_start = m.offset as usize;
+            let sub_end = sub_start + (m.subj_len as usize);
+            let pld_end = sub_end + (m.payload_len as usize);
+            let entry = Entry {
+                seq: m.seq,
+                stream_id: m.stream_id,
+                timestamp: m.ts,
+                subject: &data[sub_start..sub_end],
+                payload: &data[sub_end..pld_end],
+                flags: m.flags,
+            };
+            f(&entry);
         }
         Ok(())
     }
