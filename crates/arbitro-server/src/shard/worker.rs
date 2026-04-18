@@ -393,27 +393,41 @@ impl CommandWorker {
     /// Rebuild the drain snapshot from current bindings + engine match tables
     /// and swap it into the shared SnapshotSwap.
     pub(super) fn rebuild_and_swap_snapshot(&self) {
-        let mut binding_index = HashMap::with_capacity(self.bindings.len());
         // We need to clone bindings for the snapshot because drain holds Arc
         // while we might modify our local copy later.
         let snap_bindings: Vec<ActiveBinding> = self
             .bindings
             .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                binding_index.insert((b.consumer_id.0, b.connection_id.0), i);
-                ActiveBinding {
-                    binding_id: b.binding_id,
-                    connection_id: b.connection_id,
-                    consumer_id: b.consumer_id,
-                    stream_id: b.stream_id,
-                    queue_id: b.queue_id,
-                    max_inflight: b.max_inflight,
-                    fire_and_forget: b.fire_and_forget,
-                    tx: b.tx.clone(),
-                }
+            .map(|b| ActiveBinding {
+                binding_id: b.binding_id,
+                connection_id: b.connection_id,
+                consumer_id: b.consumer_id,
+                stream_id: b.stream_id,
+                queue_id: b.queue_id,
+                max_inflight: b.max_inflight,
+                fire_and_forget: b.fire_and_forget,
+                tx: b.tx.clone(),
             })
             .collect();
+
+        // Build the sorted binding index. The sort happens on the cold path
+        // (snapshot rebuild, only on structural changes), so its cost is
+        // amortised across thousands of drain cycles.
+        let mut binding_index: Vec<crate::shard::shared::BindingIndexEntry> = self
+            .bindings
+            .iter()
+            .enumerate()
+            .map(|(i, b)| crate::shard::shared::BindingIndexEntry {
+                consumer_id: b.consumer_id.0,
+                connection_id: b.connection_id.0,
+                binding_idx: i as u32,
+            })
+            .collect();
+        binding_index.sort_unstable_by(|a, b| {
+            a.consumer_id
+                .cmp(&b.consumer_id)
+                .then(a.connection_id.cmp(&b.connection_id))
+        });
 
         // Clone match tables from engine catalog.
         let catalog = &self.engine.ctx().catalog;

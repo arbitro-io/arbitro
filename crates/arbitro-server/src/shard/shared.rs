@@ -294,20 +294,50 @@ impl SharedCounters {
 pub struct DrainSnapshot {
     /// Active bindings — iterated by drain for delivery.
     pub bindings: Vec<ActiveBinding>,
-    /// Pre-built O(1) binding lookup: (consumer_id, connection_id) → index.
-    pub binding_index: HashMap<(u32, u64), usize>,
+    /// Pre-built binding lookup, sorted by (consumer_id, connection_id).
+    /// Drain does binary search on this in the hot path — matches the
+    /// "no HashMap on inner deliver loop" rule while keeping lookups at
+    /// O(log N) on cache-friendly contiguous memory.
+    pub binding_index: Vec<BindingIndexEntry>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
     pub match_tables: Vec<Option<MatchTable>>,
+}
+
+/// Compact, cache-line-friendly index entry. Sorted by (consumer_id,
+/// connection_id) so binary search is stable.
+#[derive(Debug, Clone, Copy)]
+pub struct BindingIndexEntry {
+    pub consumer_id: u32,
+    pub connection_id: u64,
+    pub binding_idx: u32,
 }
 
 impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
-            binding_index: HashMap::new(),
+            binding_index: Vec::new(),
             match_tables: Vec::new(),
         }
     }
+}
+
+/// Binary-search helper for the drain hot path. Returns the binding index
+/// or `None` if no binding matches the `(consumer_id, connection_id)` pair.
+#[inline]
+pub fn find_binding_idx(
+    index: &[BindingIndexEntry],
+    consumer_id: u32,
+    connection_id: u64,
+) -> Option<usize> {
+    index
+        .binary_search_by(|e| {
+            e.consumer_id
+                .cmp(&consumer_id)
+                .then(e.connection_id.cmp(&connection_id))
+        })
+        .ok()
+        .map(|i| index[i].binding_idx as usize)
 }
 
 // ── SnapshotSwap ───────────────────────────────────────────────────────────

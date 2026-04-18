@@ -36,7 +36,9 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use crate::common::Gate;
-use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters};
+use crate::shard::shared::{
+    find_binding_idx, BindingIndexEntry, DrainNotification, DrainSnapshot, SharedCounters,
+};
 use crate::shard::worker::ActiveBinding;
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -347,7 +349,7 @@ fn dispatch_recipients(
     local_inflight: &mut HashMap<u32, u32>,
     local_subject: &mut HashMap<u32, u32>,
     bindings: &[ActiveBinding],
-    binding_index: &HashMap<(u32, u64), usize>,
+    binding_index: &[BindingIndexEntry],
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {
@@ -379,8 +381,9 @@ fn dispatch_recipients(
             continue;
         }
 
-        let binding_idx = match binding_index.get(&(consumer_id.0, connection_id.0)) {
-            Some(&idx) => idx,
+        let binding_idx = match find_binding_idx(binding_index, consumer_id.0, connection_id.0)
+        {
+            Some(idx) => idx,
             None => continue,
         };
         let binding = &bindings[binding_idx];
