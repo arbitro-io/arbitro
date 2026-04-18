@@ -28,6 +28,7 @@ atomic-wait = "1"
 libc = "0.2"
 parking_lot = "0.12"
 crossbeam-utils = "0.8"
+futures = "0.3"
 
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -51,4 +52,8 @@ harness = false
 
 [[bench]]
 name    = "gate_notify"
+harness = false
+
+[[bench]]
+name    = "fanout"
 harness = false
