@@ -227,7 +227,8 @@ struct PipelineStats {
 
 /// Per-stage timings for the drain pipeline, isolated.
 struct StageStats {
-    fetch: Duration,
+    fetch: Duration,        // for_each in batches of max_feed
+    fetch_single: Duration, // Store::get called once per seq (no batching)
     encode: Duration, // differential: fetch_encode - fetch
     send: Duration,
     recv: Duration,
@@ -743,20 +744,48 @@ async fn run_stage_measurements(
     let store = build_prefilled_store(journal_kind, data_dir, total_msgs, subject, payload);
     let last_seq = store.info().last_seq;
 
-    // ── Stage 1: fetch — for_each with noop callback ────────────────────
+    // ── Stage 1: fetch — for_each in batches of max_feed, noop callback.
+    //    This matches what the drain actually does: chunked walks, one per
+    //    cycle. Measuring a single huge walk would let the compiler/CPU
+    //    amortise costs that the drain can't.
     let t0 = Instant::now();
     let mut fetched = 0u64;
-    store
-        .for_each(1, last_seq + 1, &mut |entry| {
-            // Touch the fields so the compiler can't elide the walk.
-            std::hint::black_box(entry.seq);
-            std::hint::black_box(entry.subject.as_ptr());
-            std::hint::black_box(entry.payload.as_ptr());
-            fetched += 1;
-        })
-        .unwrap();
+    let mut cursor_f = 0u64;
+    while cursor_f < last_seq {
+        let from = cursor_f + 1;
+        let to = (from + max_feed as u64).min(last_seq + 1);
+        store
+            .for_each(from, to, &mut |entry| {
+                // Touch the fields so the compiler can't elide the walk.
+                std::hint::black_box(entry.seq);
+                std::hint::black_box(entry.subject.as_ptr());
+                std::hint::black_box(entry.payload.as_ptr());
+                fetched += 1;
+            })
+            .unwrap();
+        cursor_f = to - 1;
+    }
     let fetch_elapsed = t0.elapsed();
     assert_eq!(fetched, total_msgs, "fetch count mismatch");
+
+    // ── Stage 1b: fetch-single — Store::get once per seq (no batching).
+    //    Exercises the per-entry call overhead: one dispatch per message,
+    //    one seq→index lookup per call. Contrasts with the batched
+    //    for_each above which amortises the lookup across the cycle.
+    let t_fetch_single = Instant::now();
+    let mut fetched_single = 0u64;
+    for seq in 1..=last_seq {
+        let _ok = store
+            .get(seq, &mut |entry| {
+                std::hint::black_box(entry.seq);
+                std::hint::black_box(entry.subject.as_ptr());
+                std::hint::black_box(entry.payload.as_ptr());
+                fetched_single += 1;
+            })
+            .unwrap();
+    }
+    let fetch_single_elapsed = t_fetch_single.elapsed();
+    assert_eq!(fetched_single, total_msgs, "fetch-single count mismatch");
 
     // ── Stage 2: fetch+encode — build frames in BytesMut ────────────────
     let t1 = Instant::now();
@@ -927,6 +956,7 @@ async fn run_stage_measurements(
 
     StageStats {
         fetch: fetch_elapsed,
+        fetch_single: fetch_single_elapsed,
         encode: encode_pure,
         send: send_elapsed,
         recv: recv_elapsed,
@@ -1030,6 +1060,12 @@ async fn run_for_kind(
             mode: "pipeline/fetch",
             total_msgs,
             elapsed: stages.fetch,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/fetch-single",
+            total_msgs,
+            elapsed: stages.fetch_single,
         },
         RunResult {
             label: label.into(),
