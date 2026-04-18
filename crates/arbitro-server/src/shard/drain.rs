@@ -25,7 +25,9 @@ use arbitro_engine_v2::catalog::match_table::MatchEntry;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
 use arbitro_proto::action::Action;
-use arbitro_proto::wire::delivery::{DeliveryEntryHeader, RepBatchFixed};
+use arbitro_proto::wire::delivery::{
+    DeliveryEntryHeader, RepBatchFixed, DELIVERY_ENTRY_HEADER_SIZE,
+};
 use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_store::Store;
 use bytes::BytesMut;
@@ -414,18 +416,35 @@ fn dispatch_recipients(
 
         let subj_len = entry.subject.len();
         let data_len = subj_len + entry.payload.len();
-        bucket.body.extend_from_slice(
-            DeliveryEntryHeader {
-                consumer_id: U32::new(consumer_id.0),
-                seq: U64::new(entry.seq),
-                subj_len: U16::new(subj_len as u16),
-                data_len: U32::new(data_len as u32),
-                subject_hash: U32::new(subject_hash),
-            }
-            .as_bytes(),
-        );
-        bucket.body.extend_from_slice(entry.subject);
-        bucket.body.extend_from_slice(entry.payload);
+        // Build (header + subject + payload) in a stack scratch, then emit
+        // with a single `extend_from_slice`. Three separate extends cost
+        // 3 capacity checks + 3 non-vectorisable memcpys. One contiguous
+        // memcpy lets AVX move it in a handful of instructions.
+        //
+        // Falls back to 3 extends for oversized payloads (> 4 KB).
+        const ENTRY_SCRATCH_SIZE: usize = 4096;
+        let total = DELIVERY_ENTRY_HEADER_SIZE + data_len;
+        let header = DeliveryEntryHeader {
+            consumer_id: U32::new(consumer_id.0),
+            seq: U64::new(entry.seq),
+            subj_len: U16::new(subj_len as u16),
+            data_len: U32::new(data_len as u32),
+            subject_hash: U32::new(subject_hash),
+        };
+        if total <= ENTRY_SCRATCH_SIZE {
+            let mut scratch_buf = [0u8; ENTRY_SCRATCH_SIZE];
+            scratch_buf[..DELIVERY_ENTRY_HEADER_SIZE]
+                .copy_from_slice(header.as_bytes());
+            let subj_end = DELIVERY_ENTRY_HEADER_SIZE + subj_len;
+            scratch_buf[DELIVERY_ENTRY_HEADER_SIZE..subj_end]
+                .copy_from_slice(entry.subject);
+            scratch_buf[subj_end..total].copy_from_slice(entry.payload);
+            bucket.body.extend_from_slice(&scratch_buf[..total]);
+        } else {
+            bucket.body.extend_from_slice(header.as_bytes());
+            bucket.body.extend_from_slice(entry.subject);
+            bucket.body.extend_from_slice(entry.payload);
+        }
 
         bucket.count += 1;
         bucket.delivered.push(PendingDelivery {
