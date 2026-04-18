@@ -50,10 +50,14 @@ pub struct ActiveBinding {
     pub(super) max_inflight: u32,
     /// `AckPolicy::None` — skip inflight tracking and capacity checks.
     pub(super) fire_and_forget: bool,
-    /// Cached write-channel sender — cloned once from the registry at
-    /// subscribe time (~26 ns). The drain uses `tx.try_send()` (~3 ns)
-    /// for delivery, bypassing the registry Mutex entirely on the hot path.
-    pub(super) tx: mpsc::Sender<Bytes>,
+    /// Cached shared writer half — cloned once from the registry at
+    /// subscribe time (~3 ns). The drain writes directly to the socket
+    /// via `try_write` + `writable()` for backpressure — no intermediate
+    /// channel, no writer task.
+    pub(super) writer: Arc<tokio::net::tcp::OwnedWriteHalf>,
+    /// Tokio runtime handle — needed so the drain OS thread can
+    /// `block_on(writer.writable())` when the kernel buffer fills.
+    pub(super) runtime: tokio::runtime::Handle,
 }
 
 // ── Accumulator private types ────────────────────────────────────────────────
@@ -406,7 +410,8 @@ impl CommandWorker {
                 queue_id: b.queue_id,
                 max_inflight: b.max_inflight,
                 fire_and_forget: b.fire_and_forget,
-                tx: b.tx.clone(),
+                writer: Arc::clone(&b.writer),
+                runtime: b.runtime.clone(),
             })
             .collect();
 

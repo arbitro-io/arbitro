@@ -602,46 +602,43 @@ fn flush_bucket(
     );
 
     let frozen = bucket.body.split().freeze();
-    match tx_binding.tx.try_send(frozen) {
-        Ok(()) => {
-            crate::lifecycle_trace!(
-                "30_send_bytes_done",
-                connection_id.0,
-                bucket.count as u64,
-                "shard"
-            );
+    let ok = crate::transport::registry::write_all_blocking(
+        &tx_binding.writer,
+        &frozen,
+        &tx_binding.runtime,
+    );
 
-            // Increment atomic inflight counters for ack-mode deliveries.
-            // `bucket.delivered` only contains non-fire-and-forget entries
-            // (gated at push time), so no per-entry branch is needed here.
-            for pd in &bucket.delivered {
-                counters.inc_inflight(pd.consumer_id, pd.queue_id);
-                counters.inc_subject(pd.entry.subject_hash);
-            }
+    if ok {
+        crate::lifecycle_trace!(
+            "30_send_bytes_done",
+            connection_id.0,
+            bucket.count as u64,
+            "shard"
+        );
 
-            // Notify command thread — only if there are actual ack-mode
-            // entries. `bucket.delivered` is empty when every recipient
-            // was fire-and-forget, so the allocation + channel send is
-            // elided entirely for the pub/sub default path.
-            if !bucket.delivered.is_empty() {
-                notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
-            }
+        // Increment atomic inflight counters for ack-mode deliveries.
+        // `bucket.delivered` only contains non-fire-and-forget entries
+        // (gated at push time), so no per-entry branch is needed here.
+        for pd in &bucket.delivered {
+            counters.inc_inflight(pd.consumer_id, pd.queue_id);
+            counters.inc_subject(pd.entry.subject_hash);
+        }
 
-            // Body is empty after split(); clear bookkeeping and return
-            // the bucket to the pool.
-            bucket.release();
+        // Notify command thread — only if there are actual ack-mode
+        // entries. `bucket.delivered` is empty when every recipient
+        // was fire-and-forget, so the allocation + channel send is
+        // elided entirely for the pub/sub default path.
+        if !bucket.delivered.is_empty() {
+            notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            *more_pending = true;
-            track_skipped(lowest_skipped, bucket.first_seq);
-            // Data dropped; cursor rewinds to first_seq. Release the
-            // bucket so the next cycle can reuse it.
-            bucket.release();
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            dead_connections.push(connection_id);
-            bucket.release();
-        }
+
+        bucket.release();
+    } else {
+        // Non-recoverable: socket closed/reset. Mark connection dead.
+        let _ = lowest_skipped;
+        let _ = more_pending;
+        dead_connections.push(connection_id);
+        bucket.release();
     }
 }
 

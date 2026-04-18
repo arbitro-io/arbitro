@@ -10,7 +10,6 @@ use arbitro_engine_v2::command::Command;
 use arbitro_engine_v2::types::*;
 use arbitro_proto::error::ErrorCode;
 use arbitro_store::EntryRef;
-use tokio::sync::mpsc;
 
 use crate::common::reply::{send_error, send_rep_ok};
 use crate::shard::command::*;
@@ -276,24 +275,21 @@ impl CommandWorker {
                     .map(|c| c.ack_policy == AckPolicy::None)
                     .unwrap_or(false);
 
-                let tx = self
-                    .registry
-                    .get_sender(connection_id.0)
-                    .unwrap_or_else(|| {
-                        let (tx, _rx) = mpsc::channel(1);
-                        tx
+                // Skip binding if connection disappeared before subscribe
+                // applied — stale demand cleaned up by mark_connection_dead.
+                if let Some(writer) = self.registry.get_writer(connection_id.0) {
+                    self.bindings.push(ActiveBinding {
+                        binding_id,
+                        connection_id,
+                        consumer_id,
+                        stream_id,
+                        queue_id,
+                        max_inflight,
+                        fire_and_forget,
+                        writer,
+                        runtime: self.registry.runtime_handle(),
                     });
-
-                self.bindings.push(ActiveBinding {
-                    binding_id,
-                    connection_id,
-                    consumer_id,
-                    stream_id,
-                    queue_id,
-                    max_inflight,
-                    fire_and_forget,
-                    tx,
-                });
+                }
 
                 // Increment demand atomic (but DON'T release gate yet).
                 self.counters.inc_demand(stream_id.raw());
@@ -474,24 +470,19 @@ impl CommandWorker {
                 .map(|c| c.ack_policy == AckPolicy::None)
                 .unwrap_or(false);
 
-            let tx = self
-                .registry
-                .get_sender(cmd.connection_id.0)
-                .unwrap_or_else(|| {
-                    let (tx, _rx) = mpsc::channel(1);
-                    tx
+            if let Some(writer) = self.registry.get_writer(cmd.connection_id.0) {
+                self.bindings.push(ActiveBinding {
+                    binding_id,
+                    connection_id: cmd.connection_id,
+                    consumer_id,
+                    stream_id,
+                    queue_id,
+                    max_inflight,
+                    fire_and_forget,
+                    writer,
+                    runtime: self.registry.runtime_handle(),
                 });
-
-            self.bindings.push(ActiveBinding {
-                binding_id,
-                connection_id: cmd.connection_id,
-                consumer_id,
-                stream_id,
-                queue_id,
-                max_inflight,
-                fire_and_forget,
-                tx,
-            });
+            }
 
             // Increment demand (but don't release gate yet).
             self.counters.inc_demand(stream_id.raw());

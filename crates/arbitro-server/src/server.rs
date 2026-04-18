@@ -134,12 +134,10 @@ impl ArbitroServer {
                                     continue;
                                 }
 
-                                let (conn_id, rx) = accept_registry.register();
-                                tracing::debug!(conn_id, %addr, "accepted");
-
                                 let _ = stream.set_nodelay(true);
                                 let (reader, writer) = stream.into_split();
-                                tokio::spawn(write_loop(conn_id, writer, rx));
+                                let conn_id = accept_registry.register(std::sync::Arc::new(writer));
+                                tracing::debug!(conn_id, %addr, "accepted");
 
                                 let tx = frame_tx.clone();
                                 let reg = accept_registry.clone();
@@ -283,87 +281,6 @@ async fn read_loop(
     let disconnect = Bytes::copy_from_slice(build_disconnect_frame().as_bytes());
     let _ = tx.send((conn_id, disconnect)).await;
     registry.remove(conn_id);
-}
-
-/// Write loop — drains channel, coalesces frames, writes with write_vectored.
-async fn write_loop(
-    _conn_id: u64,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Bytes>,
-) {
-    let mut batch: Vec<Bytes> = Vec::with_capacity(64);
-
-    loop {
-        match rx.recv().await {
-            Some(frame) => batch.push(frame),
-            None => break,
-        }
-        crate::lifecycle_trace!("31_write_loop_recv", _conn_id, 0, "transport_write");
-
-        // Coalesce: drain all ready frames without blocking
-        while let Ok(frame) = rx.try_recv() {
-            batch.push(frame);
-        }
-
-        let failed = if batch.len() == 1 {
-            writer.write_all(&batch[0]).await.is_err()
-        } else {
-            write_all_vectored(&mut writer, &batch).await.is_err()
-        };
-        crate::lifecycle_trace!(
-            "32_tcp_write_done",
-            _conn_id,
-            batch.len() as u64,
-            "transport_write"
-        );
-
-        if failed {
-            break;
-        }
-
-        batch.clear();
-    }
-}
-
-/// Write all frames via write_vectored. Handles partial writes.
-async fn write_all_vectored(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    frames: &[Bytes],
-) -> std::io::Result<()> {
-    use std::io::IoSlice;
-
-    let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
-    let total: usize = frames.iter().map(|f| f.len()).sum();
-    let mut written = 0usize;
-
-    while written < total {
-        let n = writer.write_vectored(&slices).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "write_vectored returned 0",
-            ));
-        }
-        written += n;
-
-        // Advance past consumed slices
-        let mut skip = n;
-        while !slices.is_empty() && skip >= slices[0].len() {
-            skip -= slices[0].len();
-            slices.remove(0);
-        }
-        if skip > 0 && !slices.is_empty() {
-            let remaining_frame_idx = frames.len() - slices.len();
-            writer
-                .write_all(&frames[remaining_frame_idx][skip..])
-                .await?;
-            for frame in &frames[remaining_frame_idx + 1..] {
-                writer.write_all(frame).await?;
-            }
-            return Ok(());
-        }
-    }
-    Ok(())
 }
 
 fn build_disconnect_frame() -> Envelope {
