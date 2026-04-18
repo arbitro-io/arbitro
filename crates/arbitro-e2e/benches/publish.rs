@@ -227,8 +227,9 @@ struct PipelineStats {
 
 /// Per-stage timings for the drain pipeline, isolated.
 struct StageStats {
-    fetch: Duration,        // for_each in batches of max_feed
+    fetch: Duration,        // for_each in batches of max_feed (3 hot fields)
     fetch_single: Duration, // Store::get called once per seq (no batching)
+    fetch_all: Duration,    // for_each reading EVERY field of the Entry
     encode: Duration, // differential: fetch_encode - fetch
     send: Duration,
     recv: Duration,
@@ -787,6 +788,40 @@ async fn run_stage_measurements(
     let fetch_single_elapsed = t_fetch_single.elapsed();
     assert_eq!(fetched_single, total_msgs, "fetch-single count mismatch");
 
+    // ── Stage 1c: fetch-all — for_each reading EVERY field of Entry.
+    //    Contrasts with `fetch` which only touches 3 fields (seq, subject,
+    //    payload). Since LogMetadata fits in one cache line, reading more
+    //    or fewer fields should produce the SAME time — the whole line is
+    //    brought in by the first load, all subsequent field reads hit L1.
+    //    This is an empirical validation: if fetch_all ≈ fetch, we've
+    //    proven the cache-line argument; if fetch_all is slower, the
+    //    struct crosses cache lines somewhere.
+    let t_fetch_all = Instant::now();
+    let mut fetched_all = 0u64;
+    let mut cursor_a = 0u64;
+    while cursor_a < last_seq {
+        let from = cursor_a + 1;
+        let to = (from + max_feed as u64).min(last_seq + 1);
+        store
+            .for_each(from, to, &mut |entry| {
+                // Every field of Entry — seq, stream_id, timestamp, subject,
+                // payload, flags. Black-box each so nothing is elided.
+                std::hint::black_box(entry.seq);
+                std::hint::black_box(entry.stream_id);
+                std::hint::black_box(entry.timestamp);
+                std::hint::black_box(entry.subject.as_ptr());
+                std::hint::black_box(entry.subject.len());
+                std::hint::black_box(entry.payload.as_ptr());
+                std::hint::black_box(entry.payload.len());
+                std::hint::black_box(entry.flags);
+                fetched_all += 1;
+            })
+            .unwrap();
+        cursor_a = to - 1;
+    }
+    let fetch_all_elapsed = t_fetch_all.elapsed();
+    assert_eq!(fetched_all, total_msgs, "fetch-all count mismatch");
+
     // ── Stage 2: fetch+encode — build frames in BytesMut ────────────────
     let t1 = Instant::now();
     let mut frames: Vec<Bytes> = Vec::new();
@@ -957,6 +992,7 @@ async fn run_stage_measurements(
     StageStats {
         fetch: fetch_elapsed,
         fetch_single: fetch_single_elapsed,
+        fetch_all: fetch_all_elapsed,
         encode: encode_pure,
         send: send_elapsed,
         recv: recv_elapsed,
@@ -1066,6 +1102,12 @@ async fn run_for_kind(
             mode: "pipeline/fetch-single",
             total_msgs,
             elapsed: stages.fetch_single,
+        },
+        RunResult {
+            label: label.into(),
+            mode: "pipeline/fetch-all",
+            total_msgs,
+            elapsed: stages.fetch_all,
         },
         RunResult {
             label: label.into(),
