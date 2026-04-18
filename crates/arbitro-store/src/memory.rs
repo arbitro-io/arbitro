@@ -1,16 +1,19 @@
-//! In-memory journal — segmented, append-only.
+//! In-memory journal — segmented, append-only, backed by **anonymous mmap**.
 //!
-//! Each segment is a fixed-capacity `Vec<u8>` allocated once. When the
+//! Each segment is a fixed-size anonymous `MmapMut` allocated once. When the
 //! active segment fills up it is sealed (frozen, read-only) and a fresh
-//! segment is allocated for further writes. This avoids the realloc chain
-//! of a single growing `Vec<u8>` (64 KB → 128 KB → ... → 16 MB → ...),
-//! which fragments the heap and hurts cache locality of encoder buffers.
+//! segment is mmap'd for further writes. This avoids the realloc chain
+//! of a single growing `Vec<u8>` AND matches the memory layout properties
+//! of `TolerantStore`: page-aligned (4 KB boundaries), OS-managed prefetch,
+//! and a virtual-address region separate from the process heap.
 //!
-//! Mirrors the segment layout of `TolerantStore` but keeps data in RAM
-//! (no mmap, no persistence).
+//! The only difference vs `TolerantStore` is the backing storage:
+//! `MemoryStore` uses `MmapMut::map_anon(..)` (pure RAM, no file, no
+//! persistence) while `TolerantStore` maps a real file for durability.
 
 use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
 use arbitro_engine_v2::catalog::fnv1a_32;
+use memmap2::{MmapMut, MmapOptions};
 
 /// Default capacity per segment. Chosen as a balance between
 /// per-segment overhead and per-store footprint for workloads that
@@ -21,20 +24,23 @@ pub const DEFAULT_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 const MIN_SEGMENT_SIZE: usize = 4 * 1024;
 
 pub struct MemoryStore {
-    /// Active segment — the one currently being written to. Allocated
-    /// with `Vec::with_capacity(segment_size)` and never resized; once
-    /// it fills up it is moved into `sealed` and a new one allocated.
-    active: Vec<u8>,
-    /// Read-only segments, in insertion order. Index `segment_idx` in
-    /// entries refers either into `sealed` (if `< sealed.len()`) or to
-    /// `active` (if `== sealed.len()`).
-    sealed: Vec<Vec<u8>>,
+    /// Active segment — anonymous mmap, fixed size. Page-aligned.
+    active: MmapMut,
+    /// Bytes written into `active`. Writes advance this counter; the
+    /// unused tail is never read.
+    active_len: usize,
+    /// Sealed segments, in insertion order. Held as `MmapMut` (not
+    /// `Mmap`) to avoid a frozen/unfrozen split in the type system;
+    /// the code treats them as read-only (only reads ever occur).
+    sealed: Vec<MmapMut>,
+    /// Number of used bytes in each sealed segment (for bounds-safe reads).
+    sealed_lens: Vec<usize>,
     /// Global index: seq → location.
     index: Vec<LogMetadata>,
     next_seq: u64,
     first_seq: u64,
     total_bytes: u64,
-    /// Fixed size of each segment. Configured at construction.
+    /// Fixed size of each mmap segment. Configured at construction.
     segment_size: usize,
 }
 
@@ -84,9 +90,12 @@ impl MemoryStore {
     /// the optimal per-segment budget.
     pub fn with_segment_size(segment_size: usize, index_cap: usize) -> Self {
         let segment_size = segment_size.max(MIN_SEGMENT_SIZE);
+        let active = alloc_anon_segment(segment_size);
         Self {
-            active: Vec::with_capacity(segment_size),
+            active,
+            active_len: 0,
             sealed: Vec::new(),
+            sealed_lens: Vec::new(),
             index: Vec::with_capacity(index_cap),
             next_seq: 1,
             first_seq: 1,
@@ -127,20 +136,24 @@ impl MemoryStore {
     /// next entry would exceed the active segment's capacity.
     #[inline(never)]
     fn rotate(&mut self) {
-        let mut new_active = Vec::with_capacity(self.segment_size);
-        std::mem::swap(&mut self.active, &mut new_active);
-        self.sealed.push(new_active);
+        let new_active = alloc_anon_segment(self.segment_size);
+        let full_len = self.active_len;
+        let full = std::mem::replace(&mut self.active, new_active);
+        self.sealed.push(full);
+        self.sealed_lens.push(full_len);
+        self.active_len = 0;
     }
 
-    /// Return an immutable slice into the segment identified by `segment_idx`.
+    /// Return an immutable slice into the segment identified by `segment_idx`,
+    /// bounded to the number of bytes actually used in that segment.
     #[inline]
     fn segment_slice(&self, segment_idx: u32) -> &[u8] {
         let idx = segment_idx as usize;
         if idx < self.sealed.len() {
-            &self.sealed[idx]
+            &self.sealed[idx][..self.sealed_lens[idx]]
         } else {
             debug_assert_eq!(idx, self.sealed.len());
-            &self.active
+            &self.active[..self.active_len]
         }
     }
 
@@ -155,15 +168,20 @@ impl MemoryStore {
         let subject_hash = fnv1a_32(entry.subject);
 
         // Rotate if this entry wouldn't fit in the active segment.
-        if self.active.len() + entry_bytes > self.segment_size {
+        if self.active_len + entry_bytes > self.segment_size {
             self.rotate();
         }
 
         let segment_idx = self.sealed.len() as u32;
-        let offset = self.active.len() as u32;
+        let offset = self.active_len as u32;
 
-        self.active.extend_from_slice(entry.subject);
-        self.active.extend_from_slice(entry.payload);
+        // Direct mmap writes: no growable Vec, no bounds check branch for
+        // capacity (we already rotated if needed).
+        let subj_end = self.active_len + (subj_len as usize);
+        let pld_end = subj_end + (payload_len as usize);
+        self.active[self.active_len..subj_end].copy_from_slice(entry.subject);
+        self.active[subj_end..pld_end].copy_from_slice(entry.payload);
+        self.active_len = pld_end;
 
         self.index.push(LogMetadata {
             seq,
@@ -288,6 +306,7 @@ impl Store for MemoryStore {
         let dropped_segments = remaining_start_seg.min(self.sealed.len());
         if dropped_segments > 0 {
             self.sealed.drain(0..dropped_segments);
+            self.sealed_lens.drain(0..dropped_segments);
             // Reindex surviving entries.
             for m in &mut self.index[cut..] {
                 m.segment_idx -= dropped_segments as u32;
@@ -310,8 +329,11 @@ impl Store for MemoryStore {
 
     fn purge(&mut self) -> u64 {
         let count = self.index.len() as u64;
-        self.active.clear();
+        // Reset active segment by zeroing its length. The mmap region stays
+        // resident — we just re-use it for future appends.
+        self.active_len = 0;
         self.sealed.clear();
+        self.sealed_lens.clear();
         self.index.clear();
         self.first_seq = self.next_seq;
         self.total_bytes = 0;
@@ -367,6 +389,17 @@ impl Store for MemoryStore {
             last_seq: self.next_seq.saturating_sub(1),
         }
     }
+}
+
+/// Allocate an anonymous mmap of exactly `size` bytes, zero-initialised.
+/// Panics if the mapping fails — this is a constructor helper and an
+/// OOM/ENOMEM at this point is unrecoverable for the caller anyway.
+#[inline]
+fn alloc_anon_segment(size: usize) -> MmapMut {
+    MmapOptions::new()
+        .len(size)
+        .map_anon()
+        .expect("MemoryStore: anonymous mmap failed")
 }
 
 #[cfg(test)]
