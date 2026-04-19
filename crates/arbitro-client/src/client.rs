@@ -8,6 +8,7 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_proto::action::Action;
 use arbitro_proto::config::{ConsumerConfig, StreamConfig, fnv1a_32};
+use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction, ListStreamsAction};
 use arbitro_proto::wire::publish::PublishEntry;
 use arbitro_proto::wire::stream::{CreateStreamFixed, DeleteStreamFixed};
@@ -82,6 +83,22 @@ impl Client {
 
         self.inner.request(Action::CreateStream, 0, &body).await?;
         Ok(())
+    }
+
+    /// Create a stream if it does not exist. Idempotent — treats
+    /// `StreamAlreadyExists` as success, so the caller gets a stable
+    /// "stream is ready" guarantee without hand-rolling the retry.
+    ///
+    /// Use the raw `create_stream` if you need a hard failure on config
+    /// drift (e.g. CI bootstraps against a clean broker).
+    ///
+    /// See `.agent/rules/features-invariants.md` §Client API.
+    pub async fn get_or_create_stream(&self, config: &StreamConfig) -> Result<(), ClientError> {
+        match self.create_stream(config).await {
+            Ok(()) => Ok(()),
+            Err(ClientError::Broker(ErrorCode::StreamAlreadyExists)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// List all streams. Returns stream info entries.
@@ -162,6 +179,28 @@ impl Client {
         let consumer_id = self.inner.request(Action::CreateConsumer, stream_id, &body).await? as u32;
 
         Ok(Consumer::new(self.inner.clone(), consumer_id, stream_id))
+    }
+
+    /// Create a consumer if one with that name does not exist. Idempotent —
+    /// returns the new `Consumer` on success, or `None` if the consumer name
+    /// was already taken (use the `ConsumerId` you received from your
+    /// original `create_consumer` call).
+    ///
+    /// **Invariant reminder:** `ConsumerId` is keyed by name across the
+    /// entire process. Two tenants sharing a name share inflight counters,
+    /// pause state, and `max_subject_inflight` bookkeeping — this helper
+    /// does NOT protect you from that. Always scope consumer names.
+    ///
+    /// See `.agent/rules/features-invariants.md` §Identity model.
+    pub async fn get_or_create_consumer(
+        &self,
+        config: &ConsumerConfig,
+    ) -> Result<Option<Consumer>, ClientError> {
+        match self.create_consumer(config).await {
+            Ok(consumer) => Ok(Some(consumer)),
+            Err(ClientError::Broker(ErrorCode::ConsumerAlreadyExists)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete a consumer.
