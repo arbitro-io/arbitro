@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::shared::{
-    find_binding_idx, find_writer, DrainNotification, DrainSnapshot, SharedCounters,
+    find_writer, DrainNotification, DrainSnapshot, SharedCounters,
 };
 use crate::shard::worker::ActiveBinding;
 
@@ -456,7 +456,6 @@ fn process_drain_entry(
         subject_limit,
         scratch,
         &snap.bindings,
-        &snap.binding_index,
         more_pending,
         lowest_skipped,
     );
@@ -473,7 +472,6 @@ fn dispatch_recipients(
     subject_limit: Option<u32>,
     scratch: &mut DrainScratch,
     bindings: &[ActiveBinding],
-    binding_index: &std::collections::HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {
@@ -514,11 +512,16 @@ fn dispatch_recipients(
             continue;
         }
 
-        let binding_idx = match find_binding_idx(binding_index, consumer_id.0, connection_id.0)
+        // Fase C.2: binding_idx is stamped directly in MatchEntry during
+        // snapshot rebuild — zero HashMap lookup on hot path. Skip
+        // unbound entries (pull-model subscriptions without an active
+        // connection binding yet).
+        let binding_idx = me.binding_idx as usize;
+        if me.binding_idx == arbitro_engine_v2::catalog::match_table::BINDING_IDX_UNBOUND
+            || binding_idx >= bindings.len()
         {
-            Some(idx) => idx,
-            None => continue,
-        };
+            continue;
+        }
         let binding = &bindings[binding_idx];
 
         // Paused check — atomic read.

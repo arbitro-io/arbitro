@@ -284,14 +284,15 @@ impl SharedCounters {
 ///
 /// Drain loads this once per cycle (~3ns Arc clone). The command thread
 /// builds a new snapshot and swaps it in on structural changes (rare).
+///
+/// **Fase C.2 note**: `binding_index` was removed. The drain no longer
+/// looks up bindings via `(consumer_id, connection_id)` HashMap. Instead,
+/// `MatchEntry.binding_idx` is stamped directly during snapshot rebuild
+/// (see `worker.rs::rebuild_and_swap_snapshot`), so per-match dispatch
+/// is a direct `bindings[match_entry.binding_idx]` Vec access.
 pub struct DrainSnapshot {
     /// Active bindings — iterated by drain for delivery.
     pub bindings: Vec<ActiveBinding>,
-    /// Binding lookup by `(consumer_id, connection_id)` → `binding_idx`.
-    /// HashMap+ahash per rule (performance.md dense/sparse): binary_search
-    /// is ~3-13× slower than HashMap+ahash for composite keys at any size
-    /// (see `lookup_strategies` bench — 3.4 ns vs 14-51 ns at N=10..10k).
-    pub binding_index: HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
     /// Per-connection writer index. One entry per connection (dedup'd
     /// from bindings — multiple consumers share a writer).
     /// HashMap+ahash: connection_id is unbounded-monotonic, so direct
@@ -299,6 +300,8 @@ pub struct DrainSnapshot {
     /// search is 2× slower than HashMap at all sizes (2.6 ns vs 3-15 ns).
     pub writers_by_conn: HashMap<u64, WriterIndexEntry, rustc_hash::FxBuildHasher>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
+    /// `MatchEntry.binding_idx` is stamped with the server-layer
+    /// binding index during rebuild.
     pub match_tables: Vec<Option<MatchTable>>,
 }
 
@@ -314,7 +317,6 @@ impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
-            binding_index: HashMap::with_hasher(rustc_hash::FxBuildHasher::default()),
             writers_by_conn: HashMap::with_hasher(rustc_hash::FxBuildHasher::default()),
             match_tables: Vec::new(),
         }
@@ -328,17 +330,6 @@ pub fn find_writer<'a>(
     connection_id: u64,
 ) -> Option<&'a WriterIndexEntry> {
     index.get(&connection_id)
-}
-
-/// Binding lookup for a given `(consumer_id, connection_id)` pair.
-/// HashMap+ahash, O(1) amortised.
-#[inline]
-pub fn find_binding_idx(
-    index: &HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
-    consumer_id: u32,
-    connection_id: u64,
-) -> Option<usize> {
-    index.get(&(consumer_id, connection_id)).map(|&i| i as usize)
 }
 
 // ── SnapshotSwap ───────────────────────────────────────────────────────────

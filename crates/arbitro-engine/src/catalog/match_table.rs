@@ -353,24 +353,27 @@ impl MatchTable {
     }
 
     /// Stamp `binding_idx` onto every match entry matching
-    /// `(subscription_id, consumer_id, connection_id)`.
+    /// `(consumer_id, connection_id)`.
+    ///
+    /// Semantics: a binding is unique per `(consumer, connection)` pair;
+    /// a consumer may have multiple subscriptions (different patterns)
+    /// but they all reach the same underlying connection/writer. All
+    /// match entries for that pair must point to the same binding slot
+    /// in `DrainSnapshot.bindings`.
     ///
     /// Called by the server during `rebuild_and_swap_snapshot` on the
     /// **cloned** match table (not the engine's canonical copy) so the
     /// drain can fetch the binding with a direct `bindings[idx]` Vec
     /// access instead of a `(consumer_id, connection_id) → idx`
     /// HashMap lookup per match. O(S + C + P) per binding.
-    pub fn set_binding_idx_for_subscription(
+    pub fn set_binding_idx_for(
         &mut self,
-        subscription_id: SubscriptionId,
         consumer_id: ConsumerId,
         connection_id: ConnectionId,
         binding_idx: u32,
     ) {
         let matches = |e: &MatchEntry| {
-            e.subscription_id == subscription_id
-                && e.consumer_id == consumer_id
-                && e.connection_id == connection_id
+            e.consumer_id == consumer_id && e.connection_id == connection_id
         };
         for entries in self.exact.values_mut() {
             for e in entries.iter_mut() {
@@ -524,39 +527,35 @@ mod tests {
     }
 
     #[test]
-    fn set_binding_idx_for_subscription_stamps_all_locations() {
+    fn set_binding_idx_for_stamps_all_locations() {
         let mut mt = MatchTable::new();
         let e_exact = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
         let e_catch = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
         mt.add_exact(0xBEEF, e_exact);
         mt.add_catch_all(e_catch);
 
-        mt.set_binding_idx_for_subscription(
-            SubscriptionId(100),
+        mt.set_binding_idx_for(
             ConsumerId(1),
             ConnectionId(5),
             777,
         );
 
         let r = mt.lookup(0xBEEF);
-        // exact + catch_all = 2, but PartialEq dedups them → 1 entry
-        // if they're logically equal. Check both slices explicitly.
         assert!(r.exact.iter().all(|e| e.binding_idx == 777));
         assert!(r.catch_all.iter().all(|e| e.binding_idx == 777));
     }
 
     #[test]
-    fn set_binding_idx_only_stamps_matching_triple() {
+    fn set_binding_idx_only_stamps_matching_pair() {
         let mut mt = MatchTable::new();
-        // Two different subscriptions on the same subject.
+        // Two different (consumer, connection) pairs on the same subject.
         let e1 = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
         let e2 = MatchEntry { connection_id: ConnectionId(6), ..entry(2, 20, 200) };
         mt.add_exact(0xBEEF, e1);
         mt.add_exact(0xBEEF, e2);
 
-        // Stamp only subscription 100 on conn 5
-        mt.set_binding_idx_for_subscription(
-            SubscriptionId(100),
+        // Stamp only (consumer 1, conn 5)
+        mt.set_binding_idx_for(
             ConsumerId(1),
             ConnectionId(5),
             777,
@@ -572,8 +571,28 @@ mod tests {
                 seen_unbound += 1;
             }
         }
-        assert_eq!(seen_777, 1, "only sub 100 gets stamped");
-        assert_eq!(seen_unbound, 1, "sub 200 stays unbound");
+        assert_eq!(seen_777, 1, "only (consumer 1, conn 5) gets stamped");
+        assert_eq!(seen_unbound, 1, "other pair stays unbound");
+    }
+
+    #[test]
+    fn set_binding_idx_covers_all_subs_of_pair() {
+        // A single binding (consumer 1, conn 5) might have MULTIPLE subscriptions
+        // (different patterns). All must get the same binding_idx.
+        let mut mt = MatchTable::new();
+        let e_sub_a = MatchEntry { subscription_id: SubscriptionId(100), ..entry(1, 10, 100) };
+        let e_sub_b = MatchEntry { subscription_id: SubscriptionId(101), ..entry(1, 10, 101) };
+        let mut e_sub_a = e_sub_a;
+        let mut e_sub_b = e_sub_b;
+        e_sub_a.connection_id = ConnectionId(5);
+        e_sub_b.connection_id = ConnectionId(5);
+        mt.add_exact(0xBEEF, e_sub_a);
+        mt.add_exact(0xDEAD, e_sub_b);
+
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 42);
+
+        assert!(mt.lookup(0xBEEF).exact.iter().all(|e| e.binding_idx == 42));
+        assert!(mt.lookup(0xDEAD).exact.iter().all(|e| e.binding_idx == 42));
     }
 
     #[test]

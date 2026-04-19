@@ -400,6 +400,12 @@ impl CommandWorker {
 
     /// Rebuild the drain snapshot from current bindings + engine match tables
     /// and swap it into the shared SnapshotSwap.
+    ///
+    /// Fase C.2: the snapshot's match_tables get their `binding_idx`
+    /// fields **stamped** with the server-layer binding index, so the
+    /// drain can fetch the binding via `bindings[match_entry.binding_idx]`
+    /// — a direct Vec index — instead of a `(consumer_id, connection_id)`
+    /// HashMap lookup on every match.
     pub(super) fn rebuild_and_swap_snapshot(&self) {
         // We need to clone bindings for the snapshot because drain holds Arc
         // while we might modify our local copy later.
@@ -419,18 +425,6 @@ impl CommandWorker {
             })
             .collect();
 
-        // Build binding index — HashMap+ahash, O(1) lookup in drain hot path.
-        // Per rule (performance.md dense/sparse + lookup_strategies bench),
-        // HashMap+ahash beats binary_search at every size for composite keys.
-        let mut binding_index: std::collections::HashMap<
-            (u32, u64), u32, rustc_hash::FxBuildHasher,
-        > = std::collections::HashMap::with_capacity_and_hasher(
-            self.bindings.len(), rustc_hash::FxBuildHasher::default(),
-        );
-        for (i, b) in self.bindings.iter().enumerate() {
-            binding_index.insert((b.consumer_id.0, b.connection_id.0), i as u32);
-        }
-
         // Build per-connection writer index. Dedup by connection_id —
         // multiple consumers on the same conn share a single writer.
         // HashMap+ahash: connection_id is unbounded-monotonic, direct
@@ -449,13 +443,30 @@ impl CommandWorker {
                 });
         }
 
-        // Clone match tables from engine catalog.
+        // Clone match tables from engine catalog (deep clone — the
+        // stamping mutates this copy, NOT the engine's canonical state).
         let catalog = &self.engine.ctx().catalog;
-        let match_tables = catalog.clone_match_tables();
+        let mut match_tables = catalog.clone_match_tables();
+
+        // Stamp `binding_idx` onto match entries by walking self.bindings.
+        // For each active binding at server-index `i`, find all match
+        // entries on its stream's match table that correspond to
+        // `(consumer_id, connection_id)` and stamp `binding_idx = i`.
+        // Match entries not covered here retain BINDING_IDX_UNBOUND —
+        // drain skips them defensively.
+        for (i, b) in self.bindings.iter().enumerate() {
+            let stream_idx = b.stream_id.0 as usize;
+            if let Some(Some(mt)) = match_tables.get_mut(stream_idx) {
+                mt.set_binding_idx_for(
+                    b.consumer_id,
+                    b.connection_id,
+                    i as u32,
+                );
+            }
+        }
 
         self.snapshot.store(DrainSnapshot {
             bindings: snap_bindings,
-            binding_index,
             writers_by_conn,
             match_tables,
         });
