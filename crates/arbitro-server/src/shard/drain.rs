@@ -86,11 +86,18 @@ pub(in crate::shard) struct DrainScratch {
     /// and generate per-binding notifications.
     deliveries: Vec<PendingNotify>,
 
-    /// Per-cycle inflight deltas: `(consumer_id, pending)`. Linear scan;
-    /// matches the "no HashMap on inner deliver loop" rule.
+    /// Per-cycle inflight deltas: `(consumer_id, pending)`.
+    /// Vec + linear scan — N is typically 1-4 consumers per cycle, where
+    /// Vec scan (~0.7-3 ns per op) beats HashMap+ahash (~1.4 ns) thanks
+    /// to cache locality. Measured in `benches/local_delta.rs`.
     local_inflight: Vec<(u32, u32)>,
-    /// Per-cycle subject deltas: `(subject_hash, pending)`.
-    local_subject: Vec<(u32, u32)>,
+    /// Per-cycle subject deltas: `subject_hash -> pending`.
+    /// HashMap+ahash — N can reach hundreds of unique subjects per cycle
+    /// (one per distinct message subject). Vec scan cost grows linearly
+    /// and crosses HashMap+ahash at N≈3-4. Measured in
+    /// `benches/local_delta.rs`: at N=128, Vec = 18.7 ns/op vs
+    /// HashMap+ahash = 1.4 ns/op (13x faster).
+    local_subject: HashMap<u32, u32, ahash::RandomState>,
 }
 
 impl DrainScratch {
@@ -108,7 +115,9 @@ impl DrainScratch {
             acc: Accumulator::new(),
             deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
-            local_subject: Vec::with_capacity(8),
+            local_subject: HashMap::with_capacity_and_hasher(
+                128, ahash::RandomState::new(),
+            ),
         }
     }
 }
@@ -248,12 +257,23 @@ pub(in crate::shard) fn drain_cycle(
     // Phase 3 — post-flush bookkeeping (atomics + command-thread
     // notifications). Fire-and-forget entries never hit scratch.deliveries,
     // so this loop is a no-op in the pub/sub default path.
-    for (conn, ok) in &flush_results {
+    //
+    // Build a (conn -> ok) map once; drain uses it to skip deliveries for
+    // failed frames without a nested per-conn scan. Turns the previous
+    // O(F x D) filter into a single O(D) pass (F = frames, D = deliveries).
+    let mut flush_ok: std::collections::HashMap<ConnectionId, bool, ahash::RandomState> =
+        std::collections::HashMap::with_capacity_and_hasher(
+            flush_results.len(),
+            ahash::RandomState::new(),
+        );
+    for &(conn, ok) in &flush_results {
+        flush_ok.insert(conn, ok);
         if !ok {
-            scratch.dead_connections.push(*conn);
-            continue;
+            scratch.dead_connections.push(conn);
         }
-        for d in scratch.deliveries.iter().filter(|d| d.conn == *conn) {
+    }
+    for d in &scratch.deliveries {
+        if flush_ok.get(&d.conn).copied().unwrap_or(false) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
             counters.inc_subject(d.subject_hash);
         }
@@ -268,7 +288,7 @@ pub(in crate::shard) fn drain_cycle(
             notify_tx,
             &snap.bindings,
             &scratch.deliveries,
-            &flush_results,
+            &flush_ok,
         );
     }
 
@@ -350,7 +370,11 @@ fn process_drain_entry(
                 mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
             });
         if let Some(max) = *limit {
-            let pending = local_delta_get(&scratch.local_subject, subject_hash);
+            let pending = scratch
+                .local_subject
+                .get(&subject_hash)
+                .copied()
+                .unwrap_or(0);
             // Effective cap check: atomic + pending-in-this-cycle >= max.
             if pending >= max
                 || !counters.subject_has_room(subject_hash, max - pending)
@@ -485,7 +509,7 @@ fn dispatch_recipients(
                 queue_id: queue_id.0,
             });
             local_delta_inc(&mut scratch.local_inflight, consumer_id.0);
-            local_delta_inc(&mut scratch.local_subject, subject_hash);
+            *scratch.local_subject.entry(subject_hash).or_insert(0) += 1;
         }
 
         if queue_id != QueueId(0) {
@@ -507,10 +531,10 @@ fn notify_delivered_grouped(
     notify_tx: &mpsc::Sender<DrainNotification>,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
-    flush_results: &[(ConnectionId, bool)],
+    flush_ok: &std::collections::HashMap<ConnectionId, bool, ahash::RandomState>,
 ) {
     let frame_ok = |conn: ConnectionId| -> bool {
-        flush_results.iter().any(|(c, ok)| *c == conn && *ok)
+        flush_ok.get(&conn).copied().unwrap_or(false)
     };
 
     // Fast path — every delivery belongs to the same binding AND all

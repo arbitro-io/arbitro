@@ -39,3 +39,7 @@ arbitro-client = { path = "../arbitro-client" }
 [[bench]]
 name = "lookup_strategies"
 harness = false
+
+[[bench]]
+name = "local_delta"
+harness = false
