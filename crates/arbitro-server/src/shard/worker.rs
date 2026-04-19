@@ -215,7 +215,10 @@ pub struct CommandWorker {
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     // Accumulator
     pub(super) flusher_config: FlusherConfig,
-    pub(super) accum_streams: HashMap<StreamId, StreamAccum>,
+    // StreamId is dense but admin-path (publish accumulation), so HashMap is
+    // acceptable here — but we opt into ahash per the dense/sparse rule
+    // (performance.md): non-std hashers for any keyed lookup.
+    pub(super) accum_streams: HashMap<StreamId, StreamAccum, ahash::RandomState>,
     pub(super) accum_deadline: Option<Instant>,
     pub(super) accum_total: usize,
     pub(super) accum_bytes: usize,
@@ -434,6 +437,26 @@ impl CommandWorker {
                 .then(a.connection_id.cmp(&b.connection_id))
         });
 
+        // Build per-connection writer index. Dedup by connection_id —
+        // multiple consumers on the same conn share a single writer.
+        // Sorted for binary search in the drain flush phase.
+        let mut writers_by_conn: Vec<crate::shard::shared::WriterIndexEntry> =
+            Vec::with_capacity(self.bindings.len());
+        for b in &self.bindings {
+            if writers_by_conn
+                .iter()
+                .any(|w| w.connection_id == b.connection_id.0)
+            {
+                continue;
+            }
+            writers_by_conn.push(crate::shard::shared::WriterIndexEntry {
+                connection_id: b.connection_id.0,
+                writer: Arc::clone(&b.writer),
+                runtime: b.runtime.clone(),
+            });
+        }
+        writers_by_conn.sort_unstable_by_key(|w| w.connection_id);
+
         // Clone match tables from engine catalog.
         let catalog = &self.engine.ctx().catalog;
         let match_tables = catalog.clone_match_tables();
@@ -441,6 +464,7 @@ impl CommandWorker {
         self.snapshot.store(DrainSnapshot {
             bindings: snap_bindings,
             binding_index,
+            writers_by_conn,
             match_tables,
         });
     }

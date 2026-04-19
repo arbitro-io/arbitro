@@ -299,6 +299,13 @@ pub struct DrainSnapshot {
     /// "no HashMap on inner deliver loop" rule while keeping lookups at
     /// O(log N) on cache-friendly contiguous memory.
     pub binding_index: Vec<BindingIndexEntry>,
+    /// Per-connection writer index, sorted by `connection_id`. Used by
+    /// the drain flush phase to look up the writer for a frame's target
+    /// connection in O(log N) without scanning `bindings`. Rule
+    /// (`performance.md`, dense/sparse): ConnectionId is unbounded-dense,
+    /// so a sorted Vec + binary search is the canonical cache-friendly
+    /// structure (matches the binding_index approach).
+    pub writers_by_conn: Vec<WriterIndexEntry>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
     pub match_tables: Vec<Option<MatchTable>>,
 }
@@ -312,14 +319,38 @@ pub struct BindingIndexEntry {
     pub binding_idx: u32,
 }
 
+/// Per-connection writer handle, deduplicated from bindings (one entry
+/// per connection even if multiple consumers live on the same conn).
+/// Sorted by `connection_id` for O(log N) binary search.
+#[derive(Clone)]
+pub struct WriterIndexEntry {
+    pub connection_id: u64,
+    pub writer: std::sync::Arc<tokio::net::tcp::OwnedWriteHalf>,
+    pub runtime: tokio::runtime::Handle,
+}
+
 impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
             binding_index: Vec::new(),
+            writers_by_conn: Vec::new(),
             match_tables: Vec::new(),
         }
     }
+}
+
+/// Binary-search helper for the writer index. Returns the writer entry
+/// for the given connection or `None` if no writer is registered.
+#[inline]
+pub fn find_writer(
+    index: &[WriterIndexEntry],
+    connection_id: u64,
+) -> Option<&WriterIndexEntry> {
+    index
+        .binary_search_by(|e| e.connection_id.cmp(&connection_id))
+        .ok()
+        .map(|i| &index[i])
 }
 
 /// Binary-search helper for the drain hot path. Returns the binding index

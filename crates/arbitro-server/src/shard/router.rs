@@ -109,7 +109,9 @@ impl ShardRouter {
                 notify_rx,
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
-                accum_streams: std::collections::HashMap::new(),
+                accum_streams: std::collections::HashMap::with_hasher(
+                    ahash::RandomState::new(),
+                ),
                 accum_deadline: None,
                 accum_total: 0,
                 accum_bytes: 0,

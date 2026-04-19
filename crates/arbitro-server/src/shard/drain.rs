@@ -24,20 +24,14 @@ use arbitro_engine_v2::catalog::fnv1a_32;
 use arbitro_engine_v2::catalog::match_table::MatchEntry;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
-use arbitro_proto::action::Action;
-use arbitro_proto::wire::delivery::{
-    DeliveryEntryHeader, RepBatchFixed, DELIVERY_ENTRY_HEADER_SIZE,
-};
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_store::Store;
-use bytes::BytesMut;
 use tokio::sync::mpsc;
-use zerocopy::IntoBytes;
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use crate::common::Gate;
+use crate::shard::accumulator::Accumulator;
 use crate::shard::shared::{
-    find_binding_idx, BindingIndexEntry, DrainNotification, DrainSnapshot, SharedCounters,
+    find_binding_idx, find_writer, BindingIndexEntry, DrainNotification, DrainSnapshot,
+    SharedCounters,
 };
 use crate::shard::worker::ActiveBinding;
 
@@ -49,78 +43,24 @@ pub(in crate::shard) struct DrainConfig {
     pub batch_size: u16,
 }
 
-// ── Per-delivery metadata ───────────────────────────────────────────────────
+// ── Per-cycle ack-mode delivery record ──────────────────────────────────────
 
-/// Per-entry metadata tracked alongside the wire body.
-struct PendingDelivery {
-    entry: DeliveredEntry,
+/// Per-entry metadata captured for ack-mode deliveries. Lives in
+/// `DrainScratch.deliveries` alongside the wire bytes held by the
+/// `Accumulator`. After a frame flushes successfully, the matching
+/// records bump the `SharedCounters` atomics and feed
+/// `DrainNotification::Delivered` to the command thread, which owns
+/// `Binding.pending` and `InFlightCounters`. Fire-and-forget never
+/// pushes here — no ack will ever arrive.
+#[derive(Clone, Copy)]
+struct PendingNotify {
+    conn: ConnectionId,
+    stream: StreamId,
     binding_idx: usize,
+    seq: u64,
+    subject_hash: u32,
     consumer_id: u32,
     queue_id: u32,
-    fire_and_forget: bool,
-}
-
-// ── Per-connection bucket ───────────────────────────────────────────────────
-
-/// One bucket per (connection, stream) active in the current cycle.
-/// All entries sent to the same connection are accumulated here and
-/// emitted as a single `RepBatch` frame at the end of the cycle.
-struct Bucket {
-    body: BytesMut,
-    count: u16,
-    first_seq: u64,
-    stream_id: StreamId,
-    /// Index of any binding on this connection — used to obtain the tx handle.
-    tx_binding_idx: usize,
-    delivered: Vec<PendingDelivery>,
-    /// Pool lifecycle flag. True while the bucket participates in the
-    /// in-progress cycle; false when it is idle in the pool.
-    in_use: bool,
-}
-
-impl Bucket {
-    /// Fresh bucket — only called when the pool needs to grow.
-    fn new_blank() -> Self {
-        Self {
-            body: BytesMut::with_capacity(64 * 1024),
-            count: 0,
-            first_seq: 0,
-            stream_id: StreamId(0),
-            tx_binding_idx: 0,
-            delivered: Vec::with_capacity(256),
-            in_use: false,
-        }
-    }
-
-    /// Prepare a pooled bucket for a new active use. Body is unconditionally
-    /// cleared defensively — never trusts prior state.
-    fn activate(&mut self, tx_binding_idx: usize, stream_id: StreamId, first_seq: u64) {
-        self.body.clear();
-        self.body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
-        self.body.extend_from_slice(
-            RepBatchFixed {
-                count: U16::new(0),
-                _pad: U16::new(0),
-            }
-            .as_bytes(),
-        );
-        self.count = 0;
-        self.first_seq = first_seq;
-        self.stream_id = stream_id;
-        self.tx_binding_idx = tx_binding_idx;
-        self.delivered.clear();
-        self.in_use = true;
-    }
-
-    /// Release the bucket back to the pool. Called after every flush path
-    /// (Ok, Full, Closed, empty) — the `in_use` invariant is: at the end
-    /// of a cycle, no bucket has `in_use = true`.
-    fn release(&mut self) {
-        self.body.clear();
-        self.count = 0;
-        self.delivered.clear();
-        self.in_use = false;
-    }
 }
 
 // ── Scratch buffers ─────────────────────────────────────────────────────────
@@ -130,15 +70,22 @@ pub(in crate::shard) struct DrainScratch {
     served_queues: Vec<QueueId>,
     dead_connections: Vec<ConnectionId>,
     /// Local pattern resolution cache. Avoids mutating shared match table.
-    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>>,
+    /// Sparse composite key (stream_id, subject_hash) → ahash (rule: sparse IDs).
+    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, ahash::RandomState>,
     /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
-    subject_limit_cache: HashMap<(u32, u32), Option<u32>>,
+    /// Sparse composite key → ahash (rule: sparse IDs).
+    subject_limit_cache: HashMap<(u32, u32), Option<u32>, ahash::RandomState>,
 
-    /// Bucket pool — never shrinks. Grown lazily by `acquire_bucket`.
-    buckets: Vec<Bucket>,
-    /// Active bucket keys this cycle: `(conn_raw, stream_raw, bucket_idx)`.
-    /// Linear scan; typical cycle has very few active conns.
-    active_buckets: Vec<(u64, u32, usize)>,
+    /// Wire-level frame accumulator. One bucket per (conn, stream)
+    /// active this cycle; each bucket emits one `RepBatch` frame at
+    /// flush time. The drain owns zero frame-building bytes now —
+    /// those live inside the accumulator.
+    acc: Accumulator,
+
+    /// Parallel ack-mode tracking. Populated only when a delivery is
+    /// NOT fire-and-forget. Indexed into at flush time to bump atomics
+    /// and generate per-binding notifications.
+    deliveries: Vec<PendingNotify>,
 
     /// Per-cycle inflight deltas: `(consumer_id, pending)`. Linear scan;
     /// matches the "no HashMap on inner deliver loop" rule.
@@ -153,43 +100,17 @@ impl DrainScratch {
             matches: Vec::with_capacity(16),
             served_queues: Vec::with_capacity(8),
             dead_connections: Vec::with_capacity(4),
-            resolve_cache: HashMap::with_capacity(64),
-            subject_limit_cache: HashMap::with_capacity(64),
-            buckets: Vec::with_capacity(16),
-            active_buckets: Vec::with_capacity(16),
+            resolve_cache: HashMap::with_capacity_and_hasher(
+                64, ahash::RandomState::new(),
+            ),
+            subject_limit_cache: HashMap::with_capacity_and_hasher(
+                64, ahash::RandomState::new(),
+            ),
+            acc: Accumulator::new(),
+            deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
             local_subject: Vec::with_capacity(8),
         }
-    }
-
-    /// Return the index into `self.buckets` for the given `(conn, stream)`.
-    /// Reuses a pooled idle bucket if available; grows the pool by one
-    /// otherwise. The bucket is activated (cleared + header placeholders)
-    /// before return so the caller can append immediately.
-    fn acquire_bucket(
-        &mut self,
-        conn_id: u64,
-        stream_id: StreamId,
-        tx_binding_idx: usize,
-        first_seq: u64,
-    ) -> usize {
-        // Fast path: already active this cycle.
-        for &(c, s, idx) in self.active_buckets.iter() {
-            if c == conn_id && s == stream_id.raw() {
-                return idx;
-            }
-        }
-        // Find an idle bucket in the pool.
-        let idx = match self.buckets.iter().position(|b| !b.in_use) {
-            Some(i) => i,
-            None => {
-                self.buckets.push(Bucket::new_blank());
-                self.buckets.len() - 1
-            }
-        };
-        self.buckets[idx].activate(tx_binding_idx, stream_id, first_seq);
-        self.active_buckets.push((conn_id, stream_id.raw(), idx));
-        idx
     }
 }
 
@@ -252,9 +173,10 @@ pub(in crate::shard) fn drain_cycle(
     let mut lowest_skipped: Option<u64> = None;
 
     scratch.dead_connections.clear();
-    scratch.active_buckets.clear();
     scratch.local_inflight.clear();
     scratch.local_subject.clear();
+    scratch.deliveries.clear();
+    scratch.acc.clear();
     // Pattern and subject-limit caches must be flushed every cycle —
     // they hold entries resolved against the match_table snapshot, and
     // the snapshot may have changed since the last cycle (subscribe /
@@ -281,21 +203,73 @@ pub(in crate::shard) fn drain_cycle(
         })
         .ok();
 
-    // Phase 2 — flush every active bucket. The pool's `in_use` flag is
-    // cleared inside `flush_bucket` on every path (Ok/Full/Closed/empty).
-    let active_count = scratch.active_buckets.len();
-    for i in 0..active_count {
-        let (conn_raw, _stream_raw, bucket_idx) = scratch.active_buckets[i];
-        flush_bucket(
-            counters,
-            &mut scratch.buckets[bucket_idx],
-            ConnectionId(conn_raw),
-            &snap.bindings,
-            names,
+    // Phase 2 — flush every accumulator bucket as one RepBatch frame.
+    // Results are captured into a small Vec so Phase 3 can do ack
+    // bookkeeping without borrowing scratch inside the for_each closure.
+    let mut flush_results: Vec<(ConnectionId, bool)> = Vec::with_capacity(8);
+    {
+        let writers_by_conn = &snap.writers_by_conn;
+        scratch.acc.for_each(names, |frame| {
+            // O(log N) binary search — rule (performance.md dense/sparse):
+            // ConnectionId is unbounded-dense, sorted Vec + binary search
+            // is the canonical structure for this workload.
+            let Some(writer) = find_writer(writers_by_conn, frame.connection_id.0) else {
+                return false;
+            };
+            crate::lifecycle_trace!(
+                "29_frame_built",
+                frame.connection_id.0,
+                frame.count as u64,
+                "shard"
+            );
+            if std::env::var("ARBITRO_WIRE_TRACE").is_ok() {
+                eprintln!(
+                    "[wire] conn={} entries={} bytes={}",
+                    frame.connection_id.0, frame.count, frame.bytes.len()
+                );
+            }
+            let ok = crate::transport::registry::write_all_blocking(
+                &writer.writer,
+                &frame.bytes,
+                &writer.runtime,
+            );
+            if ok {
+                crate::lifecycle_trace!(
+                    "30_send_bytes_done",
+                    frame.connection_id.0,
+                    frame.count as u64,
+                    "shard"
+                );
+            }
+            flush_results.push((frame.connection_id, ok));
+            ok
+        });
+    }
+
+    // Phase 3 — post-flush bookkeeping (atomics + command-thread
+    // notifications). Fire-and-forget entries never hit scratch.deliveries,
+    // so this loop is a no-op in the pub/sub default path.
+    for (conn, ok) in &flush_results {
+        if !ok {
+            scratch.dead_connections.push(*conn);
+            continue;
+        }
+        for d in scratch.deliveries.iter().filter(|d| d.conn == *conn) {
+            counters.inc_inflight(d.consumer_id, d.queue_id);
+            counters.inc_subject(d.subject_hash);
+        }
+    }
+
+    // Group successful deliveries by binding_id and notify the command
+    // thread once per binding. Matches the old `notify_delivered_grouped`
+    // semantics so the engine's Command::Delivered handler sees the same
+    // shape it did before.
+    if !scratch.deliveries.is_empty() {
+        notify_delivered_grouped(
             notify_tx,
-            &mut more_pending,
-            &mut lowest_skipped,
-            &mut scratch.dead_connections,
+            &snap.bindings,
+            &scratch.deliveries,
+            &flush_results,
         );
     }
 
@@ -487,67 +461,33 @@ fn dispatch_recipients(
             }
         }
 
-        // ── Append to this connection's bucket (from pool) ────────────────
+        // ── Hand off to the accumulator ───────────────────────────────────
+        //
+        // The accumulator is pure wire grouping: (conn, stream) → one
+        // `RepBatch` frame. It does not know or care about ack state —
+        // that lives in `scratch.deliveries` below, gated on
+        // `!fire_and_forget`.
 
         let fire_and_forget = binding.fire_and_forget;
-        let bucket_idx = scratch.acquire_bucket(
-            connection_id.0,
+        scratch.acc.add(
+            connection_id,
             stream_id,
-            binding_idx,
+            consumer_id,
             entry.seq,
+            entry.subject,
+            subject_hash,
+            entry.payload,
         );
-        let bucket = &mut scratch.buckets[bucket_idx];
 
-        let subj_len = entry.subject.len();
-        let data_len = subj_len + entry.payload.len();
-        // Build (header + subject + payload) in a stack scratch, then emit
-        // with a single `extend_from_slice`. Three separate extends cost
-        // 3 capacity checks + 3 non-vectorisable memcpys. One contiguous
-        // memcpy lets AVX move it in a handful of instructions.
-        //
-        // Falls back to 3 extends for oversized payloads (> 4 KB).
-        const ENTRY_SCRATCH_SIZE: usize = 4096;
-        let total = DELIVERY_ENTRY_HEADER_SIZE + data_len;
-        let header = DeliveryEntryHeader {
-            consumer_id: U32::new(consumer_id.0),
-            seq: U64::new(entry.seq),
-            subj_len: U16::new(subj_len as u16),
-            data_len: U32::new(data_len as u32),
-            subject_hash: U32::new(subject_hash),
-        };
-        if total <= ENTRY_SCRATCH_SIZE {
-            let mut scratch_buf = [0u8; ENTRY_SCRATCH_SIZE];
-            scratch_buf[..DELIVERY_ENTRY_HEADER_SIZE]
-                .copy_from_slice(header.as_bytes());
-            let subj_end = DELIVERY_ENTRY_HEADER_SIZE + subj_len;
-            scratch_buf[DELIVERY_ENTRY_HEADER_SIZE..subj_end]
-                .copy_from_slice(entry.subject);
-            scratch_buf[subj_end..total].copy_from_slice(entry.payload);
-            bucket.body.extend_from_slice(&scratch_buf[..total]);
-        } else {
-            bucket.body.extend_from_slice(header.as_bytes());
-            bucket.body.extend_from_slice(entry.subject);
-            bucket.body.extend_from_slice(entry.payload);
-        }
-
-        bucket.count += 1;
-
-        // Only track `PendingDelivery` for entries that actually need ack
-        // bookkeeping. Fire-and-forget deliveries never produce acks, so
-        // storing their metadata is pure memory pressure (32 B × N) and
-        // branch overhead in the flush loop. Skip the push entirely —
-        // `bucket.count` already carries the wire count for header patch.
         if !fire_and_forget {
-            bucket.delivered.push(PendingDelivery {
-                entry: DeliveredEntry {
-                    seq: entry.seq,
-                    subject_hash,
-                    _pad: 0,
-                },
+            scratch.deliveries.push(PendingNotify {
+                conn: connection_id,
+                stream: stream_id,
                 binding_idx,
+                seq: entry.seq,
+                subject_hash,
                 consumer_id: consumer_id.0,
                 queue_id: queue_id.0,
-                fire_and_forget: false,
             });
             local_delta_inc(&mut scratch.local_inflight, consumer_id.0);
             local_delta_inc(&mut scratch.local_subject, subject_hash);
@@ -559,108 +499,41 @@ fn dispatch_recipients(
     }
 }
 
-// ── Bucket flush ────────────────────────────────────────────────────────────
+// ── Ack-mode notifications ──────────────────────────────────────────────────
 
-/// Flush a single bucket: patch headers, try_send, notify command thread.
-/// Marks the bucket as idle in the pool on every exit path so the next
-/// cycle can reuse it via `acquire_bucket`.
-fn flush_bucket(
-    counters: &SharedCounters,
-    bucket: &mut Bucket,
-    connection_id: ConnectionId,
-    bindings: &[ActiveBinding],
-    names: &Arc<crate::common::NameRegistry>,
-    notify_tx: &mpsc::Sender<DrainNotification>,
-    more_pending: &mut bool,
-    lowest_skipped: &mut Option<u64>,
-    dead_connections: &mut Vec<ConnectionId>,
-) {
-    if bucket.count == 0 {
-        bucket.release();
-        return;
-    }
-
-    let tx_binding = &bindings[bucket.tx_binding_idx];
-    let stream_id = bucket.stream_id;
-
-    // Patch RepBatchFixed count (offset 0 in fixed header, right after envelope).
-    let count_offset = ENVELOPE_SIZE;
-    bucket.body[count_offset..count_offset + 2]
-        .copy_from_slice(&bucket.count.to_le_bytes());
-
-    // Patch envelope.
-    let body_len = bucket.body.len() - ENVELOPE_SIZE;
-    let wire_stream_id = names
-        .stream_wire(stream_id)
-        .unwrap_or_else(|| stream_id.raw());
-    let envelope = Envelope::new(
-        Action::RepBatch,
-        wire_stream_id,
-        body_len as u32,
-        0,
-    );
-    bucket.body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
-
-    crate::lifecycle_trace!(
-        "29_frame_built",
-        connection_id.0,
-        bucket.count as u64,
-        "shard"
-    );
-
-    let frozen = bucket.body.split().freeze();
-    let ok = crate::transport::registry::write_all_blocking(
-        &tx_binding.writer,
-        &frozen,
-        &tx_binding.runtime,
-    );
-
-    if ok {
-        crate::lifecycle_trace!(
-            "30_send_bytes_done",
-            connection_id.0,
-            bucket.count as u64,
-            "shard"
-        );
-
-        // Increment atomic inflight counters for ack-mode deliveries.
-        // `bucket.delivered` only contains non-fire-and-forget entries
-        // (gated at push time), so no per-entry branch is needed here.
-        for pd in &bucket.delivered {
-            counters.inc_inflight(pd.consumer_id, pd.queue_id);
-            counters.inc_subject(pd.entry.subject_hash);
-        }
-
-        // Notify command thread — only if there are actual ack-mode
-        // entries. `bucket.delivered` is empty when every recipient
-        // was fire-and-forget, so the allocation + channel send is
-        // elided entirely for the pub/sub default path.
-        if !bucket.delivered.is_empty() {
-            notify_delivered_grouped(notify_tx, bindings, &mut bucket.delivered);
-        }
-
-        bucket.release();
-    } else {
-        // Non-recoverable: socket closed/reset. Mark connection dead.
-        let _ = lowest_skipped;
-        let _ = more_pending;
-        dead_connections.push(connection_id);
-        bucket.release();
-    }
-}
-
-/// Group delivered entries by binding_id and send one notification per binding.
+/// After the accumulator flushed this cycle's frames, walk the
+/// per-entry `deliveries` list, keep only the ones whose (conn, stream)
+/// frame succeeded, group them by `binding_idx`, and emit one
+/// `DrainNotification::Delivered` per binding. The command thread then
+/// turns each of those into a `Command::Delivered` which updates
+/// `Binding.pending` and `InFlightCounters` — the single source of
+/// truth for ack-matching.
 fn notify_delivered_grouped(
     notify_tx: &mpsc::Sender<DrainNotification>,
     bindings: &[ActiveBinding],
-    delivered: &mut Vec<PendingDelivery>,
+    deliveries: &[PendingNotify],
+    flush_results: &[(ConnectionId, bool)],
 ) {
-    // Fast path: all entries belong to the same binding.
-    if let Some(first) = delivered.first() {
+    let frame_ok = |conn: ConnectionId| -> bool {
+        flush_results.iter().any(|(c, ok)| *c == conn && *ok)
+    };
+
+    // Fast path — every delivery belongs to the same binding AND all
+    // frames succeeded. Pub/sub of a single consumer hits this path.
+    if let Some(first) = deliveries.first() {
         let first_idx = first.binding_idx;
-        if delivered.iter().all(|d| d.binding_idx == first_idx) {
+        if deliveries.iter().all(|d| d.binding_idx == first_idx)
+            && deliveries.iter().all(|d| frame_ok(d.conn))
+        {
             let binding = &bindings[first_idx];
-            let entries: Vec<DeliveredEntry> = delivered.iter().map(|d| d.entry).collect();
+            let entries: Vec<DeliveredEntry> = deliveries
+                .iter()
+                .map(|d| DeliveredEntry {
+                    seq: d.seq,
+                    subject_hash: d.subject_hash,
+                    _pad: 0,
+                })
+                .collect();
             let _ = notify_tx.try_send(DrainNotification::Delivered {
                 binding_id: binding.binding_id,
                 consumer_id: binding.consumer_id,
@@ -671,14 +544,25 @@ fn notify_delivered_grouped(
         }
     }
 
-    // Slow path: mixed bindings — group and send one notification each.
-    delivered.sort_unstable_by_key(|d| d.binding_idx);
+    // Slow path — mixed bindings and/or partial frame success. Sort by
+    // binding_idx, scan groups, drop entries whose frame failed.
+    let mut sorted: Vec<PendingNotify> = deliveries
+        .iter()
+        .copied()
+        .filter(|d| frame_ok(d.conn))
+        .collect();
+    sorted.sort_unstable_by_key(|d| d.binding_idx);
+
     let mut i = 0;
-    while i < delivered.len() {
-        let idx = delivered[i].binding_idx;
+    while i < sorted.len() {
+        let idx = sorted[i].binding_idx;
         let mut entries = Vec::new();
-        while i < delivered.len() && delivered[i].binding_idx == idx {
-            entries.push(delivered[i].entry);
+        while i < sorted.len() && sorted[i].binding_idx == idx {
+            entries.push(DeliveredEntry {
+                seq: sorted[i].seq,
+                subject_hash: sorted[i].subject_hash,
+                _pad: 0,
+            });
             i += 1;
         }
         let binding = &bindings[idx];

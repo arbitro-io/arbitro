@@ -74,7 +74,8 @@ impl Default for NameRegistry {
 struct Inner {
     /// Forward translation: wire stream_id (`fnv1a_32(name)`, client-computed)
     /// → small sequential engine `StreamId`.
-    streams_by_wire: HashMap<u32, StreamId>,
+    /// Sparse key (fnv1a_32 hash) → ahash (rule: sparse IDs).
+    streams_by_wire: HashMap<u32, StreamId, ahash::RandomState>,
     /// Reverse translation: engine `StreamId.0` → wire stream_id. Indexed
     /// directly by seq id; gaps from removed streams stay as `0`. Used by
     /// `ListStreams` to give the client the same wire IDs it computes
@@ -85,13 +86,17 @@ struct Inner {
     /// Consumers are keyed by name because the wire never carries a
     /// pre-computed consumer id — the server allocates one and the client
     /// echoes it back. Re-creates with the same name return the same id.
-    consumers_by_name: HashMap<Vec<u8>, ConsumerId>,
+    /// Sparse key (arbitrary bytes) → ahash (rule: sparse IDs).
+    consumers_by_name: HashMap<Vec<u8>, ConsumerId, ahash::RandomState>,
     /// Per-consumer queue mapping. Populated at create time so that
     /// `dispatch_subscribe` can recover the same queue id without parsing
     /// the (group-less) Subscribe wire body — guarantees that the binding
     /// reads from the same ready ring `ensure_subscription` writes to via
     /// the match table.
-    consumer_queue: HashMap<ConsumerId, QueueId>,
+    /// Dense key (ConsumerId) but admin path — HashMap+ahash still
+    /// dominates the SipHash default (rule: dense IDs may still use ahash
+    /// when direct indexing is impractical across callers).
+    consumer_queue: HashMap<ConsumerId, QueueId, ahash::RandomState>,
     /// Consumer ids start at 1 so `0` can keep its conventional "unset /
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
@@ -102,20 +107,21 @@ struct Inner {
     /// Two consumers with the same group on the same stream MUST resolve
     /// to the same queue id (queue-group semantics). Allocation is shared
     /// across all queue creates so a single counter advances per request.
-    queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId>,
+    /// Composite key with a sparse `Vec<u8>` → ahash (rule: sparse IDs).
+    queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId, ahash::RandomState>,
     next_queue: u32,
 }
 
 impl Inner {
     fn new() -> Self {
         Self {
-            streams_by_wire: HashMap::new(),
+            streams_by_wire: HashMap::with_hasher(ahash::RandomState::new()),
             streams_seq_to_wire: Vec::new(),
             next_stream: 0,
-            consumers_by_name: HashMap::new(),
-            consumer_queue: HashMap::new(),
+            consumers_by_name: HashMap::with_hasher(ahash::RandomState::new()),
+            consumer_queue: HashMap::with_hasher(ahash::RandomState::new()),
             next_consumer: 1,
-            queues_by_key: HashMap::new(),
+            queues_by_key: HashMap::with_hasher(ahash::RandomState::new()),
             // Queue ids start at 1 for the same reason as consumers — leave
             // 0 as "unset" so accidental zeroed-out queue ids are easy to
             // spot in logs.

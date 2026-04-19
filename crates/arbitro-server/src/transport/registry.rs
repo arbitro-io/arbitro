@@ -24,7 +24,10 @@ pub struct ConnectionRegistry {
 }
 
 struct Inner {
-    sessions: Mutex<HashMap<u64, Session>>,
+    // conn_id is unbounded-dense (ConnIdGen monotonic counter). Memory
+    // footprint of a Vec<Option<Session>> would grow without bound, so we
+    // use HashMap + ahash per the dense/sparse rule (performance.md).
+    sessions: Mutex<HashMap<u64, Session, ahash::RandomState>>,
     conn_id_gen: ConnIdGen,
     #[allow(dead_code)]
     write_buffer_cap: usize,
@@ -40,7 +43,7 @@ impl ConnectionRegistry {
             .expect("ConnectionRegistry::new must be called inside a tokio runtime");
         Self {
             inner: Arc::new(Inner {
-                sessions: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(HashMap::with_hasher(ahash::RandomState::new())),
                 conn_id_gen: ConnIdGen::new(),
                 write_buffer_cap,
                 runtime,

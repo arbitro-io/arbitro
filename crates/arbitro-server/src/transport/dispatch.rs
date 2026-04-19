@@ -571,22 +571,9 @@ async fn dispatch_create_consumer(
     // HashMap-keyed QueueId, fatal if any path ever indexes by it. We
     // also remember the resolved queue per consumer so the subscribe
     // path (which carries no group on the wire) can recover it.
-    // Queue groups only apply in Queue deliver mode. Fanout consumers
-    // (DeliverMode::Fanout == 0) must have queue_id=0 so the drain's
-    // queue-dedup (`served_queues.contains(queue_id)`) does not collapse
-    // distinct fanout subscribers onto a shared dedup key and drop every
-    // delivery after the first. The client defaults `group` to the stream
-    // name even for fanout consumers, so filtering on emptiness alone is
-    // insufficient — we key off `deliver_mode`.
     let group = view.group();
-    let is_queue_mode = view.deliver_mode() != 0;
-    let queue_id = if is_queue_mode && !group.is_empty() {
-        let q = server.names().get_or_create_queue(seq_stream, group);
-        server.names().set_consumer_queue(seq_consumer, q);
-        q
-    } else {
-        QueueId(0)
-    };
+    let queue_id = server.names().get_or_create_queue(seq_stream, group);
+    server.names().set_consumer_queue(seq_consumer, queue_id);
 
     let ack_policy = match view.ack_policy() {
         0 => AckPolicy::None,

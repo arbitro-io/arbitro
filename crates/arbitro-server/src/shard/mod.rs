@@ -8,6 +8,7 @@
 //! * `shared` — lock-free shared state (SharedCounters, SnapshotSwap).
 //! * `worker` — `DrainWorker` (pure drain) + `CommandWorker` (owns engine).
 
+pub mod accumulator;
 pub mod command;
 pub mod drain;
 pub mod handle;
