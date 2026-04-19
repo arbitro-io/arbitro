@@ -52,6 +52,7 @@ use arbitro_server::{ArbitroServer, Config};
 
 const DEFAULT_SECS: u64 = 10;
 const DEFAULT_PRODUCERS: u64 = 4;
+const DEFAULT_CONSUMERS: u64 = 1;
 /// Per-producer target rate (msgs/second).
 const DEFAULT_RATE: u64 = 1_000;
 const BATCH_SIZE: usize = 32;
@@ -190,6 +191,7 @@ async fn producer_task(
 async fn main() {
     let secs = env_u64("BENCH_CHAOS_SECS", DEFAULT_SECS);
     let n_producers = env_u64("BENCH_CHAOS_PRODUCERS", DEFAULT_PRODUCERS);
+    let n_consumers = env_u64("BENCH_CHAOS_CONSUMERS", DEFAULT_CONSUMERS);
     let rate = env_u64("BENCH_CHAOS_RATE", DEFAULT_RATE);
 
     // ── Pre-run cleanup ─────────────────────────────────────────────────
@@ -205,7 +207,7 @@ async fn main() {
     println!("========================================================");
     println!("                      Chaos bench");
     println!("========================================================");
-    println!("  duration={secs}s   producers={n_producers}   rate={rate} msg/s/producer");
+    println!("  duration={secs}s   producers={n_producers}   consumers={n_consumers}   rate={rate} msg/s/producer");
     println!("  total target: {total_target_rate} msg/s  ~  {expected_total} msgs");
     println!("  batch={BATCH_SIZE}   payload={PAYLOAD_SIZE}B");
     println!("  journal=Tolerant   data_dir={}", data_dir.display());
@@ -220,17 +222,92 @@ async fn main() {
         .build();
     control_client.create_stream(&stream_cfg).await.expect("create stream");
 
-    let consumer_cfg = ConsumerConfig::new(b"chaos_worker", STREAM)
-        .filter(b">")
-        .ack_policy(AckPolicy::Explicit)
-        .max_inflight(u16::MAX)
-        .deliver_policy(DeliverPolicy::All)
-        .build()
-        .unwrap();
-    let consumer = control_client.create_consumer(&consumer_cfg).await.unwrap();
-    let mut sub = consumer.subscribe(None).await.unwrap();
+    // Create N consumers, each with a UNIQUE name + UNIQUE group so they
+    // form independent fanout streams — every msg must reach every consumer.
+    // BENCH_CHAOS_CONSUMERS=1 keeps the original single-consumer behaviour.
+    for i in 0..n_consumers {
+        let name = format!("chaos-{i}");
+        let group = format!("chaos-grp-{i}");
+        let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
+            .group(group.as_bytes())
+            .filter(b">")
+            .ack_policy(AckPolicy::Explicit)
+            .max_inflight(u16::MAX)
+            .deliver_policy(DeliverPolicy::All)
+            .build()
+            .unwrap();
+        control_client.create_consumer(&cfg).await.unwrap();
+    }
 
-    // ── Kick off producers ──────────────────────────────────────────────
+    // ── Consumer tasks — N parallel TCP connections drain concurrently ───
+    // Each consumer has its own HashSet of received seqs (to verify
+    // per-consumer no-loss) and its own counter. Under fanout semantics
+    // each consumer must receive every msg published.
+    //
+    // Subscribers start BEFORE producers so every consumer's subscribe
+    // RPC has landed on the server by the time the first publish happens.
+    // Otherwise early msgs race the subscribe and — despite
+    // DeliverPolicy::All — risk being filed before the binding is live.
+    let consumer_stop = Arc::new(AtomicBool::new(false));
+    let per_consumer_seqs: Vec<Arc<std::sync::Mutex<HashSet<u64>>>> = (0..n_consumers)
+        .map(|_| {
+            Arc::new(std::sync::Mutex::new(HashSet::with_capacity(
+                expected_total as usize,
+            )))
+        })
+        .collect();
+    let per_consumer_count: Vec<Arc<AtomicU64>> =
+        (0..n_consumers).map(|_| Arc::new(AtomicU64::new(0))).collect();
+
+    let mut recv_tasks = Vec::new();
+    for i in 0..n_consumers {
+        let addr = addr.clone();
+        let consumer_stop = Arc::clone(&consumer_stop);
+        let seqs = Arc::clone(&per_consumer_seqs[i as usize]);
+        let counter = Arc::clone(&per_consumer_count[i as usize]);
+
+        recv_tasks.push(tokio::spawn(async move {
+            // Each consumer gets its own Client = its own TCP connection.
+            let client = connect(&addr).await;
+            let name = format!("chaos-{i}");
+            let group = format!("chaos-grp-{i}");
+            let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
+                .group(group.as_bytes())
+                .filter(b">")
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(u16::MAX)
+                .deliver_policy(DeliverPolicy::All)
+                .build()
+                .unwrap();
+            let consumer = client.create_consumer(&cfg).await.unwrap();
+            let mut sub = consumer.subscribe(None).await.unwrap();
+
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+                    Ok(Some(msg)) => {
+                        let seq = msg.seq;
+                        msg.ack();
+                        seqs.lock().unwrap().insert(seq);
+                        counter.fetch_add(1, Relaxed);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        if consumer_stop.load(Relaxed) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Give every subscriber a moment to complete `subscribe()` on the
+    // server before producers start. 200 ms is plenty for loopback; if
+    // this races on a slower box, raise BENCH_CHAOS_SETTLE_MS.
+    let settle_ms = env_u64("BENCH_CHAOS_SETTLE_MS", 200);
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+
+    // ── Kick off producers (after subscribers are ready) ───────────────
     let stop = Arc::new(AtomicBool::new(false));
     let published = Arc::new(AtomicU64::new(0));
 
@@ -242,36 +319,6 @@ async fn main() {
             tokio::spawn(producer_task(id, addr, rate, stop, published))
         })
         .collect();
-
-    // ── Consumer task — drains concurrently with publishers ────────────
-    let received_seqs: Arc<std::sync::Mutex<HashSet<u64>>> =
-        Arc::new(std::sync::Mutex::new(HashSet::with_capacity(expected_total as usize)));
-    let received_count = Arc::new(AtomicU64::new(0));
-    let consumer_stop = Arc::new(AtomicBool::new(false));
-
-    let recv_task = {
-        let received_seqs = Arc::clone(&received_seqs);
-        let received_count = Arc::clone(&received_count);
-        let consumer_stop = Arc::clone(&consumer_stop);
-        tokio::spawn(async move {
-            loop {
-                match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
-                    Ok(Some(msg)) => {
-                        let seq = msg.seq;
-                        msg.ack();
-                        received_seqs.lock().unwrap().insert(seq);
-                        received_count.fetch_add(1, Relaxed);
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        if consumer_stop.load(Relaxed) {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-    };
 
     // ── Baseline metrics BEFORE the run ────────────────────────────────
     let rss_start_kb = rss_kb();
@@ -297,11 +344,19 @@ async fn main() {
     for elapsed in 1..=secs {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let pub_total = published.load(Relaxed);
-        let recv_total = received_count.load(Relaxed);
+        // Aggregate received across all consumers (for the progress line).
+        let recv_total: u64 = per_consumer_count
+            .iter()
+            .map(|c| c.load(Relaxed))
+            .sum();
+        let min_recv = per_consumer_count
+            .iter()
+            .map(|c| c.load(Relaxed))
+            .min()
+            .unwrap_or(0);
         let rss_now_mb = rss_kb() / 1024;
         println!(
-            "  [t={elapsed:>2}s] published={pub_total:>6} received={recv_total:>6} lag={:>5} rss={rss_now_mb:>4} MB",
-            pub_total.saturating_sub(recv_total)
+            "  [t={elapsed:>2}s] published={pub_total:>6} received={recv_total:>6} min_per_consumer={min_recv:>5} rss={rss_now_mb:>4} MB",
         );
     }
 
@@ -319,33 +374,49 @@ async fn main() {
         pub_total_final as f64 / pub_elapsed.as_secs_f64()
     );
 
-    // ── Wait for consumer to catch the tail ────────────────────────────
+    // ── Wait for every consumer to catch the tail ─────────────────────
+    // Each consumer must independently have received all published msgs
+    // (fanout semantics). We're done when the MIN of per-consumer counts
+    // reaches pub_total_final.
     let target_seq = pub_total_final;
     let drain_start = Instant::now();
     let drain_deadline = drain_start + Duration::from_secs(15);
-    let mut last_recv = received_count.load(Relaxed);
+    let total_so_far = |counts: &[Arc<AtomicU64>]| -> u64 {
+        counts.iter().map(|c| c.load(Relaxed)).sum()
+    };
+    let min_so_far = |counts: &[Arc<AtomicU64>]| -> u64 {
+        counts.iter().map(|c| c.load(Relaxed)).min().unwrap_or(0)
+    };
+    let mut last_recv = total_so_far(&per_consumer_count);
     let mut stall_start = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let recv = received_count.load(Relaxed);
-        if recv >= target_seq {
+        let per_min = min_so_far(&per_consumer_count);
+        if per_min >= target_seq {
             break;
         }
         if Instant::now() >= drain_deadline {
-            println!("  WARN drain_deadline hit — received {recv}/{target_seq}");
+            println!(
+                "  WARN drain_deadline hit — min per-consumer {per_min}/{target_seq}"
+            );
             break;
         }
+        let recv = total_so_far(&per_consumer_count);
         if recv != last_recv {
             last_recv = recv;
             stall_start = Instant::now();
         } else if Instant::now().duration_since(stall_start) > Duration::from_secs(3) {
-            println!("  WARN drain stalled — received {recv}/{target_seq} (no progress 3s)");
+            println!(
+                "  WARN drain stalled — min per-consumer {per_min}/{target_seq} (no progress 3s)"
+            );
             break;
         }
     }
 
     consumer_stop.store(true, Relaxed);
-    let _ = recv_task.await;
+    for h in recv_tasks {
+        let _ = h.await;
+    }
     sampler_stop.store(true, Relaxed);
     let _ = sampler_task.await;
 
@@ -356,37 +427,53 @@ async fn main() {
 
     let drain_elapsed = drain_start.elapsed();
     let total_elapsed = run_start.elapsed();
-    let recv_final = received_count.load(Relaxed);
-    let set = received_seqs.lock().unwrap();
-    let set_len = set.len();
-    let min_seq = set.iter().copied().min().unwrap_or(0);
-    let max_seq = set.iter().copied().max().unwrap_or(0);
-    let gaps: Vec<u64> = if max_seq > 0 && set_len > 0 {
-        (1..=max_seq).filter(|s| !set.contains(s)).take(10).collect()
-    } else {
-        Vec::new()
-    };
-    let duplicates = recv_final.saturating_sub(set_len as u64);
-    drop(set);
 
     println!("  drain tail: {drain_elapsed:.2?}");
     println!();
 
-    // ── Loss verification ──────────────────────────────────────────────
+    // ── Loss verification (per-consumer) ──────────────────────────────
     println!("--------------------------------------------------------");
-    println!("  Loss check");
+    println!("  Loss check  (per-consumer fanout integrity)");
     println!("--------------------------------------------------------");
-    println!("  published          : {pub_total_final}");
-    println!("  received (count)   : {recv_final}");
-    println!("  received (unique)  : {set_len}");
-    println!("  seq range received : {min_seq}..={max_seq}");
-    println!("  duplicates         : {duplicates}");
-    if gaps.is_empty() {
-        println!("  gaps               : none");
-    } else {
-        println!("  gaps (first 10)    : {gaps:?}");
+    println!("  published : {pub_total_final}");
+    println!();
+
+    let mut any_loss = false;
+    let mut total_recv_all = 0u64;
+    let mut all_gaps: Vec<Vec<u64>> = Vec::new();
+    for i in 0..n_consumers {
+        let seqs = per_consumer_seqs[i as usize].lock().unwrap();
+        let count = per_consumer_count[i as usize].load(Relaxed);
+        let unique = seqs.len() as u64;
+        let duplicates = count.saturating_sub(unique);
+        let max_seq = seqs.iter().copied().max().unwrap_or(0);
+        let gaps: Vec<u64> = if max_seq > 0 {
+            (1..=pub_total_final)
+                .filter(|s| !seqs.contains(s))
+                .take(5)
+                .collect()
+        } else {
+            (1..=pub_total_final.min(5)).collect()
+        };
+        drop(seqs);
+
+        let ok = count == pub_total_final && unique == pub_total_final && gaps.is_empty();
+        if !ok {
+            any_loss = true;
+        }
+        total_recv_all += count;
+        all_gaps.push(gaps.clone());
+
+        let status = if ok { "OK" } else { "LOSS" };
+        println!(
+            "  consumer {i:<2}: recv={count:>6} unique={unique:>6} dup={duplicates} max_seq={max_seq} [{status}]"
+        );
+        if !gaps.is_empty() {
+            println!("             missing (first 5): {gaps:?}");
+        }
     }
     println!();
+    println!("  aggregate received : {total_recv_all}  (expected {})", pub_total_final * n_consumers);
 
     println!("--------------------------------------------------------");
     println!("  Summary");
@@ -397,8 +484,8 @@ async fn main() {
         pub_total_final as f64 / pub_elapsed.as_secs_f64()
     );
     println!(
-        "  end-to-end rate    : {:.0} msg/s",
-        recv_final as f64 / total_elapsed.as_secs_f64()
+        "  end-to-end rate    : {:.0} msg/s  (aggregate across {n_consumers} consumers)",
+        total_recv_all as f64 / total_elapsed.as_secs_f64()
     );
 
     // Resource usage summary.
@@ -416,21 +503,21 @@ async fn main() {
     );
     println!(
         "  CPU used           : {cpu_used_secs:>6.2} s   ({cpu_pct:>5.1}% of wall)   per msg: {:>5.0} ns",
-        cpu_used_ns as f64 / recv_final.max(1) as f64
+        cpu_used_ns as f64 / total_recv_all.max(1) as f64
     );
 
     // ── Assertions ─────────────────────────────────────────────────────
     assert!(pub_total_final > 0, "no messages were published");
+    assert!(!any_loss, "per-consumer loss detected: {all_gaps:?}");
     assert_eq!(
-        set_len as u64, pub_total_final,
-        "unique received ({}) != published ({}) — message loss detected",
-        set_len, pub_total_final,
+        total_recv_all,
+        pub_total_final * n_consumers,
+        "aggregate received ({total_recv_all}) != published * consumers ({})",
+        pub_total_final * n_consumers,
     );
-    assert_eq!(duplicates, 0, "duplicate deliveries detected: {duplicates}");
-    assert!(gaps.is_empty(), "seq gaps detected: {gaps:?}");
 
     println!();
-    println!("  RESULT: OK — no loss, no duplicates, no gaps");
+    println!("  RESULT: OK — no loss per consumer, no duplicates, no gaps");
     println!();
 
     // DataDirCleanup drops here and removes the dir.

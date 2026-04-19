@@ -80,6 +80,17 @@ const DIST_SUBS: &[DistSub] = &[
     DistSub { label: "ignore.me",            filter: Some(b"ignore.me"),            expected: 0 },
 ];
 
+// ── Single-connection multi-subscription stage ──────────────────────────
+
+// One TCP connection, N fanout consumers on it, all receiving every msg.
+// This is the shape where broadcast collapse yields linear savings:
+// today the server emits one wire entry per (msg, consumer) — this stage
+// measures that directly against the logical delivery count.
+const SCMS_N_CONSUMERS: usize = 4;
+const SCMS_MSGS: u64 = 50_000;
+const SCMS_STREAM: &[u8] = b"fanout_scms";
+const SCMS_SUBJECT: &[u8] = b"scms.topic";
+
 fn portpicker() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
@@ -133,10 +144,16 @@ async fn spawn_consumers(
         let stream_v = stream.to_vec();
         let client = client.clone();
         subscribe_futures.push(async move {
+            // Each fanout consumer needs its OWN queue group to avoid
+            // the drain's shared-queue dedup. Without this they all fall
+            // into the default group (= stream name) and the drain
+            // delivers each message to only one of them.
+            let group_name = format!("fanout_g{i}");
             let ccfg = ConsumerConfig::new(name.as_bytes(), &stream_v)
                 .deliver_mode(DeliverMode::Fanout)
                 .deliver_policy(policy)
                 .ack_policy(AckPolicy::None)
+                .group(group_name.as_bytes())
                 .build()
                 .unwrap();
             let consumer = client.create_consumer(&ccfg).await.unwrap();
@@ -304,10 +321,12 @@ async fn run_distribution() {
     for (i, s) in DIST_SUBS.iter().enumerate() {
         let client = Client::connect(&addr).await.unwrap();
         let cname = format!("c{i}");
+        let group = format!("dist_g{i}");
         let ccfg = ConsumerConfig::new(cname.as_bytes(), DIST_STREAM)
             .deliver_mode(DeliverMode::Fanout)
             .deliver_policy(DeliverPolicy::New)
             .ack_policy(AckPolicy::None)
+            .group(group.as_bytes())
             .build()
             .unwrap();
         let consumer = client.create_consumer(&ccfg).await.unwrap();
@@ -329,6 +348,7 @@ async fn run_distribution() {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let total: u64 = DIST_SUBJECTS.len() as u64 * DIST_PER_SUBJECT;
+    eprintln!("[wire-marker] BEGIN distribution");
     let pub_start = Instant::now();
     for subject in DIST_SUBJECTS {
         let mut remaining = DIST_PER_SUBJECT as usize;
@@ -387,6 +407,95 @@ async fn run_distribution() {
     }
 }
 
+// ── Single-connection multi-sub stage ────────────────────────────────────
+
+async fn run_single_conn_multi_sub() {
+    let addr = spawn_server().await;
+    let setup = Client::connect(&addr).await.unwrap();
+    setup
+        .create_stream(&StreamConfig::new(SCMS_STREAM, b">").build())
+        .await
+        .unwrap();
+
+    // ONE TCP connection for all N consumers — this is the whole point.
+    let sub_client = Client::connect(&addr).await.unwrap();
+
+    let mut counts: Vec<Arc<AtomicU64>> = Vec::with_capacity(SCMS_N_CONSUMERS);
+    let mut _handles = Vec::with_capacity(SCMS_N_CONSUMERS);
+
+    for i in 0..SCMS_N_CONSUMERS {
+        let cname = format!("scms_c{i}");
+        // Unique group so each consumer is a real fanout subscriber,
+        // not a queue worker sharing deliveries with its peers.
+        let group = format!("scms_g{i}");
+        let ccfg = ConsumerConfig::new(cname.as_bytes(), SCMS_STREAM)
+            .deliver_mode(DeliverMode::Fanout)
+            .deliver_policy(DeliverPolicy::New)
+            .ack_policy(AckPolicy::None)
+            .group(group.as_bytes())
+            .build()
+            .unwrap();
+        let consumer = sub_client.create_consumer(&ccfg).await.unwrap();
+
+        let count = Arc::new(AtomicU64::new(0));
+        let cc = count.clone();
+        let h = consumer
+            .subscribe_callback(None, move |_msg| {
+                cc.fetch_add(1, Relaxed);
+            })
+            .await
+            .unwrap();
+
+        counts.push(count);
+        _handles.push(h);
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    eprintln!("[wire-marker] BEGIN single_conn_multi_sub");
+
+    let pub_start = Instant::now();
+    let mut remaining = SCMS_MSGS as usize;
+    while remaining > 0 {
+        let size = remaining.min(BATCH_SIZE);
+        let entries: Vec<(&[u8], &[u8])> =
+            (0..size).map(|_| (SCMS_SUBJECT, PAYLOAD)).collect();
+        setup.publish_batch(SCMS_STREAM, &entries).await.unwrap();
+        remaining -= size;
+    }
+    let pub_dur = pub_start.elapsed();
+
+    let wait_start = Instant::now();
+    let timeout = Duration::from_secs(30);
+    loop {
+        let all_ready = counts.iter().all(|c| c.load(Relaxed) >= SCMS_MSGS);
+        if all_ready { break; }
+        if wait_start.elapsed() > timeout { break; }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let delivery_dur = wait_start.elapsed();
+
+    let total_callbacks: u64 = counts.iter().map(|c| c.load(Relaxed)).sum();
+    let wire_today = SCMS_MSGS * SCMS_N_CONSUMERS as u64;
+    let wire_collapsed = SCMS_MSGS;
+    let reduction = SCMS_N_CONSUMERS as u64;
+
+    println!("\n  ── Shape: 1 TCP connection, {} fanout consumers, {} msgs ──",
+             SCMS_N_CONSUMERS, SCMS_MSGS);
+    println!("    publish {:.2?}   delivery window {:.2?}", pub_dur, delivery_dur);
+    for (i, c) in counts.iter().enumerate() {
+        println!("    c{i} recv {}/{}", c.load(Relaxed), SCMS_MSGS);
+    }
+    println!();
+    println!("    total client callbacks (delivered):     {}", total_callbacks);
+    println!("    wire entries emitted today (no collapse): {}  (msgs × consumers)", wire_today);
+    println!("    wire entries WITH broadcast collapse:     {}  (msgs × 1 conn)", wire_collapsed);
+    println!("    potential reduction:                      {}×", reduction);
+    println!();
+    println!("    Run with ARBITRO_WIRE_TRACE=1 to verify the server-side");
+    println!("    entry count against these numbers.");
+}
+
 #[tokio::main]
 async fn main() {
     println!("\n========================================================");
@@ -413,7 +522,18 @@ async fn main() {
     run_stage("replay × batch",   Mode::Replay, Pub::Batch).await;
 
     println!("\n--------------------------------------------------------");
-    println!("  Section 2 — distribution check (subject filters)");
+    println!("  Section 2 — single connection, many subscriptions");
+    println!("--------------------------------------------------------");
+    println!(
+        "  Measures broadcast-collapse potential: today the server emits");
+    println!(
+        "  1 wire entry per (msg × consumer); with collapse it would emit");
+    println!(
+        "  1 wire entry per (msg × connection).");
+    run_single_conn_multi_sub().await;
+
+    println!("\n--------------------------------------------------------");
+    println!("  Section 3 — distribution check (subject filters)");
     println!("--------------------------------------------------------");
     println!(
         "  consumers={}   per-subject msgs={}   total msgs={}   stream=\"{}\"",

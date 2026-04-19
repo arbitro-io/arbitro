@@ -20,8 +20,8 @@
 //!   wsl bash -lc "cp .../target/release/deps/ack-* /tmp/arbitro-bench/ && \
 //!     cd /tmp/arbitro-bench && timeout 120 ./ack-* --bench"
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitro_client::Client;
@@ -69,7 +69,12 @@ async fn connect(addr: &str) -> Client {
 
 /// Prepare: create stream, consumer (ack-explicit), subscribe, publish N msgs.
 /// Returns the subscription handle and the client for ack publishing.
-async fn setup(client: &Client, max_inflight: u16, total: u64, label: &[u8]) -> arbitro_client::SubscriptionHandle {
+async fn setup(
+    client: &Client,
+    max_inflight: u16,
+    total: u64,
+    label: &[u8],
+) -> arbitro_client::SubscriptionHandle {
     let mut stream_name = STREAM.to_vec();
     stream_name.extend_from_slice(b"_");
     stream_name.extend_from_slice(label);
@@ -89,8 +94,7 @@ async fn setup(client: &Client, max_inflight: u16, total: u64, label: &[u8]) -> 
     let sub = consumer.subscribe(None).await.unwrap();
 
     // Publish total msgs via a single batch publish.
-    let entries: Vec<(&[u8], &[u8])> =
-        (0..total).map(|_| (SUBJECT, PAYLOAD)).collect();
+    let entries: Vec<(&[u8], &[u8])> = (0..total).map(|_| (SUBJECT, PAYLOAD)).collect();
     client.publish_batch(&stream_name, &entries).await.unwrap();
 
     sub
@@ -147,12 +151,109 @@ async fn stage_ack_batch(total: u64) -> (Duration, u64) {
     (elapsed, received)
 }
 
+/// Multi-client batch stage: N parallel clients each with their own
+/// consumer, each acking its fanout share. Measures scalability with
+/// multiple TCP connections acking concurrently.
+async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
+    let addr = spawn_server().await;
+
+    // Stream set up by a control client.
+    let control = connect(&addr).await;
+    let stream_name = b"ack_bench_multi".to_vec();
+    control
+        .create_stream(&StreamConfig::new(&stream_name, b">").build())
+        .await
+        .unwrap();
+
+    // Create N consumers, each with a UNIQUE name and a UNIQUE group
+    // (fanout: each consumer receives all msgs independently).
+    let cap = total.saturating_add(256).min(u16::MAX as u64) as u16;
+    for i in 0..n_clients {
+        let name = format!("acker-{i}");
+        let group = format!("grp-{i}");
+        let cfg = ConsumerConfig::new(name.as_bytes(), &stream_name)
+            .group(group.as_bytes())
+            .ack_policy(AckPolicy::Explicit)
+            .max_inflight(cap)
+            .deliver_policy(DeliverPolicy::All)
+            .build()
+            .unwrap();
+        control.create_consumer(&cfg).await.unwrap();
+    }
+
+    // Spawn N subscriber tasks, each on its own TCP connection.
+    let mut worker_handles = Vec::new();
+    let received_counts: Vec<Arc<AtomicU64>> =
+        (0..n_clients).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    for i in 0..n_clients {
+        let addr = addr.clone();
+        let stream_name = stream_name.clone();
+        let counter = Arc::clone(&received_counts[i as usize]);
+        worker_handles.push(tokio::spawn(async move {
+            let client = connect(&addr).await;
+            let name = format!("acker-{i}");
+            let group = format!("grp-{i}");
+            let cfg = ConsumerConfig::new(name.as_bytes(), &stream_name)
+                .group(group.as_bytes())
+                .ack_policy(AckPolicy::Explicit)
+                .max_inflight(cap)
+                .deliver_policy(DeliverPolicy::All)
+                .build()
+                .unwrap();
+            let consumer = client.create_consumer(&cfg).await.unwrap();
+            let mut sub = consumer.subscribe(None).await.unwrap();
+
+            let mut last_msg: Option<arbitro_client::Message> = None;
+            while counter.load(Relaxed) < total {
+                match tokio::time::timeout(Duration::from_secs(10), sub.next()).await {
+                    Ok(Some(msg)) => {
+                        if let Some(prev) = last_msg.take() {
+                            prev.ack();
+                        }
+                        last_msg = Some(msg);
+                        counter.fetch_add(1, Relaxed);
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(last) = last_msg {
+                let _ = last.ack_sync().await;
+            }
+        }));
+    }
+
+    // Give subscribers a moment to register.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Publisher: 1 batch of `total` msgs.
+    let entries: Vec<(&[u8], &[u8])> = (0..total).map(|_| (SUBJECT, PAYLOAD)).collect();
+    let start = Instant::now();
+    control.publish_batch(&stream_name, &entries).await.unwrap();
+
+    // Wait for all subscribers to receive + ack all msgs.
+    for h in worker_handles {
+        let _ = h.await;
+    }
+    let elapsed = start.elapsed();
+
+    // Verify each received exactly `total` (fanout contract).
+    let mut total_received = 0u64;
+    for (i, c) in received_counts.iter().enumerate() {
+        let cnt = c.load(Relaxed);
+        assert_eq!(cnt, total, "client {i} received {cnt} (expected {total})");
+        total_received += cnt;
+    }
+
+    (elapsed, total_received)
+}
+
 /// Correctness probe: after the bench, publish K more messages and confirm
 /// they arrive. Stale pendings would block redelivery because max_inflight
 /// would already be saturated.
 async fn correctness_probe(addr: &str, client: &Client, stream: &[u8], probe_count: u32) -> u32 {
-    let entries: Vec<(&[u8], &[u8])> =
-        (0..probe_count).map(|_| (b"ack.bench.probe".as_slice(), b"p".as_slice())).collect();
+    let entries: Vec<(&[u8], &[u8])> = (0..probe_count)
+        .map(|_| (b"ack.bench.probe".as_slice(), b"p".as_slice()))
+        .collect();
     client.publish_batch(stream, &entries).await.unwrap();
 
     // Reuse existing sub via a fresh consumer (simpler — avoid reusing a subscription after a bench).
@@ -181,14 +282,17 @@ async fn correctness_probe(addr: &str, client: &Client, stream: &[u8], probe_cou
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let total = env_u64("BENCH_ACK_MSGS", DEFAULT_TOTAL);
+    let n_clients = env_u64("BENCH_ACK_CLIENTS", 4);
 
     println!();
     println!("========================================================");
     println!("                      Ack bench");
     println!("========================================================");
-    println!("  total_msgs={total}   payload={}B   stream=\"{}\"",
+    println!(
+        "  total_msgs={total}   payload={}B   stream=\"{}\"",
         PAYLOAD.len(),
-        String::from_utf8_lossy(STREAM));
+        String::from_utf8_lossy(STREAM)
+    );
     println!();
 
     // Stage 1 — single ack (one round-trip each)
@@ -221,14 +325,47 @@ async fn main() {
 
     println!();
 
+    // Stage 3 — multi-client batch ack (N parallel TCP connections)
+    println!();
+    println!("--------------------------------------------------------");
+    println!(
+        "  Stage 3 — ack_multi ({n_clients} parallel clients, each with its own consumer)"
+    );
+    println!("--------------------------------------------------------");
+    let (dur_multi, total_recv_multi) = stage_ack_multi(total, n_clients).await;
+    let throughput_multi = total_recv_multi as f64 / dur_multi.as_secs_f64();
+    let ns_per_ack_multi = dur_multi.as_nanos() as f64 / total_recv_multi as f64;
+    println!(
+        "  {n_clients} clients × {total} msgs each = {total_recv_multi} acks in {:.2?}",
+        dur_multi
+    );
+    println!(
+        "  aggregate: {:.0} acks/s  ({:.0} ns/ack)   per-client: {:.0} acks/s",
+        throughput_multi,
+        ns_per_ack_multi,
+        throughput_multi / n_clients as f64
+    );
+
     // Summary
+    println!();
     let speedup = throughput_batch / throughput_single;
+    let scale = throughput_multi / throughput_batch;
     println!("--------------------------------------------------------");
     println!("  Summary");
     println!("--------------------------------------------------------");
-    println!("  single : {:>10.0} acks/s   ({:>6.0} ns/ack)", throughput_single, ns_per_ack_single);
-    println!("  batch  : {:>10.0} acks/s   ({:>6.0} ns/ack)", throughput_batch, ns_per_ack_batch);
-    println!("  batch is {speedup:.1}x faster than single");
+    println!(
+        "  single (1 client, sync ack)        : {:>10.0} acks/s   ({:>6.0} ns/ack)",
+        throughput_single, ns_per_ack_single
+    );
+    println!(
+        "  batch  (1 client, coalesced acks)  : {:>10.0} acks/s   ({:>6.0} ns/ack)",
+        throughput_batch, ns_per_ack_batch
+    );
+    println!(
+        "  multi  ({n_clients} clients, coalesced)         : {:>10.0} acks/s   ({:>6.0} ns/ack)",
+        throughput_multi, ns_per_ack_multi
+    );
+    println!("  batch/single: {speedup:.1}x   multi/batch: {scale:.1}x");
 
     // Correctness: spin up a fresh server/client for the probe so we know
     // acks didn't leave orphans from the bench run's state.
