@@ -29,6 +29,50 @@ Every design decision must respect the hardware. No exceptions.
 11. **Slab over HashMap for hot-path lookups** — array index O(1) worst-case vs hash O(1) amortized.
 12. **Reuse buffers** — PublishScratch, reply scratch, all `.clear()` and reuse.
 
+## ID Storage — Dense vs Sparse (INVIOLABLE)
+
+**The shape of the key determines the container. Never use HashMap for dense keys; never use a bucket array for sparse keys.**
+
+### Dense IDs (0, 1, 2, …) → bucket array
+
+Any ID assigned monotonically by a registry is DENSE — use direct-indexed `Vec<T>` / `Box<[T]>`:
+
+```rust
+// ✅ ConsumerId dense → array index ~1 ns
+consumer: Vec<u32>;
+consumer[consumer_id.0 as usize] += 1;
+
+// ❌ HashMap for dense key is ~10-15 ns (hash + probe + entry API)
+consumer: HashMap<ConsumerId, u32>
+```
+
+Dense IDs in this crate: `ConsumerId`, `QueueId`, `StreamId`, `BindingId`, `SubscriptionId`, `ConnectionId`.
+
+### Sparse IDs (content hashes) → HashMap + ahash
+
+Any key spread across u32/u64 (hash of arbitrary bytes) is SPARSE. Vec would need GiB:
+
+```rust
+// ✅ subject_hash spans full u32 range
+subject: HashMap<u32, u32, ahash::RandomState>
+
+// ❌ std HashMap default uses SipHash (~3× slower than ahash)
+subject: HashMap<u32, u32>
+
+// ❌ bucket array with modulo loses accuracy (collisions → over-count)
+subject: Box<[AtomicU32; 16384]>
+```
+
+Sparse keys in this crate: `subject_hash`, `tx_hash` (idempotency).
+
+### Linear scan exception
+
+Linear `.iter().find()` is acceptable **only** when:
+- The collection is bounded to ≤ 8 elements (cache-line fits), AND
+- The scan happens outside the innermost loop (once per drain cycle, not per entry).
+
+Anywhere else, `.iter().find(|x| x.id == target)` on dense-keyed data is a **rule violation** and must be replaced with direct indexing or an ahash side-index.
+
 ## Syscall Minimization
 
 13. **Batch I/O** — `write_vectored` for multiple frames. Never one `write_all` per message.

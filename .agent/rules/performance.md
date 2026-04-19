@@ -27,6 +27,64 @@ Every design decision must respect the hardware. No exceptions.
 11. **`Box<[u8]>` over `Vec<u8>`** for owned byte data — 16 bytes vs 24 bytes, no unused capacity.
 12. **Reuse buffers** — `Flusher`, `PublishScratch`, frame builders all `.clear()` and reuse.
 
+## ID Storage — Dense vs Sparse (INVIOLABLE)
+
+**The shape of the key determines the container. Never use HashMap for dense keys; never use a bucket array for sparse keys.**
+
+### Dense IDs → bucket array (Vec<T> / Box<[T]>)
+
+Any ID assigned monotonically (0, 1, 2, 3, …) by a registry is DENSE. Use a direct-indexed array:
+
+```rust
+// ✅ ConnectionId is assigned sequentially by ConnectionRegistry
+// Lookup: O(1) worst-case, ~1 ns (one cache-line load, zero hashing)
+writers_by_conn: Vec<Option<WriterHandle>>,   // indexed by conn.0
+writers_by_conn[conn.0 as usize]              // direct load
+
+// ❌ WRONG — wasteful hashing for a dense key
+writers_by_conn: HashMap<ConnectionId, WriterHandle>
+```
+
+Applies to: `ConnectionId`, `ConsumerId`, `QueueId`, `StreamId`, `SubscriptionId`, `BindingId` — all assigned sequentially by `NameRegistry` / catalog.
+
+**Hot-path cost** (measured): Vec indexed ~1 ns vs HashMap ~10-15 ns (hash + probe + entry API). **10× faster per lookup**, and with branch-predictable layout.
+
+### Sparse IDs → HashMap with ahash
+
+Any key that is a hash, user-supplied bytes, or otherwise spread across the full `u32`/`u64` range is SPARSE. A Vec would need GiB. Use `HashMap` with **ahash** (not SipHash):
+
+```rust
+// ✅ subject_hash is fnv1a_32 of arbitrary bytes → sparse across u32
+use ahash::RandomState;
+subject_inflight: HashMap<u32, u32, RandomState>
+
+// ❌ WRONG — std HashMap uses SipHash (~3× slower)
+subject_inflight: HashMap<u32, u32>  // std default
+
+// ❌ WRONG — bucket array with modulo produces collisions
+// (two distinct subjects can hash to the same slot → over-count)
+subject_inflight: Box<[AtomicU32; 16384]>
+```
+
+Applies to: `subject_hash`, arbitrary `u32`/`u64` content hashes, user-provided keys.
+
+### Decision table
+
+| ID origin | Shape | Container | Example |
+|---|---|---|---|
+| Assigned by registry (N keys) | Dense 0..N | `Vec<T>` / `Box<[T]>` | `ConnectionId`, `ConsumerId` |
+| Content hash / user bytes | Sparse u32/u64 | `HashMap<K, V, ahash::RandomState>` | `subject_hash` |
+| Dense but sparse-used (few of N) | Dense but holes | `Vec<Option<T>>` or `HashMap` (depends on density) | `writers_by_conn` if many conns idle |
+| Single cache (2-8 entries) | Any | `SmallVec` / `ArrayVec` linear scan | served-queues per entry |
+
+### Enforcement
+
+Anywhere the code does `.iter().find(|x| x.id == target)` on a dense-keyed slice, it **violates** this rule. Either:
+- The collection should be a direct-indexed Vec (dense), or
+- If truly sparse-used, a `HashMap<Id, Idx, ahash::RandomState>` side-index.
+
+Linear scans are only acceptable when N ≤ 8 (cache-line bounded) and the check runs outside inner loops.
+
 ## Syscall Minimization
 
 13. **Batch I/O** — `write_vectored` for multiple frames in one syscall. Never one `write_all` per message.
