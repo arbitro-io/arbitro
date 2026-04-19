@@ -35,6 +35,7 @@ ahash             = "0.8"
 
 [dev-dependencies]
 arbitro-client = { path = "../arbitro-client" }
+papaya         = "0.2"
 
 [[bench]]
 name = "lookup_strategies"
@@ -50,4 +51,8 @@ harness = false
 
 [[bench]]
 name = "matchentry_enrichment"
+harness = false
+
+[[bench]]
+name = "subject_inflight"
 harness = false

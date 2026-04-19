@@ -433,5 +433,135 @@ fn main() {
         hashes.clone(),
     );
 
+    // ── Workload E: write-heavy churn (NEW keys + remove-at-zero bursts) ─
+    //
+    // Reader: continuous has_room on a stable pool of 256 hot subjects.
+    // Writer: infinite churn — insert fresh key (new hash every iter), then
+    //         immediately dec it to 0 → forces remove.
+    //         Exercises BOTH write-lock paths: `entry().or_insert()` AND
+    //         `map.remove()` in RwLock<HashMap>.
+    //
+    // This is the realistic production pattern: new subjects constantly
+    // appearing (different subject strings on every request) + ACKs
+    // decrementing them to 0.
+    println!("\n── E. Write-churn: insert new key + remove-at-zero (stresses WRITE lock) ──\n");
+    let dur = Duration::from_secs(2);
+    let hot_hashes = gen_hashes(256, false);
+
+    let rwlock_hm = Arc::new(RwLockHashMap::new());
+    for &h in &hot_hashes[..32] { rwlock_hm.inc(h); }
+    bench_churn(
+        "RwLock<HashMap>", dur, rwlock_hm,
+        |s, h, m| s.has_room(h, m),
+        |s, h| s.inc(h),
+        |s, h| s.dec(h),
+        hot_hashes.clone(),
+    );
+
+    let papaya = Arc::new(Papaya::new());
+    for &h in &hot_hashes[..32] { papaya.inc(h); }
+    bench_churn(
+        "Papaya", dur, papaya,
+        |s, h, m| s.has_room(h, m),
+        |s, h| s.inc(h),
+        |s, h| s.dec(h),
+        hot_hashes.clone(),
+    );
+
+    let bucket = Arc::new(BucketArray::new());
+    for &h in &hot_hashes[..32] { bucket.inc(h); }
+    bench_churn(
+        "BucketArray", dur, bucket,
+        |s, h, m| s.has_room(h, m),
+        |s, h| s.inc(h),
+        |s, h| s.dec(h),
+        hot_hashes.clone(),
+    );
+
     println!();
+}
+
+// ── Workload E helper: reader vs full-throttle write churn ────────────────
+//
+// Reader thread: reads `has_room` on `hot_hashes` in a rotating pattern.
+// Writer thread: infinite loop of (inc(seed), dec(seed)) with seed starting
+//                at a value FAR from the reader's pool to guarantee each
+//                inc creates a NEW key (exercising write lock on insert)
+//                and each dec reaches 0 (exercising write lock on remove).
+//
+// Reports reader throughput under real write-lock contention.
+fn bench_churn<S, R, Inc, Dec>(
+    label: &str,
+    duration: Duration,
+    state: Arc<S>,
+    read: R,
+    inc: Inc,
+    dec: Dec,
+    hot_hashes: Vec<u32>,
+) where
+    S: Send + Sync + 'static,
+    R: Fn(&S, u32, u32) -> bool + Send + Sync + 'static,
+    Inc: Fn(&S, u32) + Send + Sync + 'static,
+    Dec: Fn(&S, u32) + Send + Sync + 'static,
+{
+    let stats = Arc::new(ConcurrentStats {
+        reader_reads: AtomicU64::new(0),
+        reader_incs: AtomicU64::new(0),
+        writer_decs: AtomicU64::new(0),
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Reader: drain scenario — pure has_room calls on hot pool.
+    let reader_h = {
+        let state = state.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        let hashes = hot_hashes.clone();
+        std::thread::spawn(move || {
+            let mut i: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let h = hashes[(i as usize) % hashes.len()];
+                black_box(read(&state, h, 100));
+                stats.reader_reads.fetch_add(1, Ordering::Relaxed);
+                i = i.wrapping_add(1);
+            }
+        })
+    };
+
+    // Writer: churn cycle — fresh key every iter.
+    // inc(new_key) → forces write-lock insert path
+    // dec(new_key) → count hits 0 → forces write-lock remove path
+    let writer_h = {
+        let state = state.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            // Start far from reader's pool — never collides.
+            let mut seed: u32 = 0xDEAD_0000;
+            while !stop.load(Ordering::Relaxed) {
+                inc(&state, seed);
+                stats.reader_incs.fetch_add(1, Ordering::Relaxed);
+                dec(&state, seed);
+                stats.writer_decs.fetch_add(1, Ordering::Relaxed);
+                seed = seed.wrapping_add(1);
+            }
+        })
+    };
+
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    reader_h.join().unwrap();
+    writer_h.join().unwrap();
+
+    let reads = stats.reader_reads.load(Ordering::Relaxed);
+    let incs = stats.reader_incs.load(Ordering::Relaxed);
+    let decs = stats.writer_decs.load(Ordering::Relaxed);
+    let total_reads_per_s = reads as f64 / duration.as_secs_f64();
+    let ns_per_read = duration.as_nanos() as f64 / reads as f64;
+    let writer_churn_per_s = incs as f64 / duration.as_secs_f64();
+
+    println!(
+        "  churn {label:18} | {:>6.2} ns/read | {:>12.0} reads/s | writer_churn={:>10.0} cycles/s",
+        ns_per_read, total_reads_per_s, writer_churn_per_s
+    );
 }

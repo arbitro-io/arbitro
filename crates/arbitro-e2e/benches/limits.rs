@@ -50,6 +50,8 @@ const DEFAULT_ITERS: u64 = 1_000;
 const BASIC_BACKLOG: u32 = 100;
 const PAYLOAD_SIZE: usize = 64;
 const STREAM: &[u8] = b"limits_e2e";
+/// Default users for Stage 4 (dynamic subjects throughput).
+const DEFAULT_DYNAMIC_USERS: u64 = 10_000;
 
 fn env_u64(var: &str, fallback: u64) -> u64 {
     std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
@@ -313,10 +315,81 @@ fn report(label: &str, latencies: &[Duration]) {
     );
 }
 
+/// Stage 4 — high-cardinality dynamic subjects throughput.
+///
+/// Simulates a production pattern where each message has a UNIQUE subject
+/// (e.g. `notif.user.<id>` with thousands of distinct user IDs) AND the
+/// consumer has `max_subject_inflight` configured.
+///
+/// This exercises the WORST CASE of the subject inflight counter:
+/// - Every delivery creates a NEW key in the HashMap (insert path → write lock)
+/// - Every ack drains the counter to 0 and removes the key (remove path → write lock)
+/// - Drain checks has_room for every new subject (read lock)
+///
+/// Reports:
+/// - Total msg/s (publish → deliver → ack cycle)
+/// - Time spent in each phase
+async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
+    let addr = spawn_server().await;
+    let client = connect(&addr).await;
+
+    let stream_name: &[u8] = b"dynamic_subjects";
+    client
+        .create_stream(&StreamConfig::new(stream_name, b">").build())
+        .await
+        .unwrap();
+
+    // Consumer with max_subject_inflight on the dynamic pattern.
+    // Each unique user_id gets its own counter with cap=1.
+    let cfg = ConsumerConfig::new(b"dyn_consumer", stream_name)
+        .filter(b">")
+        .ack_policy(AckPolicy::Explicit)
+        .max_inflight(60_000)
+        .max_subject_inflight(b"notif.user.>", 1)
+        .build()
+        .unwrap();
+    let consumer = client.create_consumer(&cfg).await.unwrap();
+    let mut sub = consumer.subscribe(None).await.unwrap();
+    let payload = vec![0u8; PAYLOAD_SIZE];
+
+    // Prepare N unique subjects — one per user.
+    let subjects: Vec<String> =
+        (0..n_users).map(|i| format!("notif.user.{i}")).collect();
+    let entries: Vec<(&[u8], &[u8])> = subjects
+        .iter()
+        .map(|s| (s.as_bytes(), payload.as_slice()))
+        .collect();
+
+    // Warmup: flush any startup noise.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let start = Instant::now();
+
+    // Publish all N messages in one batch (server-side ingestion ≠ drain rate).
+    client.publish_batch(stream_name, &entries).await.unwrap();
+
+    // Receive + ack all N, counting successful deliveries.
+    // Each ack triggers dec_subject → count=0 → map.remove() (RwLock write).
+    let mut got = 0u64;
+    while got < n_users {
+        match tokio::time::timeout(Duration::from_secs(30), sub.next()).await {
+            Ok(Some(msg)) => {
+                msg.ack();
+                got += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let elapsed = start.elapsed();
+    (elapsed, got)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let iters = env_u64("BENCH_LIMITS_ITERS", DEFAULT_ITERS);
     let n_clients = env_u64("BENCH_LIMITS_CLIENTS", 4);
+    let dynamic_users = env_u64("BENCH_LIMITS_DYNAMIC_USERS", DEFAULT_DYNAMIC_USERS);
 
     println!();
     println!("========================================================");
@@ -380,5 +453,33 @@ async fn main() {
     println!("  multi    ({n_clients} clients, basic load each) avg : {:>9.2?}", avg_multi);
     println!("  ratios (vs baseline):  isolated={ratio:.2}x   multi={ratio_multi:.2}x");
     println!("  (closer to 1.0 = better isolation)");
+    println!();
+
+    // Stage 4 — dynamic subjects throughput
+    println!("--------------------------------------------------------");
+    println!(
+        "  Stage 4 — dynamic subjects throughput ({dynamic_users} unique users)"
+    );
+    println!("  Pattern: `notif.user.<id>` with max_subject_inflight=1");
+    println!("  Exercises: HashMap insert+remove on every msg lifecycle");
+    println!("--------------------------------------------------------");
+    let (elapsed, delivered) = dynamic_subjects_throughput(dynamic_users).await;
+    let msgs_per_sec = delivered as f64 / elapsed.as_secs_f64();
+    let ns_per_msg = elapsed.as_nanos() as f64 / delivered as f64;
+    println!(
+        "  {dynamic_users} users | delivered={delivered} | elapsed={:.2?} | {msgs_per_sec:>10.0} msg/s | {ns_per_msg:>7.0} ns/msg",
+        elapsed
+    );
+    println!();
+
+    // Stage 4b — 1k for comparison
+    let small_n = 1_000u64;
+    let (elapsed_s, delivered_s) = dynamic_subjects_throughput(small_n).await;
+    let msgs_per_sec_s = delivered_s as f64 / elapsed_s.as_secs_f64();
+    let ns_per_msg_s = elapsed_s.as_nanos() as f64 / delivered_s as f64;
+    println!(
+        "  {small_n} users  | delivered={delivered_s} | elapsed={:.2?} | {msgs_per_sec_s:>10.0} msg/s | {ns_per_msg_s:>7.0} ns/msg",
+        elapsed_s
+    );
     println!();
 }
