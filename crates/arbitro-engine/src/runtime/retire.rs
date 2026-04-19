@@ -27,7 +27,9 @@ pub fn retire_binding(
     let consumer_raw = binding.consumer_id.raw();
     let queue_raw = binding.queue_id.raw();
     for pending in &binding.pending {
-        events.subject_hashes_acked.push(pending.subject_hash);
+        events
+            .subject_hashes_acked
+            .push((consumer_raw, pending.subject_hash));
         ctx.inflight
             .dec_pending(pending.subject_hash, consumer_raw, queue_raw);
     }

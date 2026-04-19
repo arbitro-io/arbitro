@@ -383,8 +383,9 @@ impl CommandWorker {
             self.gate.release();
         }
         // Decrement subject inflight for acked/retired pendings.
-        for &sh in &delta.subject_hashes_acked {
-            self.counters.dec_subject(sh);
+        // Key is (consumer_id, subject_hash) — per-consumer isolation.
+        for &(cid, sh) in &delta.subject_hashes_acked {
+            self.counters.dec_subject(cid, sh);
         }
         // Demand atomics are already updated by subscribe/unsubscribe handlers.
         // DeltaEvents demand_became_available/idle are informational only here.

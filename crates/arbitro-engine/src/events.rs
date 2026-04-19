@@ -22,9 +22,11 @@ pub struct DeltaEvents {
     /// Bindings retired by `delete_stream`, `delete_consumer`, or
     /// `mark_connection_dead`.
     pub bindings_retired: Vec<BindingId>,
-    /// Subject hashes whose inflight was decremented by ack.
-    /// Used by the handler to sync `SharedCounters::dec_subject`.
-    pub subject_hashes_acked: Vec<u32>,
+    /// (consumer_id, subject_hash) pairs whose inflight was decremented by
+    /// ack. Used by the handler to sync `SharedCounters::dec_subject`.
+    /// Keyed per-consumer because `SharedCounters.subject` is keyed per
+    /// (consumer_id, subject_hash) for per-consumer isolation.
+    pub subject_hashes_acked: Vec<(u32, u32)>,
 }
 
 impl DeltaEvents {

@@ -54,13 +54,15 @@ pub struct SharedCounters {
     total_demand: AtomicU32,
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
-    /// Subject inflight — exact per-subject tracking via HashMap+ahash.
-    /// Key = subject_hash (u32). Value = AtomicU32 counter.
+    /// Subject inflight — exact per-(consumer, subject) tracking via
+    /// HashMap+ahash.
+    /// Key = (consumer_id, subject_hash). Value = AtomicU32 counter.
+    /// Keying by consumer_id is required for per-consumer isolation:
+    /// two consumers on the same stream publishing the same subject must
+    /// not share a counter (otherwise their max_subject_inflight budgets
+    /// would collide and starve one of them).
     /// Entry removed when counter reaches 0 (bounded memory to working set).
-    /// Single RwLock — reads (has_room, load) use read lock; insert/remove
-    /// (inc when empty, dec to zero) use write lock. On a hot subject,
-    /// read lock + AtomicU32 load is the steady state.
-    subject: RwLock<HashMap<u32, AtomicU32, ahash::RandomState>>,
+    subject: RwLock<HashMap<(u32, u32), AtomicU32, ahash::RandomState>>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -133,34 +135,35 @@ impl SharedCounters {
 
     // ── Subject inflight (drain: add, ack: sub) ─────────────────────
 
-    /// Increment subject inflight after delivery. Called by drain.
-    /// Fast path: entry exists → read lock + fetch_add. Slow path: create
-    /// entry under write lock. Steady state is the fast path.
+    /// Increment subject inflight for a (consumer, subject) pair.
+    /// Called by drain after delivery.
     #[inline]
-    pub fn inc_subject(&self, subject_hash: u32) {
+    pub fn inc_subject(&self, consumer_id: u32, subject_hash: u32) {
+        let key = (consumer_id, subject_hash);
         // Fast path: entry already present.
         {
             let g = self.subject.read().unwrap();
-            if let Some(c) = g.get(&subject_hash) {
+            if let Some(c) = g.get(&key) {
                 c.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
         // Slow path: insert.
         let mut g = self.subject.write().unwrap();
-        g.entry(subject_hash)
+        g.entry(key)
             .or_insert_with(|| AtomicU32::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement subject inflight after ack. Called by command thread.
-    /// Removes the entry when the counter reaches zero (bounded memory).
+    /// Decrement subject inflight for a (consumer, subject) pair.
+    /// Called by command thread after ack. Removes the entry at zero.
     #[inline]
-    pub fn dec_subject(&self, subject_hash: u32) {
+    pub fn dec_subject(&self, consumer_id: u32, subject_hash: u32) {
+        let key = (consumer_id, subject_hash);
         // Fast path: dec under read lock if count > 1 after sub.
         {
             let g = self.subject.read().unwrap();
-            if let Some(c) = g.get(&subject_hash) {
+            if let Some(c) = g.get(&key) {
                 let prev = c.fetch_sub(1, Ordering::Relaxed);
                 if prev > 1 {
                     return; // not zero yet, no cleanup needed
@@ -170,21 +173,20 @@ impl SharedCounters {
             }
         }
         // Slow path: removed the last one → write lock to remove key.
-        // Re-check under write lock because another thread may have inc'd.
         let mut g = self.subject.write().unwrap();
-        if let Some(c) = g.get(&subject_hash) {
+        if let Some(c) = g.get(&key) {
             if c.load(Ordering::Relaxed) == 0 {
-                g.remove(&subject_hash);
+                g.remove(&key);
             }
         }
     }
 
-    /// Check if subject has room for more inflight messages.
+    /// Check if the (consumer, subject) pair has room for more inflight.
     /// Missing key = 0 inflight = always has room.
     #[inline]
-    pub fn subject_has_room(&self, subject_hash: u32, max: u32) -> bool {
+    pub fn subject_has_room(&self, consumer_id: u32, subject_hash: u32, max: u32) -> bool {
         let g = self.subject.read().unwrap();
-        match g.get(&subject_hash) {
+        match g.get(&(consumer_id, subject_hash)) {
             Some(c) => c.load(Ordering::Relaxed) < max,
             None => true,
         }

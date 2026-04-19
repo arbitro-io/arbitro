@@ -91,13 +91,12 @@ pub(in crate::shard) struct DrainScratch {
     /// Vec scan (~0.7-3 ns per op) beats HashMap+ahash (~1.4 ns) thanks
     /// to cache locality. Measured in `benches/local_delta.rs`.
     local_inflight: Vec<(u32, u32)>,
-    /// Per-cycle subject deltas: `subject_hash -> pending`.
-    /// HashMap+ahash — N can reach hundreds of unique subjects per cycle
-    /// (one per distinct message subject). Vec scan cost grows linearly
-    /// and crosses HashMap+ahash at N≈3-4. Measured in
-    /// `benches/local_delta.rs`: at N=128, Vec = 18.7 ns/op vs
-    /// HashMap+ahash = 1.4 ns/op (13x faster).
-    local_subject: HashMap<u32, u32, ahash::RandomState>,
+    /// Per-cycle subject deltas: `(consumer_id, subject_hash) -> pending`.
+    /// Keyed per-consumer because subject inflight counters are
+    /// per-consumer (see `SharedCounters.subject`). Otherwise two
+    /// consumers on the same stream publishing the same subject would
+    /// collide on the local delta and under-count.
+    local_subject: HashMap<(u32, u32), u32, ahash::RandomState>,
 }
 
 impl DrainScratch {
@@ -275,7 +274,7 @@ pub(in crate::shard) fn drain_cycle(
     for d in &scratch.deliveries {
         if flush_ok.get(&d.conn).copied().unwrap_or(false) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
-            counters.inc_subject(d.subject_hash);
+            counters.inc_subject(d.consumer_id, d.subject_hash);
         }
     }
 
@@ -361,30 +360,18 @@ fn process_drain_entry(
         scratch.resolve_cache.insert(cache_key, resolved);
     }
 
-    // Step 2: subject inflight gate — pending + atomic counter.
-    if mt.has_subject_limits() {
-        let limit = scratch
-            .subject_limit_cache
-            .entry(cache_key)
-            .or_insert_with(|| {
-                mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
-            });
-        if let Some(max) = *limit {
-            let pending = scratch
-                .local_subject
-                .get(&subject_hash)
-                .copied()
-                .unwrap_or(0);
-            // Effective cap check: atomic + pending-in-this-cycle >= max.
-            if pending >= max
-                || !counters.subject_has_room(subject_hash, max - pending)
-            {
-                *more_pending = true;
-                track_skipped(lowest_skipped, entry.seq);
-                return;
-            }
-        }
-    }
+    // Step 2: resolve + cache subject_limit (stream-wide value — same for
+    // every consumer matching this subject). The counter check using this
+    // limit happens per-match in dispatch_recipients because the atomic
+    // counter is keyed by (consumer_id, subject_hash) for per-consumer
+    // isolation.
+    let subject_limit = if mt.has_subject_limits() {
+        *scratch.subject_limit_cache.entry(cache_key).or_insert_with(|| {
+            mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
+        })
+    } else {
+        None
+    };
 
     // Step 3: collect matches — reuse `lookup` computed above.
     scratch.matches.clear();
@@ -409,6 +396,7 @@ fn process_drain_entry(
         entry,
         stream_id,
         subject_hash,
+        subject_limit,
         scratch,
         &snap.bindings,
         &snap.binding_index,
@@ -419,11 +407,13 @@ fn process_drain_entry(
 
 // ── Per-recipient dispatch ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_recipients(
     counters: &SharedCounters,
     entry: &arbitro_store::Entry<'_>,
     stream_id: StreamId,
     subject_hash: u32,
+    subject_limit: Option<u32>,
     scratch: &mut DrainScratch,
     bindings: &[ActiveBinding],
     binding_index: &std::collections::HashMap<(u32, u64), u32, ahash::RandomState>,
@@ -494,6 +484,28 @@ fn dispatch_recipients(
                 track_skipped(lowest_skipped, entry.seq);
                 continue;
             }
+
+            // Per-consumer subject inflight check — counter is keyed by
+            // (consumer_id, subject_hash). Two consumers on the same
+            // subject have independent budgets.
+            if let Some(max) = subject_limit {
+                let pending_subj = scratch
+                    .local_subject
+                    .get(&(consumer_id.0, subject_hash))
+                    .copied()
+                    .unwrap_or(0);
+                if pending_subj >= max
+                    || !counters.subject_has_room(
+                        consumer_id.0,
+                        subject_hash,
+                        max - pending_subj,
+                    )
+                {
+                    *more_pending = true;
+                    track_skipped(lowest_skipped, entry.seq);
+                    continue;
+                }
+            }
         }
 
         // ── Hand off to the accumulator ───────────────────────────────────
@@ -525,7 +537,10 @@ fn dispatch_recipients(
                 queue_id: queue_id.0,
             });
             local_delta_inc(&mut scratch.local_inflight, consumer_id.0);
-            *scratch.local_subject.entry(subject_hash).or_insert(0) += 1;
+            *scratch
+                .local_subject
+                .entry((consumer_id.0, subject_hash))
+                .or_insert(0) += 1;
         }
 
         if queue_id != QueueId(0) {
