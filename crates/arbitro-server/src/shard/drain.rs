@@ -323,54 +323,50 @@ fn process_drain_entry(
     }
 
     let subject_hash = fnv1a_32(entry.subject);
-
-    // Resolve patterns from local cache (no engine mutation needed).
     let stream_raw = stream_id.raw() as usize;
-    if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
-        let lookup = mt.lookup(subject_hash);
-        if lookup.is_empty() {
-            let cache_key = (stream_id.raw(), subject_hash);
-            if !scratch.resolve_cache.contains_key(&cache_key) {
-                let mut resolved = Vec::new();
-                mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
-                scratch.resolve_cache.insert(cache_key, resolved);
+
+    // Single match_table lookup — reused across all three steps below.
+    // Early return when no match table: all three steps would skip and
+    // scratch.matches would end up empty anyway.
+    let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) else {
+        return;
+    };
+    let cache_key = (stream_id.raw(), subject_hash);
+    let lookup = mt.lookup(subject_hash);
+
+    // Step 1: pre-resolve patterns into local cache when lookup is empty.
+    if lookup.is_empty() && !scratch.resolve_cache.contains_key(&cache_key) {
+        let mut resolved = Vec::new();
+        mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
+        scratch.resolve_cache.insert(cache_key, resolved);
+    }
+
+    // Step 2: subject inflight gate — pending + atomic counter.
+    if mt.has_subject_limits() {
+        let limit = scratch
+            .subject_limit_cache
+            .entry(cache_key)
+            .or_insert_with(|| {
+                mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
+            });
+        if let Some(max) = *limit {
+            let pending = local_delta_get(&scratch.local_subject, subject_hash);
+            // Effective cap check: atomic + pending-in-this-cycle >= max.
+            if pending >= max
+                || !counters.subject_has_room(subject_hash, max - pending)
+            {
+                *more_pending = true;
+                track_skipped(lowest_skipped, entry.seq);
+                return;
             }
         }
     }
 
-    // Subject inflight check — resolve limit and check atomic counter.
-    if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
-        if mt.has_subject_limits() {
-            let cache_key = (stream_id.raw(), subject_hash);
-            let limit = scratch
-                .subject_limit_cache
-                .entry(cache_key)
-                .or_insert_with(|| {
-                    mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
-                });
-            if let Some(max) = *limit {
-                let pending = local_delta_get(&scratch.local_subject, subject_hash);
-                // Effective cap check: atomic + pending-in-this-cycle >= max.
-                if pending >= max
-                    || !counters.subject_has_room(subject_hash, max - pending)
-                {
-                    *more_pending = true;
-                    track_skipped(lowest_skipped, entry.seq);
-                    return;
-                }
-            }
-        }
-    }
-
-    // Collect match entries into scratch.
+    // Step 3: collect matches — reuse `lookup` computed above.
     scratch.matches.clear();
-    if let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) {
-        let lookup = mt.lookup(subject_hash);
-        scratch.matches.extend(lookup.iter());
-        let cache_key = (stream_id.raw(), subject_hash);
-        if let Some(resolved) = scratch.resolve_cache.get(&cache_key) {
-            scratch.matches.extend(resolved.iter());
-        }
+    scratch.matches.extend(lookup.iter());
+    if let Some(resolved) = scratch.resolve_cache.get(&cache_key) {
+        scratch.matches.extend(resolved.iter());
     }
 
     if scratch.matches.is_empty() {
