@@ -70,10 +70,10 @@ pub(in crate::shard) struct DrainScratch {
     dead_connections: Vec<ConnectionId>,
     /// Local pattern resolution cache. Avoids mutating shared match table.
     /// Sparse composite key (stream_id, subject_hash) → ahash (rule: sparse IDs).
-    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, ahash::RandomState>,
+    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, rustc_hash::FxBuildHasher>,
     /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
     /// Sparse composite key → ahash (rule: sparse IDs).
-    subject_limit_cache: HashMap<(u32, u32), Option<u32>, ahash::RandomState>,
+    subject_limit_cache: HashMap<(u32, u32), Option<u32>, rustc_hash::FxBuildHasher>,
 
     /// Wire-level frame accumulator. One bucket per (conn, stream)
     /// active this cycle; each bucket emits one `RepBatch` frame at
@@ -96,7 +96,7 @@ pub(in crate::shard) struct DrainScratch {
     /// per-consumer (see `SharedCounters.subject`). Otherwise two
     /// consumers on the same stream publishing the same subject would
     /// collide on the local delta and under-count.
-    local_subject: HashMap<(u32, u32), u32, ahash::RandomState>,
+    local_subject: HashMap<(u32, u32), u32, rustc_hash::FxBuildHasher>,
 }
 
 impl DrainScratch {
@@ -106,16 +106,16 @@ impl DrainScratch {
             served_queues: Vec::with_capacity(8),
             dead_connections: Vec::with_capacity(4),
             resolve_cache: HashMap::with_capacity_and_hasher(
-                64, ahash::RandomState::new(),
+                64, rustc_hash::FxBuildHasher::default(),
             ),
             subject_limit_cache: HashMap::with_capacity_and_hasher(
-                64, ahash::RandomState::new(),
+                64, rustc_hash::FxBuildHasher::default(),
             ),
             acc: Accumulator::new(),
             deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
             local_subject: HashMap::with_capacity_and_hasher(
-                128, ahash::RandomState::new(),
+                128, rustc_hash::FxBuildHasher::default(),
             ),
         }
     }
@@ -260,10 +260,10 @@ pub(in crate::shard) fn drain_cycle(
     // Build a (conn -> ok) map once; drain uses it to skip deliveries for
     // failed frames without a nested per-conn scan. Turns the previous
     // O(F x D) filter into a single O(D) pass (F = frames, D = deliveries).
-    let mut flush_ok: std::collections::HashMap<ConnectionId, bool, ahash::RandomState> =
+    let mut flush_ok: std::collections::HashMap<ConnectionId, bool, rustc_hash::FxBuildHasher> =
         std::collections::HashMap::with_capacity_and_hasher(
             flush_results.len(),
-            ahash::RandomState::new(),
+            rustc_hash::FxBuildHasher::default(),
         );
     for &(conn, ok) in &flush_results {
         flush_ok.insert(conn, ok);
@@ -416,7 +416,7 @@ fn dispatch_recipients(
     subject_limit: Option<u32>,
     scratch: &mut DrainScratch,
     bindings: &[ActiveBinding],
-    binding_index: &std::collections::HashMap<(u32, u64), u32, ahash::RandomState>,
+    binding_index: &std::collections::HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {
@@ -562,7 +562,7 @@ fn notify_delivered_grouped(
     notify_tx: &mpsc::Sender<DrainNotification>,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
-    flush_ok: &std::collections::HashMap<ConnectionId, bool, ahash::RandomState>,
+    flush_ok: &std::collections::HashMap<ConnectionId, bool, rustc_hash::FxBuildHasher>,
 ) {
     let frame_ok = |conn: ConnectionId| -> bool {
         flush_ok.get(&conn).copied().unwrap_or(false)

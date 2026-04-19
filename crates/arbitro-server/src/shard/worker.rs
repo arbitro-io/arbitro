@@ -218,7 +218,7 @@ pub struct CommandWorker {
     // StreamId is dense but admin-path (publish accumulation), so HashMap is
     // acceptable here — but we opt into ahash per the dense/sparse rule
     // (performance.md): non-std hashers for any keyed lookup.
-    pub(super) accum_streams: HashMap<StreamId, StreamAccum, ahash::RandomState>,
+    pub(super) accum_streams: HashMap<StreamId, StreamAccum, rustc_hash::FxBuildHasher>,
     pub(super) accum_deadline: Option<Instant>,
     pub(super) accum_total: usize,
     pub(super) accum_bytes: usize,
@@ -423,9 +423,9 @@ impl CommandWorker {
         // Per rule (performance.md dense/sparse + lookup_strategies bench),
         // HashMap+ahash beats binary_search at every size for composite keys.
         let mut binding_index: std::collections::HashMap<
-            (u32, u64), u32, ahash::RandomState,
+            (u32, u64), u32, rustc_hash::FxBuildHasher,
         > = std::collections::HashMap::with_capacity_and_hasher(
-            self.bindings.len(), ahash::RandomState::new(),
+            self.bindings.len(), rustc_hash::FxBuildHasher::default(),
         );
         for (i, b) in self.bindings.iter().enumerate() {
             binding_index.insert((b.consumer_id.0, b.connection_id.0), i as u32);
@@ -436,9 +436,9 @@ impl CommandWorker {
         // HashMap+ahash: connection_id is unbounded-monotonic, direct
         // Vec<Option<T>> would leak memory, and HashMap beats binary_search.
         let mut writers_by_conn: std::collections::HashMap<
-            u64, crate::shard::shared::WriterIndexEntry, ahash::RandomState,
+            u64, crate::shard::shared::WriterIndexEntry, rustc_hash::FxBuildHasher,
         > = std::collections::HashMap::with_capacity_and_hasher(
-            self.bindings.len(), ahash::RandomState::new(),
+            self.bindings.len(), rustc_hash::FxBuildHasher::default(),
         );
         for b in &self.bindings {
             writers_by_conn

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use papaya::HashMap as PapayaMap;
+
 use arbitro_engine_v2::catalog::match_table::MatchTable;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
@@ -23,16 +25,12 @@ use crate::shard::worker::ActiveBinding;
 /// Indices beyond this panic — resize if needed for huge deployments.
 const SLOT_COUNT: usize = 4096;
 
-// Subject inflight uses RwLock<HashMap<u32, AtomicU32, ahash>> for exact
-// per-subject tracking. This is the correctness-first implementation:
-// no hash collisions → true noisy neighbor isolation. Cost: ~30-60ns per
-// operation vs ~2-10ns bucket array, but this path only activates when
-// max_subject_inflight is configured (typically ack-mode consumers where
-// reliability > raw throughput).
-//
-// TECH DEBT: a lock-free SubjectTree (token-walk trie with integrated
-// counters) would give ~22ns + no collisions + unified pattern-match walk.
-// See subject_inflight benchmark history for the full analysis.
+// Subject inflight uses papaya::HashMap<(u32,u32), AtomicU32, ahash> for
+// true lock-free concurrent access. No RwLock — drain readers never block
+// on writer inserts/removes. Measured benefits under write-churn:
+//   RwLock<HashMap>: 137 ns/read, 7.2M reads/s    (91% degradation)
+//   papaya::HashMap:  29 ns/read, 34M reads/s     (75% degradation)
+// See crates/arbitro-server/benches/subject_inflight.rs workload E.
 
 /// Sentinel value for "no rewind requested".
 const NO_REWIND: u64 = u64::MAX;
@@ -55,14 +53,15 @@ pub struct SharedCounters {
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
     /// Subject inflight — exact per-(consumer, subject) tracking via
-    /// HashMap+ahash.
+    /// lock-free papaya::HashMap.
     /// Key = (consumer_id, subject_hash). Value = AtomicU32 counter.
     /// Keying by consumer_id is required for per-consumer isolation:
     /// two consumers on the same stream publishing the same subject must
     /// not share a counter (otherwise their max_subject_inflight budgets
     /// would collide and starve one of them).
     /// Entry removed when counter reaches 0 (bounded memory to working set).
-    subject: RwLock<HashMap<(u32, u32), AtomicU32, ahash::RandomState>>,
+    /// Lock-free: drain readers never block on writer inserts/removes.
+    subject: PapayaMap<(u32, u32), AtomicU32, rustc_hash::FxBuildHasher>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -90,7 +89,9 @@ impl SharedCounters {
             demand: mk_u32(),
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
-            subject: RwLock::new(HashMap::with_hasher(ahash::RandomState::new())),
+            subject: PapayaMap::builder()
+                .hasher(rustc_hash::FxBuildHasher::default())
+                .build(),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
         }
@@ -140,44 +141,34 @@ impl SharedCounters {
     #[inline]
     pub fn inc_subject(&self, consumer_id: u32, subject_hash: u32) {
         let key = (consumer_id, subject_hash);
-        // Fast path: entry already present.
-        {
-            let g = self.subject.read().unwrap();
-            if let Some(c) = g.get(&key) {
+        let g = self.subject.pin();
+        match g.get(&key) {
+            Some(c) => {
                 c.fetch_add(1, Ordering::Relaxed);
-                return;
+            }
+            None => {
+                // get_or_insert_with returns the final entry (inserted or
+                // raced by another thread). Always safe to fetch_add on it.
+                let c = g.get_or_insert_with(key, || AtomicU32::new(0));
+                c.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Slow path: insert.
-        let mut g = self.subject.write().unwrap();
-        g.entry(key)
-            .or_insert_with(|| AtomicU32::new(0))
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement subject inflight for a (consumer, subject) pair.
-    /// Called by command thread after ack. Removes the entry at zero.
+    /// Called by command thread after ack.
+    ///
+    /// NOTE: we DO NOT remove the entry at zero. papaya's remove is
+    /// vulnerable to the ABA race: dec goes 1→0, another thread incs to 1,
+    /// our remove deletes the entry losing the increment. Leaving zero
+    /// entries in the map is safe (has_room returns true), at cost of
+    /// bounded memory growth per distinct (consumer, subject) pair seen.
     #[inline]
     pub fn dec_subject(&self, consumer_id: u32, subject_hash: u32) {
         let key = (consumer_id, subject_hash);
-        // Fast path: dec under read lock if count > 1 after sub.
-        {
-            let g = self.subject.read().unwrap();
-            if let Some(c) = g.get(&key) {
-                let prev = c.fetch_sub(1, Ordering::Relaxed);
-                if prev > 1 {
-                    return; // not zero yet, no cleanup needed
-                }
-            } else {
-                return; // nothing to decrement
-            }
-        }
-        // Slow path: removed the last one → write lock to remove key.
-        let mut g = self.subject.write().unwrap();
+        let g = self.subject.pin();
         if let Some(c) = g.get(&key) {
-            if c.load(Ordering::Relaxed) == 0 {
-                g.remove(&key);
-            }
+            c.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -185,7 +176,7 @@ impl SharedCounters {
     /// Missing key = 0 inflight = always has room.
     #[inline]
     pub fn subject_has_room(&self, consumer_id: u32, subject_hash: u32, max: u32) -> bool {
-        let g = self.subject.read().unwrap();
+        let g = self.subject.pin();
         match g.get(&(consumer_id, subject_hash)) {
             Some(c) => c.load(Ordering::Relaxed) < max,
             None => true,
@@ -300,13 +291,13 @@ pub struct DrainSnapshot {
     /// HashMap+ahash per rule (performance.md dense/sparse): binary_search
     /// is ~3-13× slower than HashMap+ahash for composite keys at any size
     /// (see `lookup_strategies` bench — 3.4 ns vs 14-51 ns at N=10..10k).
-    pub binding_index: HashMap<(u32, u64), u32, ahash::RandomState>,
+    pub binding_index: HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
     /// Per-connection writer index. One entry per connection (dedup'd
     /// from bindings — multiple consumers share a writer).
     /// HashMap+ahash: connection_id is unbounded-monotonic, so direct
     /// Vec<Option<T>> would leak memory for closed conns, and binary
     /// search is 2× slower than HashMap at all sizes (2.6 ns vs 3-15 ns).
-    pub writers_by_conn: HashMap<u64, WriterIndexEntry, ahash::RandomState>,
+    pub writers_by_conn: HashMap<u64, WriterIndexEntry, rustc_hash::FxBuildHasher>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
     pub match_tables: Vec<Option<MatchTable>>,
 }
@@ -323,8 +314,8 @@ impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
-            binding_index: HashMap::with_hasher(ahash::RandomState::new()),
-            writers_by_conn: HashMap::with_hasher(ahash::RandomState::new()),
+            binding_index: HashMap::with_hasher(rustc_hash::FxBuildHasher::default()),
+            writers_by_conn: HashMap::with_hasher(rustc_hash::FxBuildHasher::default()),
             match_tables: Vec::new(),
         }
     }
@@ -333,7 +324,7 @@ impl DrainSnapshot {
 /// Writer lookup for a given connection. HashMap+ahash, O(1) amortised.
 #[inline]
 pub fn find_writer<'a>(
-    index: &'a HashMap<u64, WriterIndexEntry, ahash::RandomState>,
+    index: &'a HashMap<u64, WriterIndexEntry, rustc_hash::FxBuildHasher>,
     connection_id: u64,
 ) -> Option<&'a WriterIndexEntry> {
     index.get(&connection_id)
@@ -343,7 +334,7 @@ pub fn find_writer<'a>(
 /// HashMap+ahash, O(1) amortised.
 #[inline]
 pub fn find_binding_idx(
-    index: &HashMap<(u32, u64), u32, ahash::RandomState>,
+    index: &HashMap<(u32, u64), u32, rustc_hash::FxBuildHasher>,
     consumer_id: u32,
     connection_id: u64,
 ) -> Option<usize> {

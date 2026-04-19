@@ -1,12 +1,14 @@
 //! Subject inflight — measure before proposing any change.
 //!
 //! Contenders:
-//! 1. BucketArray      — `Box<[AtomicU32]>` with hash % N (actual)
-//! 2. HashMapAHash     — `HashMap<u32, u32, ahash>` (single-thread baseline,
-//!                        NOT usable concurrently — measures HashMap overhead
-//!                        without lock noise)
-//! 3. RwLockHashMap    — `RwLock<HashMap<u32, AtomicU32, ahash>>`
-//! 4. Papaya           — `papaya::HashMap<u32, AtomicU32>`
+//! 1. BucketArray          — `Box<[AtomicU32]>` with hash % N (baseline)
+//! 2. HashMapAHash         — `HashMap<u32, u32, ahash>` (single-thread)
+//! 3. HashMapRustcHash     — `HashMap<u32, u32, rustc_hash>` (single-thread)
+//! 4. HashMapRapidHash     — `HashMap<u32, u32, rapidhash>` (single-thread)
+//! 5. HashMapFoldHash      — `HashMap<u32, u32, foldhash>` (single-thread)
+//! 6. RwLockHashMap        — `RwLock<HashMap<u32, AtomicU32, ahash>>` (actual)
+//! 7. Papaya               — `papaya::HashMap<u32, AtomicU32>`
+//! 8. DashMap              — `dashmap::DashMap<u32, AtomicU32, ahash>`
 //!
 //! Workloads:
 //! A. Read-heavy hot (drain check on N hot subjects)
@@ -15,7 +17,7 @@
 //! D. Concurrent realistic:
 //!    - Reader thread: 99% has_room + 1% inc (drain)
 //!    - Writer thread: dec trickle (command, ACKs)
-//!    Measures reader throughput under realistic contention.
+//! E. Write-churn: reader vs infinite insert+remove of fresh keys.
 
 #![allow(unused)]
 
@@ -150,6 +152,126 @@ impl RwLockHashMap {
     }
 }
 
+// ── 4a. HashMap + rustc-hash (single-thread baseline) ─────────────────────
+
+struct HashMapRustcHash {
+    map: std::cell::UnsafeCell<HashMap<u32, u32, rustc_hash::FxBuildHasher>>,
+}
+unsafe impl Sync for HashMapRustcHash {}
+
+impl HashMapRustcHash {
+    fn new() -> Self {
+        Self {
+            map: std::cell::UnsafeCell::new(HashMap::with_hasher(
+                rustc_hash::FxBuildHasher::default(),
+            )),
+        }
+    }
+    #[inline]
+    fn has_room(&self, hash: u32, max: u32) -> bool {
+        let m = unsafe { &*self.map.get() };
+        match m.get(&hash) {
+            Some(c) => *c < max,
+            None => true,
+        }
+    }
+    #[inline]
+    fn inc(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        *m.entry(hash).or_insert(0) += 1;
+    }
+    #[inline]
+    fn dec(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        if let Some(c) = m.get_mut(&hash) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&hash);
+            }
+        }
+    }
+}
+
+// ── 4b. HashMap + rapidhash (single-thread baseline) ──────────────────────
+
+struct HashMapRapidHash {
+    map: std::cell::UnsafeCell<HashMap<u32, u32, rapidhash::RapidBuildHasher>>,
+}
+unsafe impl Sync for HashMapRapidHash {}
+
+impl HashMapRapidHash {
+    fn new() -> Self {
+        Self {
+            map: std::cell::UnsafeCell::new(HashMap::with_hasher(
+                rapidhash::RapidBuildHasher::default(),
+            )),
+        }
+    }
+    #[inline]
+    fn has_room(&self, hash: u32, max: u32) -> bool {
+        let m = unsafe { &*self.map.get() };
+        match m.get(&hash) {
+            Some(c) => *c < max,
+            None => true,
+        }
+    }
+    #[inline]
+    fn inc(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        *m.entry(hash).or_insert(0) += 1;
+    }
+    #[inline]
+    fn dec(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        if let Some(c) = m.get_mut(&hash) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&hash);
+            }
+        }
+    }
+}
+
+// ── 4c. HashMap + foldhash (single-thread baseline) ───────────────────────
+
+struct HashMapFoldHash {
+    map: std::cell::UnsafeCell<HashMap<u32, u32, foldhash::fast::RandomState>>,
+}
+unsafe impl Sync for HashMapFoldHash {}
+
+impl HashMapFoldHash {
+    fn new() -> Self {
+        Self {
+            map: std::cell::UnsafeCell::new(HashMap::with_hasher(
+                foldhash::fast::RandomState::default(),
+            )),
+        }
+    }
+    #[inline]
+    fn has_room(&self, hash: u32, max: u32) -> bool {
+        let m = unsafe { &*self.map.get() };
+        match m.get(&hash) {
+            Some(c) => *c < max,
+            None => true,
+        }
+    }
+    #[inline]
+    fn inc(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        *m.entry(hash).or_insert(0) += 1;
+    }
+    #[inline]
+    fn dec(&self, hash: u32) {
+        let m = unsafe { &mut *self.map.get() };
+        if let Some(c) = m.get_mut(&hash) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                m.remove(&hash);
+            }
+        }
+    }
+}
+
 // ── 4. papaya ──────────────────────────────────────────────────────────────
 
 struct Papaya {
@@ -188,6 +310,56 @@ impl Papaya {
             if prev == 1 {
                 g.remove(&hash);
             }
+        }
+    }
+}
+
+// ── 5. DashMap (sharded RwLock concurrent hashmap) ────────────────────────
+
+struct DashMapImpl {
+    map: dashmap::DashMap<u32, AtomicU32, ahash::RandomState>,
+}
+
+impl DashMapImpl {
+    fn new() -> Self {
+        Self {
+            map: dashmap::DashMap::with_hasher(ahash::RandomState::new()),
+        }
+    }
+    #[inline]
+    fn has_room(&self, hash: u32, max: u32) -> bool {
+        match self.map.get(&hash) {
+            Some(c) => c.load(Ordering::Relaxed) < max,
+            None => true,
+        }
+    }
+    #[inline]
+    fn inc(&self, hash: u32) {
+        // Fast path: entry exists.
+        if let Some(c) = self.map.get(&hash) {
+            c.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Slow path: insert. entry API handles the race.
+        self.map
+            .entry(hash)
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    fn dec(&self, hash: u32) {
+        // fetch_sub under read guard (shard read lock), then if zero,
+        // try to remove.
+        let should_try_remove = {
+            match self.map.get(&hash) {
+                Some(c) => c.fetch_sub(1, Ordering::Relaxed) == 1,
+                None => return,
+            }
+        };
+        if should_try_remove {
+            // remove_if only removes when predicate returns true — handles
+            // ABA race if another thread re-incremented.
+            self.map.remove_if(&hash, |_, c| c.load(Ordering::Relaxed) == 0);
         }
     }
 }
@@ -349,20 +521,32 @@ fn main() {
 
     let bucket = BucketArray::new();
     let hm_ahash = HashMapAHash::new();
+    let hm_rustc = HashMapRustcHash::new();
+    let hm_rapid = HashMapRapidHash::new();
+    let hm_fold = HashMapFoldHash::new();
     let rwlock_hm = RwLockHashMap::new();
     let papaya = Papaya::new();
+    let dashmap_impl = DashMapImpl::new();
     // Seed all with 1 inflight each
     for &h in &hashes[..32] {
         bucket.inc(h);
         hm_ahash.inc(h);
+        hm_rustc.inc(h);
+        hm_rapid.inc(h);
+        hm_fold.inc(h);
         rwlock_hm.inc(h);
         papaya.inc(h);
+        dashmap_impl.inc(h);
     }
 
-    bench_read("BucketArray",    &hashes, iters, |h, m| bucket.has_room(h, m));
-    bench_read("HashMap+ahash",  &hashes, iters, |h, m| hm_ahash.has_room(h, m));
-    bench_read("RwLock<HashMap>",&hashes, iters, |h, m| rwlock_hm.has_room(h, m));
-    bench_read("Papaya",         &hashes, iters, |h, m| papaya.has_room(h, m));
+    bench_read("BucketArray",     &hashes, iters, |h, m| bucket.has_room(h, m));
+    bench_read("HashMap+ahash",   &hashes, iters, |h, m| hm_ahash.has_room(h, m));
+    bench_read("HashMap+rustc",   &hashes, iters, |h, m| hm_rustc.has_room(h, m));
+    bench_read("HashMap+rapid",   &hashes, iters, |h, m| hm_rapid.has_room(h, m));
+    bench_read("HashMap+fold",    &hashes, iters, |h, m| hm_fold.has_room(h, m));
+    bench_read("RwLock<HashMap>", &hashes, iters, |h, m| rwlock_hm.has_room(h, m));
+    bench_read("Papaya",          &hashes, iters, |h, m| papaya.has_room(h, m));
+    bench_read("DashMap",         &hashes, iters, |h, m| dashmap_impl.has_room(h, m));
 
     // ── Workload B: read-heavy cold (10k distinct) ─────────────────
     println!("\n── B. Read-heavy, 10k distinct subjects (cardinality) ──\n");
@@ -370,19 +554,31 @@ fn main() {
 
     let bucket = BucketArray::new();
     let hm_ahash = HashMapAHash::new();
+    let hm_rustc = HashMapRustcHash::new();
+    let hm_rapid = HashMapRapidHash::new();
+    let hm_fold = HashMapFoldHash::new();
     let rwlock_hm = RwLockHashMap::new();
     let papaya = Papaya::new();
+    let dashmap_impl = DashMapImpl::new();
     for &h in &hashes {
         bucket.inc(h);
         hm_ahash.inc(h);
+        hm_rustc.inc(h);
+        hm_rapid.inc(h);
+        hm_fold.inc(h);
         rwlock_hm.inc(h);
         papaya.inc(h);
+        dashmap_impl.inc(h);
     }
 
-    bench_read("BucketArray",    &hashes, iters, |h, m| bucket.has_room(h, m));
-    bench_read("HashMap+ahash",  &hashes, iters, |h, m| hm_ahash.has_room(h, m));
-    bench_read("RwLock<HashMap>",&hashes, iters, |h, m| rwlock_hm.has_room(h, m));
-    bench_read("Papaya",         &hashes, iters, |h, m| papaya.has_room(h, m));
+    bench_read("BucketArray",     &hashes, iters, |h, m| bucket.has_room(h, m));
+    bench_read("HashMap+ahash",   &hashes, iters, |h, m| hm_ahash.has_room(h, m));
+    bench_read("HashMap+rustc",   &hashes, iters, |h, m| hm_rustc.has_room(h, m));
+    bench_read("HashMap+rapid",   &hashes, iters, |h, m| hm_rapid.has_room(h, m));
+    bench_read("HashMap+fold",    &hashes, iters, |h, m| hm_fold.has_room(h, m));
+    bench_read("RwLock<HashMap>", &hashes, iters, |h, m| rwlock_hm.has_room(h, m));
+    bench_read("Papaya",          &hashes, iters, |h, m| papaya.has_room(h, m));
+    bench_read("DashMap",         &hashes, iters, |h, m| dashmap_impl.has_room(h, m));
 
     // ── Workload C: inc-only (delivery) ────────────────────────────
     println!("\n── C. Inc-only, 32 hot subjects (delivery hot path) ──\n");
@@ -390,13 +586,21 @@ fn main() {
 
     let bucket = BucketArray::new();
     let hm_ahash = HashMapAHash::new();
+    let hm_rustc = HashMapRustcHash::new();
+    let hm_rapid = HashMapRapidHash::new();
+    let hm_fold = HashMapFoldHash::new();
     let rwlock_hm = RwLockHashMap::new();
     let papaya = Papaya::new();
+    let dashmap_impl = DashMapImpl::new();
 
-    bench_inc("BucketArray",    &hashes, iters, |h| bucket.inc(h));
-    bench_inc("HashMap+ahash",  &hashes, iters, |h| hm_ahash.inc(h));
-    bench_inc("RwLock<HashMap>",&hashes, iters, |h| rwlock_hm.inc(h));
-    bench_inc("Papaya",         &hashes, iters, |h| papaya.inc(h));
+    bench_inc("BucketArray",     &hashes, iters, |h| bucket.inc(h));
+    bench_inc("HashMap+ahash",   &hashes, iters, |h| hm_ahash.inc(h));
+    bench_inc("HashMap+rustc",   &hashes, iters, |h| hm_rustc.inc(h));
+    bench_inc("HashMap+rapid",   &hashes, iters, |h| hm_rapid.inc(h));
+    bench_inc("HashMap+fold",    &hashes, iters, |h| hm_fold.inc(h));
+    bench_inc("RwLock<HashMap>", &hashes, iters, |h| rwlock_hm.inc(h));
+    bench_inc("Papaya",          &hashes, iters, |h| papaya.inc(h));
+    bench_inc("DashMap",         &hashes, iters, |h| dashmap_impl.inc(h));
 
     // ── Workload D: concurrent realistic ───────────────────────────
     println!("\n── D. Concurrent: drain (99% read + 1% inc) + command (dec trickle) ──\n");
@@ -427,6 +631,16 @@ fn main() {
     for &h in &hashes[..32] { papaya.inc(h); }
     bench_concurrent(
         "Papaya", dur, papaya,
+        |s, h, m| s.has_room(h, m),
+        |s, h| s.inc(h),
+        |s, h| s.dec(h),
+        hashes.clone(),
+    );
+
+    let dashmap_impl = Arc::new(DashMapImpl::new());
+    for &h in &hashes[..32] { dashmap_impl.inc(h); }
+    bench_concurrent(
+        "DashMap", dur, dashmap_impl,
         |s, h, m| s.has_room(h, m),
         |s, h| s.inc(h),
         |s, h| s.dec(h),
@@ -472,6 +686,16 @@ fn main() {
     for &h in &hot_hashes[..32] { bucket.inc(h); }
     bench_churn(
         "BucketArray", dur, bucket,
+        |s, h, m| s.has_room(h, m),
+        |s, h| s.inc(h),
+        |s, h| s.dec(h),
+        hot_hashes.clone(),
+    );
+
+    let dashmap_impl = Arc::new(DashMapImpl::new());
+    for &h in &hot_hashes[..32] { dashmap_impl.inc(h); }
+    bench_churn(
+        "DashMap", dur, dashmap_impl,
         |s, h, m| s.has_room(h, m),
         |s, h| s.inc(h),
         |s, h| s.dec(h),
