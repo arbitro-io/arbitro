@@ -43,3 +43,11 @@ harness = false
 [[bench]]
 name = "local_delta"
 harness = false
+
+[[bench]]
+name = "dispatch_variants"
+harness = false
+
+[[bench]]
+name = "matchentry_enrichment"
+harness = false
