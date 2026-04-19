@@ -294,37 +294,25 @@ impl SharedCounters {
 pub struct DrainSnapshot {
     /// Active bindings — iterated by drain for delivery.
     pub bindings: Vec<ActiveBinding>,
-    /// Pre-built binding lookup, sorted by (consumer_id, connection_id).
-    /// Drain does binary search on this in the hot path — matches the
-    /// "no HashMap on inner deliver loop" rule while keeping lookups at
-    /// O(log N) on cache-friendly contiguous memory.
-    pub binding_index: Vec<BindingIndexEntry>,
-    /// Per-connection writer index, sorted by `connection_id`. Used by
-    /// the drain flush phase to look up the writer for a frame's target
-    /// connection in O(log N) without scanning `bindings`. Rule
-    /// (`performance.md`, dense/sparse): ConnectionId is unbounded-dense,
-    /// so a sorted Vec + binary search is the canonical cache-friendly
-    /// structure (matches the binding_index approach).
-    pub writers_by_conn: Vec<WriterIndexEntry>,
+    /// Binding lookup by `(consumer_id, connection_id)` → `binding_idx`.
+    /// HashMap+ahash per rule (performance.md dense/sparse): binary_search
+    /// is ~3-13× slower than HashMap+ahash for composite keys at any size
+    /// (see `lookup_strategies` bench — 3.4 ns vs 14-51 ns at N=10..10k).
+    pub binding_index: HashMap<(u32, u64), u32, ahash::RandomState>,
+    /// Per-connection writer index. One entry per connection (dedup'd
+    /// from bindings — multiple consumers share a writer).
+    /// HashMap+ahash: connection_id is unbounded-monotonic, so direct
+    /// Vec<Option<T>> would leak memory for closed conns, and binary
+    /// search is 2× slower than HashMap at all sizes (2.6 ns vs 3-15 ns).
+    pub writers_by_conn: HashMap<u64, WriterIndexEntry, ahash::RandomState>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
     pub match_tables: Vec<Option<MatchTable>>,
 }
 
-/// Compact, cache-line-friendly index entry. Sorted by (consumer_id,
-/// connection_id) so binary search is stable.
-#[derive(Debug, Clone, Copy)]
-pub struct BindingIndexEntry {
-    pub consumer_id: u32,
-    pub connection_id: u64,
-    pub binding_idx: u32,
-}
-
 /// Per-connection writer handle, deduplicated from bindings (one entry
 /// per connection even if multiple consumers live on the same conn).
-/// Sorted by `connection_id` for O(log N) binary search.
 #[derive(Clone)]
 pub struct WriterIndexEntry {
-    pub connection_id: u64,
     pub writer: std::sync::Arc<tokio::net::tcp::OwnedWriteHalf>,
     pub runtime: tokio::runtime::Handle,
 }
@@ -333,42 +321,31 @@ impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
-            binding_index: Vec::new(),
-            writers_by_conn: Vec::new(),
+            binding_index: HashMap::with_hasher(ahash::RandomState::new()),
+            writers_by_conn: HashMap::with_hasher(ahash::RandomState::new()),
             match_tables: Vec::new(),
         }
     }
 }
 
-/// Binary-search helper for the writer index. Returns the writer entry
-/// for the given connection or `None` if no writer is registered.
+/// Writer lookup for a given connection. HashMap+ahash, O(1) amortised.
 #[inline]
-pub fn find_writer(
-    index: &[WriterIndexEntry],
+pub fn find_writer<'a>(
+    index: &'a HashMap<u64, WriterIndexEntry, ahash::RandomState>,
     connection_id: u64,
-) -> Option<&WriterIndexEntry> {
-    index
-        .binary_search_by(|e| e.connection_id.cmp(&connection_id))
-        .ok()
-        .map(|i| &index[i])
+) -> Option<&'a WriterIndexEntry> {
+    index.get(&connection_id)
 }
 
-/// Binary-search helper for the drain hot path. Returns the binding index
-/// or `None` if no binding matches the `(consumer_id, connection_id)` pair.
+/// Binding lookup for a given `(consumer_id, connection_id)` pair.
+/// HashMap+ahash, O(1) amortised.
 #[inline]
 pub fn find_binding_idx(
-    index: &[BindingIndexEntry],
+    index: &HashMap<(u32, u64), u32, ahash::RandomState>,
     consumer_id: u32,
     connection_id: u64,
 ) -> Option<usize> {
-    index
-        .binary_search_by(|e| {
-            e.consumer_id
-                .cmp(&consumer_id)
-                .then(e.connection_id.cmp(&connection_id))
-        })
-        .ok()
-        .map(|i| index[i].binding_idx as usize)
+    index.get(&(consumer_id, connection_id)).map(|&i| i as usize)
 }
 
 // ── SnapshotSwap ───────────────────────────────────────────────────────────

@@ -70,20 +70,45 @@ Applies to: `subject_hash`, arbitrary `u32`/`u64` content hashes, user-provided 
 
 ### Decision table
 
-| ID origin | Shape | Container | Example |
+Three distinct shapes, three distinct containers. `binary_search` is **not** a general-purpose answer — it loses to HashMap+ahash at every realistic size (see `lookup_strategies` bench).
+
+| ID origin | Shape | Container | Lookup cost |
 |---|---|---|---|
-| Assigned by registry (N keys) | Dense 0..N | `Vec<T>` / `Box<[T]>` | `ConnectionId`, `ConsumerId` |
-| Content hash / user bytes | Sparse u32/u64 | `HashMap<K, V, ahash::RandomState>` | `subject_hash` |
-| Dense but sparse-used (few of N) | Dense but holes | `Vec<Option<T>>` or `HashMap` (depends on density) | `writers_by_conn` if many conns idle |
-| Single cache (2-8 entries) | Any | `SmallVec` / `ArrayVec` linear scan | served-queues per entry |
+| Registry, bounded (≤ 10k active, recycled on free) | Dense-bounded 0..N | `Vec<T>` / `Box<[T]>` direct index | **~1.4 ns** |
+| Registry, monotonic (never recycled) | Dense-unbounded | `HashMap<K, V, ahash::RandomState>` | ~2.6-3.5 ns |
+| Content hash / user bytes | Sparse u32/u64 | `HashMap<K, V, ahash::RandomState>` | ~2.6-3.5 ns |
+| Composite key `(u32, u64)` or similar | Any | `HashMap<K, V, ahash::RandomState>` | ~3.4 ns |
+| Single cache (≤ 8 entries) | Any | `SmallVec` / `ArrayVec` linear scan | ~1-2 ns |
+
+### Never use `binary_search` for dense lookups
+
+Measured `lookup_strategies` bench (10M ops, 5% miss rate):
+
+| N | HashMap+ahash | Box direct | binary_search |
+|---|--------------:|-----------:|--------------:|
+| 10 | 2.6 ns | 1.4 ns | 3.4 ns |
+| 1,000 | 2.6 ns | 1.4 ns | 9.0 ns |
+| 10,000 | 2.8 ns | 1.4 ns | 15.5 ns |
+
+For composite keys `(u32, u64)`, the gap widens dramatically:
+
+| N | HashMap+ahash | binary_search |
+|---|--------------:|--------------:|
+| 10 | 3.5 ns | 14.0 ns |
+| 10,000 | 3.8 ns | **51.2 ns** |
+
+Binary search grows `O(log N)` with bad cache behavior; HashMap is `O(1)` constant with a single hash + probe. Use HashMap+ahash whenever direct-indexing is not feasible.
 
 ### Enforcement
 
-Anywhere the code does `.iter().find(|x| x.id == target)` on a dense-keyed slice, it **violates** this rule. Either:
-- The collection should be a direct-indexed Vec (dense), or
-- If truly sparse-used, a `HashMap<Id, Idx, ahash::RandomState>` side-index.
+Anywhere the code does `.iter().find(|x| x.id == target)` on a dense-keyed slice, it **violates** this rule. Similarly, `.binary_search_by(...)` over a sorted dense-keyed `Vec` is a **violation** — it loses to HashMap+ahash at every size.
 
-Linear scans are only acceptable when N ≤ 8 (cache-line bounded) and the check runs outside inner loops.
+Acceptable lookups:
+- **Dense-bounded** (e.g. `ConsumerId` ≤ 10k): `Vec<T>` / `Box<[T]>` direct index.
+- **Dense-unbounded / sparse / composite**: `HashMap<K, V, ahash::RandomState>`.
+- **≤ 8 entries in a cache line**: linear scan via `SmallVec` outside inner loops.
+
+Linear scans and binary searches over larger collections are banned on any hot path.
 
 ## Syscall Minimization
 

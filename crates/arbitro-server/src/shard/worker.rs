@@ -418,44 +418,35 @@ impl CommandWorker {
             })
             .collect();
 
-        // Build the sorted binding index. The sort happens on the cold path
-        // (snapshot rebuild, only on structural changes), so its cost is
-        // amortised across thousands of drain cycles.
-        let mut binding_index: Vec<crate::shard::shared::BindingIndexEntry> = self
-            .bindings
-            .iter()
-            .enumerate()
-            .map(|(i, b)| crate::shard::shared::BindingIndexEntry {
-                consumer_id: b.consumer_id.0,
-                connection_id: b.connection_id.0,
-                binding_idx: i as u32,
-            })
-            .collect();
-        binding_index.sort_unstable_by(|a, b| {
-            a.consumer_id
-                .cmp(&b.consumer_id)
-                .then(a.connection_id.cmp(&b.connection_id))
-        });
+        // Build binding index — HashMap+ahash, O(1) lookup in drain hot path.
+        // Per rule (performance.md dense/sparse + lookup_strategies bench),
+        // HashMap+ahash beats binary_search at every size for composite keys.
+        let mut binding_index: std::collections::HashMap<
+            (u32, u64), u32, ahash::RandomState,
+        > = std::collections::HashMap::with_capacity_and_hasher(
+            self.bindings.len(), ahash::RandomState::new(),
+        );
+        for (i, b) in self.bindings.iter().enumerate() {
+            binding_index.insert((b.consumer_id.0, b.connection_id.0), i as u32);
+        }
 
         // Build per-connection writer index. Dedup by connection_id —
         // multiple consumers on the same conn share a single writer.
-        // Sorted for binary search in the drain flush phase.
-        let mut writers_by_conn: Vec<crate::shard::shared::WriterIndexEntry> =
-            Vec::with_capacity(self.bindings.len());
+        // HashMap+ahash: connection_id is unbounded-monotonic, direct
+        // Vec<Option<T>> would leak memory, and HashMap beats binary_search.
+        let mut writers_by_conn: std::collections::HashMap<
+            u64, crate::shard::shared::WriterIndexEntry, ahash::RandomState,
+        > = std::collections::HashMap::with_capacity_and_hasher(
+            self.bindings.len(), ahash::RandomState::new(),
+        );
         for b in &self.bindings {
-            if writers_by_conn
-                .iter()
-                .any(|w| w.connection_id == b.connection_id.0)
-            {
-                continue;
-            }
-            writers_by_conn.push(crate::shard::shared::WriterIndexEntry {
-                connection_id: b.connection_id.0,
-                writer: Arc::clone(&b.writer),
-                runtime: b.runtime.clone(),
-            });
+            writers_by_conn
+                .entry(b.connection_id.0)
+                .or_insert_with(|| crate::shard::shared::WriterIndexEntry {
+                    writer: Arc::clone(&b.writer),
+                    runtime: b.runtime.clone(),
+                });
         }
-        writers_by_conn.sort_unstable_by_key(|w| w.connection_id);
 
         // Clone match tables from engine catalog.
         let catalog = &self.engine.ctx().catalog;

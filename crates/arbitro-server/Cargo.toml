@@ -35,3 +35,7 @@ ahash             = "0.8"
 
 [dev-dependencies]
 arbitro-client = { path = "../arbitro-client" }
+
+[[bench]]
+name = "lookup_strategies"
+harness = false

@@ -30,8 +30,7 @@ use tokio::sync::mpsc;
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::shared::{
-    find_binding_idx, find_writer, BindingIndexEntry, DrainNotification, DrainSnapshot,
-    SharedCounters,
+    find_binding_idx, find_writer, DrainNotification, DrainSnapshot, SharedCounters,
 };
 use crate::shard::worker::ActiveBinding;
 
@@ -407,7 +406,7 @@ fn dispatch_recipients(
     subject_hash: u32,
     scratch: &mut DrainScratch,
     bindings: &[ActiveBinding],
-    binding_index: &[BindingIndexEntry],
+    binding_index: &std::collections::HashMap<(u32, u64), u32, ahash::RandomState>,
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {

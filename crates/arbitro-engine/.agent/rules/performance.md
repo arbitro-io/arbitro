@@ -65,13 +65,24 @@ subject: Box<[AtomicU32; 16384]>
 
 Sparse keys in this crate: `subject_hash`, `tx_hash` (idempotency).
 
-### Linear scan exception
+### Never use binary_search for dense lookups
 
-Linear `.iter().find()` is acceptable **only** when:
+Measured `lookup_strategies` bench (arbitro-server):
+
+| N | HashMap+ahash | Box direct | binary_search |
+|---|--------------:|-----------:|--------------:|
+| 100 | 3.1 ns | 1.4 ns | 5.9 ns |
+| 10,000 | 2.8 ns | 1.4 ns | 15.5 ns |
+
+For composite keys, binary search degrades to **51 ns at N=10k** vs 3.8 ns for HashMap+ahash. Always prefer HashMap+ahash when direct indexing is not feasible.
+
+### Linear scan / binary search exception
+
+Linear `.iter().find()` or `.binary_search_by()` are acceptable **only** when:
 - The collection is bounded to ≤ 8 elements (cache-line fits), AND
-- The scan happens outside the innermost loop (once per drain cycle, not per entry).
+- The check runs outside the innermost loop (once per drain cycle, not per entry).
 
-Anywhere else, `.iter().find(|x| x.id == target)` on dense-keyed data is a **rule violation** and must be replaced with direct indexing or an ahash side-index.
+Anywhere else, these patterns on dense or composite keys are a **rule violation**. Replace with direct indexing (dense-bounded) or `HashMap<K, V, ahash::RandomState>` (any other shape).
 
 ## Syscall Minimization
 
