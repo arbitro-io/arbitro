@@ -1,16 +1,30 @@
 //! Subject-limit isolation bench — VIP delivery latency under basic load.
 //!
-//! Verifies that a high-priority subject ("orders.premium.*") keeps
-//! delivering with bounded latency even while another pattern
-//! ("orders.basic.*") is saturated at `max_subject_inflight`.
+//! Verifies that a high-priority subject (`orders.premium.*`) keeps
+//! delivering with bounded latency even while `orders.basic.*` holds a
+//! large backlog at its `max_subject_inflight`.
 //!
-//! Setup (once):
-//!   - Consumer with:
-//!       max_inflight                     = 10_000
-//!       max_subject_inflight(premium.>)  = 10
-//!       max_subject_inflight(basic.>)    = 1
-//!   - 100 UNIQUE basic subjects published and drained (unacked) so the
-//!     consumer has 100 basic pendings in flight.
+//! ## Semantics being verified
+//!
+//! `max_subject_inflight(pattern, N)` sets a **per-subject** limit whose
+//! VALUE comes from the pattern. Each unique subject that matches the
+//! pattern keeps its own atomic counter capped at N — they do NOT share
+//! one counter per pattern.
+//!
+//! Example: `max_subject_inflight(b"orders.basic.>", 1)` means every
+//! unique subject under `orders.basic.>` has its own counter with cap 1.
+//! 100 different subjects can each have 1 pending simultaneously (= 100
+//! total pending). The bench exercises exactly this: 100 unique subjects
+//! are held unacked in parallel, then we publish premium VIP msgs whose
+//! (separate) subject counters are unaffected.
+//!
+//! ## Setup (once per stage)
+//!   - Consumer:
+//!       max_inflight                         = 10_000
+//!       max_subject_inflight(`premium.>`, 10)   // per-subject cap
+//!       max_subject_inflight(`basic.>`,    1)   // per-subject cap
+//!   - 100 UNIQUE basic subjects published and drained without ack so the
+//!     consumer has 100 independent basic counters each at 1/1 inflight.
 //!
 //! Loop (BENCH_LIMITS_ITERS iters, default 1000):
 //!   - Publish a fresh "orders.premium.vip_{i}" message.
