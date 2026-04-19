@@ -43,15 +43,7 @@ name    = "limits"
 harness = false
 
 [[bench]]
-name    = "publish"
-harness = false
-
-[[bench]]
 name    = "queue"
-harness = false
-
-[[bench]]
-name    = "gate_notify"
 harness = false
 
 [[bench]]
@@ -60,4 +52,8 @@ harness = false
 
 [[bench]]
 name    = "ack"
+harness = false
+
+[[bench]]
+name    = "chaos"
 harness = false
