@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "local_delta"
 harness = false
+
+[[bench]]
+name = "memcpy_sizes"
+harness = false
