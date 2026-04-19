@@ -75,6 +75,14 @@ pub(in crate::shard) struct DrainScratch {
     /// Sparse composite key → ahash (rule: sparse IDs).
     subject_limit_cache: HashMap<(u32, u32), Option<u32>, rustc_hash::FxBuildHasher>,
 
+    /// Stream-level single-slot cache (Fase A optimization).
+    /// Amortizes the stream-level lookups (demand + match_table presence
+    /// + has_subject_limits) across consecutive entries from the same
+    /// stream. Single-slot because replay workloads are stream-coherent;
+    /// interleaved streams refresh on every boundary (a single branch).
+    /// Reset per cycle; `None` forces refresh on the next entry.
+    stream_cache: Option<StreamCacheEntry>,
+
     /// Wire-level frame accumulator. One bucket per (conn, stream)
     /// active this cycle; each bucket emits one `RepBatch` frame at
     /// flush time. The drain owns zero frame-building bytes now —
@@ -99,6 +107,29 @@ pub(in crate::shard) struct DrainScratch {
     local_subject: HashMap<(u32, u32), u32, rustc_hash::FxBuildHasher>,
 }
 
+/// Cached per-stream state reused across consecutive entries sharing the
+/// same `stream_id` within a cycle. Populated on first entry for a stream,
+/// hit on subsequent same-stream entries, refreshed when stream changes.
+///
+/// `has_demand`/`has_subject_limits` are atomic reads that rarely change
+/// within a single drain cycle; caching them trades at most one stale
+/// value per entry (an entry-that-would-skip gets processed, a
+/// to-be-delivered gets skipped-until-next-cycle) for zero redundant
+/// atomic loads on the coherent hot path.
+#[derive(Clone, Copy)]
+struct StreamCacheEntry {
+    stream_id: u32,
+    /// Result of `counters.has_demand(stream_id)` at cache fill time.
+    has_demand: bool,
+    /// `true` only when `match_tables[stream_id]` is present AND
+    /// `mt.has_subject_limits()`. Guards the per-entry subject-limit
+    /// resolution; most streams have no limits.
+    has_subject_limits: bool,
+    /// `true` when `match_tables[stream_id]` exists (no match-table =
+    /// no recipients, early return path).
+    has_match_table: bool,
+}
+
 impl DrainScratch {
     pub(in crate::shard) fn new() -> Self {
         Self {
@@ -111,6 +142,7 @@ impl DrainScratch {
             subject_limit_cache: HashMap::with_capacity_and_hasher(
                 64, rustc_hash::FxBuildHasher::default(),
             ),
+            stream_cache: None,
             acc: Accumulator::new(),
             deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
@@ -191,6 +223,10 @@ pub(in crate::shard) fn drain_cycle(
     // late-binding fanout subscribers during replay.
     scratch.resolve_cache.clear();
     scratch.subject_limit_cache.clear();
+    // Stream cache must be cleared per cycle — the snapshot may have
+    // changed and stale `has_demand`/`has_subject_limits` values would
+    // silently mis-dispatch. A fresh cycle starts with no cached stream.
+    scratch.stream_cache = None;
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
@@ -327,7 +363,7 @@ fn process_drain_entry(
 ) {
     let stream_id = StreamId(entry.stream_id);
 
-    // TTL expiration.
+    // TTL expiration — cheapest check, runs first.
     if max_age_ms > 0 && entry.timestamp > 0 && entry.timestamp + max_age_ms <= now_ms {
         return;
     }
@@ -336,21 +372,42 @@ fn process_drain_entry(
         return;
     }
 
-    // Demand check — atomic read.
-    if !counters.has_demand(stream_id.raw()) {
+    // ── Fase A: stream-level cache ─────────────────────────────────────
+    // Amortize demand + match_table + has_subject_limits across entries
+    // that share the same stream_id within a cycle.
+    let stream_raw = stream_id.raw();
+    let cache = match scratch.stream_cache {
+        Some(c) if c.stream_id == stream_raw => c,
+        _ => {
+            // Cache miss — refresh atomics + Vec lookup once, then cache.
+            let has_demand = counters.has_demand(stream_raw);
+            let mt_ref = snap
+                .match_tables
+                .get(stream_raw as usize)
+                .and_then(|o| o.as_ref());
+            let entry = StreamCacheEntry {
+                stream_id: stream_raw,
+                has_demand,
+                has_match_table: mt_ref.is_some(),
+                has_subject_limits: mt_ref.is_some_and(|mt| mt.has_subject_limits()),
+            };
+            scratch.stream_cache = Some(entry);
+            entry
+        }
+    };
+
+    if !cache.has_demand || !cache.has_match_table {
         return;
     }
 
     let subject_hash = fnv1a_32(entry.subject);
-    let stream_raw = stream_id.raw() as usize;
-
-    // Single match_table lookup — reused across all three steps below.
-    // Early return when no match table: all three steps would skip and
-    // scratch.matches would end up empty anyway.
-    let Some(mt) = snap.match_tables.get(stream_raw).and_then(|o| o.as_ref()) else {
-        return;
+    // Re-fetch the match_table ref — the get() is ~1ns and saves us from
+    // carrying a raw pointer through the cache (avoids `unsafe`).
+    let mt = match snap.match_tables.get(stream_raw as usize).and_then(|o| o.as_ref()) {
+        Some(mt) => mt,
+        None => return,  // defensive — snapshot can't change mid-cycle but handle the None arm
     };
-    let cache_key = (stream_id.raw(), subject_hash);
+    let cache_key = (stream_raw, subject_hash);
     let lookup = mt.lookup(subject_hash);
 
     // Step 1: pre-resolve patterns into local cache when lookup is empty.
@@ -361,11 +418,11 @@ fn process_drain_entry(
     }
 
     // Step 2: resolve + cache subject_limit (stream-wide value — same for
-    // every consumer matching this subject). The counter check using this
-    // limit happens per-match in dispatch_recipients because the atomic
-    // counter is keyed by (consumer_id, subject_hash) for per-consumer
-    // isolation.
-    let subject_limit = if mt.has_subject_limits() {
+    // every consumer matching this subject). Gated by the cached
+    // `has_subject_limits` flag — most streams have no limits, the
+    // cache hit skips the atomic bool load and the per-subject HashMap
+    // entry allocation on the common path.
+    let subject_limit = if cache.has_subject_limits {
         *scratch.subject_limit_cache.entry(cache_key).or_insert_with(|| {
             mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
         })
