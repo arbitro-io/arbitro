@@ -16,7 +16,9 @@
 //! - `session` — depends on `tokio::sync::mpsc` (banned in engine).
 
 pub mod gate;
+pub mod id_pool;
 pub mod name_registry;
 
 pub use gate::Gate;
+pub use id_pool::{IdPool, PoolError, PoolSnapshot};
 pub use name_registry::NameRegistry;
