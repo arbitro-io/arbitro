@@ -432,8 +432,24 @@ fn dispatch_recipients(
 ) {
     scratch.served_queues.clear();
 
-    for i in 0..scratch.matches.len() {
-        let me = scratch.matches[i];
+    // Queue fairness — rotate the iteration start offset by `entry.seq` so
+    // the same binding isn't always picked first. Combined with the existing
+    // `served_queues` dedup and capacity-skip fallback, this gives strict
+    // round-robin for healthy workers and automatic failover when a worker
+    // is saturated. Zero extra state.
+    //
+    // Cost: ~1 modulo per entry (~5 ns on x86 DIV). Use sub-based wrap in
+    // the inner loop to avoid a second modulo per iteration.
+    let n = scratch.matches.len();
+    if n == 0 {
+        return;
+    }
+    let start = (entry.seq as usize) % n;
+
+    for i in 0..n {
+        let raw = start + i;
+        let idx = if raw >= n { raw - n } else { raw };
+        let me = scratch.matches[idx];
         let consumer_id = me.consumer_id;
         let connection_id = me.connection_id;
         let queue_id = me.queue_id;
