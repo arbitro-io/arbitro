@@ -14,17 +14,64 @@ use crate::common::SubjectTrie;
 use crate::types::*;
 use std::collections::HashMap;
 
+/// Sentinel value for `MatchEntry::binding_idx` meaning "unbound" — the
+/// subscription exists in the match table but no active binding has been
+/// stamped onto it yet (pull-model subscription, or the snapshot hasn't
+/// been rebuilt since bind). Drain must skip entries with this value.
+pub const BINDING_IDX_UNBOUND: u32 = u32::MAX;
+
 /// A matched consumer for a subject.
 ///
 /// `connection_id` is precomputed at bind time (management path).
 /// Publish reads it directly — zero edge/graph lookups on hot path.
 /// ConnectionId(0) means no active binding (pull model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `binding_idx` is a server-layer index into `DrainSnapshot.bindings`,
+/// stamped onto the match table during snapshot rebuild (NOT at engine
+/// bind time — engine catalog is server-agnostic). Drain uses this to
+/// fetch the binding with a direct Vec access instead of a HashMap
+/// lookup on `(consumer_id, connection_id)`. Sentinel
+/// `BINDING_IDX_UNBOUND` means no active binding — drain must skip.
+///
+/// **PartialEq / Eq explicitly EXCLUDE `binding_idx`** so that entries
+/// for the same (consumer, connection, queue, subscription) tuple dedup
+/// correctly even when `binding_idx` differs across snapshot rebuilds.
+/// Violating this invariant breaks `add_exact::contains(&entry)` and
+/// `resolve_patterns::contains(entry)` dedup.
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct MatchEntry {
     pub consumer_id: ConsumerId,
     pub queue_id: QueueId,
     pub subscription_id: SubscriptionId,
     pub connection_id: ConnectionId,
+    /// Server-layer index into snapshot bindings. `BINDING_IDX_UNBOUND`
+    /// until stamped by `rebuild_and_swap_snapshot`.
+    pub binding_idx: u32,
+}
+
+impl PartialEq for MatchEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Intentionally excludes `binding_idx` — see struct docs. Two
+        // entries that differ only in binding_idx describe the same
+        // logical subscription and MUST dedup together.
+        self.consumer_id == other.consumer_id
+            && self.queue_id == other.queue_id
+            && self.subscription_id == other.subscription_id
+            && self.connection_id == other.connection_id
+    }
+}
+
+// Hash isn't used in hot paths but derive would include binding_idx.
+// If a future caller needs `MatchEntry: Hash` they MUST implement it
+// manually with the same exclusion rule.
+impl std::hash::Hash for MatchEntry {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.consumer_id.hash(state);
+        self.queue_id.hash(state);
+        self.subscription_id.hash(state);
+        self.connection_id.hash(state);
+    }
 }
 
 /// Precomputed subject → consumer mapping.
@@ -305,6 +352,50 @@ impl MatchTable {
         self.bind_subscription(subscription_id, ConnectionId(0));
     }
 
+    /// Stamp `binding_idx` onto every match entry matching
+    /// `(subscription_id, consumer_id, connection_id)`.
+    ///
+    /// Called by the server during `rebuild_and_swap_snapshot` on the
+    /// **cloned** match table (not the engine's canonical copy) so the
+    /// drain can fetch the binding with a direct `bindings[idx]` Vec
+    /// access instead of a `(consumer_id, connection_id) → idx`
+    /// HashMap lookup per match. O(S + C + P) per binding.
+    pub fn set_binding_idx_for_subscription(
+        &mut self,
+        subscription_id: SubscriptionId,
+        consumer_id: ConsumerId,
+        connection_id: ConnectionId,
+        binding_idx: u32,
+    ) {
+        let matches = |e: &MatchEntry| {
+            e.subscription_id == subscription_id
+                && e.consumer_id == consumer_id
+                && e.connection_id == connection_id
+        };
+        for entries in self.exact.values_mut() {
+            for e in entries.iter_mut() {
+                if matches(e) {
+                    e.binding_idx = binding_idx;
+                }
+            }
+        }
+        for e in &mut self.catch_all {
+            if matches(e) {
+                e.binding_idx = binding_idx;
+            }
+        }
+        for (_, e) in &mut self.patterns {
+            if matches(e) {
+                e.binding_idx = binding_idx;
+            }
+        }
+        for e in &mut self.pattern_entries {
+            if matches(e) {
+                e.binding_idx = binding_idx;
+            }
+        }
+    }
+
     /// Number of exact subject mappings.
     pub fn exact_count(&self) -> usize { self.exact.len() }
 
@@ -392,7 +483,97 @@ mod tests {
             queue_id: QueueId(queue),
             subscription_id: SubscriptionId(sub),
             connection_id: ConnectionId(0),
+            binding_idx: BINDING_IDX_UNBOUND,
         }
+    }
+
+    #[test]
+    fn partial_eq_excludes_binding_idx() {
+        // CRITICAL INVARIANT: two entries differing only in binding_idx
+        // must compare equal, otherwise `add_exact`'s dedup breaks and
+        // rebuilds that re-stamp binding_idx would duplicate entries.
+        let a = MatchEntry {
+            consumer_id: ConsumerId(1),
+            queue_id: QueueId(10),
+            subscription_id: SubscriptionId(100),
+            connection_id: ConnectionId(42),
+            binding_idx: BINDING_IDX_UNBOUND,
+        };
+        let b = MatchEntry { binding_idx: 7, ..a };
+        let c = MatchEntry { binding_idx: 99, ..a };
+        assert_eq!(a, b, "binding_idx must NOT participate in PartialEq");
+        assert_eq!(b, c, "binding_idx must NOT participate in PartialEq");
+
+        // Other fields DO participate
+        let d = MatchEntry { consumer_id: ConsumerId(2), ..a };
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn add_exact_dedup_survives_binding_idx_restamping() {
+        // Simulates the snapshot rebuild: same subscription inserted
+        // twice with different binding_idx stamps must not duplicate.
+        let mut mt = MatchTable::new();
+        let e0 = MatchEntry { binding_idx: BINDING_IDX_UNBOUND, ..entry(1, 10, 100) };
+        mt.add_exact(0xBEEF, e0);
+        let e1 = MatchEntry { binding_idx: 42, ..entry(1, 10, 100) };
+        mt.add_exact(0xBEEF, e1);
+
+        let r = mt.lookup(0xBEEF);
+        assert_eq!(r.count(), 1, "re-insert with different binding_idx must dedup");
+    }
+
+    #[test]
+    fn set_binding_idx_for_subscription_stamps_all_locations() {
+        let mut mt = MatchTable::new();
+        let e_exact = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
+        let e_catch = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
+        mt.add_exact(0xBEEF, e_exact);
+        mt.add_catch_all(e_catch);
+
+        mt.set_binding_idx_for_subscription(
+            SubscriptionId(100),
+            ConsumerId(1),
+            ConnectionId(5),
+            777,
+        );
+
+        let r = mt.lookup(0xBEEF);
+        // exact + catch_all = 2, but PartialEq dedups them → 1 entry
+        // if they're logically equal. Check both slices explicitly.
+        assert!(r.exact.iter().all(|e| e.binding_idx == 777));
+        assert!(r.catch_all.iter().all(|e| e.binding_idx == 777));
+    }
+
+    #[test]
+    fn set_binding_idx_only_stamps_matching_triple() {
+        let mut mt = MatchTable::new();
+        // Two different subscriptions on the same subject.
+        let e1 = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
+        let e2 = MatchEntry { connection_id: ConnectionId(6), ..entry(2, 20, 200) };
+        mt.add_exact(0xBEEF, e1);
+        mt.add_exact(0xBEEF, e2);
+
+        // Stamp only subscription 100 on conn 5
+        mt.set_binding_idx_for_subscription(
+            SubscriptionId(100),
+            ConsumerId(1),
+            ConnectionId(5),
+            777,
+        );
+
+        let r = mt.lookup(0xBEEF);
+        let mut seen_777 = 0;
+        let mut seen_unbound = 0;
+        for e in r.exact {
+            if e.binding_idx == 777 {
+                seen_777 += 1;
+            } else if e.binding_idx == BINDING_IDX_UNBOUND {
+                seen_unbound += 1;
+            }
+        }
+        assert_eq!(seen_777, 1, "only sub 100 gets stamped");
+        assert_eq!(seen_unbound, 1, "sub 200 stays unbound");
     }
 
     #[test]

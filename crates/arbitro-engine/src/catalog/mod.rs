@@ -325,11 +325,16 @@ impl Catalog {
         );
 
         // Update match table.
+        // `binding_idx` is stamped by the server's `rebuild_and_swap_snapshot`
+        // when it clones the match table into the drain's snapshot — see
+        // `crates/arbitro-server/src/shard/worker.rs`. Engine catalog
+        // itself stays server-agnostic and stores the unbound sentinel.
         let match_entry = MatchEntry {
             consumer_id: config.consumer_id,
             queue_id,
             subscription_id: config.id,
             connection_id: ConnectionId(0), // set at bind time
+            binding_idx: crate::catalog::match_table::BINDING_IDX_UNBOUND,
         };
 
         self.ensure_match_table_slot(config.stream_id);
