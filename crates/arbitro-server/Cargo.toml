@@ -60,3 +60,7 @@ harness = false
 [[bench]]
 name = "subject_inflight"
 harness = false
+
+[[bench]]
+name = "accumulator_grouping"
+harness = false

@@ -25,7 +25,7 @@ use crate::shard::worker::ActiveBinding;
 /// Indices beyond this panic — resize if needed for huge deployments.
 const SLOT_COUNT: usize = 4096;
 
-// Subject inflight uses papaya::HashMap<(u32,u32), AtomicU32, ahash> for
+// Subject inflight uses papaya::HashMap<(u32,u32), AtomicU32, foldhash> for
 // true lock-free concurrent access. No RwLock — drain readers never block
 // on writer inserts/removes. Measured benefits under write-churn:
 //   RwLock<HashMap>: 137 ns/read, 7.2M reads/s    (91% degradation)
@@ -295,7 +295,7 @@ pub struct DrainSnapshot {
     pub bindings: Vec<ActiveBinding>,
     /// Per-connection writer index. One entry per connection (dedup'd
     /// from bindings — multiple consumers share a writer).
-    /// HashMap+ahash: connection_id is unbounded-monotonic, so direct
+    /// HashMap+foldhash: connection_id is unbounded-monotonic, so direct
     /// Vec<Option<T>> would leak memory for closed conns, and binary
     /// search is 2× slower than HashMap at all sizes (2.6 ns vs 3-15 ns).
     pub writers_by_conn: HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,
@@ -323,7 +323,7 @@ impl DrainSnapshot {
     }
 }
 
-/// Writer lookup for a given connection. HashMap+ahash, O(1) amortised.
+/// Writer lookup for a given connection. HashMap+foldhash, O(1) amortised.
 #[inline]
 pub fn find_writer<'a>(
     index: &'a HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,

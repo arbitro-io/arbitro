@@ -67,10 +67,10 @@ pub(in crate::shard) struct DrainScratch {
     served_queues: Vec<QueueId>,
     dead_connections: Vec<ConnectionId>,
     /// Local pattern resolution cache. Avoids mutating shared match table.
-    /// Sparse composite key (stream_id, subject_hash) → ahash (rule: sparse IDs).
+    /// Sparse composite key (stream_id, subject_hash) → foldhash (rule: sparse IDs).
     resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, foldhash::fast::FixedState>,
     /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
-    /// Sparse composite key → ahash (rule: sparse IDs).
+    /// Sparse composite key → foldhash (rule: sparse IDs).
     subject_limit_cache: HashMap<(u32, u32), Option<u32>, foldhash::fast::FixedState>,
 
     /// Wire-level frame accumulator. One bucket per (conn, stream)
@@ -86,7 +86,7 @@ pub(in crate::shard) struct DrainScratch {
 
     /// Per-cycle inflight deltas: `(consumer_id, pending)`.
     /// Vec + linear scan — N is typically 1-4 consumers per cycle, where
-    /// Vec scan (~0.7-3 ns per op) beats HashMap+ahash (~1.4 ns) thanks
+    /// Vec scan (~0.7-3 ns per op) beats HashMap+foldhash (~1.4 ns) thanks
     /// to cache locality. Measured in `benches/local_delta.rs`.
     local_inflight: Vec<(u32, u32)>,
     /// Per-cycle subject deltas: `(consumer_id, subject_hash) -> pending`.

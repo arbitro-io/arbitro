@@ -26,7 +26,7 @@ pub struct ConnectionRegistry {
 struct Inner {
     // conn_id is unbounded-dense (ConnIdGen monotonic counter). Memory
     // footprint of a Vec<Option<Session>> would grow without bound, so we
-    // use HashMap + ahash per the dense/sparse rule (performance.md).
+    // use HashMap + foldhash per the dense/sparse rule (performance.md).
     sessions: Mutex<HashMap<u64, Session, foldhash::fast::FixedState>>,
     conn_id_gen: ConnIdGen,
     #[allow(dead_code)]

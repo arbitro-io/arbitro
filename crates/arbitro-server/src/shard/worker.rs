@@ -216,7 +216,7 @@ pub struct CommandWorker {
     // Accumulator
     pub(super) flusher_config: FlusherConfig,
     // StreamId is dense but admin-path (publish accumulation), so HashMap is
-    // acceptable here — but we opt into ahash per the dense/sparse rule
+    // acceptable here — but we opt into foldhash per the dense/sparse rule
     // (performance.md): non-std hashers for any keyed lookup.
     pub(super) accum_streams: HashMap<StreamId, StreamAccum, foldhash::fast::FixedState>,
     pub(super) accum_deadline: Option<Instant>,
@@ -427,7 +427,7 @@ impl CommandWorker {
 
         // Build per-connection writer index. Dedup by connection_id —
         // multiple consumers on the same conn share a single writer.
-        // HashMap+ahash: connection_id is unbounded-monotonic, direct
+        // HashMap+foldhash: connection_id is unbounded-monotonic, direct
         // Vec<Option<T>> would leak memory, and HashMap beats binary_search.
         let mut writers_by_conn: std::collections::HashMap<
             u64, crate::shard::shared::WriterIndexEntry, foldhash::fast::FixedState,
