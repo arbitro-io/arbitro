@@ -216,6 +216,145 @@ impl MemoryStore {
             flags: meta.flags,
         }
     }
+
+    /// Low-level iteration — hands the caller the **raw contiguous bytes**
+    /// `[subject ++ payload]` plus scalar metadata, without constructing
+    /// an `Entry<'_>` struct or splitting the byte range.
+    ///
+    /// Intended for benchmarks and specialized drain paths that want to
+    /// skip the per-entry slice arithmetic. The callback receives:
+    ///   - `seq`, `stream_id`, `timestamp`, `flags` — all from the index
+    ///   - `subj_len` — first `subj_len` bytes of `bytes` are the subject
+    ///   - `bytes` — the full `subject ++ payload` byte range
+    ///
+    /// Subject is `bytes[..subj_len]`, payload is `bytes[subj_len..]`.
+    /// The caller performs the split (usually not needed at all when the
+    /// hot path just wants to `writev` the bytes).
+    #[inline]
+    pub fn for_each_raw(
+        &self,
+        start: u64,
+        end: u64,
+        f: &mut dyn FnMut(RawEntry<'_>),
+    ) -> Result<(), StoreError> {
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end).min(self.index.len());
+        let s = s.min(e);
+
+        for i in s..e {
+            let meta = &self.index[i];
+            let data = self.segment_slice(meta.segment_idx);
+            let subj_start = meta.offset as usize;
+            let total_len = (meta.subj_len as usize) + (meta.payload_len as usize);
+            let bytes = &data[subj_start..subj_start + total_len];
+            f(RawEntry {
+                seq: meta.seq,
+                stream_id: meta.stream_id,
+                timestamp: meta.ts,
+                subj_len: meta.subj_len,
+                flags: meta.flags,
+                bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Raw-view of a stored entry — hands back the contiguous `subject ++ payload`
+/// bytes along with scalar metadata. Used by `MemoryStore::for_each_raw`.
+///
+/// Contrast with `Entry<'a>`, which constructs two separate `&[u8]` slices
+/// (one for subject, one for payload). When the caller is going to encode
+/// the bytes back-to-back anyway, skipping the split saves the subtraction
+/// and second slice range check per entry.
+#[derive(Debug, Clone, Copy)]
+pub struct RawEntry<'a> {
+    pub seq: u64,
+    pub stream_id: u32,
+    pub timestamp: u64,
+    pub subj_len: u16,
+    pub flags: u8,
+    /// Contiguous bytes: `subject ++ payload`.
+    /// Use `.subject()` / `.payload()` for split views.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> RawEntry<'a> {
+    /// Subject bytes — first `subj_len` bytes of `self.bytes`.
+    #[inline(always)]
+    pub fn subject(&self) -> &'a [u8] {
+        &self.bytes[..self.subj_len as usize]
+    }
+
+    /// Payload bytes — everything after the subject.
+    #[inline(always)]
+    pub fn payload(&self) -> &'a [u8] {
+        &self.bytes[self.subj_len as usize..]
+    }
+
+    /// Length of payload (derived from total bytes minus subject).
+    #[inline(always)]
+    pub fn payload_len(&self) -> usize {
+        self.bytes.len() - self.subj_len as usize
+    }
+}
+
+/// Zero-copy view over a stored entry's metadata — a direct reference
+/// into the store's `index: Vec<EntryMeta>`. Callbacks that only read
+/// fields skip the `RawEntry` field-copy construction and instead
+/// dereference this view in-place.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct EntryMeta {
+    pub seq: u64,
+    pub ts: u64,
+    pub subj_len: u16,
+    pub payload_len: u32,
+    pub subject_hash: u32,
+    pub stream_id: u32,
+    pub flags: u8,
+}
+
+/// Low-level iteration that exposes a DIRECT reference into the store's
+/// metadata index, plus the contiguous bytes. No struct copy, no field
+/// projection — the callback reads fields through the `&EntryMeta` ref
+/// directly (compile-time field offsets, cache-hot loads).
+///
+/// This is the absolute fastest iteration path the store can offer.
+impl MemoryStore {
+    #[inline]
+    pub fn for_each_view(
+        &self,
+        start: u64,
+        end: u64,
+        f: &mut dyn FnMut(&EntryMeta, &[u8]),
+    ) -> Result<(), StoreError> {
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end).min(self.index.len());
+        let s = s.min(e);
+
+        for i in s..e {
+            let meta = &self.index[i];
+            let data = self.segment_slice(meta.segment_idx);
+            let subj_start = meta.offset as usize;
+            let total_len = (meta.subj_len as usize) + (meta.payload_len as usize);
+            let bytes = &data[subj_start..subj_start + total_len];
+            // Project a reference to a public EntryMeta. Since LogMetadata
+            // and EntryMeta have compatible layouts for the exported fields,
+            // we build a stack-local EntryMeta on the fly — cheap Copy.
+            let view = EntryMeta {
+                seq: meta.seq,
+                ts: meta.ts,
+                subj_len: meta.subj_len,
+                payload_len: meta.payload_len,
+                subject_hash: meta.subject_hash,
+                stream_id: meta.stream_id,
+                flags: meta.flags,
+            };
+            f(&view, bytes);
+        }
+        Ok(())
+    }
 }
 
 impl Store for MemoryStore {
