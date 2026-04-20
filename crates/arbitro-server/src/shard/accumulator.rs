@@ -49,6 +49,13 @@ struct Bucket {
     stream_id: StreamId,
     connection_id: ConnectionId,
     in_use: bool,
+    /// `true` → emit as `Action::FanoutBatch` (1 entry per msg, per-conn,
+    /// `consumer_id = 0`, client demuxes via local SubjectTrie).
+    /// `false` → emit as `Action::RepBatch` (1 entry per (msg × consumer),
+    /// `consumer_id` populated, client routes by consumer_id).
+    /// Wire body layout is identical for both — only the envelope action
+    /// code differs at flush time.
+    is_fanout: bool,
 }
 
 impl Bucket {
@@ -60,10 +67,17 @@ impl Bucket {
             stream_id: StreamId(0),
             connection_id: ConnectionId(0),
             in_use: false,
+            is_fanout: false,
         }
     }
 
-    fn activate(&mut self, conn: ConnectionId, stream: StreamId, first_seq: u64) {
+    fn activate(
+        &mut self,
+        conn: ConnectionId,
+        stream: StreamId,
+        first_seq: u64,
+        is_fanout: bool,
+    ) {
         self.body.clear();
         self.body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
         self.body.extend_from_slice(
@@ -74,12 +88,14 @@ impl Bucket {
         self.stream_id = stream;
         self.connection_id = conn;
         self.in_use = true;
+        self.is_fanout = is_fanout;
     }
 
     fn release(&mut self) {
         self.body.clear();
         self.count = 0;
         self.in_use = false;
+        self.is_fanout = false;
     }
 
     #[inline]
@@ -128,9 +144,13 @@ impl Bucket {
 /// Mechanical wire grouper. Reused across drain cycles.
 pub struct Accumulator {
     buckets: Vec<Bucket>,
-    /// `(conn_raw, stream_raw, bucket_idx)` — linear scan over the
-    /// handful of connections touched in a cycle.
-    active: Vec<(u64, u32, usize)>,
+    /// `(conn_raw, stream_raw, is_fanout, bucket_idx)` — linear scan over
+    /// the handful of buckets active in a cycle. `is_fanout` is part of
+    /// the key so a single (conn, stream) can simultaneously hold a
+    /// per-consumer `RepBatch` bucket AND a `FanoutBatch` bucket: the
+    /// dispatcher emits ack-mode consumers as `RepBatch` entries and
+    /// fire-and-forget consumers as one collapsed `FanoutBatch` entry.
+    active: Vec<(u64, u32, bool, usize)>,
 }
 
 impl Default for Accumulator {
@@ -164,12 +184,9 @@ impl Accumulator {
         self.active.clear();
     }
 
-    /// Append one entry's wire bytes to the bucket for `(conn, stream)`.
-    /// The bucket is created on first touch per cycle; subsequent calls
-    /// for the same `(conn, stream)` append to the same `BytesMut`.
-    ///
-    /// `consumer_id` is written verbatim into the `DeliveryEntryHeader`.
-    /// Use `0` for broadcast (client resolves locally).
+    /// Append a per-consumer entry. Routes to the `RepBatch` bucket for
+    /// `(conn, stream)`. Each call adds one wire entry with the supplied
+    /// `consumer_id`; the client routes by consumer.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn add(
@@ -182,8 +199,31 @@ impl Accumulator {
         subject_hash: u32,
         payload: &[u8],
     ) {
-        let idx = self.acquire_bucket(conn, stream, seq);
+        let idx = self.acquire_bucket(conn, stream, seq, /* is_fanout */ false);
         self.buckets[idx].push_entry_bytes(consumer.0, seq, subject_hash, subject, payload);
+    }
+
+    /// Append a broadcast entry. Routes to the `FanoutBatch` bucket for
+    /// `(conn, stream)`. Each call adds **one** wire entry per message
+    /// regardless of how many consumers on this connection match — the
+    /// client demultiplexes locally via its SubjectTrie.
+    ///
+    /// Wire `consumer_id` is hard-zero (broadcast marker). Caller must
+    /// only invoke this when ALL matched consumers on `(conn, stream)`
+    /// for this entry are fire-and-forget; otherwise per-consumer ack
+    /// tracking breaks. The dispatcher in `drain.rs` enforces this.
+    #[inline]
+    pub fn add_fanout(
+        &mut self,
+        conn: ConnectionId,
+        stream: StreamId,
+        seq: u64,
+        subject: &[u8],
+        subject_hash: u32,
+        payload: &[u8],
+    ) {
+        let idx = self.acquire_bucket(conn, stream, seq, /* is_fanout */ true);
+        self.buckets[idx].push_entry_bytes(0, seq, subject_hash, subject, payload);
     }
 
     /// Iterate each active bucket, patch envelope + count, hand the
@@ -193,7 +233,7 @@ impl Accumulator {
     where
         F: FnMut(Frame) -> bool,
     {
-        for &(_conn_raw, _stream_raw, idx) in self.active.iter() {
+        for &(_conn_raw, _stream_raw, _is_fanout, idx) in self.active.iter() {
             let b = &mut self.buckets[idx];
             if b.count == 0 {
                 b.release();
@@ -207,7 +247,12 @@ impl Accumulator {
             let wire_stream_id = names
                 .stream_wire(b.stream_id)
                 .unwrap_or_else(|| b.stream_id.raw());
-            let envelope = Envelope::new(Action::RepBatch, wire_stream_id, body_len as u32, 0);
+            let action = if b.is_fanout {
+                Action::FanoutBatch
+            } else {
+                Action::RepBatch
+            };
+            let envelope = Envelope::new(action, wire_stream_id, body_len as u32, 0);
             b.body[..ENVELOPE_SIZE].copy_from_slice(envelope.as_bytes());
 
             let frame = Frame {
@@ -223,9 +268,15 @@ impl Accumulator {
         self.active.clear();
     }
 
-    fn acquire_bucket(&mut self, conn: ConnectionId, stream: StreamId, first_seq: u64) -> usize {
-        for &(c, s, idx) in self.active.iter() {
-            if c == conn.0 && s == stream.raw() {
+    fn acquire_bucket(
+        &mut self,
+        conn: ConnectionId,
+        stream: StreamId,
+        first_seq: u64,
+        is_fanout: bool,
+    ) -> usize {
+        for &(c, s, f, idx) in self.active.iter() {
+            if c == conn.0 && s == stream.raw() && f == is_fanout {
                 return idx;
             }
         }
@@ -236,8 +287,8 @@ impl Accumulator {
                 self.buckets.len() - 1
             }
         };
-        self.buckets[idx].activate(conn, stream, first_seq);
-        self.active.push((conn.0, stream.raw(), idx));
+        self.buckets[idx].activate(conn, stream, first_seq, is_fanout);
+        self.active.push((conn.0, stream.raw(), is_fanout, idx));
         idx
     }
 
@@ -246,10 +297,33 @@ impl Accumulator {
     #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize { self.active.len() }
 
+    /// Count of entries in the per-consumer (`RepBatch`) bucket for
+    /// `(conn, stream)`. `None` if no such bucket is active this cycle.
     #[cfg(test)]
     pub(crate) fn bucket_count_for(&self, conn: ConnectionId, stream: StreamId) -> Option<u16> {
-        self.active.iter().find_map(|&(c, s, idx)| {
-            if c == conn.0 && s == stream.raw() { Some(self.buckets[idx].count) } else { None }
+        self.active.iter().find_map(|&(c, s, f, idx)| {
+            if c == conn.0 && s == stream.raw() && !f {
+                Some(self.buckets[idx].count)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Count of entries in the fanout (`FanoutBatch`) bucket for
+    /// `(conn, stream)`. `None` if no fanout bucket is active this cycle.
+    #[cfg(test)]
+    pub(crate) fn fanout_bucket_count_for(
+        &self,
+        conn: ConnectionId,
+        stream: StreamId,
+    ) -> Option<u16> {
+        self.active.iter().find_map(|&(c, s, f, idx)| {
+            if c == conn.0 && s == stream.raw() && f {
+                Some(self.buckets[idx].count)
+            } else {
+                None
+            }
         })
     }
 }
@@ -367,8 +441,104 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         acc.add(ConnectionId(100), StreamId(1),
-                ConsumerId(0),            // broadcast
+                ConsumerId(0),            // broadcast (consumer_id=0 in RepBatch)
                 1, SUBJECT, 0xDEAD, PAYLOAD);
         assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(1));
+    }
+
+    // ── FanoutBatch (per-bucket action) ───────────────────────────────────
+
+    /// `add_fanout` produces a separate bucket from `add` even on the
+    /// same `(conn, stream)` pair. Per-consumer ack-mode entries can
+    /// coexist with a single fire-and-forget broadcast entry.
+    #[test]
+    fn add_fanout_uses_separate_bucket_from_add() {
+        let mut acc = Accumulator::new();
+        acc.clear();
+
+        // 2 ack-mode consumers on this conn
+        acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
+                1, SUBJECT, 0xDEAD, PAYLOAD);
+        acc.add(ConnectionId(100), StreamId(1), ConsumerId(8),
+                1, SUBJECT, 0xDEAD, PAYLOAD);
+
+        // 1 broadcast entry on the same conn (collapsed fire-and-forget)
+        acc.add_fanout(ConnectionId(100), StreamId(1),
+                       1, SUBJECT, 0xDEAD, PAYLOAD);
+
+        assert_eq!(acc.active_count(), 2, "RepBatch + FanoutBatch buckets");
+        assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(2));
+        assert_eq!(acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)), Some(1));
+    }
+
+    /// Multiple `add_fanout` calls with the same `(conn, stream)` collapse
+    /// into one bucket — exactly the 1-entry-per-msg invariant.
+    #[test]
+    fn add_fanout_same_conn_stream_collapses_to_one_bucket() {
+        let mut acc = Accumulator::new();
+        acc.clear();
+        for seq in 1..=10u64 {
+            acc.add_fanout(ConnectionId(100), StreamId(1), seq, SUBJECT, 0xDEAD, PAYLOAD);
+        }
+        assert_eq!(acc.active_count(), 1);
+        assert_eq!(acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)), Some(10));
+    }
+
+    /// Fanout bucket flushes with `Action::FanoutBatch` (`0x0207`) in
+    /// the envelope; per-consumer bucket flushes with `Action::RepBatch`
+    /// (`0x0205`). Confirms the per-bucket action selection in
+    /// `for_each`.
+    #[test]
+    fn for_each_emits_correct_action_per_bucket_kind() {
+        use arbitro_proto::wire::envelope::Envelope;
+        use zerocopy::FromBytes;
+
+        let mut acc = Accumulator::new();
+        acc.clear();
+        acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
+                1, SUBJECT, 0xDEAD, PAYLOAD);
+        acc.add_fanout(ConnectionId(100), StreamId(1),
+                       2, SUBJECT, 0xBEEF, PAYLOAD);
+
+        let mut actions: Vec<u16> = Vec::new();
+        acc.for_each(&names(), |frame| {
+            let env = Envelope::ref_from_bytes(&frame.bytes[..ENVELOPE_SIZE]).unwrap();
+            actions.push(env.action.get());
+            true
+        });
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            vec![Action::RepBatch.as_u16(), Action::FanoutBatch.as_u16()],
+            "one frame per bucket kind, with the right action code each",
+        );
+    }
+
+    /// Wire `consumer_id` is forced to `0` for fanout entries —
+    /// regardless of which consumer ids matched on the server side.
+    /// Client uses `0` as the broadcast marker that triggers local
+    /// SubjectTrie demultiplexing.
+    #[test]
+    fn fanout_entries_carry_consumer_id_zero() {
+        use arbitro_proto::wire::delivery::RepBatchView;
+
+        let mut acc = Accumulator::new();
+        acc.clear();
+        acc.add_fanout(ConnectionId(100), StreamId(1),
+                       42, SUBJECT, 0xBEEF, PAYLOAD);
+
+        let mut saw = false;
+        acc.for_each(&names(), |frame| {
+            // Skip the envelope; RepBatchView parses `[count][pad] entries…`
+            let body = &frame.bytes[ENVELOPE_SIZE..];
+            let view = RepBatchView::new(body);
+            for e in view.entries() {
+                assert_eq!(e.consumer_id, 0, "fanout marker on the wire");
+                assert_eq!(e.seq, 42);
+                saw = true;
+            }
+            true
+        });
+        assert!(saw);
     }
 }
