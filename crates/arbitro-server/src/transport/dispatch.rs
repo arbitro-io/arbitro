@@ -394,7 +394,7 @@ async fn dispatch_create_stream(
     // Wire id is what the client computes locally (and ships in subsequent
     // frame envelopes); seq id is what the engine indexes by. The registry
     // pairs them up so the rest of dispatch can look the seq up by wire id.
-    let wire_stream = arbitro_engine_v2::catalog::fnv1a_32(name);
+    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
     let shard = server.shard_for(seq_stream);
 
@@ -433,7 +433,7 @@ async fn dispatch_delete_stream(
 ) {
     let view = DeleteStreamView::new(body);
     let name = view.name();
-    let wire_stream = arbitro_engine_v2::catalog::fnv1a_32(name);
+    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => {
@@ -490,7 +490,7 @@ async fn dispatch_list_streams(
     buf.extend_from_slice(&(all_streams.len() as u32).to_le_bytes());
     for (seq_id, name) in &all_streams {
         // Send back the WIRE id (what the client computes locally with
-        // fnv1a_32), not the engine seq id, so client-side caches stay
+        // wire_hash_32), not the engine seq id, so client-side caches stay
         // consistent across list/create/delete.
         let wire_id = server
             .names()
@@ -559,14 +559,14 @@ async fn dispatch_create_consumer(
     // Allocate a small sequential consumer id by name. The integer the
     // client receives in the reply is what it will echo on subsequent
     // wire frames (subscribe/ack/delete), so the engine never sees a
-    // huge fnv1a_32 hash on the ConsumerId Vec index path.
+    // huge wire_hash_32 hash on the ConsumerId Vec index path.
     let (seq_consumer, _created) = server.names().get_or_create_consumer(consumer_name);
     let shard = server.shard_for(seq_stream);
 
     // Queue id is content-addressed by `(seq_stream, group)` so two
     // consumers with the same group on the same stream resolve to the
     // SAME ready ring (queue-group round-robin semantics, see
-    // `name_registry.rs`). The original code used `fnv1a_32(group)` for
+    // `name_registry.rs`). The original code used `wire_hash_32(group)` for
     // this, but that produces ~4B integers — fine for the catalog's
     // HashMap-keyed QueueId, fatal if any path ever indexes by it. We
     // also remember the resolved queue per consumer so the subscribe

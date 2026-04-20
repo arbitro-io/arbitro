@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::segment::{self, SegmentMetadata, MAX_SEGMENT_BYTES};
 use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo};
-use arbitro_engine_v2::catalog::fnv1a_32;
+use arbitro_engine_v2::catalog::wire_hash_32;
 
 #[derive(Debug, Clone, Copy)]
 struct LogMetadata {
@@ -136,7 +136,7 @@ impl TolerantStore {
             }
             last = seq;
             let data_off = offset + HEADER_SIZE;
-            let subject_hash = fnv1a_32(&mmap[data_off..data_off + subj_len as usize]);
+            let subject_hash = wire_hash_32(&mmap[data_off..data_off + subj_len as usize]);
             self.index.push(LogMetadata {
                 seq,
                 ts,
@@ -209,7 +209,7 @@ impl Store for TolerantStore {
             .copy_from_slice(entry.payload);
 
         // WHY: Zero-allocation push (capacity guaranteed by init())
-        let subject_hash = fnv1a_32(entry.subject);
+        let subject_hash = wire_hash_32(entry.subject);
         self.index.push(LogMetadata {
             seq,
             ts: timestamp,

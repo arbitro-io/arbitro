@@ -110,7 +110,7 @@ impl ShardRouter {
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
                 accum_streams: std::collections::HashMap::with_hasher(
-                    rustc_hash::FxBuildHasher::default(),
+                    foldhash::fast::FixedState::default(),
                 ),
                 accum_deadline: None,
                 accum_total: 0,

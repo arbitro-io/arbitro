@@ -12,7 +12,7 @@
 //!
 //! That means **`StreamId` and `ConsumerId` values are interpreted as
 //! physical Vec indices**. They MUST be small. Hashing a name with
-//! `fnv1a_32` produces values up to ~4_000_000_000, which would resize the
+//! `wire_hash_32` produces values up to ~4_000_000_000, which would resize the
 //! catalog Vec to that length and instantly OOM (~300 GB on a 64-bit host).
 //! The engine is frozen and cannot be changed, so the constraint lives here
 //! on the server side.
@@ -24,14 +24,14 @@
 //! be **content-addressed** by `(stream, group)` so that two consumers
 //! created with the same group share a single ready ring (queue groups,
 //! `DeliverMode::Queue` round-robin). The original code derived this id
-//! with `fnv1a_32(group)`, which collides with the StreamId/ConsumerId
+//! with `wire_hash_32(group)`, which collides with the StreamId/ConsumerId
 //! Vec-index constraint when the engine ever indexes by `QueueId.0`. The
 //! registry therefore allocates **deterministic small ints** keyed by the
 //! `(seq_stream, group_bytes)` tuple — same group → same id, but small.
 //!
 //! ## Wire convention
 //!
-//! Stream IDs are computed **client-side** as `fnv1a_32(name)` and shipped
+//! Stream IDs are computed **client-side** as `wire_hash_32(name)` and shipped
 //! as the `u32` wire stream_id on every frame (the server does not own this
 //! value). The registry therefore maintains a `wire_id → seq_id` translation
 //! table populated at `CreateStream` time so dispatch can convert wire IDs
@@ -72,14 +72,14 @@ impl Default for NameRegistry {
 
 #[derive(Debug)]
 struct Inner {
-    /// Forward translation: wire stream_id (`fnv1a_32(name)`, client-computed)
+    /// Forward translation: wire stream_id (`wire_hash_32(name)`, client-computed)
     /// → small sequential engine `StreamId`.
-    /// Sparse key (fnv1a_32 hash) → ahash (rule: sparse IDs).
-    streams_by_wire: HashMap<u32, StreamId, ahash::RandomState>,
+    /// Sparse key (wire_hash_32 hash) → ahash (rule: sparse IDs).
+    streams_by_wire: HashMap<u32, StreamId, foldhash::fast::FixedState>,
     /// Reverse translation: engine `StreamId.0` → wire stream_id. Indexed
     /// directly by seq id; gaps from removed streams stay as `0`. Used by
     /// `ListStreams` to give the client the same wire IDs it computes
-    /// locally with `fnv1a_32`.
+    /// locally with `wire_hash_32`.
     streams_seq_to_wire: Vec<u32>,
     next_stream: u32,
 
@@ -87,7 +87,7 @@ struct Inner {
     /// pre-computed consumer id — the server allocates one and the client
     /// echoes it back. Re-creates with the same name return the same id.
     /// Sparse key (arbitrary bytes) → ahash (rule: sparse IDs).
-    consumers_by_name: HashMap<Vec<u8>, ConsumerId, ahash::RandomState>,
+    consumers_by_name: HashMap<Vec<u8>, ConsumerId, foldhash::fast::FixedState>,
     /// Per-consumer queue mapping. Populated at create time so that
     /// `dispatch_subscribe` can recover the same queue id without parsing
     /// the (group-less) Subscribe wire body — guarantees that the binding
@@ -96,7 +96,7 @@ struct Inner {
     /// Dense key (ConsumerId) but admin path — HashMap+ahash still
     /// dominates the SipHash default (rule: dense IDs may still use ahash
     /// when direct indexing is impractical across callers).
-    consumer_queue: HashMap<ConsumerId, QueueId, ahash::RandomState>,
+    consumer_queue: HashMap<ConsumerId, QueueId, foldhash::fast::FixedState>,
     /// Consumer ids start at 1 so `0` can keep its conventional "unset /
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
@@ -108,20 +108,20 @@ struct Inner {
     /// to the same queue id (queue-group semantics). Allocation is shared
     /// across all queue creates so a single counter advances per request.
     /// Composite key with a sparse `Vec<u8>` → ahash (rule: sparse IDs).
-    queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId, ahash::RandomState>,
+    queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId, foldhash::fast::FixedState>,
     next_queue: u32,
 }
 
 impl Inner {
     fn new() -> Self {
         Self {
-            streams_by_wire: HashMap::with_hasher(ahash::RandomState::new()),
+            streams_by_wire: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             streams_seq_to_wire: Vec::new(),
             next_stream: 0,
-            consumers_by_name: HashMap::with_hasher(ahash::RandomState::new()),
-            consumer_queue: HashMap::with_hasher(ahash::RandomState::new()),
+            consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_consumer: 1,
-            queues_by_key: HashMap::with_hasher(ahash::RandomState::new()),
+            queues_by_key: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             // Queue ids start at 1 for the same reason as consumers — leave
             // 0 as "unset" so accidental zeroed-out queue ids are easy to
             // spot in logs.
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn streams_translate_wire_to_sequential() {
         let r = NameRegistry::new();
-        // Two arbitrary 32-bit hash values such as fnv1a_32 would produce.
+        // Two arbitrary 32-bit hash values such as wire_hash_32 would produce.
         let w_a = 0xDEAD_BEEF;
         let w_b = 0x1234_5678;
         assert_eq!(r.get_or_create_stream(w_a), (StreamId(0), true));

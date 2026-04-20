@@ -7,4 +7,4 @@ description = "Shared primitives (gate, name registry) used across Arbitro crate
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
-ahash             = "0.8"
+foldhash          = "0.1"

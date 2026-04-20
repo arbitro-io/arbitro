@@ -61,7 +61,7 @@ pub struct SharedCounters {
     /// would collide and starve one of them).
     /// Entry removed when counter reaches 0 (bounded memory to working set).
     /// Lock-free: drain readers never block on writer inserts/removes.
-    subject: PapayaMap<(u32, u32), AtomicU32, rustc_hash::FxBuildHasher>,
+    subject: PapayaMap<(u32, u32), AtomicU32, foldhash::fast::FixedState>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -90,7 +90,7 @@ impl SharedCounters {
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
             subject: PapayaMap::builder()
-                .hasher(rustc_hash::FxBuildHasher::default())
+                .hasher(foldhash::fast::FixedState::default())
                 .build(),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
@@ -298,7 +298,7 @@ pub struct DrainSnapshot {
     /// HashMap+ahash: connection_id is unbounded-monotonic, so direct
     /// Vec<Option<T>> would leak memory for closed conns, and binary
     /// search is 2× slower than HashMap at all sizes (2.6 ns vs 3-15 ns).
-    pub writers_by_conn: HashMap<u64, WriterIndexEntry, rustc_hash::FxBuildHasher>,
+    pub writers_by_conn: HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,
     /// Match tables — indexed by StreamId.raw(). `None` = no stream.
     /// `MatchEntry.binding_idx` is stamped with the server-layer
     /// binding index during rebuild.
@@ -317,7 +317,7 @@ impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
             bindings: Vec::new(),
-            writers_by_conn: HashMap::with_hasher(rustc_hash::FxBuildHasher::default()),
+            writers_by_conn: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::new(),
         }
     }
@@ -326,7 +326,7 @@ impl DrainSnapshot {
 /// Writer lookup for a given connection. HashMap+ahash, O(1) amortised.
 #[inline]
 pub fn find_writer<'a>(
-    index: &'a HashMap<u64, WriterIndexEntry, rustc_hash::FxBuildHasher>,
+    index: &'a HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,
     connection_id: u64,
 ) -> Option<&'a WriterIndexEntry> {
     index.get(&connection_id)

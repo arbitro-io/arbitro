@@ -220,7 +220,7 @@ mod tests {
             replicas: 1,
             journal_kind: 0,
             retention: 0,
-            _pad: 0,
+            discard: 0,
         };
         let mut body = Vec::new();
         body.extend_from_slice(fixed.as_bytes());
@@ -294,7 +294,7 @@ mod tests {
                 replicas: 1,
                 journal_kind: 0,
                 retention: 0,
-                _pad: 0,
+                discard: 0,
             };
             let mut body = Vec::new();
             body.extend_from_slice(fixed.as_bytes());

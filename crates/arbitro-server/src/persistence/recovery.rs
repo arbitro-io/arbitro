@@ -169,11 +169,11 @@ impl MetadataApplier for ReplayApplier {
             CMD_CREATE_STREAM => {
                 let sv = CreateStreamView::new(view.body());
                 let name = sv.name();
-                // Wire stream_id is the client-side fnv1a_32(name); translate
+                // Wire stream_id is the client-side wire_hash_32(name); translate
                 // through NameRegistry to a small sequential engine StreamId
                 // (the engine catalog indexes match_tables by raw u32 — see
                 // common::name_registry for full rationale).
-                let wire_id = arbitro_engine_v2::catalog::fnv1a_32(name);
+                let wire_id = arbitro_engine_v2::catalog::wire_hash_32(name);
                 let (stream_id, _created) = self.server.names().get_or_create_stream(wire_id);
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
@@ -187,7 +187,7 @@ impl MetadataApplier for ReplayApplier {
             CMD_DELETE_STREAM => {
                 let sv = arbitro_proto::wire::stream::DeleteStreamView::new(view.body());
                 let name = sv.name();
-                let wire_id = arbitro_engine_v2::catalog::fnv1a_32(name);
+                let wire_id = arbitro_engine_v2::catalog::wire_hash_32(name);
                 let stream_id = match self.server.names().stream_seq(wire_id) {
                     Some(id) => id,
                     None => {

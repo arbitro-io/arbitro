@@ -8,13 +8,12 @@ mod trie;
 pub use subject::{subject_matches, next_token};
 pub use trie::{SubjectTrie, TrieNode};
 
-/// FNV-1a 32-bit hash. Deterministic, fast, no randomness.
+/// 32-bit wire hash. Foldhash with fixed seed → deterministic across
+/// processes and versions (within a given foldhash release).
 #[inline]
-pub fn fnv1a_32(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for &b in data {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+pub fn wire_hash_32(data: &[u8]) -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = foldhash::fast::FixedState::default().build_hasher();
+    h.write(data);
+    h.finish() as u32
 }

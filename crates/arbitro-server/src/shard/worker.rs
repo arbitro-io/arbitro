@@ -218,7 +218,7 @@ pub struct CommandWorker {
     // StreamId is dense but admin-path (publish accumulation), so HashMap is
     // acceptable here — but we opt into ahash per the dense/sparse rule
     // (performance.md): non-std hashers for any keyed lookup.
-    pub(super) accum_streams: HashMap<StreamId, StreamAccum, rustc_hash::FxBuildHasher>,
+    pub(super) accum_streams: HashMap<StreamId, StreamAccum, foldhash::fast::FixedState>,
     pub(super) accum_deadline: Option<Instant>,
     pub(super) accum_total: usize,
     pub(super) accum_bytes: usize,
@@ -430,9 +430,9 @@ impl CommandWorker {
         // HashMap+ahash: connection_id is unbounded-monotonic, direct
         // Vec<Option<T>> would leak memory, and HashMap beats binary_search.
         let mut writers_by_conn: std::collections::HashMap<
-            u64, crate::shard::shared::WriterIndexEntry, rustc_hash::FxBuildHasher,
+            u64, crate::shard::shared::WriterIndexEntry, foldhash::fast::FixedState,
         > = std::collections::HashMap::with_capacity_and_hasher(
-            self.bindings.len(), rustc_hash::FxBuildHasher::default(),
+            self.bindings.len(), foldhash::fast::FixedState::default(),
         );
         for b in &self.bindings {
             writers_by_conn

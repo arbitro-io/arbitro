@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use super::stream::fnv1a_32;
+use super::stream::wire_hash_32;
 
 /// Consumer configuration — cold path, created once.
 ///
@@ -101,7 +101,7 @@ impl ConsumerConfig {
         ConsumerConfigBuilder {
             name: Box::from(name),
             stream_name: Box::from(stream_name),
-            stream_id: fnv1a_32(stream_name),
+            stream_id: wire_hash_32(stream_name),
             group: None,
             filters: Vec::new(),
             max_subject_inflights: Vec::new(),

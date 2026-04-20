@@ -117,22 +117,22 @@ pub struct Recipient {
 /// The catalog: entity lifecycle, match tables, bindings, demand tracking.
 pub struct Catalog {
     // Entity storage — direct HashMap, no graph indirection.
-    streams: HashMap<StreamId, StreamInfo, ahash::RandomState>,
-    consumers: HashMap<ConsumerId, ConsumerInfo, ahash::RandomState>,
-    subscriptions: HashMap<SubscriptionId, SubscriptionInfo, ahash::RandomState>,
+    streams: HashMap<StreamId, StreamInfo, foldhash::fast::FixedState>,
+    consumers: HashMap<ConsumerId, ConsumerInfo, foldhash::fast::FixedState>,
+    subscriptions: HashMap<SubscriptionId, SubscriptionInfo, foldhash::fast::FixedState>,
 
     // Bindings with 3 secondary indices.
-    bindings: HashMap<BindingId, Binding, ahash::RandomState>,
-    by_stream: HashMap<StreamId, Vec<BindingId>, ahash::RandomState>,
-    by_consumer: HashMap<ConsumerId, Vec<BindingId>, ahash::RandomState>,
-    by_connection: HashMap<ConnectionId, Vec<BindingId>, ahash::RandomState>,
+    bindings: HashMap<BindingId, Binding, foldhash::fast::FixedState>,
+    by_stream: HashMap<StreamId, Vec<BindingId>, foldhash::fast::FixedState>,
+    by_consumer: HashMap<ConsumerId, Vec<BindingId>, foldhash::fast::FixedState>,
+    by_connection: HashMap<ConnectionId, Vec<BindingId>, foldhash::fast::FixedState>,
     next_binding_id: u32,
 
     // Connection tracking.
-    connections: HashMap<ConnectionId, NodeId, ahash::RandomState>,
+    connections: HashMap<ConnectionId, NodeId, foldhash::fast::FixedState>,
 
     // Demand counters: streams with ≥1 active binding.
-    demand: HashMap<StreamId, u32, ahash::RandomState>,
+    demand: HashMap<StreamId, u32, foldhash::fast::FixedState>,
 
     // Per-stream match tables.
     match_tables: Vec<Option<MatchTable>>,
@@ -141,16 +141,16 @@ pub struct Catalog {
 impl Catalog {
     pub fn new() -> Self {
         Self {
-            streams: HashMap::with_hasher(ahash::RandomState::new()),
-            consumers: HashMap::with_hasher(ahash::RandomState::new()),
-            subscriptions: HashMap::with_hasher(ahash::RandomState::new()),
-            bindings: HashMap::with_hasher(ahash::RandomState::new()),
-            by_stream: HashMap::with_hasher(ahash::RandomState::new()),
-            by_consumer: HashMap::with_hasher(ahash::RandomState::new()),
-            by_connection: HashMap::with_hasher(ahash::RandomState::new()),
+            streams: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumers: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            subscriptions: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            bindings: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_connection: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_binding_id: 1,
-            connections: HashMap::with_hasher(ahash::RandomState::new()),
-            demand: HashMap::with_hasher(ahash::RandomState::new()),
+            connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::with_capacity(16),
         }
     }
@@ -347,7 +347,7 @@ impl Catalog {
                 if filter.contains(&b'*') || filter.contains(&b'>') {
                     mt.add_pattern(filter.clone(), match_entry);
                 } else {
-                    let hash = fnv1a_32(filter);
+                    let hash = wire_hash_32(filter);
                     mt.add_exact(hash, match_entry);
                 }
             }
@@ -647,18 +647,17 @@ impl Default for Catalog {
     }
 }
 
-// ── FNV-1a hash (inline, branch-free) ───────────────────────────────────────
+// ── Wire hash (foldhash, deterministic fixed-seed) ──────────────────────────
 
-/// FNV-1a 32-bit hash. Used for subject hashing.
-/// Inline, branch-free, ~0.7ns/byte for typical 15-byte subjects.
+/// 32-bit wire hash used for subjects / stream ids / queue keys.
+/// Backed by `foldhash::fast::FixedState` (constant seed → deterministic
+/// across processes). ~1 ns for subjects ≤32 B.
 #[inline]
-pub fn fnv1a_32(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for &byte in data {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+pub fn wire_hash_32(data: &[u8]) -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = foldhash::fast::FixedState::default().build_hasher();
+    h.write(data);
+    h.finish() as u32
 }
 
 #[cfg(test)]
@@ -840,7 +839,7 @@ mod tests {
 
     #[test]
     fn fnv1a_deterministic() {
-        assert_eq!(fnv1a_32(b"orders.created"), fnv1a_32(b"orders.created"));
-        assert_ne!(fnv1a_32(b"orders.created"), fnv1a_32(b"orders.updated"));
+        assert_eq!(wire_hash_32(b"orders.created"), wire_hash_32(b"orders.created"));
+        assert_ne!(wire_hash_32(b"orders.created"), wire_hash_32(b"orders.updated"));
     }
 }

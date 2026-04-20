@@ -8,4 +8,4 @@ license.workspace = true
 zerocopy = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-
+foldhash = "0.1"

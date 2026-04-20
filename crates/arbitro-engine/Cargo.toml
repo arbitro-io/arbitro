@@ -5,7 +5,7 @@ edition = "2021"
 description = "Pure oracle engine for Arbitro — sync, zero-copy, single-threaded"
 
 [dependencies]
-ahash = "0.8"
+foldhash = "0.1"
 bytes = "1"
 zerocopy = { version = "0.8", features = ["derive"] }
 

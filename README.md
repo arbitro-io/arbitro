@@ -7,50 +7,86 @@
 
 Built in Rust with a **Zero-Allocation, Zero-Copy** architecture, Arbitro follows the principle of **Hardware Sympathy** to maximize L1/L2 cache locality and eliminate heap fragmentation.
 
+## Star Feature: `MaxSubjectInflight`
+
+Arbitro's unique power is not "streams + consumers" — that's table stakes. It is **per-subject, per-consumer flow control** with wildcard patterns, resolved at delivery time with O(1) atomics on the hot path.
+
+```rust
+let consumer_cfg = ConsumerConfig::new(b"gateway", b"ORDERS")
+    .filter(b"orders.>")
+    .ack_policy(AckPolicy::Explicit)
+    .max_inflight(10000)
+    .max_subject_inflight(b"orders.premium.>", 30)   // 30 per unique premium.*
+    .max_subject_inflight(b"orders.basic.>", 10)     // 10 per unique basic.*
+    .max_subject_inflight(b"orders.freemium.>", 1)   // 1 per unique freemium.*
+    .build();
+```
+
+One rule isolates an unbounded number of subjects. A saturated `orders.freemium.u_12345` does **not** impact `orders.freemium.u_12346` — each unique subject is an independent credit pool.
+
 ## Key Features
 
-- **Massive Subject Partitioning**: Independently control flow for millions of unique subjects with zero configuration.
-- **Ultra-High Throughput**: 14.2M+ messages per second ingestion on commodity hardware.
-- **Predictable Latency**: Sub-microsecond internal dispatch with deterministic performance.
-- **Crash-Safe Persistence**: Zero-Copy indexing with **Magic Byte (0xAF)** validation to guarantee recovery after abrupt process failure (`SIGKILL`).
-- **Reactive Model**: Efficient non-blocking delivery for both callback-based and pull-based consumers.
+- **Massive Subject Partitioning** — millions of unique subjects, one rule.
+- **Ultra-High Throughput** — 14.2M+ msg/s ingest, 4.3M+ msg/s replay drain.
+- **Predictable Latency** — sub-microsecond internal dispatch, zero GC pauses.
+- **Crash-Safe Persistence** — Magic Byte (0xAF) validation survives `SIGKILL`.
+- **Reactive Model** — callback + pull subscription modes.
+- **Shard-Parallel Architecture** — lock-free drain + command threads per shard.
 
 ## Performance (E2E Throughput)
 
-Arbitro is built for **Hardware Sympathy**. These benchmarks represent the full end-to-end cycle (TCP + Protocol + Engine) on a single server instance (WSL, 64B payload, Local Memory Persistence).
+Arbitro is built for **Hardware Sympathy**. Benchmarks represent the full end-to-end cycle (TCP + Protocol + Engine) on a single server instance (WSL, 64B payload, Memory backend).
 
-| Mode | Throughput Range (1K - 1M msgs) | Latency / Unit |
-| :--- | :--- | :--- |
-| **Publish (Ingest)** | **6.3M — 14.2M msg/s** | ~70ns per msg |
-| **Cycle Fire-and-Forget** | **6.5M — 15.1M msg/s** | ~66ns per msg |
-| **Cycle Explicit Ack** | **2.1M — 2.52M msg/s** | ~390ns per msg |
-| **VIP Subject Isolation** | **Independent of Noise** | **31ns (L3) — 84µs (Network)** |
+| Mode | Throughput (1K → 1M msgs) | Latency / unit |
+|------|----------------------------|----------------|
+| **Publish (ingest)** | 6.3M — 14.2M msg/s | ~70 ns |
+| **Cycle fire-and-forget** | 6.5M — 15.1M msg/s | ~66 ns |
+| **Cycle explicit ack** | 2.1M — 2.52M msg/s | ~390 ns |
+| **VIP subject isolation** | Independent of noise | 31 ns (L3) — 84 µs (net) |
 
-## Endurance & Stability (1-Minute Sustained)
+## Endurance & Stability (1-minute sustained)
 
-Arbitro isn't just fast in bursts; it's designed for **Thermal and Memory Stability** under zero-truce pressure. These metrics are captured by the engine's **Integrated Process Radar** (`/proc/self`).
-
-| Scenario | Throughput (Avg) | CPU Load | RAM (RSS) | Stability |
-| :--- | :--- | :--- | :--- | :--- |
-| **Memory Hot-Path** | **~2.8M msg/s** | **~10.8%** | **~2.99 GB** | **O(1) Hybrid Index** |
-| **Disk Persistence (Tolerant)** | **~35,400 msg/s** | **~3.2%** | **~120 MB** | **Crash-Safe (AF)** |
-| **Chaos Resilience** | **10s Stress** | **Isolated PIDs** | **Stable** | **100% Recovery Proof** |
-
-> [!TIP]
-> **Zero-Allocation Telemetry**: The internal metrics radar reads directly from the kernel interface, ensuring that monitoring the engine doesn't pollute the engine's own Performance Profile.
+| Scenario | Throughput | CPU | RSS | Stability |
+|----------|-----------|-----|-----|-----------|
+| Memory hot-path | ~2.8M msg/s | ~10.8% | ~2.99 GB | O(1) hybrid index |
+| Disk persistence | ~35.4k msg/s | ~3.2% | ~120 MB | Crash-safe (0xAF) |
+| Chaos resilience | 10 s stress | Isolated PIDs | Stable | 100% recovery proof |
 
 > [!IMPORTANT]
-> **Performance Consistency**: Introducing *Dynamic Subject Isolation* with hashing and state recycling resulted in **0% regression** in global throughput.
+> **Performance Consistency**: Introducing *Dynamic Subject Isolation* resulted in **0% regression** in global throughput.
+
+## Architecture Overview
+
+Arbitro is a workspace of seven crates:
+
+```
+arbitro-proto    # wire protocol (zerocopy-backed, repr(C))
+arbitro-engine   # single-threaded oracle (catalog + matcher + inflight)
+arbitro-common   # Gate, NameRegistry, IdPool
+arbitro-store    # journal trait + Memory / Tolerant backends
+arbitro-server   # shard orchestration + transport + persistence
+arbitro-client   # client SDK
+arbitro-e2e      # integration tests + benchmarks
+```
+
+Each **shard** owns one engine + one store and runs two dedicated OS threads:
+
+- **Drain thread** — linear walk of the store, atomic reads of counters, dispatch to TCP. Zero locks on engine.
+- **Command thread** — mutates engine via `&mut self`, updates atomics, swaps snapshots.
+
+Communication across threads is **lock-free**: atomics for counters, `arc_swap`-style snapshot pointers for structural state, and mpsc channels for drain → command notifications.
+
+Full architectural details, sharding strategy, and data-structure trade-offs live in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ## Quick Start
 
-### Build and Run (WSL Only)
+### Build and Run (WSL only — 9P on `/mnt` is slow)
 
 ```bash
-# Compile from the Windows source (it's fine to compile on /mnt/)
+# Compile from the Windows source
 cargo build --release -p arbitro-server
 
-# MUST copy to /tmp to avoid 9P filesystem bottleneck during execution
+# MUST copy to /tmp to avoid 9P filesystem bottleneck
 mkdir -p /tmp/arbitro && cp -a ./target/release/arbitro-server /tmp/arbitro/
 cd /tmp/arbitro && ./arbitro-server
 ```
@@ -58,130 +94,86 @@ cd /tmp/arbitro && ./arbitro-server
 ### Docker
 
 ```bash
-# Default port: 4222
-docker compose up -d
+docker compose up -d   # default port: 4222
 ```
 
-## Power Feature: Dynamic Subject Isolation
+## Environment
 
-Arbitro's unique power isn't just limiting a stream; it's **Stateful Flow Partitioning**. With a single wildcard rule, Arbitro dynamically isolates credits for an infinite number of unique subjects matching your patterns.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARBITRO_LISTEN` | `0.0.0.0:9898` | TCP listen address |
+| `ARBITRO_MAX_CONNECTIONS` | `10000` | Max concurrent TCP connections |
+| `ARBITRO_WRITE_BUFFER_CAP` | `8192` | Write channel capacity per connection |
+| `ARBITRO_IDLE_TIMEOUT` | `300` | Idle timeout (s) |
+| `ARBITRO_KEEPALIVE_INTERVAL` | `30` | Keepalive ping interval (s) |
 
-### The "Freemium" Isolation Logic
-Traditional brokers apply limits at the wildcard level. Arbitro applies them to the **resolved subject**. This creates an **independent credit pool** for every unique entity in parallel.
+## Usage
 
-> [!NOTE]
-> **Global Ceiling**: The subject limits are partitions of the **Global Credit Limit** (`max_inflight`). The global limit acts as a hard ceiling for the consumer's total pending ACKs, while subject limits ensure fair distribution within that ceiling.
-
-```text
-Active Subject Slots (CreditMap - Atomic Hashing)
--------------------------------------------------------------------
-[Slot A] orders.freemium.u_1  | [ 1 / 1  ] | (BLOCKED - 1 at a time)
-[Slot B] orders.freemium.u_2  | [ 0 / 1  ] | (FLOWING - Independent!)
-[Slot C] orders.basic.u_3     | [ 5 / 10 ] | (FLOWING - 10 allowed)
-[Slot D] orders.premium.u_4   | [ 1 / 30 ] | (FLOWING - 30 allowed)
-
-Outcome: A freemium user saturating their credit does NOT impact any other user, 
-even if they share the same rule. 1 Rule -> 1,000,000+ Subjects Managed.
-```
-
-### Multi-Tenant Example (1 rule -> Many Subjects)
-Govern a massive tenant base with just 3 hierarchical policies.
+### Callback subscription (zero-latency)
 
 ```rust
-let consumer_cfg = ConsumerConfig::new(b"gateway", b"ORDERS")
-    .filter(b"orders.>")
-    .ack_policy(AckPolicy::Explicit)
-    .max_inflight(10000)
-    // 30 credits for EACH unique premium user
-    .max_subject_inflight(b"orders.premium.>", 30)
-    // 10 credits for EACH unique basic user
-    .max_subject_inflight(b"orders.basic.>", 10)
-    // ONLY 1 credit for EACH unique freemium user (1 at a time)
-    .max_subject_inflight(b"orders.freemium.>", 1)
-    .build();
-```
-
-## Usage Paradigms: Choosing Your Flow
-
-Arbitro offers multiple subscription models tailored for performance. Whether you need reactive low-latency closures or heavy-duty pull workers, the engine is optimized for zero-copy delivery.
-
-### 1. Reactive Callbacks (Zero-Latency Flow)
-The most efficient way to process messages. Closures are executed directly by the engine for ultra-low latency.
-
-```rust
-// Reactive, non-blocking flow
 let _handle = consumer.subscribe_callback(Some(b"orders.premium.>"), move |msg| {
-    println!("VIP logic fired for subject: {:?}", msg.subject);
-    msg.ack(); // Instant credit release
+    println!("VIP logic fired: {:?}", msg.subject);
+    msg.ack();
 }).await?;
 ```
 
-### 2. Massive Fanout (Optimized Delivery)
-Arbitro ensures that if you have 100+ local subscribers on the same stream, delivery is handled with extreme efficiency, minimizing CPU overhead and network noise.
+### Pull subscription (worker-paced)
 
 ```rust
-// 100 subscribers, minimal CPU noise
-for i in 0..100 {
-    consumer.subscribe_callback(None, move |msg| {
-        // Parallel reactive processing
-    }).await?;
-}
-```
-
-### 3. Manual Pull / Fetch (Total Control)
-For workers that need to manage their own pace or perform batching. Use the async iterator pattern to pull messages when the worker is ready.
-
-```rust
-let mut subscription = consumer.subscribe(Some(b"orders.basic.>")).await?;
-
-while let Some(msg) = subscription.next().await {
+let mut sub = consumer.subscribe(Some(b"orders.basic.>")).await?;
+while let Some(msg) = sub.next().await {
     // Process at your own speed
     msg.ack();
 }
 ```
 
-### 4. Atomic Publish (High-Density Ingest)
-Ingest millions of messages with hardware-level throughput.
+### Publish
 
 ```rust
-// Single fire-and-forget ingestion
+// Single fire-and-forget
 client.publish(b"ORDERS", b"orders.freemium.u1", payload).await?;
 
-// Or use high-density batches for 14.2M msg/s throughput
+// High-density batch (14.2M msg/s)
 client.publish_batch(b"ORDERS", &[
     (b"orders.premium.u1", &payload),
     (b"orders.premium.u2", &payload),
 ]).await?;
 ```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ARBITRO_LISTEN` | `0.0.0.0:9898` | TCP listen address (**Default Port: 9898**) |
-| `ARBITRO_MAX_CONNECTIONS` | `10000` | Max concurrent TCP connections |
-| `ARBITRO_WRITE_BUFFER_CAP` | `8192` | Write channel capacity per connection |
-| `ARBITRO_IDLE_TIMEOUT` | `300` | Idle timeout in seconds |
-| `ARBITRO_KEEPALIVE_INTERVAL` | `30` | Keepalive ping interval in seconds |
-
-
 ## Roadmap
 
-### Phase 1: Core Engine (Completed)
-- [x] **Zero-Copy Hot Path**: Optimized frame dispatch and delivery.
-- [x] **Dynamic Subject Isolation**: Intelligent credit partitioning per entity.
-- [x] **Atomic State Management**: Efficient resource cleanup after processing.
-- [x] **High-Speed Storage**: Optimized linear ingestion store.
+### Phase 1 — Core Engine (done)
+- [x] Zero-copy hot path
+- [x] Dynamic subject isolation (`MaxSubjectInflight`)
+- [x] Atomic state management
+- [x] Linear-ingestion store
+- [x] Shard-parallel drain/command split
 
-### Phase 2: Persistence & Connectivity (Validated)
-- [x] **Disk Persistence**: High-performance AEP/NVMe storage backend (**TolerantStore**).
-- [x] **Crash-Safe Journaling**: **Magic Byte (0xAF)** validation for recovery after `SIGKILL`.
-- [x] **Sync Acks**: Guaranteed delivery points with explicit `AckSync` protocol.
-- [ ] **Subject Scavenging**: Automatic expiration of inactive subject slots.
-- [ ] **Multi-Language Clients**: Official TypeScript (`arbitro-ts`) and Go (`arbitro-go`) support.
+### Phase 2 — Persistence & Connectivity (done)
+- [x] Disk persistence (TolerantStore)
+- [x] Crash-safe journaling (Magic Byte 0xAF)
+- [x] Sync acks (`AckSync`)
+- [x] Per-entry `consumer_id` routing (broadcast collapse)
+- [ ] Subject scavenging (TTL-based inactive-slot cleanup)
+- [ ] Multi-language clients (TypeScript, Go)
 
-### Phase 3: Observability & Scale (Planned)
-- [ ] **Prometheus Integration**: Native metrics for subject pressure and throughput.
-- [ ] **Clustering (Raft)**: Distributed consensus for stream and consumer state.
-- [ ] **Adaptive Flow Control**: Machine learning-assisted subject prioritization.
+### Phase 3 — Observability & Scale (planned)
+- [ ] Prometheus-native metrics
+- [ ] Clustering (Raft) for stream state replication
+- [ ] Adaptive subject prioritization
+- [ ] Cross-shard subject aggregation for global limits
+
+## Next Session Context
+
+If a new session is picking up this project, start with [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md). It documents:
+
+- Every data structure and whether it's sharded
+- BucketArray vs HashMap decision matrix
+- Thread ownership model
+- Lock-free synchronization primitives
+- Open work ordered by priority
+- Testing + benchmark rules
 
 ## License
 

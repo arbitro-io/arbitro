@@ -58,8 +58,8 @@ dependencies = [
 name = "arbitro-common"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "arbitro-engine",
+ "foldhash",
 ]
 
 [[package]]
@@ -91,9 +91,9 @@ dependencies = [
 name = "arbitro-engine"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "bytes",
  "criterion",
+ "foldhash",
  "zerocopy",
 ]
 
@@ -102,6 +102,7 @@ name = "arbitro-proto"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "foldhash",
  "serde",
  "zerocopy",
 ]

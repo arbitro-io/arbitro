@@ -148,7 +148,7 @@ mod tests {
             replicas: 1,
             journal_kind: 0,
             retention: 0,
-            _pad: 0,
+            discard: 0,
         };
         let mut body = Vec::new();
         body.extend_from_slice(fixed.as_bytes());
@@ -194,7 +194,7 @@ mod tests {
             ack_policy: 1,
             deliver_policy: 0,
             deliver_mode: 0,
-            _pad: 0,
+            discard: 0,
             group_len: U16::new(0),
             ack_wait_ms: U32::new(30000),
             start_seq: U64::new(0),

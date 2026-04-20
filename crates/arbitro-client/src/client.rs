@@ -7,7 +7,7 @@ use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
 use arbitro_proto::action::Action;
-use arbitro_proto::config::{ConsumerConfig, StreamConfig, fnv1a_32};
+use arbitro_proto::config::{ConsumerConfig, StreamConfig, wire_hash_32};
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction, ListStreamsAction};
 use arbitro_proto::wire::publish::PublishEntry;
@@ -73,7 +73,7 @@ impl Client {
             replicas: config.replicas,
             journal_kind: config.journal_kind as u8,
             retention: config.retention as u8,
-            _pad: 0,
+            discard: config.discard as u8,
         };
 
         let mut body = Vec::with_capacity(32 + config.name.len() + config.filter.len());
@@ -134,7 +134,7 @@ impl Client {
         body.extend_from_slice(fixed.as_bytes());
         body.extend_from_slice(name);
 
-        let stream_id = fnv1a_32(name);
+        let stream_id = wire_hash_32(name);
         self.inner.request(Action::DeleteStream, stream_id, &body).await?;
         Ok(())
     }
@@ -209,7 +209,7 @@ impl Client {
         stream_name: &[u8],
         consumer_id: u32,
     ) -> Result<(), ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let body = DeleteConsumerAction {
             consumer_id: U32::new(consumer_id),
@@ -229,7 +229,7 @@ impl Client {
         subject: &[u8],
         payload: &[u8],
     ) -> Result<(), ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         // Build batch body: [2 count][entry_header][subject][payload]
         let entry = PublishEntry {
@@ -256,7 +256,7 @@ impl Client {
         stream_name: &[u8],
         entries: &[(&[u8], &[u8])],
     ) -> Result<(), ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let total_body: usize = 4 + entries.iter()
             .map(|(s, p)| 12 + s.len() + p.len())
@@ -289,7 +289,7 @@ impl Client {
         subject: &[u8],
         payload: &[u8],
     ) -> Result<(), ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let entry = PublishEntry {
             data_len: U32::new(payload.len() as u32),
@@ -317,7 +317,7 @@ impl Client {
         subject: &[u8],
         payload: &[u8],
     ) -> Result<u64, ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let entry = PublishEntry {
             data_len: U32::new(payload.len() as u32),
@@ -345,7 +345,7 @@ impl Client {
         subject: &[u8],
         payload: &[u8],
     ) -> Result<u64, ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let entry = PublishEntry {
             data_len: U32::new(payload.len() as u32),
@@ -372,7 +372,7 @@ impl Client {
         stream_name: &[u8],
         entries: &[(&[u8], &[u8])],
     ) -> Result<u64, ClientError> {
-        let stream_id = fnv1a_32(stream_name);
+        let stream_id = wire_hash_32(stream_name);
 
         let total_body: usize = 4 + entries.iter()
             .map(|(s, p)| 12 + s.len() + p.len())

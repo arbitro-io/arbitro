@@ -81,7 +81,7 @@ impl std::hash::Hash for MatchEntry {
 #[derive(Clone)]
 pub struct MatchTable {
     /// Exact subject_hash → matched consumers.
-    exact: HashMap<u32, Vec<MatchEntry>, ahash::RandomState>,
+    exact: HashMap<u32, Vec<MatchEntry>, foldhash::fast::FixedState>,
 
     /// Wildcard subscriptions that match all subjects on a stream.
     /// These are appended to every lookup result.
@@ -99,7 +99,7 @@ pub struct MatchTable {
     pattern_entries: Vec<MatchEntry>,
 
     /// Cache of subjects we've already resolved patterns for.
-    resolved_subjects: HashMap<u32, bool, ahash::RandomState>,
+    resolved_subjects: HashMap<u32, bool, foldhash::fast::FixedState>,
 
     /// Subject limit patterns: (pattern_bytes, max_inflight).
     /// Resolved to concrete hashes at publish time (same as match patterns).
@@ -113,22 +113,22 @@ pub struct MatchTable {
 
     /// Precomputed subject_hash → max inflight.
     /// Populated at publish time when patterns are resolved.
-    max_subject_inflights: HashMap<u32, u32, ahash::RandomState>,
+    max_subject_inflights: HashMap<u32, u32, foldhash::fast::FixedState>,
 }
 
 impl MatchTable {
     pub fn new() -> Self {
         Self {
-            exact: HashMap::with_hasher(ahash::RandomState::new()),
+            exact: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             catch_all: Vec::new(),
             patterns: Vec::new(),
             pattern_trie: SubjectTrie::new(),
             pattern_entries: Vec::new(),
-            resolved_subjects: HashMap::with_hasher(ahash::RandomState::new()),
+            resolved_subjects: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             limit_patterns: Vec::new(),
             limit_trie: SubjectTrie::new(),
             limit_values: Vec::new(),
-            max_subject_inflights: HashMap::with_hasher(ahash::RandomState::new()),
+            max_subject_inflights: HashMap::with_hasher(foldhash::fast::FixedState::default()),
         }
     }
 
@@ -258,7 +258,7 @@ impl MatchTable {
             self.resolved_subjects.clear();
         } else {
             // Literal — resolve immediately
-            let hash = crate::catalog::fnv1a_32(pattern);
+            let hash = crate::catalog::wire_hash_32(pattern);
             self.max_subject_inflights.insert(hash, max_inflight);
         }
     }
@@ -270,7 +270,7 @@ impl MatchTable {
             self.rebuild_limit_trie();
             self.resolved_subjects.clear();
         } else {
-            let hash = crate::catalog::fnv1a_32(pattern);
+            let hash = crate::catalog::wire_hash_32(pattern);
             self.max_subject_inflights.remove(&hash);
         }
     }

@@ -32,14 +32,14 @@ tracing-subscriber = { workspace = true }
 bytes             = { workspace = true }
 zerocopy          = { workspace = true }
 papaya            = "0.2"
-rustc-hash        = "2"
+foldhash          = "0.1"
 
 [dev-dependencies]
 arbitro-client = { path = "../arbitro-client" }
 ahash          = "0.8"
 dashmap        = "6"
 rapidhash      = "1"
-foldhash       = "0.1"
+rustc-hash     = "2"
 
 [[bench]]
 name = "lookup_strategies"

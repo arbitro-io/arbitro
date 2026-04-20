@@ -12,7 +12,7 @@
 //! persistence) while `TolerantStore` maps a real file for durability.
 
 use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
-use arbitro_engine_v2::catalog::fnv1a_32;
+use arbitro_engine_v2::catalog::wire_hash_32;
 use memmap2::{MmapMut, MmapOptions};
 
 /// Default capacity per segment. Chosen as a balance between
@@ -165,7 +165,7 @@ impl MemoryStore {
         let subj_len = entry.subject.len() as u16;
         let payload_len = entry.payload.len() as u32;
         let entry_bytes = (subj_len as usize) + (payload_len as usize);
-        let subject_hash = fnv1a_32(entry.subject);
+        let subject_hash = wire_hash_32(entry.subject);
 
         // Rotate if this entry wouldn't fit in the active segment.
         if self.active_len + entry_bytes > self.segment_size {

@@ -183,8 +183,9 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
 
     // Spawn N subscriber tasks, each on its own TCP connection.
     let mut worker_handles = Vec::new();
-    let received_counts: Vec<Arc<AtomicU64>> =
-        (0..n_clients).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let received_counts: Vec<Arc<AtomicU64>> = (0..n_clients)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
     for i in 0..n_clients {
         let addr = addr.clone();
         let stream_name = stream_name.clone();
@@ -328,9 +329,7 @@ async fn main() {
     // Stage 3 — multi-client batch ack (N parallel TCP connections)
     println!();
     println!("--------------------------------------------------------");
-    println!(
-        "  Stage 3 — ack_multi ({n_clients} parallel clients, each with its own consumer)"
-    );
+    println!("  Stage 3 — ack_multi ({n_clients} parallel clients, each with its own consumer)");
     println!("--------------------------------------------------------");
     let (dur_multi, total_recv_multi) = stage_ack_multi(total, n_clients).await;
     let throughput_multi = total_recv_multi as f64 / dur_multi.as_secs_f64();

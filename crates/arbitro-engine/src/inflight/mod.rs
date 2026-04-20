@@ -37,7 +37,7 @@ pub enum InFlightScope {
 /// Per-scope inflight counter storage. See module docs for rationale.
 pub struct InFlightCounters {
     /// Subject inflight: sparse u32 hash → HashMap.
-    subject: HashMap<u32, u32, ahash::RandomState>,
+    subject: HashMap<u32, u32, foldhash::fast::FixedState>,
     /// Consumer inflight: dense consumer_id → Vec indexed by raw id.
     consumer: Vec<u32>,
     /// Queue inflight: dense queue_id → Vec indexed by raw id.
@@ -62,7 +62,7 @@ pub struct InFlightCounters {
 impl InFlightCounters {
     pub fn new() -> Self {
         Self {
-            subject: HashMap::with_hasher(ahash::RandomState::new()),
+            subject: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             // Start with a modest capacity; auto-grows on first write past len.
             consumer: Vec::with_capacity(64),
             queue: Vec::with_capacity(64),
@@ -206,7 +206,7 @@ impl Default for InFlightCounters {
 
 /// Decrement a subject counter in the HashMap, removing entry at zero.
 #[inline]
-fn dec_subject(map: &mut HashMap<u32, u32, ahash::RandomState>, key: u32) {
+fn dec_subject(map: &mut HashMap<u32, u32, foldhash::fast::FixedState>, key: u32) {
     if let Some(count) = map.get_mut(&key) {
         *count = count.saturating_sub(1);
         if *count == 0 {

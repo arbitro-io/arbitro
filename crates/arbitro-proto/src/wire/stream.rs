@@ -4,11 +4,12 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// 32B fixed — Create a stream. Variable name + filter follow.
 ///
 /// ```text
-/// [2 name_len][2 filter_len][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 pad]
+/// [2 name_len][2 filter_len][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 discard]
 /// ```
 ///
 /// Variable data layout: `[name (name_len)][filter (filter_len)]`
 /// `filter` is the subject pattern this stream captures (e.g. `"orders.>"`).
+/// `discard`: 0 = Old (ring-buffer, default), 1 = New (reject publish when full).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct CreateStreamFixed {
@@ -20,7 +21,7 @@ pub struct CreateStreamFixed {
     pub replicas: u8,
     pub journal_kind: u8,
     pub retention: u8,
-    pub _pad: u8,
+    pub discard: u8,
 }
 
 pub const CREATE_STREAM_FIXED_SIZE: usize = core::mem::size_of::<CreateStreamFixed>();
@@ -115,6 +116,9 @@ impl<'a> CreateStreamView<'a> {
 
     #[inline(always)]
     pub fn retention(&self) -> u8 { self.fixed().retention }
+
+    #[inline(always)]
+    pub fn discard(&self) -> u8 { self.fixed().discard }
 }
 
 pub struct DeleteStreamView<'a> {
