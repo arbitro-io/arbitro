@@ -29,9 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
-use crate::shard::shared::{
-    find_writer, DrainNotification, DrainSnapshot, SharedCounters,
-};
+use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
 use crate::shard::worker::ActiveBinding;
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -99,7 +97,6 @@ pub(in crate::shard) struct DrainScratch {
     local_subject: HashMap<(u32, u32), u32, rustc_hash::FxBuildHasher>,
 }
 
-
 impl DrainScratch {
     pub(in crate::shard) fn new() -> Self {
         Self {
@@ -107,16 +104,19 @@ impl DrainScratch {
             served_queues: Vec::with_capacity(8),
             dead_connections: Vec::with_capacity(4),
             resolve_cache: HashMap::with_capacity_and_hasher(
-                64, rustc_hash::FxBuildHasher::default(),
+                64,
+                rustc_hash::FxBuildHasher::default(),
             ),
             subject_limit_cache: HashMap::with_capacity_and_hasher(
-                64, rustc_hash::FxBuildHasher::default(),
+                64,
+                rustc_hash::FxBuildHasher::default(),
             ),
             acc: Accumulator::new(),
             deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
             local_subject: HashMap::with_capacity_and_hasher(
-                128, rustc_hash::FxBuildHasher::default(),
+                128,
+                rustc_hash::FxBuildHasher::default(),
             ),
         }
     }
@@ -230,17 +230,13 @@ pub(in crate::shard) fn drain_cycle(
                 frame.count as u64,
                 "shard"
             );
-            if std::env::var("ARBITRO_WIRE_TRACE").is_ok() {
-                eprintln!(
-                    "[wire] conn={} entries={} bytes={}",
-                    frame.connection_id.0, frame.count, frame.bytes.len()
-                );
-            }
+
             let ok = crate::transport::registry::write_all_blocking(
                 &writer.writer,
                 &frame.bytes,
                 &writer.runtime,
             );
+
             if ok {
                 crate::lifecycle_trace!(
                     "30_send_bytes_done",
@@ -284,12 +280,7 @@ pub(in crate::shard) fn drain_cycle(
     // semantics so the engine's Command::Delivered handler sees the same
     // shape it did before.
     if !scratch.deliveries.is_empty() {
-        notify_delivered_grouped(
-            notify_tx,
-            &snap.bindings,
-            &scratch.deliveries,
-            &flush_ok,
-        );
+        notify_delivered_grouped(notify_tx, &snap.bindings, &scratch.deliveries, &flush_ok);
     }
 
     // Cursor advances to last fully-processed entry.
@@ -348,7 +339,11 @@ fn process_drain_entry(
     // Single match_table lookup — reused across all three steps below.
     // Early return when no match table: all three steps would skip and
     // scratch.matches would end up empty anyway.
-    let Some(mt) = snap.match_tables.get(stream_raw as usize).and_then(|o| o.as_ref()) else {
+    let Some(mt) = snap
+        .match_tables
+        .get(stream_raw as usize)
+        .and_then(|o| o.as_ref())
+    else {
         return;
     };
     let cache_key = (stream_raw, subject_hash);
@@ -367,9 +362,10 @@ fn process_drain_entry(
     // counter is keyed by (consumer_id, subject_hash) for per-consumer
     // isolation.
     let subject_limit = if mt.has_subject_limits() {
-        *scratch.subject_limit_cache.entry(cache_key).or_insert_with(|| {
-            mt.resolve_subject_limit_readonly(subject_hash, entry.subject)
-        })
+        *scratch
+            .subject_limit_cache
+            .entry(cache_key)
+            .or_insert_with(|| mt.resolve_subject_limit_readonly(subject_hash, entry.subject))
     } else {
         None
     };
@@ -479,10 +475,7 @@ fn dispatch_recipients(
         if !binding.fire_and_forget {
             let pending = local_delta_get(&scratch.local_inflight, consumer_id.0);
             if pending >= binding.max_inflight
-                || !counters.consumer_has_capacity(
-                    consumer_id.0,
-                    binding.max_inflight - pending,
-                )
+                || !counters.consumer_has_capacity(consumer_id.0, binding.max_inflight - pending)
             {
                 *more_pending = true;
                 track_skipped(lowest_skipped, entry.seq);
@@ -499,11 +492,7 @@ fn dispatch_recipients(
                     .copied()
                     .unwrap_or(0);
                 if pending_subj >= max
-                    || !counters.subject_has_room(
-                        consumer_id.0,
-                        subject_hash,
-                        max - pending_subj,
-                    )
+                    || !counters.subject_has_room(consumer_id.0, subject_hash, max - pending_subj)
                 {
                     *more_pending = true;
                     track_skipped(lowest_skipped, entry.seq);
@@ -568,9 +557,7 @@ fn notify_delivered_grouped(
     deliveries: &[PendingNotify],
     flush_ok: &std::collections::HashMap<ConnectionId, bool, rustc_hash::FxBuildHasher>,
 ) {
-    let frame_ok = |conn: ConnectionId| -> bool {
-        flush_ok.get(&conn).copied().unwrap_or(false)
-    };
+    let frame_ok = |conn: ConnectionId| -> bool { flush_ok.get(&conn).copied().unwrap_or(false) };
 
     // Fast path — every delivery belongs to the same binding AND all
     // frames succeeded. Pub/sub of a single consumer hits this path.
