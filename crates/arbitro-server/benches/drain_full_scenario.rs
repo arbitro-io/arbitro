@@ -27,6 +27,9 @@
 //!                            measured to quantify how much the per-conn grouping costs).
 //!   V5  PER-STREAM-DRAINER — msgs pre-grouped by stream (simulates task-per-stream
 //!                            architecture). Per-stream serial match+emit loop.
+//!   V6  TRIE-WALK          — V1 shape + resolve via real SubjectTrie walk over
+//!                            subject tokens (production-shaped factor 6), instead
+//!                            of linear pattern Vec iteration.
 //!
 //! Reports per variant:
 //!   - ns/cycle, ns/msg, msgs/s
@@ -74,6 +77,8 @@ const PAYLOAD_SIZE:         usize = 128;
 const INITIAL_CAP:          u16   = 32;
 const MAX_AGE_MS:           u64   = 60_000;
 const CYCLES:               usize = 5_000;
+const N_CATEGORIES:         usize = 4;   // "meta", "qr", "transfer", "notify"
+const N_TIERS:              usize = 3;   // "premium", "basic", "free"
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -84,8 +89,9 @@ struct StoreEntry {
     subject_hash: u32,
     timestamp:    u64,
     flags:        u8,           // bit 0 = TOMBSTONE
-    // Subject/payload live in shared buffers to keep the entry small
-    // (matches the real store: subjects are interned, payloads in arena).
+    /// Precomputed token hashes (4 tokens: "message.cat.tier.user_id").
+    /// Used by V6 TRIE-WALK — V1..V5 ignore this field.
+    tokens:       [u64; 4],
 }
 
 const FLAG_TOMBSTONE: u8 = 1 << 0;
@@ -115,8 +121,13 @@ struct StreamMeta {
 struct MatchTable {
     /// Fast path: concrete-subject hash -> list of matching entries.
     exact: HashMap<u32, Vec<u16>, foldhash::fast::FixedState>,   // values = entry indices
-    /// Wildcard patterns; resolved when `exact` lookup is empty.
-    patterns: Vec<(u32, u16)>,  // (pattern_id, entry_idx)
+    /// Wildcard patterns (linear Vec) — used by V1..V5 (`resolve`).
+    /// Compiled `Pattern` so V1..V5 match on the SAME semantics as V6's trie —
+    /// the only difference between variants is HOW they scan (linear vs trie),
+    /// not WHICH bindings they select.
+    patterns: Vec<(Pattern, u16)>,
+    /// SubjectTrie — used by V6 (`resolve_trie`).
+    trie: TrieNode,
     /// All entries for this stream — referenced by index from `exact` and `patterns`.
     entries: Vec<MatchEntry>,
     /// Has any entry with a subject limit (gates subject-limit lookup).
@@ -125,20 +136,33 @@ struct MatchTable {
 
 impl MatchTable {
     /// Mirror `MatchTable::lookup` + `resolve_patterns_readonly` from production.
-    /// Fills `out` with matching entry indices. Uses scratch to avoid allocs.
+    /// Fills `out` with matching entry indices. V1..V5 entry point — LINEAR walk
+    /// over compiled patterns with `Pattern.matches(tokens)`.
     #[inline]
-    fn resolve(&self, subject_hash: u32, out: &mut Vec<u16>) {
+    fn resolve(&self, subject_hash: u32, tokens: &[u64; 4], out: &mut Vec<u16>) {
         out.clear();
         if let Some(v) = self.exact.get(&subject_hash) {
             out.extend_from_slice(v);
             return;
         }
-        // Pattern fallback: walk patterns (simulates trie walk cost).
-        for &(pid, idx) in &self.patterns {
-            if pattern_matches(subject_hash, pid) {
-                out.push(idx);
-            }
+        for (pat, idx) in &self.patterns {
+            if pat.matches(tokens) { out.push(*idx); }
         }
+        // Stable order so subject_limit consumes matches in the same order
+        // regardless of which variant runs (linear vs trie DFS can differ).
+        out.sort_unstable();
+    }
+
+    /// V6 path: exact HashMap hit → fallback to real SubjectTrie walk.
+    #[inline]
+    fn resolve_trie(&self, subject_hash: u32, tokens: &[u64; 4], out: &mut Vec<u16>) {
+        out.clear();
+        if let Some(v) = self.exact.get(&subject_hash) {
+            out.extend_from_slice(v);
+            return;
+        }
+        self.trie.walk(tokens, out);
+        out.sort_unstable();
     }
 }
 
@@ -153,6 +177,101 @@ fn pattern_matches(subject_hash: u32, pattern_id: u32) -> bool {
 
 /// Dense-by-connection liveness bitmap (conn_id < TOTAL_CONNS).
 struct ConnAlive { alive: Vec<bool> }
+
+// ── SubjectTrie (production-shaped pattern resolve, used by V6) ────────────
+
+#[derive(Clone, Copy)]
+enum Tok {
+    Exact(u64),
+    Star,
+}
+
+#[derive(Clone, Copy)]
+struct Pattern {
+    toks: [Tok; 4],
+    has_gt: bool,   // ">" wildcard after toks[len..]
+    len: u8,
+}
+
+impl Pattern {
+    #[inline(always)]
+    fn matches(&self, tokens: &[u64; 4]) -> bool {
+        let n = self.len as usize;
+        for i in 0..n {
+            match self.toks[i] {
+                Tok::Exact(h) => if tokens[i] != h { return false; },
+                Tok::Star     => {}
+            }
+        }
+        if self.has_gt { true } else { n == 4 }
+    }
+}
+
+struct TrieNode {
+    children: HashMap<u64, Box<TrieNode>, foldhash::fast::FixedState>,
+    wildcard_star: Option<Box<TrieNode>>,
+    gt_bindings: Vec<u16>,
+    terminal_bindings: Vec<u16>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            children: HashMap::with_capacity_and_hasher(4, foldhash::fast::FixedState::default()),
+            wildcard_star: None,
+            gt_bindings: Vec::new(),
+            terminal_bindings: Vec::new(),
+        }
+    }
+    fn insert(&mut self, pat: &Pattern, b_idx: u16) {
+        let mut node = self;
+        for i in 0..(pat.len as usize) {
+            match pat.toks[i] {
+                Tok::Exact(h) => {
+                    node = node.children.entry(h).or_insert_with(|| Box::new(TrieNode::new()));
+                }
+                Tok::Star => {
+                    if node.wildcard_star.is_none() {
+                        node.wildcard_star = Some(Box::new(TrieNode::new()));
+                    }
+                    node = node.wildcard_star.as_mut().unwrap();
+                }
+            }
+        }
+        if pat.has_gt { node.gt_bindings.push(b_idx); } else { node.terminal_bindings.push(b_idx); }
+    }
+    #[inline]
+    fn walk(&self, tokens: &[u64; 4], out: &mut Vec<u16>) {
+        walk_rec(self, tokens, 0, out);
+    }
+}
+
+#[inline]
+fn walk_rec(node: &TrieNode, tokens: &[u64; 4], depth: usize, out: &mut Vec<u16>) {
+    if !node.gt_bindings.is_empty() { out.extend_from_slice(&node.gt_bindings); }
+    if depth == 4 {
+        if !node.terminal_bindings.is_empty() { out.extend_from_slice(&node.terminal_bindings); }
+        return;
+    }
+    let tok = tokens[depth];
+    if let Some(child) = node.children.get(&tok) {
+        walk_rec(child, tokens, depth + 1, out);
+    }
+    if let Some(star) = node.wildcard_star.as_deref() {
+        walk_rec(star, tokens, depth + 1, out);
+    }
+}
+
+// FNV-1a for deterministic token hashing in the bench.
+#[inline]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01B3); }
+    h
+}
+
+const CAT_NAMES:  [&[u8]; 4] = [b"meta", b"qr", b"transfer", b"notify"];
+const TIER_NAMES: [&[u8]; 3] = [b"premium", b"basic", b"free"];
 
 /// Shared atomics stand-in: per-stream demand + global demand gate.
 struct Counters {
@@ -283,7 +402,7 @@ fn run_v1(
         let mt = unsafe { mts.get_unchecked(sid) };
 
         // Factor 6: match_table resolve (exact + patterns).
-        mt.resolve(entry.subject_hash, &mut scratch.resolved);
+        mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
         if scratch.resolved.is_empty() { continue; }
 
         // Factor 7: subject limit.
@@ -332,7 +451,7 @@ fn run_v2(
         let sid = entry.stream_id as usize;
         let mt = unsafe { mts.get_unchecked(sid) };
 
-        mt.resolve(entry.subject_hash, &mut scratch.resolved);
+        mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
         if scratch.resolved.is_empty() { continue; }
 
         let mut subj_remaining = if mt.has_subject_limits {
@@ -404,7 +523,7 @@ fn run_v3(
         let caps = unsafe { scratch.caps.get_unchecked_mut(sid) };
         for &i in grp {
             let entry = unsafe { entries.get_unchecked(i) };
-            mt.resolve(entry.subject_hash, &mut scratch.resolved);
+            mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
             if scratch.resolved.is_empty() { continue; }
             let mut subj_remaining = if mt.has_subject_limits {
                 stream_metas[sid].subject_limits.get(&entry.subject_hash).copied()
@@ -449,7 +568,7 @@ fn run_v4(
         let sid = entry.stream_id as usize;
         let mt = unsafe { mts.get_unchecked(sid) };
 
-        mt.resolve(entry.subject_hash, &mut scratch.resolved);
+        mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
         if scratch.resolved.is_empty() { continue; }
 
         let mut subj_remaining = if mt.has_subject_limits {
@@ -503,7 +622,7 @@ fn run_v5(
             if sm.max_age_ms > 0 && entry.timestamp + sm.max_age_ms <= now { continue; }
             if entry.flags & FLAG_TOMBSTONE != 0 { continue; }
 
-            mt.resolve(entry.subject_hash, &mut scratch.resolved);
+            mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
             if scratch.resolved.is_empty() { continue; }
             let mut subj_remaining = if mt.has_subject_limits {
                 sm.subject_limits.get(&entry.subject_hash).copied()
@@ -518,6 +637,46 @@ fn run_v5(
                 write_entry(buf, entry.seq, m.consumer_id, m.sub_id, subject, payload);
                 emit += 1;
             }
+        }
+    }
+    let mut frames = 0u64;
+    for (_k, buf) in scratch.acc_bucket.iter() { black_box(&buf[..]); frames += 1; }
+    (emit, frames)
+}
+
+// V6 — TRIE-WALK (V1 shape + resolve_trie instead of linear Vec walk)
+fn run_v6(
+    entries: &[StoreEntry], mts: &[MatchTable], stream_metas: &[StreamMeta],
+    counters: &Counters, conns: &ConnAlive, scratch: &mut Scratch,
+    subject: &[u8], payload: &[u8], now: u64,
+) -> (u64, u64) {
+    if !counters.has_any_demand { return (0, 0); }
+    scratch.acc_bucket.clear();
+    scratch.reset_caps(mts);
+    let mut emit = 0u64;
+
+    for e in entries {
+        let entry = preflight!(*e, now, stream_metas, counters);
+        let sid = entry.stream_id as usize;
+        let mt = unsafe { mts.get_unchecked(sid) };
+
+        // Factor 6: same hit-set as V1..V5 but via trie walk (not linear).
+        mt.resolve_trie(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
+        if scratch.resolved.is_empty() { continue; }
+
+        let mut subj_remaining = if mt.has_subject_limits {
+            stream_metas[sid].subject_limits.get(&entry.subject_hash).copied()
+        } else { None };
+
+        let mut seen_mask = 0u64;
+        let caps = unsafe { scratch.caps.get_unchecked_mut(sid) };
+        for &ei in &scratch.resolved {
+            let m = unsafe { mt.entries.get_unchecked(ei as usize) };
+            if !check_and_consume(m, caps, ei, conns, &mut seen_mask, &mut subj_remaining) { continue; }
+            let buf = scratch.acc_bucket.entry((m.connection_id, entry.stream_id))
+                .or_insert_with(|| BytesMut::with_capacity(2048));
+            write_entry(buf, entry.seq, m.consumer_id, m.sub_id, subject, payload);
+            emit += 1;
         }
     }
     let mut frames = 0u64;
@@ -553,9 +712,24 @@ fn build_world(rng: &mut Rng) -> (Vec<MatchTable>, Vec<StreamMeta>, Counters, Co
                 exact.entry(h).or_default().push(i as u16);
             }
         }
-        let mut patterns = Vec::with_capacity(PATTERNS_PER_STREAM);
+        // Compile patterns ONCE and share between linear walk (V1..V5) and trie
+        // (V6) so both variants make IDENTICAL match decisions.
+        let mut patterns: Vec<(Pattern, u16)> = Vec::with_capacity(SUBS_PER_STREAM);
+        let mut trie = TrieNode::new();
         for i in 0..SUBS_PER_STREAM {
-            patterns.push((entries[i].pattern_id, i as u16));
+            let cat  = rng.range_usize(N_CATEGORIES);
+            let tier = rng.range_usize(N_TIERS);
+            let star_cat  = rng.range(100) < 40;
+            let star_tier = rng.range(100) < 50;
+            let toks = [
+                Tok::Exact(fnv1a(b"message")),
+                if star_cat  { Tok::Star } else { Tok::Exact(fnv1a(CAT_NAMES[cat])) },
+                if star_tier { Tok::Star } else { Tok::Exact(fnv1a(TIER_NAMES[tier])) },
+                Tok::Star,
+            ];
+            let pat = Pattern { toks, has_gt: false, len: 4 };
+            trie.insert(&pat, i as u16);
+            patterns.push((pat, i as u16));
         }
 
         let has_subject_limits = rng.range(100) < 10;
@@ -567,7 +741,7 @@ fn build_world(rng: &mut Rng) -> (Vec<MatchTable>, Vec<StreamMeta>, Counters, Co
             }
         }
 
-        mts.push(MatchTable { exact, patterns, entries, has_subject_limits });
+        mts.push(MatchTable { exact, patterns, trie, entries, has_subject_limits });
         metas.push(StreamMeta {
             paused: rng.range(1000) < 5,   // 0.5% paused
             max_age_ms: MAX_AGE_MS,
@@ -586,14 +760,27 @@ fn build_world(rng: &mut Rng) -> (Vec<MatchTable>, Vec<StreamMeta>, Counters, Co
 fn build_cycle(rng: &mut Rng, base_seq: u64, now_ms: u64) -> Vec<StoreEntry> {
     // Mix streams interleaved (walk-by-seq shape); ACTIVE_STREAMS get msgs.
     let mut out = Vec::with_capacity(MSGS_PER_CYCLE);
+    let t_msg  = fnv1a(b"message");
     for i in 0..MSGS_PER_CYCLE {
-        let sid = (rng.range_usize(ACTIVE_STREAMS)) as u16;
+        let sid  = (rng.range_usize(ACTIVE_STREAMS)) as u16;
+        let cat  = rng.range_usize(N_CATEGORIES);
+        let tier = rng.range_usize(N_TIERS);
+        let user = rng.range(SUBJECT_CARDINALITY);
+        let t_cat  = fnv1a(CAT_NAMES[cat]);
+        let t_tier = fnv1a(TIER_NAMES[tier]);
+        // Per-user token: derive a stable hash from user id.
+        let t_user = fnv1a(&user.to_le_bytes());
+        // subject_hash: stable fn of (cat, tier, user) so V1/V6 hash to same bucket.
+        let sh = ((t_msg ^ t_cat).wrapping_mul(0x9E37_79B1)
+                  ^ t_tier.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                  ^ t_user) as u32;
         out.push(StoreEntry {
             seq:          base_seq + i as u64,
             stream_id:    sid,
-            subject_hash: rng.range(SUBJECT_CARDINALITY),
+            subject_hash: sh,
             timestamp:    now_ms.saturating_sub(rng.range(30_000) as u64),
             flags:        if rng.range(1000) < 5 { FLAG_TOMBSTONE } else { 0 },
+            tokens:       [t_msg, t_cat, t_tier, t_user],
         });
     }
     out
@@ -664,12 +851,17 @@ fn main() {
     let ns5 = start.elapsed().as_nanos() as f64 / CYCLES as f64;
     let r5 = ("V5  PER-STREAM     (pre-grouped, simulates task-per-stream) ", ns5, e5, f5);
 
-    // ── Correctness: V1/V2/V3/V5 must emit same count (same per-(conn,stream)
-    // semantics). V4 may differ in frame count but NOT in entry count.
+    let r6 = measure!("V6  TRIE-WALK      (V1 shape + SubjectTrie walk resolve)  ",
+        |c: &Vec<StoreEntry>| run_v6(c, &mts, &metas, &counters, &conns, &mut scratch, &subject, &payload, now_ms));
+
+    // ── Correctness: every variant must emit the same total entry count
+    // (all validate the same 9 factors). V4 may have fewer frames but equal
+    // entry count (merges per-conn into per-stream buffers).
     assert_eq!(r1.2, r2.2, "emit mismatch V1 vs V2");
     assert_eq!(r1.2, r3.2, "emit mismatch V1 vs V3");
     assert_eq!(r1.2, r4.2, "emit mismatch V1 vs V4");
     assert_eq!(r1.2, r5.2, "emit mismatch V1 vs V5");
+    assert_eq!(r1.2, r6.2, "emit mismatch V1 vs V6");
 
     // ── Report ──────────────────────────────────────────────────────────
     println!();
@@ -683,7 +875,7 @@ fn main() {
     println!("{:<60} | {:>12} | {:>12} | {:>10} | {:>12} | {:>10}",
              "Variant", "ns/cycle", "ns/msg", "msgs/s", "emit (total)", "frames");
     println!("{}", "-".repeat(128));
-    for (name, ns, emit, frames) in [r1, r2, r3, r4, r5] {
+    for (name, ns, emit, frames) in [r1, r2, r3, r4, r5, r6] {
         let per_msg = ns / MSGS_PER_CYCLE as f64;
         let mps = (MSGS_PER_CYCLE as f64 * 1e9 / ns) / 1e6;
         println!("{:<60} | {:>9.0} ns | {:>9.2} ns | {:>6.2} M/s | {:>12} | {:>10}",
@@ -692,7 +884,7 @@ fn main() {
     println!();
     let base = r1.1;
     println!("Delta vs V1 (ACCUMULATOR, prod shape):");
-    for (name, ns, _, _) in [r2, r3, r4, r5] {
+    for (name, ns, _, _) in [r2, r3, r4, r5, r6] {
         let delta = base / ns;
         let pct = (delta - 1.0) * 100.0;
         println!("  {:<60}  {:>6.2}×  ({:+.1}%)", name, delta, pct);
