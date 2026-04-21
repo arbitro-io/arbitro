@@ -40,6 +40,9 @@ ahash          = "0.8"
 dashmap        = "6"
 rapidhash      = "1"
 rustc-hash     = "2"
+arc-swap       = "1"
+crossbeam-channel = "0.5"
+crossbeam-queue   = "0.3"
 
 [[bench]]
 name = "lookup_strategies"
@@ -63,4 +66,40 @@ harness = false
 
 [[bench]]
 name = "accumulator_grouping"
+harness = false
+
+[[bench]]
+name = "topology_graph"
+harness = false
+
+[[bench]]
+name = "shared_dense_vs_map"
+harness = false
+
+[[bench]]
+name = "fastswap_patterns"
+harness = false
+
+[[bench]]
+name = "state_via_channel"
+harness = false
+
+[[bench]]
+name = "spmc_patterns"
+harness = false
+
+[[bench]]
+name = "tokio_scale"
+harness = false
+
+[[bench]]
+name = "drain_pipeline"
+harness = false
+
+[[bench]]
+name = "trie_walk"
+harness = false
+
+[[bench]]
+name = "drain_writer_lookup"
 harness = false
