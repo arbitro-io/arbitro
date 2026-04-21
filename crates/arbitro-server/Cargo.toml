@@ -103,3 +103,7 @@ harness = false
 [[bench]]
 name = "drain_writer_lookup"
 harness = false
+
+[[bench]]
+name = "drain_full_scenario"
+harness = false
