@@ -55,6 +55,10 @@ pub struct ActiveBinding {
     /// via `try_write` + `writable()` for backpressure — no intermediate
     /// channel, no writer task.
     pub(super) writer: Arc<tokio::net::tcp::OwnedWriteHalf>,
+    /// Per-connection write lock. Serializes full frames across threads
+    /// so `try_write` loops from different shards don't interleave bytes
+    /// on the wire. See `transport::registry::write_all_blocking`.
+    pub(super) write_lock: Arc<std::sync::Mutex<()>>,
     /// Tokio runtime handle — needed so the drain OS thread can
     /// `block_on(writer.writable())` when the kernel buffer fills.
     pub(super) runtime: tokio::runtime::Handle,
@@ -421,6 +425,7 @@ impl CommandWorker {
                 max_inflight: b.max_inflight,
                 fire_and_forget: b.fire_and_forget,
                 writer: Arc::clone(&b.writer),
+                write_lock: Arc::clone(&b.write_lock),
                 runtime: b.runtime.clone(),
             })
             .collect();
@@ -439,6 +444,7 @@ impl CommandWorker {
                 .entry(b.connection_id.0)
                 .or_insert_with(|| crate::shard::shared::WriterIndexEntry {
                     writer: Arc::clone(&b.writer),
+                    write_lock: Arc::clone(&b.write_lock),
                     runtime: b.runtime.clone(),
                 });
         }

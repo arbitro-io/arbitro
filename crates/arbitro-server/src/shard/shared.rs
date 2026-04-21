@@ -310,6 +310,10 @@ pub struct DrainSnapshot {
 #[derive(Clone)]
 pub struct WriterIndexEntry {
     pub writer: std::sync::Arc<tokio::net::tcp::OwnedWriteHalf>,
+    /// Per-connection write lock. Serializes full frames across threads
+    /// so `try_write` loops from different shards don't interleave bytes
+    /// on the wire. See `transport::registry::write_all_blocking`.
+    pub write_lock: std::sync::Arc<std::sync::Mutex<()>>,
     pub runtime: tokio::runtime::Handle,
 }
 

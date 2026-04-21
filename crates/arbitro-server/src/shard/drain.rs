@@ -233,6 +233,7 @@ pub(in crate::shard) fn drain_cycle(
 
             let ok = crate::transport::registry::write_all_blocking(
                 &writer.writer,
+                &writer.write_lock,
                 &frame.bytes,
                 &writer.runtime,
             );

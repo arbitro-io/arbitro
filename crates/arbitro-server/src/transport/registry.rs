@@ -56,6 +56,7 @@ impl ConnectionRegistry {
         let conn_id = self.inner.conn_id_gen.next();
         let session = Session {
             writer,
+            write_lock: Arc::new(Mutex::new(())),
             last_activity: Instant::now(),
         };
         self.inner
@@ -87,6 +88,19 @@ impl ConnectionRegistry {
     pub fn get_writer(&self, conn_id: u64) -> Option<Arc<OwnedWriteHalf>> {
         let sessions = self.inner.sessions.lock().unwrap();
         sessions.get(&conn_id).map(|s| Arc::clone(&s.writer))
+    }
+
+    /// Clone both the writer half and the per-connection write lock. O(1)
+    /// — two Arc refcount bumps. The lock must be held around any
+    /// full-frame write to guarantee wire atomicity across threads.
+    pub fn get_writer_locked(
+        &self,
+        conn_id: u64,
+    ) -> Option<(Arc<OwnedWriteHalf>, Arc<Mutex<()>>)> {
+        let sessions = self.inner.sessions.lock().unwrap();
+        sessions
+            .get(&conn_id)
+            .map(|s| (Arc::clone(&s.writer), Arc::clone(&s.write_lock)))
     }
 
     /// Clone the cached tokio runtime handle (cheap — Arc bump).
@@ -150,14 +164,14 @@ impl ConnectionRegistry {
     }
 
     fn write_to(&self, conn_id: u64, frame: &[u8]) -> bool {
-        let writer = {
+        let (writer, write_lock) = {
             let sessions = self.inner.sessions.lock().unwrap();
             match sessions.get(&conn_id) {
-                Some(s) => Arc::clone(&s.writer),
+                Some(s) => (Arc::clone(&s.writer), Arc::clone(&s.write_lock)),
                 None => return false,
             }
         };
-        write_all_blocking(&writer, frame, &self.inner.runtime)
+        write_all_blocking(&writer, &write_lock, frame, &self.inner.runtime)
     }
 }
 
@@ -165,10 +179,28 @@ impl ConnectionRegistry {
 /// until `WouldBlock`; then `Handle::block_on(writer.writable())` to park
 /// the caller in the tokio reactor until the kernel buffer has space.
 ///
+/// `write_lock` is held for the entire duration of the frame write.
+/// `OwnedWriteHalf::try_write(&self, ..)` allows concurrent callers, but
+/// a multi-syscall write loop is NOT atomic across threads — two
+/// concurrent writers would interleave bytes on the wire, corrupting
+/// the length-prefixed framing. The lock serializes full frames.
+///
 /// Returns `false` on a non-recoverable error (closed / reset socket).
 /// Safe to call from any thread — including OS threads not owned by the
 /// tokio runtime (the `Handle::block_on` drives the reactor for us).
-pub fn write_all_blocking(writer: &OwnedWriteHalf, frame: &[u8], handle: &Handle) -> bool {
+pub fn write_all_blocking(
+    writer: &OwnedWriteHalf,
+    write_lock: &Mutex<()>,
+    frame: &[u8],
+    handle: &Handle,
+) -> bool {
+    let _guard = write_lock.lock().unwrap_or_else(|poisoned| {
+        // A previous writer panicked mid-frame. The socket may have
+        // partial bytes from that frame already flushed — there is no
+        // recovery; but holding the lock lets this caller at least stop
+        // the wire from compounding corruption.
+        poisoned.into_inner()
+    });
     let mut off = 0;
     while off < frame.len() {
         match writer.try_write(&frame[off..]) {

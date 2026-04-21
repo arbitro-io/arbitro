@@ -277,7 +277,9 @@ impl CommandWorker {
 
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
-                if let Some(writer) = self.registry.get_writer(connection_id.0) {
+                if let Some((writer, write_lock)) =
+                    self.registry.get_writer_locked(connection_id.0)
+                {
                     self.bindings.push(ActiveBinding {
                         binding_id,
                         connection_id,
@@ -287,6 +289,7 @@ impl CommandWorker {
                         max_inflight,
                         fire_and_forget,
                         writer,
+                        write_lock,
                         runtime: self.registry.runtime_handle(),
                     });
                 }
@@ -470,7 +473,9 @@ impl CommandWorker {
                 .map(|c| c.ack_policy == AckPolicy::None)
                 .unwrap_or(false);
 
-            if let Some(writer) = self.registry.get_writer(cmd.connection_id.0) {
+            if let Some((writer, write_lock)) =
+                self.registry.get_writer_locked(cmd.connection_id.0)
+            {
                 self.bindings.push(ActiveBinding {
                     binding_id,
                     connection_id: cmd.connection_id,
@@ -480,6 +485,7 @@ impl CommandWorker {
                     max_inflight,
                     fire_and_forget,
                     writer,
+                    write_lock,
                     runtime: self.registry.runtime_handle(),
                 });
             }
