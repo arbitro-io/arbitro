@@ -26,6 +26,7 @@
 //! Buckets are pooled. `BytesMut` capacity is reused across cycles — no
 //! reallocation in steady state.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbitro_engine_v2::types::{ConnectionId, ConsumerId, StreamId};
@@ -144,13 +145,21 @@ impl Bucket {
 /// Mechanical wire grouper. Reused across drain cycles.
 pub struct Accumulator {
     buckets: Vec<Bucket>,
-    /// `(conn_raw, stream_raw, is_fanout, bucket_idx)` — linear scan over
-    /// the handful of buckets active in a cycle. `is_fanout` is part of
-    /// the key so a single (conn, stream) can simultaneously hold a
-    /// per-consumer `RepBatch` bucket AND a `FanoutBatch` bucket: the
-    /// dispatcher emits ack-mode consumers as `RepBatch` entries and
-    /// fire-and-forget consumers as one collapsed `FanoutBatch` entry.
-    active: Vec<(u64, u32, bool, usize)>,
+    /// Ordered list of bucket indices active in the current cycle.
+    /// Preserves first-touch order so `for_each` emits frames deterministically.
+    active: Vec<usize>,
+    /// `(conn_raw, stream_raw, is_fanout) -> bucket_idx` — O(1) bucket
+    /// lookup during `add`/`add_fanout`. `is_fanout` is part of the key so
+    /// a single (conn, stream) can simultaneously hold a per-consumer
+    /// `RepBatch` bucket AND a `FanoutBatch` bucket: the dispatcher emits
+    /// ack-mode consumers as `RepBatch` entries and fire-and-forget
+    /// consumers as one collapsed `FanoutBatch` entry.
+    ///
+    /// Replaces the previous linear-scan `Vec<(u64, u32, bool, usize)>`.
+    /// Bench (`drain_full_scenario`) showed +51% throughput at 64 active
+    /// buckets × ~668 emits/cycle — linear scan was the dominant cost in
+    /// acquire_bucket. foldhash `FixedState` per `.agent/rules/performance.md`.
+    index: HashMap<(u64, u32, bool), usize, foldhash::fast::FixedState>,
 }
 
 impl Default for Accumulator {
@@ -172,6 +181,10 @@ impl Accumulator {
         Self {
             buckets: Vec::with_capacity(16),
             active: Vec::with_capacity(16),
+            index: HashMap::with_capacity_and_hasher(
+                16,
+                foldhash::fast::FixedState::default(),
+            ),
         }
     }
 
@@ -182,6 +195,7 @@ impl Accumulator {
             if b.in_use { b.release(); }
         }
         self.active.clear();
+        self.index.clear();
     }
 
     /// Append a per-consumer entry. Routes to the `RepBatch` bucket for
@@ -233,7 +247,7 @@ impl Accumulator {
     where
         F: FnMut(Frame) -> bool,
     {
-        for &(_conn_raw, _stream_raw, _is_fanout, idx) in self.active.iter() {
+        for &idx in self.active.iter() {
             let b = &mut self.buckets[idx];
             if b.count == 0 {
                 b.release();
@@ -266,8 +280,10 @@ impl Accumulator {
             b.release();
         }
         self.active.clear();
+        self.index.clear();
     }
 
+    #[inline]
     fn acquire_bucket(
         &mut self,
         conn: ConnectionId,
@@ -275,10 +291,9 @@ impl Accumulator {
         first_seq: u64,
         is_fanout: bool,
     ) -> usize {
-        for &(c, s, f, idx) in self.active.iter() {
-            if c == conn.0 && s == stream.raw() && f == is_fanout {
-                return idx;
-            }
+        let key = (conn.0, stream.raw(), is_fanout);
+        if let Some(&idx) = self.index.get(&key) {
+            return idx;
         }
         let idx = match self.buckets.iter().position(|b| !b.in_use) {
             Some(i) => i,
@@ -288,7 +303,8 @@ impl Accumulator {
             }
         };
         self.buckets[idx].activate(conn, stream, first_seq, is_fanout);
-        self.active.push((conn.0, stream.raw(), is_fanout, idx));
+        self.active.push(idx);
+        self.index.insert(key, idx);
         idx
     }
 
@@ -301,13 +317,9 @@ impl Accumulator {
     /// `(conn, stream)`. `None` if no such bucket is active this cycle.
     #[cfg(test)]
     pub(crate) fn bucket_count_for(&self, conn: ConnectionId, stream: StreamId) -> Option<u16> {
-        self.active.iter().find_map(|&(c, s, f, idx)| {
-            if c == conn.0 && s == stream.raw() && !f {
-                Some(self.buckets[idx].count)
-            } else {
-                None
-            }
-        })
+        self.index
+            .get(&(conn.0, stream.raw(), false))
+            .map(|&idx| self.buckets[idx].count)
     }
 
     /// Count of entries in the fanout (`FanoutBatch`) bucket for
@@ -318,13 +330,9 @@ impl Accumulator {
         conn: ConnectionId,
         stream: StreamId,
     ) -> Option<u16> {
-        self.active.iter().find_map(|&(c, s, f, idx)| {
-            if c == conn.0 && s == stream.raw() && f {
-                Some(self.buckets[idx].count)
-            } else {
-                None
-            }
-        })
+        self.index
+            .get(&(conn.0, stream.raw(), true))
+            .map(|&idx| self.buckets[idx].count)
     }
 }
 
