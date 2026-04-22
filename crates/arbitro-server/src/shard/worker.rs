@@ -29,9 +29,7 @@ use tokio::sync::mpsc;
 use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::router::SharedStore;
-use crate::shard::shared::{
-    DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap,
-};
+use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
 
 // ── Cross-handler private types ──────────────────────────────────────────────
@@ -136,7 +134,9 @@ impl DrainWorker {
         }
 
         loop {
+            crate::lifecycle_trace!("19_1_gate_waiting", 0, 0, "shard");
             self.gate.acquire();
+            crate::lifecycle_trace!("19_2_gate_acquired", 0, 0, "shard");
 
             if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
@@ -185,9 +185,7 @@ impl DrainWorker {
 
                 // Backpressure: cursor didn't advance → downstream full.
                 if stalled && self.gate.is_open() {
-                    std::thread::park_timeout(
-                        std::time::Duration::from_micros(50),
-                    );
+                    std::thread::park_timeout(std::time::Duration::from_micros(50));
                     break;
                 }
             }
@@ -240,11 +238,10 @@ impl CommandWorker {
             self.drain_notifications();
 
             if self.accum_total > 0 {
-                let timeout = self.accum_deadline
+                let timeout = self
+                    .accum_deadline
                     .map(|d| d.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_millis(
-                        self.flusher_config.interval_ms,
-                    ));
+                    .unwrap_or(Duration::from_millis(self.flusher_config.interval_ms));
 
                 tokio::select! {
                     cmd = self.rx.recv() => {
@@ -332,7 +329,8 @@ impl CommandWorker {
             if let Err(e) = self.store.lock().unwrap().shutdown() {
                 tracing::error!(error = ?e, "store shutdown failed");
             }
-            self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             self.gate.release();
             return true;
         }
@@ -346,9 +344,7 @@ impl CommandWorker {
         }
         let force = self.accum_total >= self.flusher_config.max_size
             || self.accum_bytes >= self.flusher_config.max_bytes;
-        let expired = self
-            .accum_deadline
-            .is_some_and(|d| Instant::now() >= d);
+        let expired = self.accum_deadline.is_some_and(|d| Instant::now() >= d);
         if force || expired {
             self.flush_accumulator();
         }
@@ -435,18 +431,21 @@ impl CommandWorker {
         // HashMap+foldhash: connection_id is unbounded-monotonic, direct
         // Vec<Option<T>> would leak memory, and HashMap beats binary_search.
         let mut writers_by_conn: std::collections::HashMap<
-            u64, crate::shard::shared::WriterIndexEntry, foldhash::fast::FixedState,
+            u64,
+            crate::shard::shared::WriterIndexEntry,
+            foldhash::fast::FixedState,
         > = std::collections::HashMap::with_capacity_and_hasher(
-            self.bindings.len(), foldhash::fast::FixedState::default(),
+            self.bindings.len(),
+            foldhash::fast::FixedState::default(),
         );
         for b in &self.bindings {
-            writers_by_conn
-                .entry(b.connection_id.0)
-                .or_insert_with(|| crate::shard::shared::WriterIndexEntry {
+            writers_by_conn.entry(b.connection_id.0).or_insert_with(|| {
+                crate::shard::shared::WriterIndexEntry {
                     writer: Arc::clone(&b.writer),
                     write_lock: Arc::clone(&b.write_lock),
                     runtime: b.runtime.clone(),
-                });
+                }
+            });
         }
 
         // Clone match tables from engine catalog (deep clone — the
@@ -463,11 +462,7 @@ impl CommandWorker {
         for (i, b) in self.bindings.iter().enumerate() {
             let stream_idx = b.stream_id.0 as usize;
             if let Some(Some(mt)) = match_tables.get_mut(stream_idx) {
-                mt.set_binding_idx_for(
-                    b.consumer_id,
-                    b.connection_id,
-                    i as u32,
-                );
+                mt.set_binding_idx_for(b.consumer_id, b.connection_id, i as u32);
             }
         }
 

@@ -175,6 +175,12 @@ impl CommandWorker {
             // Release gate so drain re-checks from current cursor.
             // Cursor already stopped at lowest_skipped in drain_cycle,
             // so freed capacity will be used on the next cycle.
+            crate::lifecycle_trace!(
+                "a12c_acker_gate_fire",
+                0,
+                0,
+                "shard"
+            );
             self.gate.release();
             crate::lifecycle_trace!(
                 "a13_acker_gate_released",

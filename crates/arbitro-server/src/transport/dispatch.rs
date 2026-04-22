@@ -174,6 +174,7 @@ fn dispatch_publish(
     crate::lifecycle_trace!("13_pub_rep_ok_sent", conn_id, first_seq, "frame_loop");
 
     // Notify drain — gate is the ONLY connection between publish and drain.
+    crate::lifecycle_trace!("13b_pub_gate_fire", conn_id, first_seq, "frame_loop");
     server.gate_for(seq_stream).release();
     crate::lifecycle_trace!("14_pub_gate_released", conn_id, first_seq, "frame_loop");
 }

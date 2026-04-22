@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arbitro_engine_v2::catalog::wire_hash_32;
 use arbitro_engine_v2::catalog::match_table::MatchEntry;
+use arbitro_engine_v2::catalog::wire_hash_32;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
 use arbitro_store::Store;
@@ -263,6 +263,7 @@ pub(in crate::shard) fn drain_cycle(
             flush_results.len(),
             foldhash::fast::FixedState::default(),
         );
+
     for &(conn, ok) in &flush_results {
         flush_ok.insert(conn, ok);
         if !ok {
