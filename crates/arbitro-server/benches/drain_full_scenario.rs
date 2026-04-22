@@ -30,6 +30,12 @@
 //!   V6  TRIE-WALK          — V1 shape + resolve via real SubjectTrie walk over
 //!                            subject tokens (production-shaped factor 6), instead
 //!                            of linear pattern Vec iteration.
+//!   V7  PROD-SHAPE         — EXACT production accumulator shape: `Vec<Bucket>` pool
+//!                            with linear-scan `Vec<(conn, stream, fanout, idx)>` to
+//!                            resolve buckets. This is what `shard/accumulator.rs`
+//!                            does today — included so V2's HashMap-indexed win is
+//!                            measured against the real baseline (not the
+//!                            HashMap<(conn,stream), BytesMut> strawman of V1).
 //!
 //! Reports per variant:
 //!   - ns/cycle, ns/msg, msgs/s
@@ -337,6 +343,9 @@ struct Scratch {
     v4_out:      Vec<BytesMut>,
     v4_touched:  Vec<bool>,
     v4_active:   Vec<u16>,
+    // V7: production shape — dense bucket pool + linear-scan active Vec<tuple>.
+    v7_buckets:  Vec<BytesMut>,
+    v7_active:   Vec<(u32, u16, usize)>,   // (conn, stream, bucket_idx)
 }
 
 impl Scratch {
@@ -352,6 +361,8 @@ impl Scratch {
             v4_out:     (0..TOTAL_STREAMS).map(|_| BytesMut::with_capacity(8192)).collect(),
             v4_touched: vec![false; TOTAL_STREAMS],
             v4_active:  Vec::with_capacity(ACTIVE_STREAMS),
+            v7_buckets: Vec::with_capacity(64),
+            v7_active:  Vec::with_capacity(64),
         }
     }
 
@@ -684,6 +695,84 @@ fn run_v6(
     (emit, frames)
 }
 
+// V7 — PROD-SHAPE (Vec<Bucket> pool + linear-scan Vec<(conn, stream, idx)>)
+//
+// Mirrors `shard/accumulator.rs::Accumulator::acquire_bucket` today:
+//   - Reusable BytesMut pool (cleared each cycle).
+//   - `active` tracks which buckets are in use with `(conn, stream, idx)`.
+//   - Lookup = linear scan over `active`. O(N_active); N_active ≤ 64 typical.
+//
+// This is the REAL baseline production pays — V2's HashMap index must beat
+// this to be worth implementing.
+fn run_v7(
+    entries: &[StoreEntry], mts: &[MatchTable], stream_metas: &[StreamMeta],
+    counters: &Counters, conns: &ConnAlive, scratch: &mut Scratch,
+    subject: &[u8], payload: &[u8], now: u64,
+) -> (u64, u64) {
+    if !counters.has_any_demand { return (0, 0); }
+    // Clear bucket contents (keep allocation) + reset active list.
+    for &(_, _, idx) in scratch.v7_active.iter() {
+        unsafe { scratch.v7_buckets.get_unchecked_mut(idx).clear(); }
+    }
+    scratch.v7_active.clear();
+    scratch.reset_caps(mts);
+    let mut emit = 0u64;
+
+    for e in entries {
+        let entry = preflight!(*e, now, stream_metas, counters);
+        let sid = entry.stream_id as usize;
+        let mt = unsafe { mts.get_unchecked(sid) };
+
+        mt.resolve(entry.subject_hash, &entry.tokens, &mut scratch.resolved);
+        if scratch.resolved.is_empty() { continue; }
+
+        let mut subj_remaining = if mt.has_subject_limits {
+            stream_metas[sid].subject_limits.get(&entry.subject_hash).copied()
+        } else { None };
+
+        let mut seen_mask = 0u64;
+        let caps = unsafe { scratch.caps.get_unchecked_mut(sid) };
+        for &ei in &scratch.resolved {
+            let m = unsafe { mt.entries.get_unchecked(ei as usize) };
+            if !check_and_consume(m, caps, ei, conns, &mut seen_mask, &mut subj_remaining) { continue; }
+
+            // acquire_bucket: linear scan — matches production verbatim.
+            let conn = m.connection_id;
+            let stream = entry.stream_id;
+            let mut found: Option<usize> = None;
+            for &(c, s, idx) in scratch.v7_active.iter() {
+                if c == conn && s == stream { found = Some(idx); break; }
+            }
+            let bidx = match found {
+                Some(i) => i,
+                None => {
+                    // Pool-or-push new bucket.
+                    let i = scratch.v7_active.len();
+                    if scratch.v7_buckets.len() <= i {
+                        scratch.v7_buckets.push(BytesMut::with_capacity(2048));
+                    }
+                    // Note: production uses a separate `len` counter for pool
+                    // reuse across cycles; here bucket index == active index
+                    // within the cycle, which is functionally equivalent for
+                    // the scan cost we're measuring.
+                    scratch.v7_active.push((conn, stream, i));
+                    i
+                }
+            };
+            let buf = unsafe { scratch.v7_buckets.get_unchecked_mut(bidx) };
+            write_entry(buf, entry.seq, m.consumer_id, m.sub_id, subject, payload);
+            emit += 1;
+        }
+    }
+
+    let mut frames = 0u64;
+    for &(_, _, idx) in scratch.v7_active.iter() {
+        black_box(&scratch.v7_buckets[idx][..]);
+        frames += 1;
+    }
+    (emit, frames)
+}
+
 // ── World builder ───────────────────────────────────────────────────────────
 
 fn build_world(rng: &mut Rng) -> (Vec<MatchTable>, Vec<StreamMeta>, Counters, ConnAlive) {
@@ -853,6 +942,8 @@ fn main() {
 
     let r6 = measure!("V6  TRIE-WALK      (V1 shape + SubjectTrie walk resolve)  ",
         |c: &Vec<StoreEntry>| run_v6(c, &mts, &metas, &counters, &conns, &mut scratch, &subject, &payload, now_ms));
+    let r7 = measure!("V7  PROD-SHAPE     (Vec<Bucket> pool + linear-scan active) ",
+        |c: &Vec<StoreEntry>| run_v7(c, &mts, &metas, &counters, &conns, &mut scratch, &subject, &payload, now_ms));
 
     // ── Correctness: every variant must emit the same total entry count
     // (all validate the same 9 factors). V4 may have fewer frames but equal
@@ -862,6 +953,7 @@ fn main() {
     assert_eq!(r1.2, r4.2, "emit mismatch V1 vs V4");
     assert_eq!(r1.2, r5.2, "emit mismatch V1 vs V5");
     assert_eq!(r1.2, r6.2, "emit mismatch V1 vs V6");
+    assert_eq!(r1.2, r7.2, "emit mismatch V1 vs V7");
 
     // ── Report ──────────────────────────────────────────────────────────
     println!();
@@ -875,16 +967,16 @@ fn main() {
     println!("{:<60} | {:>12} | {:>12} | {:>10} | {:>12} | {:>10}",
              "Variant", "ns/cycle", "ns/msg", "msgs/s", "emit (total)", "frames");
     println!("{}", "-".repeat(128));
-    for (name, ns, emit, frames) in [r1, r2, r3, r4, r5, r6] {
+    for (name, ns, emit, frames) in [r1, r2, r3, r4, r5, r6, r7] {
         let per_msg = ns / MSGS_PER_CYCLE as f64;
         let mps = (MSGS_PER_CYCLE as f64 * 1e9 / ns) / 1e6;
         println!("{:<60} | {:>9.0} ns | {:>9.2} ns | {:>6.2} M/s | {:>12} | {:>10}",
                  name, ns, per_msg, mps, emit, frames);
     }
     println!();
-    let base = r1.1;
-    println!("Delta vs V1 (ACCUMULATOR, prod shape):");
-    for (name, ns, _, _) in [r2, r3, r4, r5, r6] {
+    let base = r7.1;
+    println!("Delta vs V7 (PROD-SHAPE — real production baseline):");
+    for (name, ns, _, _) in [r1, r2, r3, r4, r5, r6] {
         let delta = base / ns;
         let pct = (delta - 1.0) * 100.0;
         println!("  {:<60}  {:>6.2}×  ({:+.1}%)", name, delta, pct);
