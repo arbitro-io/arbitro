@@ -2,19 +2,20 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::watch;
-use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
-use arbitro_proto::config::{ConsumerConfig, StreamConfig, wire_hash_32};
+use arbitro_proto::config::{wire_hash_32, ConsumerConfig, StreamConfig};
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::manager::{CreateConsumerFixed, DeleteConsumerAction, ListStreamsAction};
-use arbitro_proto::wire::publish::PublishEntry;
 use arbitro_proto::wire::stream::{CreateStreamFixed, DeleteStreamFixed};
 
 use crate::conn;
 use crate::consumer::Consumer;
+use crate::encode::encode_publish;
 use crate::error::ClientError;
 use crate::inner::{ConnState, Inner};
 
@@ -108,7 +109,10 @@ impl Client {
             limit: U32::new(u32::MAX),
         };
 
-        let raw = self.inner.request_body(Action::ListStreams, 0, body.as_bytes()).await?;
+        let raw = self
+            .inner
+            .request_body(Action::ListStreams, 0, body.as_bytes())
+            .await?;
         Ok(parse_list_streams(&raw))
     }
 
@@ -119,7 +123,10 @@ impl Client {
             limit: U32::new(u32::MAX),
         };
 
-        let raw = self.inner.request_body(Action::ListConsumers, 0, body.as_bytes()).await?;
+        let raw = self
+            .inner
+            .request_body(Action::ListConsumers, 0, body.as_bytes())
+            .await?;
         Ok(parse_list_consumers(&raw))
     }
 
@@ -135,7 +142,9 @@ impl Client {
         body.extend_from_slice(name);
 
         let stream_id = wire_hash_32(name);
-        self.inner.request(Action::DeleteStream, stream_id, &body).await?;
+        self.inner
+            .request(Action::DeleteStream, stream_id, &body)
+            .await?;
         Ok(())
     }
 
@@ -162,7 +171,8 @@ impl Client {
             start_seq: U64::new(config.start_seq),
         };
 
-        let mut body = Vec::with_capacity(28 + config.name.len() + config.group.len() + subject.len());
+        let mut body =
+            Vec::with_capacity(28 + config.name.len() + config.group.len() + subject.len());
         body.extend_from_slice(fixed.as_bytes());
         body.extend_from_slice(&config.name);
         body.extend_from_slice(&config.group);
@@ -176,7 +186,10 @@ impl Client {
             body.extend_from_slice(&sl.pattern);
         }
 
-        let consumer_id = self.inner.request(Action::CreateConsumer, stream_id, &body).await? as u32;
+        let consumer_id = self
+            .inner
+            .request(Action::CreateConsumer, stream_id, &body)
+            .await? as u32;
 
         Ok(Consumer::new(self.inner.clone(), consumer_id, stream_id))
     }
@@ -216,13 +229,24 @@ impl Client {
             _pad: U32::new(0),
         };
 
-        self.inner.request(Action::DeleteConsumer, stream_id, body.as_bytes()).await?;
+        self.inner
+            .request(Action::DeleteConsumer, stream_id, body.as_bytes())
+            .await?;
         Ok(())
     }
 
     // ── Publish ──────────────────────────────────────────────────
 
     /// Publish a single message (fire-and-forget — no round-trip wait).
+    ///
+    /// The `payload` is wrapped in `Bytes` once at the API boundary
+    /// (one unavoidable copy: `&[u8]` is borrowed and must become owned
+    /// to cross the OS-thread boundary into the write loop). After that
+    /// it travels as a separate iovec via `write_vectored` and never
+    /// gets copied in userspace again.
+    ///
+    /// For zero copies all the way through, use [`publish_bytes`] with
+    /// a caller-owned `Bytes`.
     pub async fn publish(
         &self,
         stream_name: &[u8],
@@ -230,111 +254,23 @@ impl Client {
         payload: &[u8],
     ) -> Result<(), ClientError> {
         let stream_id = wire_hash_32(stream_name);
-
-        // Build batch body: [2 count][entry_header][subject][payload]
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0u8; 3],
-        };
-
-        let body_len = 4 + 12 + subject.len() + payload.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u32.to_le_bytes()); // count = 1 (u32, see proto/wire/publish.rs)
-        body.extend_from_slice(entry.as_bytes());
-        body.extend_from_slice(subject);
-        body.extend_from_slice(payload);
-
-        self.inner.fire_and_forget(Action::Publish, stream_id, &body).await
+        let payload = Bytes::copy_from_slice(payload);
+        self.inner
+            .fire_and_forget_publish_single(Action::Publish, stream_id, subject, payload)
+            .await
     }
 
-    /// Publish a batch of (subject, payload) pairs (fire-and-forget).
-    pub async fn publish_batch(
-        &self,
-        stream_name: &[u8],
-        entries: &[(&[u8], &[u8])],
-    ) -> Result<(), ClientError> {
-        let stream_id = wire_hash_32(stream_name);
-
-        let total_body: usize = 4 + entries.iter()
-            .map(|(s, p)| 12 + s.len() + p.len())
-            .sum::<usize>();
-
-        let mut body = Vec::with_capacity(total_body);
-        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-
-        for (subject, payload) in entries {
-            let entry = PublishEntry {
-                data_len: U32::new(payload.len() as u32),
-                subj_len: U16::new(subject.len() as u16),
-                reply_len: U16::new(0),
-                flags: 0,
-                _pad: [0u8; 3],
-            };
-            body.extend_from_slice(entry.as_bytes());
-            body.extend_from_slice(subject);
-            body.extend_from_slice(payload);
-        }
-
-        self.inner.fire_and_forget(Action::Publish, stream_id, &body).await
-    }
-
-    /// Publish a single message via server-side accumulation (fire-and-forget).
-    /// The server batches entries and flushes with append_batch after 5ms or 1024 entries.
-    pub async fn publish_accumulate(
+    /// Zero-copy variant of [`publish`] — payload is consumed as-is.
+    pub async fn publish_bytes(
         &self,
         stream_name: &[u8],
         subject: &[u8],
-        payload: &[u8],
+        payload: Bytes,
     ) -> Result<(), ClientError> {
         let stream_id = wire_hash_32(stream_name);
-
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0u8; 3],
-        };
-
-        let body_len = 4 + 12 + subject.len() + payload.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u32.to_le_bytes());
-        body.extend_from_slice(entry.as_bytes());
-        body.extend_from_slice(subject);
-        body.extend_from_slice(payload);
-
-        self.inner.fire_and_forget(Action::PublishAccumulate, stream_id, &body).await
-    }
-
-    /// Publish a single message via server-side accumulation and wait for confirmation.
-    /// Returns the assigned sequence number after the server flushes the batch.
-    pub async fn publish_accumulate_sync(
-        &self,
-        stream_name: &[u8],
-        subject: &[u8],
-        payload: &[u8],
-    ) -> Result<u64, ClientError> {
-        let stream_id = wire_hash_32(stream_name);
-
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0u8; 3],
-        };
-
-        let body_len = 4 + 12 + subject.len() + payload.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u32.to_le_bytes());
-        body.extend_from_slice(entry.as_bytes());
-        body.extend_from_slice(subject);
-        body.extend_from_slice(payload);
-
-        self.inner.request(Action::PublishAccumulate, stream_id, &body).await
+        self.inner
+            .fire_and_forget_publish_single(Action::Publish, stream_id, subject, payload)
+            .await
     }
 
     /// Publish a single message and wait for server confirmation.
@@ -346,23 +282,66 @@ impl Client {
         payload: &[u8],
     ) -> Result<u64, ClientError> {
         let stream_id = wire_hash_32(stream_name);
+        let payload = Bytes::copy_from_slice(payload);
+        self.inner
+            .request_publish_single(Action::Publish, stream_id, subject, payload)
+            .await
+    }
 
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0u8; 3],
-        };
+    /// Zero-copy variant of [`publish_sync`].
+    pub async fn publish_sync_bytes(
+        &self,
+        stream_name: &[u8],
+        subject: &[u8],
+        payload: Bytes,
+    ) -> Result<u64, ClientError> {
+        let stream_id = wire_hash_32(stream_name);
+        self.inner
+            .request_publish_single(Action::Publish, stream_id, subject, payload)
+            .await
+    }
 
-        let body_len = 4 + 12 + subject.len() + payload.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&1u32.to_le_bytes());
-        body.extend_from_slice(entry.as_bytes());
-        body.extend_from_slice(subject);
-        body.extend_from_slice(payload);
+    /// Publish a single message via server-side accumulation (fire-and-forget).
+    /// The server batches entries and flushes with append_batch after 5ms or 1024 entries.
+    pub async fn publish_accumulate(
+        &self,
+        stream_name: &[u8],
+        subject: &[u8],
+        payload: &[u8],
+    ) -> Result<(), ClientError> {
+        let stream_id = wire_hash_32(stream_name);
+        let payload = Bytes::copy_from_slice(payload);
+        self.inner
+            .fire_and_forget_publish_single(Action::PublishAccumulate, stream_id, subject, payload)
+            .await
+    }
 
-        self.inner.request(Action::Publish, stream_id, &body).await
+    /// Publish a single message via server-side accumulation and wait for confirmation.
+    /// Returns the assigned sequence number after the server flushes the batch.
+    pub async fn publish_accumulate_sync(
+        &self,
+        stream_name: &[u8],
+        subject: &[u8],
+        payload: &[u8],
+    ) -> Result<u64, ClientError> {
+        let stream_id = wire_hash_32(stream_name);
+        let payload = Bytes::copy_from_slice(payload);
+        self.inner
+            .request_publish_single(Action::PublishAccumulate, stream_id, subject, payload)
+            .await
+    }
+
+    /// Publish a batch of (subject, payload) pairs (fire-and-forget).
+    pub async fn publish_batch(
+        &self,
+        stream_name: &[u8],
+        entries: &[(&[u8], &[u8])],
+    ) -> Result<(), ClientError> {
+        let stream_id = wire_hash_32(stream_name);
+        let body = encode_publish(entries);
+        self.inner
+            .fire_and_forget(Action::Publish, stream_id, &body)
+            .await
     }
 
     /// Publish a batch and wait for server confirmation.
@@ -373,27 +352,7 @@ impl Client {
         entries: &[(&[u8], &[u8])],
     ) -> Result<u64, ClientError> {
         let stream_id = wire_hash_32(stream_name);
-
-        let total_body: usize = 4 + entries.iter()
-            .map(|(s, p)| 12 + s.len() + p.len())
-            .sum::<usize>();
-
-        let mut body = Vec::with_capacity(total_body);
-        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-
-        for (subject, payload) in entries {
-            let entry = PublishEntry {
-                data_len: U32::new(payload.len() as u32),
-                subj_len: U16::new(subject.len() as u16),
-                reply_len: U16::new(0),
-                flags: 0,
-                _pad: [0u8; 3],
-            };
-            body.extend_from_slice(entry.as_bytes());
-            body.extend_from_slice(subject);
-            body.extend_from_slice(payload);
-        }
-
+        let body = encode_publish(entries);
         self.inner.request(Action::Publish, stream_id, &body).await
     }
 
@@ -430,7 +389,8 @@ fn parse_list_streams(body: &[u8]) -> Vec<StreamInfo> {
         if pos + 6 > body.len() {
             break;
         }
-        let stream_id = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        let stream_id =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
         let name_len = u16::from_le_bytes([body[pos + 4], body[pos + 5]]) as usize;
         pos += 6;
 
@@ -468,13 +428,21 @@ fn parse_list_consumers(body: &[u8]) -> Vec<ConsumerInfo> {
         if pos + 13 > body.len() {
             break;
         }
-        let consumer_id = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
-        let stream_id = u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]);
-        let queue_id = u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]);
+        let consumer_id =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        let stream_id =
+            u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]);
+        let queue_id =
+            u32::from_le_bytes([body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11]]);
         let paused = body[pos + 12] != 0;
         pos += 13;
 
-        out.push(ConsumerInfo { consumer_id, stream_id, queue_id, paused });
+        out.push(ConsumerInfo {
+            consumer_id,
+            stream_id,
+            queue_id,
+            paused,
+        });
     }
 
     out

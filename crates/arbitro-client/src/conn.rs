@@ -29,7 +29,7 @@ use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
 use arbitro_proto::wire::system::ConnectFixed;
 
 use crate::inner::{
-    ConnState, Inner, WriteProducer, ACK_RING_CAP, WRITE_RING_CAP,
+    ConnState, Inner, WriteFrame, WriteProducer, ACK_RING_CAP, WRITE_RING_CAP,
 };
 use crate::message::AckCmd;
 
@@ -97,7 +97,7 @@ async fn run_session(inner: &Arc<Inner>, stream: TcpStream) -> bool {
 
     // Build write channel: M=1 producer (Mutex-shared), 1 consumer on write thread.
     let (mut write_producers, write_consumer, write_shutdown) =
-        Mpsc::<Bytes, WRITE_RING_CAP>::new(1);
+        Mpsc::<WriteFrame, WRITE_RING_CAP>::new(1);
     let write_producer: WriteProducer =
         Arc::new(Mutex::new(write_producers.pop().unwrap()));
     inner.install_write_producer(write_producer.clone());
@@ -168,7 +168,7 @@ fn send_connect(inner: &Arc<Inner>) {
     let mut frame = Vec::with_capacity(ENVELOPE_SIZE + 16);
     frame.extend_from_slice(envelope.as_bytes());
     frame.extend_from_slice(body.as_bytes());
-    inner.send_frame(Bytes::from(frame));
+    inner.send_mono(Bytes::from(frame));
 }
 
 /// Re-send Subscribe frames for all active subscriptions.
@@ -199,7 +199,7 @@ fn resubscribe_all(inner: &Arc<Inner>) {
     };
 
     for frame in frames {
-        inner.send_frame(frame);
+        inner.send_mono(frame);
     }
 }
 
@@ -237,78 +237,73 @@ async fn read_loop(inner: &Arc<Inner>, mut reader: TcpStream) {
 
 // ── Write loop (OS thread) ──────────────────────────────────────────────
 
-/// Drain the write ring, batch-coalesce, write_vectored. Runs on a
-/// dedicated OS thread (sync). Returns when the consumer observes shutdown.
-fn write_loop(mut writer: std::net::TcpStream, consumer: MpscConsumer<Bytes, WRITE_RING_CAP>) {
+/// Drain the write ring one frame at a time — no cross-frame coalesce.
+/// `Mono` frames go out as a single `write_all`; `PubSingle` uses
+/// `write_vectored` so the user payload is shipped to the kernel as a
+/// separate iovec, never copied in userspace.
+/// Runs on a dedicated OS thread (sync).
+fn write_loop(
+    mut writer: std::net::TcpStream,
+    consumer: MpscConsumer<WriteFrame, WRITE_RING_CAP>,
+) {
     use std::io::Write;
 
     consumer.bind();
 
     let _ = writer.set_nonblocking(false);
 
-    let mut batch: Vec<Bytes> = Vec::with_capacity(64);
-
     loop {
-        // Block for the first frame.
         match consumer.recv() {
-            Ok(frame) => batch.push(frame),
+            Ok(WriteFrame::Mono(frame)) => {
+                if writer.write_all(&frame).is_err() {
+                    return;
+                }
+            }
+            Ok(WriteFrame::PubSingle { header, payload }) => {
+                if write_all_vectored2(&mut writer, &header, &payload).is_err() {
+                    return;
+                }
+            }
             Err(_shutdown) => return,
         }
-
-        // Drain everything currently available — coalesce.
-        while let Some(frame) = consumer.try_recv() {
-            batch.push(frame);
-        }
-
-        let result = if batch.len() == 1 {
-            writer.write_all(&batch[0])
-        } else {
-            write_all_vectored(&mut writer, &batch)
-        };
-
-        if result.is_err() {
-            return;
-        }
-        batch.clear();
     }
 }
 
-/// Sync write_vectored with partial-write handling.
-fn write_all_vectored(
+/// Sync `write_vectored` for a 2-iovec frame (publish header + payload),
+/// with partial-write handling. While the header is still partially
+/// outstanding we keep using `write_vectored` so the kernel can consume
+/// the rest of the header + the payload in one syscall when ready;
+/// once the header is fully drained we fall back to `write_all` on the
+/// payload remainder.
+fn write_all_vectored2(
     writer: &mut std::net::TcpStream,
-    frames: &[Bytes],
+    header: &[u8],
+    payload: &[u8],
 ) -> std::io::Result<()> {
     use std::io::{IoSlice, Write};
 
-    let mut slices: Vec<IoSlice<'_>> = frames.iter().map(|f| IoSlice::new(f)).collect();
-    let total: usize = frames.iter().map(|f| f.len()).sum();
-    let mut written = 0usize;
+    let mut header_written = 0usize;
 
-    while written < total {
-        let n = writer.write_vectored(&slices)?;
+    while header_written < header.len() {
+        let h = &header[header_written..];
+        let bufs = [IoSlice::new(h), IoSlice::new(payload)];
+        let n = writer.write_vectored(&bufs)?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "write_vectored returned 0",
             ));
         }
-        written += n;
-
-        let mut skip = n;
-        while !slices.is_empty() && skip >= slices[0].len() {
-            skip -= slices[0].len();
-            slices.remove(0);
-        }
-        if skip > 0 && !slices.is_empty() {
-            let remaining_idx = frames.len() - slices.len();
-            writer.write_all(&frames[remaining_idx][skip..])?;
-            for frame in &frames[remaining_idx + 1..] {
-                writer.write_all(frame)?;
-            }
-            return Ok(());
+        if n <= h.len() {
+            header_written += n;
+        } else {
+            // Header fully drained, payload partially drained.
+            let payload_done = n - h.len();
+            return writer.write_all(&payload[payload_done..]);
         }
     }
-    Ok(())
+    // Header fully drained on a previous iteration boundary; flush payload.
+    writer.write_all(payload)
 }
 
 // ── Ack loop (OS thread) ────────────────────────────────────────────────
@@ -352,7 +347,10 @@ fn process_ack_cmd(
         }
         AckCmd::Nack { stream_id, consumer_id, seq } => {
             let frame = build_ack_frame(Action::Nack, stream_id, consumer_id, seq);
-            let _ = write_producer.lock().unwrap().try_send(frame);
+            let _ = write_producer
+                .lock()
+                .unwrap()
+                .try_send(WriteFrame::Mono(frame));
         }
     }
 }
@@ -380,7 +378,7 @@ fn flush_batch_acks(
             let _ = write_producer
                 .lock()
                 .unwrap()
-                .try_send(Bytes::from(buf.clone()));
+                .try_send(WriteFrame::Mono(Bytes::from(buf.clone())));
         }
 
         i = j;

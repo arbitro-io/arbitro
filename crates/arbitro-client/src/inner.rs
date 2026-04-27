@@ -29,6 +29,7 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::wire::delivery::{RepBatchView, RepErrorAction, RepOkAction};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
+use arbitro_proto::wire::publish::PublishEntry;
 use arbitro_engine_v2::common::SubjectTrie;
 
 use crate::error::ClientError;
@@ -36,8 +37,12 @@ use crate::message::{AckCmd, AckProducer, Message};
 use crate::subscription::Subscription;
 
 /// Ring capacity for write_tx and ack_tx.
-pub(crate) const WRITE_RING_CAP: usize = 256;
-pub(crate) const ACK_RING_CAP: usize = 256;
+///
+/// 4096 publish frames is ~256 KB worst-case (Bytes is 32 B, PubSingle is
+/// 2× Bytes + tag ≈ 72 B). Sized to absorb fire-and-forget bursts without
+/// forcing producers into backpressure parking on every other publish.
+pub(crate) const WRITE_RING_CAP: usize = 4096;
+pub(crate) const ACK_RING_CAP: usize = 4096;
 
 /// Connection state broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,10 +60,23 @@ pub(crate) enum RequestResult {
     Error(ErrorCode),
 }
 
+/// Write-ring item. Two variants so the publish hot path can ship the
+/// user payload as a separate iovec (zero-copy via `write_vectored`),
+/// while every other frame stays in a single contiguous buffer.
+pub(crate) enum WriteFrame {
+    /// Single contiguous frame (envelope + body in one alloc).
+    Mono(Bytes),
+    /// Two-part frame for single-entry publish.
+    /// `header` = `[envelope][count=1][PublishEntry][subject]`
+    /// `payload` = the user's bytes (never copied past the API boundary).
+    PubSingle { header: Bytes, payload: Bytes },
+}
+
+
 /// Producer handle for the write channel. Wrapped in Arc<Mutex<…>> so it can
 /// be cloned across send call sites and reset on reconnect without taking
 /// down the live Inner struct.
-pub(crate) type WriteProducer = Arc<Mutex<MpscProducer<Bytes, WRITE_RING_CAP>>>;
+pub(crate) type WriteProducer = Arc<Mutex<MpscProducer<WriteFrame, WRITE_RING_CAP>>>;
 
 /// Shared state between the connection task and the client API.
 pub(crate) struct Inner {
@@ -179,13 +197,160 @@ impl Inner {
         self.next_seq.fetch_add(1, Relaxed)
     }
 
-    /// Try to enqueue a frame for the write loop. Returns false if
-    /// disconnected OR the ring is full (caller-visible backpressure).
-    pub(crate) fn send_frame(&self, frame: Bytes) -> bool {
+    /// Non-blocking enqueue. Returns `false` if disconnected OR the ring
+    /// is full. Used by code paths that explicitly handle backpressure
+    /// or by best-effort send sites (Pong, internal bookkeeping).
+    pub(crate) fn send_frame(&self, frame: WriteFrame) -> bool {
         let guard = self.write_tx.read().unwrap();
         match guard.as_ref() {
             Some(producer) => producer.lock().unwrap().try_send(frame).is_ok(),
             None => false,
+        }
+    }
+
+    /// Convenience: enqueue a `Bytes` as a single contiguous frame.
+    #[inline]
+    pub(crate) fn send_mono(&self, frame: Bytes) -> bool {
+        self.send_frame(WriteFrame::Mono(frame))
+    }
+
+    /// Snapshot the current write producer, if any.
+    fn current_producer(&self) -> Option<WriteProducer> {
+        self.write_tx.read().unwrap().clone()
+    }
+
+    /// Backpressure-aware enqueue used by `publish` / `request` paths.
+    ///
+    /// Layered policy:
+    /// 1. `try_send` — succeeds in the steady state (ring has room).
+    /// 2. On `Full`, burn a short window of cooperative `yield_now`
+    ///    turns so the writer task has a chance to drain without
+    ///    paying spawn_blocking overhead (~50 µs/publish, kills
+    ///    throughput).
+    /// 3. If the ring stays full beyond that, return
+    ///    `Err(ClientError::Backpressure)`. The frame was NOT enqueued;
+    ///    the caller decides retry / drop / circuit-break. Sync
+    ///    wrappers translate this into a bounded retry loop.
+    ///
+    /// Returns `Err(ClientError::Disconnected)` only when the producer
+    /// handle is actually gone (clear_write_producer happened) — never
+    /// on transient backpressure.
+    pub(crate) async fn enqueue(&self, mut frame: WriteFrame) -> Result<(), ClientError> {
+        const FAST_YIELDS: usize = 64;
+
+        for _ in 0..FAST_YIELDS {
+            let producer = match self.current_producer() {
+                Some(p) => p,
+                None => return Err(ClientError::Disconnected),
+            };
+            match producer.lock().unwrap().try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(returned) => frame = returned,
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Ring saturated past the absorption window. Surface backpressure
+        // to the caller — do NOT spawn_blocking (~50 µs/publish), do NOT
+        // disconnect (the connection is fine, the network is just slow).
+        Err(ClientError::Backpressure)
+    }
+
+    /// Build the header for a single-entry publish frame in one alloc.
+    /// Layout: `[envelope 16][count=1, 4][PublishEntry 12][subject N]`.
+    /// The user payload is NOT included — it travels separately as a
+    /// second iovec to the write loop, never copied past the API boundary.
+    #[inline]
+    fn build_publish_single_header(
+        seq: u32,
+        action: Action,
+        stream_id: u32,
+        subject: &[u8],
+        payload_len: usize,
+    ) -> Bytes {
+        let body_len: u32 = (4 + 12 + subject.len() + payload_len) as u32;
+        let total = ENVELOPE_SIZE + 4 + 12 + subject.len();
+        let mut buf = Vec::with_capacity(total);
+
+        let env = Envelope {
+            action: U16::new(action.as_u16()),
+            flags: 0,
+            _rsv: 0,
+            stream_id: U32::new(stream_id),
+            msg_len: U32::new(body_len),
+            env_seq: U32::new(seq),
+        };
+        buf.extend_from_slice(env.as_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        let entry = PublishEntry {
+            data_len: U32::new(payload_len as u32),
+            subj_len: U16::new(subject.len() as u16),
+            reply_len: U16::new(0),
+            flags: 0,
+            _pad: [0u8; 3],
+        };
+        buf.extend_from_slice(entry.as_bytes());
+        buf.extend_from_slice(subject);
+        debug_assert_eq!(buf.len(), total);
+        Bytes::from(buf)
+    }
+
+    /// Fire-and-forget single-entry publish — zero-copy of `payload`.
+    /// `payload` is shipped to the write loop as a separate iovec and
+    /// goes to the kernel via `write_vectored` without ever being
+    /// copied in userspace past this point.
+    pub(crate) async fn fire_and_forget_publish_single(
+        &self,
+        action: Action,
+        stream_id: u32,
+        subject: &[u8],
+        payload: Bytes,
+    ) -> Result<(), ClientError> {
+        let seq = self.alloc_seq();
+        let header = Self::build_publish_single_header(
+            seq, action, stream_id, subject, payload.len(),
+        );
+        self.enqueue(WriteFrame::PubSingle { header, payload }).await
+    }
+
+    /// Sync single-entry publish — same zero-copy path as
+    /// `fire_and_forget_publish_single`, with reply correlation.
+    pub(crate) async fn request_publish_single(
+        &self,
+        action: Action,
+        stream_id: u32,
+        subject: &[u8],
+        payload: Bytes,
+    ) -> Result<u64, ClientError> {
+        let seq = self.alloc_seq();
+        let (tx, rx) = OneShot::<RequestResult>::new();
+        self.pending.lock().unwrap().insert(seq, tx);
+
+        let header = Self::build_publish_single_header(
+            seq, action, stream_id, subject, payload.len(),
+        );
+
+        if let Err(e) = self.enqueue(WriteFrame::PubSingle { header, payload }).await {
+            self.pending.lock().unwrap().remove(&seq);
+            return Err(e);
+        }
+
+        let timeout_dur = self.request_timeout;
+        let handle = tokio::task::spawn_blocking(move || {
+            rx.bind();
+            rx.recv()
+        });
+
+        match tokio::time::timeout(timeout_dur, handle).await {
+            Ok(Ok(Ok(RequestResult::Ok(v)))) => Ok(v),
+            Ok(Ok(Ok(RequestResult::OkBody(_)))) => Ok(0),
+            Ok(Ok(Ok(RequestResult::Error(code)))) => Err(ClientError::Broker(code)),
+            Ok(Ok(Err(_closed))) => Err(ClientError::Disconnected),
+            Ok(Err(_join)) => Err(ClientError::Disconnected),
+            Err(_elapsed) => {
+                self.pending.lock().unwrap().remove(&seq);
+                Err(ClientError::Timeout)
+            }
         }
     }
 
@@ -245,9 +410,9 @@ impl Inner {
         frame.extend_from_slice(envelope.as_bytes());
         frame.extend_from_slice(body);
 
-        if !self.send_frame(Bytes::from(frame)) {
+        if let Err(e) = self.enqueue(WriteFrame::Mono(Bytes::from(frame))).await {
             self.pending.lock().unwrap().remove(&seq);
-            return Err(ClientError::Disconnected);
+            return Err(e);
         }
 
         let timeout_dur = self.request_timeout;
@@ -292,11 +457,7 @@ impl Inner {
         frame.extend_from_slice(envelope.as_bytes());
         frame.extend_from_slice(body);
 
-        if self.send_frame(Bytes::from(frame)) {
-            Ok(())
-        } else {
-            Err(ClientError::Disconnected)
-        }
+        self.enqueue(WriteFrame::Mono(Bytes::from(frame))).await
     }
 
     /// Send a frame with no reply expected (internal use, e.g. Pong).
@@ -313,7 +474,7 @@ impl Inner {
         let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
         frame.extend_from_slice(envelope.as_bytes());
         frame.extend_from_slice(body);
-        self.send_frame(Bytes::from(frame));
+        self.send_mono(Bytes::from(frame));
     }
 
     /// Process an incoming frame from the server.

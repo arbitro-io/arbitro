@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 arbitro-proto      = { path = "../arbitro-proto" }
 arbitro-engine-v2  = { workspace = true }
+arbitro-kit        = { path = "../../../arbitro-kit" }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
 bytes         = { workspace = true }

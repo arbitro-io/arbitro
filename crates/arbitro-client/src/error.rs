@@ -15,6 +15,10 @@ pub enum ClientError {
     Timeout,
     /// Not connected.
     Disconnected,
+    /// Write ring is saturated; the writer task can't drain as fast as
+    /// the publisher produces (typically TCP backpressure). The frame
+    /// was NOT enqueued — caller decides retry / drop / circuit-break.
+    Backpressure,
 }
 
 impl fmt::Display for ClientError {
@@ -24,6 +28,7 @@ impl fmt::Display for ClientError {
             Self::Broker(code) => write!(f, "broker: {code:?}"),
             Self::Timeout => write!(f, "request timed out"),
             Self::Disconnected => write!(f, "not connected"),
+            Self::Backpressure => write!(f, "write ring saturated; retry"),
         }
     }
 }
