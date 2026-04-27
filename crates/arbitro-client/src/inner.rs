@@ -4,7 +4,9 @@
 //!
 //! - `write_tx`     : `kit::Mpsc<Bytes, 256>` — M:1 fan-in to write_loop (OS thread).
 //! - `ack_tx`       : `kit::Mpsc<AckCmd, 256>` — M:1 fan-in to ack_loop (OS thread).
-//! - `pending`      : `kit::OneShot<RequestResult>` — per-request reply slot.
+//! - `pending`      : `tokio::sync::oneshot<RequestResult>` — per-request reply slot.
+//!                    (async-native: `rx.await` directly, no spawn_blocking,
+//!                    no OS thread parked per in-flight request.)
 //! - `state_tx`     : `tokio::sync::watch` — kept (pub/sub many subscribers, async API).
 //!
 //! `MpscProducer` is `Send + !Sync`. Many concurrent call sites push frames →
@@ -17,12 +19,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use zerocopy::{FromBytes, IntoBytes};
 use zerocopy::byteorder::little_endian::{U16, U32};
 
 use arbitro_kit::route::{
-    Mpsc, MpscConsumer, MpscProducer, MpscShutdown, OneShot, OneShotSender,
+    Mpsc, MpscConsumer, MpscProducer, MpscShutdown,
 };
 
 use arbitro_proto::action::Action;
@@ -87,12 +89,12 @@ pub(crate) struct Inner {
     /// Connection state broadcast.
     pub(crate) state_tx: watch::Sender<ConnState>,
 
-    /// Pending request-reply correlation: env_seq → kit OneShot sender.
-    /// Each in-flight `request*` allocates one OneShot pair; the Sender
+    /// Pending request-reply correlation: env_seq → tokio oneshot sender.
+    /// Each in-flight `request*` allocates one oneshot pair; the Sender
     /// lives here until the reply arrives or the request is cleaned up
     /// (timeout / disconnect). Dropping the Sender wakes the parked
     /// receiver with `Err(Closed)`.
-    pub(crate) pending: Mutex<HashMap<u32, OneShotSender<RequestResult>>>,
+    pub(crate) pending: Mutex<HashMap<u32, oneshot::Sender<RequestResult>>>,
 
     /// Monotonic sequence for env_seq correlation.
     pub(crate) next_seq: AtomicU32,
@@ -323,7 +325,7 @@ impl Inner {
         payload: Bytes,
     ) -> Result<u64, ClientError> {
         let seq = self.alloc_seq();
-        let (tx, rx) = OneShot::<RequestResult>::new();
+        let (tx, rx) = oneshot::channel::<RequestResult>();
         self.pending.lock().unwrap().insert(seq, tx);
 
         let header = Self::build_publish_single_header(
@@ -336,17 +338,11 @@ impl Inner {
         }
 
         let timeout_dur = self.request_timeout;
-        let handle = tokio::task::spawn_blocking(move || {
-            rx.bind();
-            rx.recv()
-        });
-
-        match tokio::time::timeout(timeout_dur, handle).await {
-            Ok(Ok(Ok(RequestResult::Ok(v)))) => Ok(v),
-            Ok(Ok(Ok(RequestResult::OkBody(_)))) => Ok(0),
-            Ok(Ok(Ok(RequestResult::Error(code)))) => Err(ClientError::Broker(code)),
-            Ok(Ok(Err(_closed))) => Err(ClientError::Disconnected),
-            Ok(Err(_join)) => Err(ClientError::Disconnected),
+        match tokio::time::timeout(timeout_dur, rx).await {
+            Ok(Ok(RequestResult::Ok(v))) => Ok(v),
+            Ok(Ok(RequestResult::OkBody(_))) => Ok(0),
+            Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
+            Ok(Err(_closed)) => Err(ClientError::Disconnected),
             Err(_elapsed) => {
                 self.pending.lock().unwrap().remove(&seq);
                 Err(ClientError::Timeout)
@@ -382,10 +378,14 @@ impl Inner {
         }
     }
 
-    /// Internal: build the frame, register the OneShot Sender in `pending`,
-    /// enqueue, then await the reply via spawn_blocking + tokio timeout.
-    /// On timeout we drop the Sender (by removing from `pending`), which
-    /// wakes the parked receiver in spawn_blocking with `Closed`.
+    /// Internal: build the frame, register the oneshot Sender in `pending`,
+    /// enqueue, then `rx.await` directly with a tokio timeout. No
+    /// spawn_blocking — `tokio::sync::oneshot` is async-native, so this
+    /// path consumes zero OS threads from the blocking pool regardless
+    /// of in-flight request count.
+    ///
+    /// On timeout we drop the Sender (by removing from `pending`),
+    /// which wakes `rx.await` with `Err(Closed)`.
     async fn do_request(
         &self,
         action: Action,
@@ -393,7 +393,7 @@ impl Inner {
         body: &[u8],
     ) -> Result<RequestResult, ClientError> {
         let seq = self.alloc_seq();
-        let (tx, rx) = OneShot::<RequestResult>::new();
+        let (tx, rx) = oneshot::channel::<RequestResult>();
 
         self.pending.lock().unwrap().insert(seq, tx);
 
@@ -416,18 +416,12 @@ impl Inner {
         }
 
         let timeout_dur = self.request_timeout;
-        let handle = tokio::task::spawn_blocking(move || {
-            rx.bind();
-            rx.recv()
-        });
-
-        match tokio::time::timeout(timeout_dur, handle).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(_closed))) => Err(ClientError::Disconnected),
-            Ok(Err(_join)) => Err(ClientError::Disconnected),
+        match tokio::time::timeout(timeout_dur, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_closed)) => Err(ClientError::Disconnected),
             Err(_elapsed) => {
-                // Drop the Sender: dropping wakes the parked spawn_blocking
-                // task with Err(Closed); it cleans itself up.
+                // Drop the Sender by removing it; that wakes `rx.await`
+                // with `Err(Closed)` and the future drops cleanly.
                 self.pending.lock().unwrap().remove(&seq);
                 Err(ClientError::Timeout)
             }
@@ -516,7 +510,7 @@ impl Inner {
 
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            tx.send(RequestResult::Ok(ref_seq));
+            let _ = tx.send(RequestResult::Ok(ref_seq));
         }
     }
 
@@ -532,7 +526,7 @@ impl Inner {
 
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            tx.send(RequestResult::Error(code));
+            let _ = tx.send(RequestResult::Error(code));
         }
     }
 
@@ -607,14 +601,14 @@ impl Inner {
     fn on_list_streams(&self, env_seq: u32, body: &[u8]) {
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
         }
     }
 
     fn on_list_consumers(&self, env_seq: u32, body: &[u8]) {
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
         }
     }
 
@@ -687,7 +681,7 @@ impl Inner {
         self.rebuild_trie();
     }
 
-    /// Drain all `pending` OneShot senders by dropping them. Receivers wake
+    /// Drain all `pending` oneshot senders by dropping them. Receivers wake
     /// with `Closed`; callers translate to `ClientError::Disconnected`.
     /// Called by `connection_loop` on disconnect / shutdown.
     pub(crate) fn drain_pending(&self) {
