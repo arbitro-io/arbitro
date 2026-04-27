@@ -3,7 +3,7 @@
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use zerocopy::byteorder::little_endian::{U16, U64};
 use zerocopy::IntoBytes;
 
@@ -115,13 +115,19 @@ impl ArbitroServer {
             keepalive_loop(keepalive_registry, idle_timeout, keepalive_interval).await;
         });
 
-        // Frame channel — read loops send parsed frames here
-        let (frame_tx, mut frame_rx) = mpsc::channel::<(u64, Bytes)>(65536);
+        // Per-connection ingress: each read_loop dispatches frames directly.
+        // No central mpsc — TCP guarantees order per connection, and each
+        // connection already runs in its own task, so we get free parallelism
+        // on the dispatch path. Server state (shard router, registry, command
+        // log) is cloneable Arc-backed and shared across read tasks.
 
         // Accept task
         let accept_registry = self.registry.clone();
         let max_connections = self.config.max_connections;
         let mut shutdown_accept = shutdown_rx.clone();
+        let accept_server = self.server.clone();
+        let accept_log = self.command_log.clone();
+        let accept_shutdown = shutdown_rx.clone();
         let accept_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -139,9 +145,13 @@ impl ArbitroServer {
                                 let conn_id = accept_registry.register(std::sync::Arc::new(writer));
                                 tracing::debug!(conn_id, %addr, "accepted");
 
-                                let tx = frame_tx.clone();
                                 let reg = accept_registry.clone();
-                                tokio::spawn(read_loop(conn_id, reader, tx, reg));
+                                let srv = accept_server.clone();
+                                let log = accept_log.clone();
+                                let sd = accept_shutdown.clone();
+                                tokio::spawn(async move {
+                                    read_loop(conn_id, reader, srv, reg, log, sd).await;
+                                });
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "accept failed");
@@ -163,32 +173,16 @@ impl ArbitroServer {
             let _ = bridge_tx.send(true);
         });
 
-        // Frame processing loop
+        // Wait for shutdown signal — all real work happens in per-connection
+        // read tasks now.
         let mut shutdown_process = shutdown_rx.clone();
-        loop {
-            tokio::select! {
-                frame = frame_rx.recv() => {
-                    match frame {
-                        Some((conn_id, frame)) => {
-                            crate::lifecycle_trace!("04_frame_chan_recv", conn_id, 0, "frame_loop");
-                            dispatch::dispatch_frame(
-                                conn_id, frame, &self.server, &self.registry,
-                                self.command_log.as_ref(),
-                            ).await;
-                            crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "frame_loop");
-                        }
-                        None => break,
-                    }
-                }
-                _ = shutdown_process.changed() => {
-                    tracing::info!("frame processing stopping");
-                    break;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("ctrl+c received, initiating shutdown");
-                    let _ = shutdown_tx.send(true);
-                    break;
-                }
+        tokio::select! {
+            _ = shutdown_process.changed() => {
+                tracing::info!("shutdown signal received");
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("ctrl+c received, initiating shutdown");
+                let _ = shutdown_tx.send(true);
             }
         }
 
@@ -216,8 +210,6 @@ impl ArbitroServer {
             self.registry.remove(*conn_id);
         }
 
-        while frame_rx.try_recv().is_ok() {}
-
         // ── LifeCycle: on_shutdown ──────────────────────────────────────
         for service in &mut self.services {
             service.on_shutdown();
@@ -228,25 +220,43 @@ impl ArbitroServer {
     }
 }
 
-/// Read loop — reads frames from TCP, sends to processing channel.
+/// Read loop — reads frames from TCP and dispatches them in-line.
+///
+/// One task per connection. TCP guarantees frame order within a connection,
+/// and dispatch is safe to call concurrently across connections (shard
+/// router + registry are Arc-backed). No central mpsc bottleneck.
 async fn read_loop(
     conn_id: u64,
     mut reader: tokio::net::tcp::OwnedReadHalf,
-    tx: mpsc::Sender<(u64, Bytes)>,
+    server: crate::shard::router::ShardRouter,
     registry: ConnectionRegistry,
+    command_log: Option<SharedCommandLog>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut header_buf = [0u8; ENVELOPE_SIZE];
 
     loop {
-        match reader.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::debug!(conn_id, "client disconnected (EOF)");
+        // Race read against shutdown — once shutdown fires we stop dispatching
+        // immediately so callers that race shutdown with publish_sync see the
+        // expected disconnect/timeout error contract.
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                tracing::debug!(conn_id, "read loop stopping (shutdown)");
                 break;
             }
-            Err(e) => {
-                tracing::debug!(conn_id, error = %e, "read error");
-                break;
+            r = reader.read_exact(&mut header_buf) => {
+                match r {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        tracing::debug!(conn_id, "client disconnected (EOF)");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(conn_id, error = %e, "read error");
+                        break;
+                    }
+                }
             }
         }
         crate::lifecycle_trace!("01_tcp_read_header", conn_id, 0, "transport_read");
@@ -271,15 +281,30 @@ async fn read_loop(
 
         registry.touch(conn_id);
 
-        if tx.send((conn_id, buf.freeze())).await.is_err() {
-            break;
-        }
-        crate::lifecycle_trace!("03_frame_chan_send", conn_id, 0, "transport_read");
+        let frame = buf.freeze();
+        crate::lifecycle_trace!("04_dispatch_enter", conn_id, 0, "read_loop");
+        dispatch::dispatch_frame(
+            conn_id,
+            frame,
+            &server,
+            &registry,
+            command_log.as_ref(),
+        )
+        .await;
+        crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "read_loop");
     }
 
-    // Build and send disconnect frame
+    // Synthesize a Disconnect frame so all the engine bookkeeping
+    // (drain_connection across shards) runs once on EOF/error.
     let disconnect = Bytes::copy_from_slice(build_disconnect_frame().as_bytes());
-    let _ = tx.send((conn_id, disconnect)).await;
+    dispatch::dispatch_frame(
+        conn_id,
+        disconnect,
+        &server,
+        &registry,
+        command_log.as_ref(),
+    )
+    .await;
     registry.remove(conn_id);
 }
 

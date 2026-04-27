@@ -1,23 +1,43 @@
 //! Inner — shared state for connection, request correlation, subscriber demux.
+//!
+//! ## Channel topology (kit-native, zero `tokio::sync::*`)
+//!
+//! - `write_tx`     : `kit::Mpsc<Bytes, 256>` — M:1 fan-in to write_loop (OS thread).
+//! - `ack_tx`       : `kit::Mpsc<AckCmd, 256>` — M:1 fan-in to ack_loop (OS thread).
+//! - `pending`      : `kit::OneShot<RequestResult>` — per-request reply slot.
+//! - `state_tx`     : `tokio::sync::watch` — kept (pub/sub many subscribers, async API).
+//!
+//! `MpscProducer` is `Send + !Sync`. Many concurrent call sites push frames →
+//! we wrap the producer in `Mutex<MpscProducer>` (single producer slot, M=1).
+//! The Mutex serialises pushes; kit's lock-free `try_send` (Relaxed + Release,
+//! no LOCK-prefixed RMW) still beats `tokio::mpsc::Sender::try_send`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::watch;
 use zerocopy::{FromBytes, IntoBytes};
 use zerocopy::byteorder::little_endian::{U16, U32};
 
+use arbitro_kit::route::{
+    Mpsc, MpscConsumer, MpscProducer, MpscShutdown, OneShot, OneShotSender,
+};
+
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_proto::wire::delivery::{RepErrorAction, RepOkAction, RepBatchView};
+use arbitro_proto::wire::delivery::{RepBatchView, RepErrorAction, RepOkAction};
 use arbitro_proto::wire::envelope::{Envelope, FrameView, ENVELOPE_SIZE};
 use arbitro_engine_v2::common::SubjectTrie;
 
 use crate::error::ClientError;
-use crate::message::{AckCmd, Message};
+use crate::message::{AckCmd, AckProducer, Message};
 use crate::subscription::Subscription;
+
+/// Ring capacity for write_tx and ack_tx.
+pub(crate) const WRITE_RING_CAP: usize = 256;
+pub(crate) const ACK_RING_CAP: usize = 256;
 
 /// Connection state broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,42 +55,40 @@ pub(crate) enum RequestResult {
     Error(ErrorCode),
 }
 
+/// Producer handle for the write channel. Wrapped in Arc<Mutex<…>> so it can
+/// be cloned across send call sites and reset on reconnect without taking
+/// down the live Inner struct.
+pub(crate) type WriteProducer = Arc<Mutex<MpscProducer<Bytes, WRITE_RING_CAP>>>;
+
 /// Shared state between the connection task and the client API.
 pub(crate) struct Inner {
-    /// Write channel — enqueues frames for the write loop.
-    pub(crate) write_tx: Mutex<Option<mpsc::Sender<Bytes>>>,
+    /// Producer half of the write channel. `None` while disconnected.
+    /// Replaced on each reconnect session.
+    pub(crate) write_tx: RwLock<Option<WriteProducer>>,
 
     /// Connection state broadcast.
     pub(crate) state_tx: watch::Sender<ConnState>,
 
-    /// Pending request-reply correlation: env_seq → oneshot.
-    pub(crate) pending: Mutex<HashMap<u32, oneshot::Sender<RequestResult>>>,
+    /// Pending request-reply correlation: env_seq → kit OneShot sender.
+    /// Each in-flight `request*` allocates one OneShot pair; the Sender
+    /// lives here until the reply arrives or the request is cleaned up
+    /// (timeout / disconnect). Dropping the Sender wakes the parked
+    /// receiver with `Err(Closed)`.
+    pub(crate) pending: Mutex<HashMap<u32, OneShotSender<RequestResult>>>,
 
     /// Monotonic sequence for env_seq correlation.
     pub(crate) next_seq: AtomicU32,
 
     /// Active subscriptions for local demux.
-    /// Indexed: stream_id → consumer_id → Vec<(sub_id, Subscription)>.
-    ///
-    /// RwLock: hot-path frame delivery reads this on every RepBatch /
-    /// FanoutBatch / Deliver frame; writes only happen on subscribe /
-    /// unsubscribe (cold path). Heavy-read asymmetry justifies RwLock
-    /// over Mutex — readers don't block each other.
     pub(crate) subscriptions: RwLock<HashMap<u32, HashMap<u32, Vec<(u64, Subscription)>>>>,
 
-    /// Current ack/nack sender — replaced on each reconnect.
-    /// Messages hold a clone; after reconnect the old clone goes stale
-    /// (send fails silently) so stale ACKs are discarded automatically.
-    ///
-    /// RwLock: cloned on every delivered frame (read), replaced only on
-    /// reconnect (write).
-    pub(crate) ack_tx: RwLock<mpsc::Sender<AckCmd>>,
+    /// Current ack producer — replaced on each reconnect session.
+    /// Messages hold a clone (`Arc<Mutex<MpscProducer>>`); after reconnect
+    /// the old clone goes stale (try_send may succeed into a doomed ring,
+    /// or fail — both are correct: stale ACKs are discarded).
+    pub(crate) ack_tx: RwLock<AckProducer>,
 
     /// Precomputed Trie for O(M) fanout distribution.
-    /// Rebuilt on each membership change (cold path).
-    ///
-    /// RwLock: read on every FanoutBatch frame, rewritten only on
-    /// subscribe / unsubscribe.
     pub(crate) subject_trie: RwLock<SubjectTrie>,
 
     /// Monotonic subscription ID — shared across all Consumer objects.
@@ -86,15 +104,20 @@ pub(crate) struct Inner {
 impl Inner {
     pub(crate) fn new(addr: String, request_timeout: std::time::Duration) -> Self {
         let (state_tx, _) = watch::channel(ConnState::Disconnected);
-        // Initial channel — replaced on each reconnect session.
-        let (ack_tx, _ack_rx) = mpsc::channel::<AckCmd>(4096);
+
+        // Initial sentinel ack producer — replaced on first session via new_ack_channel.
+        // We need a valid Arc<Mutex<MpscProducer>> to satisfy the type before the
+        // first session brings up a real channel.
+        let (mut producers, _consumer, _shutdown) =
+            Mpsc::<AckCmd, ACK_RING_CAP>::new(1);
+        let ack_tx = Arc::new(Mutex::new(producers.pop().unwrap()));
 
         Self {
-            write_tx: Mutex::new(None),
+            write_tx: RwLock::new(None),
             state_tx,
             pending: Mutex::new(HashMap::new()),
             next_seq: AtomicU32::new(1),
-            subscriptions: RwLock::new(HashMap::new()), // stream → consumer → subs
+            subscriptions: RwLock::new(HashMap::new()),
             subject_trie: RwLock::new(SubjectTrie::new()),
             ack_tx: RwLock::new(ack_tx),
             next_sub_id: AtomicU64::new(1),
@@ -114,20 +137,41 @@ impl Inner {
                     if let Some(ref filter) = sub.filter {
                         trie.insert(filter, id as u32);
                     } else {
-                        trie.insert(b">", id as u32); // No filter = match all
+                        trie.insert(b">", id as u32);
                     }
                 }
             }
         }
     }
 
-    /// Replace the ack sender with a fresh channel for a new session.
-    /// Returns the receiver for the new ack loop.
-    /// Old Message handles hold the previous sender — their ACKs fail silently (correct).
-    pub(crate) fn new_ack_channel(&self) -> mpsc::Receiver<AckCmd> {
-        let (tx, rx) = mpsc::channel(4096);
-        *self.ack_tx.write().unwrap() = tx;
-        rx
+    /// Build a fresh ack channel for a new session. Returns the consumer +
+    /// shutdown handle for the ack_loop thread; installs the new producer
+    /// into `self.ack_tx`. Old `Message` clones hold the previous producer
+    /// (correctly stale).
+    pub(crate) fn new_ack_channel(
+        &self,
+    ) -> (
+        MpscConsumer<AckCmd, ACK_RING_CAP>,
+        MpscShutdown<AckCmd, ACK_RING_CAP>,
+    ) {
+        let (mut producers, consumer, shutdown) =
+            Mpsc::<AckCmd, ACK_RING_CAP>::new(1);
+        let new_tx = Arc::new(Mutex::new(producers.pop().unwrap()));
+        *self.ack_tx.write().unwrap() = new_tx;
+        (consumer, shutdown)
+    }
+
+    /// Install a new write channel producer. Called by `run_session` after
+    /// `Mpsc::new(1)` has spun up the consumer/shutdown handles for the
+    /// dedicated write OS thread.
+    pub(crate) fn install_write_producer(&self, producer: WriteProducer) {
+        *self.write_tx.write().unwrap() = Some(producer);
+    }
+
+    /// Clear the write producer (on disconnect). Subsequent `send_frame`
+    /// returns `false` until the next reconnect installs a new producer.
+    pub(crate) fn clear_write_producer(&self) {
+        *self.write_tx.write().unwrap() = None;
     }
 
     /// Allocate next env_seq.
@@ -135,82 +179,58 @@ impl Inner {
         self.next_seq.fetch_add(1, Relaxed)
     }
 
-    /// Send a raw frame to the write loop. Returns false if disconnected.
+    /// Try to enqueue a frame for the write loop. Returns false if
+    /// disconnected OR the ring is full (caller-visible backpressure).
     pub(crate) fn send_frame(&self, frame: Bytes) -> bool {
-        let guard = self.write_tx.lock().unwrap();
-        if let Some(tx) = guard.as_ref() {
-            tx.try_send(frame).is_ok()
-        } else {
-            false
+        let guard = self.write_tx.read().unwrap();
+        match guard.as_ref() {
+            Some(producer) => producer.lock().unwrap().try_send(frame).is_ok(),
+            None => false,
         }
     }
 
-    /// Send a request and wait for a reply (with timeout).
+    /// Send a request and wait for a fixed-size reply (with timeout).
     pub(crate) async fn request(
         &self,
         action: Action,
         stream_id: u32,
         body: &[u8],
     ) -> Result<u64, ClientError> {
-        let seq = self.alloc_seq();
-        let (tx, rx) = oneshot::channel();
-
-        // Register pending
-        {
-            let mut pending = self.pending.lock().unwrap();
-            pending.insert(seq, tx);
-        }
-
-        // Build frame
-        let envelope = Envelope {
-            action: U16::new(action.as_u16()),
-            flags: 0,
-            _rsv: 0,
-            stream_id: U32::new(stream_id),
-            msg_len: U32::new(body.len() as u32),
-            env_seq: U32::new(seq),
-        };
-
-        let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
-        frame.extend_from_slice(envelope.as_bytes());
-        frame.extend_from_slice(body);
-
-        if !self.send_frame(Bytes::from(frame)) {
-            // Cleanup pending
-            let mut pending = self.pending.lock().unwrap();
-            pending.remove(&seq);
-            return Err(ClientError::Disconnected);
-        }
-
-        // Wait for response with timeout
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(RequestResult::Ok(ref_seq))) => Ok(ref_seq),
-            Ok(Ok(RequestResult::OkBody(_))) => Ok(0), // unexpected body reply for scalar request
-            Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
-            Ok(Err(_)) => Err(ClientError::Disconnected), // oneshot dropped
-            Err(_) => {
-                // Timeout — cleanup pending
-                let mut pending = self.pending.lock().unwrap();
-                pending.remove(&seq);
-                Err(ClientError::Timeout)
-            }
+        match self.do_request(action, stream_id, body).await? {
+            RequestResult::Ok(v) => Ok(v),
+            RequestResult::OkBody(_) => Ok(0),
+            RequestResult::Error(code) => Err(ClientError::Broker(code)),
         }
     }
 
-    /// Send a request and wait for a variable-length body reply (with timeout).
+    /// Send a request and wait for a variable-length body reply.
     pub(crate) async fn request_body(
         &self,
         action: Action,
         stream_id: u32,
         body: &[u8],
     ) -> Result<Bytes, ClientError> {
-        let seq = self.alloc_seq();
-        let (tx, rx) = oneshot::channel();
-
-        {
-            let mut pending = self.pending.lock().unwrap();
-            pending.insert(seq, tx);
+        match self.do_request(action, stream_id, body).await? {
+            RequestResult::OkBody(data) => Ok(data),
+            RequestResult::Ok(_) => Ok(Bytes::new()),
+            RequestResult::Error(code) => Err(ClientError::Broker(code)),
         }
+    }
+
+    /// Internal: build the frame, register the OneShot Sender in `pending`,
+    /// enqueue, then await the reply via spawn_blocking + tokio timeout.
+    /// On timeout we drop the Sender (by removing from `pending`), which
+    /// wakes the parked receiver in spawn_blocking with `Closed`.
+    async fn do_request(
+        &self,
+        action: Action,
+        stream_id: u32,
+        body: &[u8],
+    ) -> Result<RequestResult, ClientError> {
+        let seq = self.alloc_seq();
+        let (tx, rx) = OneShot::<RequestResult>::new();
+
+        self.pending.lock().unwrap().insert(seq, tx);
 
         let envelope = Envelope {
             action: U16::new(action.as_u16()),
@@ -226,26 +246,32 @@ impl Inner {
         frame.extend_from_slice(body);
 
         if !self.send_frame(Bytes::from(frame)) {
-            let mut pending = self.pending.lock().unwrap();
-            pending.remove(&seq);
+            self.pending.lock().unwrap().remove(&seq);
             return Err(ClientError::Disconnected);
         }
 
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(RequestResult::OkBody(data))) => Ok(data),
-            Ok(Ok(RequestResult::Ok(_))) => Ok(Bytes::new()),
-            Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
-            Ok(Err(_)) => Err(ClientError::Disconnected),
-            Err(_) => {
-                let mut pending = self.pending.lock().unwrap();
-                pending.remove(&seq);
+        let timeout_dur = self.request_timeout;
+        let handle = tokio::task::spawn_blocking(move || {
+            rx.bind();
+            rx.recv()
+        });
+
+        match tokio::time::timeout(timeout_dur, handle).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(_closed))) => Err(ClientError::Disconnected),
+            Ok(Err(_join)) => Err(ClientError::Disconnected),
+            Err(_elapsed) => {
+                // Drop the Sender: dropping wakes the parked spawn_blocking
+                // task with Err(Closed); it cleans itself up.
+                self.pending.lock().unwrap().remove(&seq);
                 Err(ClientError::Timeout)
             }
         }
     }
 
-    /// Fire-and-forget: send frame with backpressure, no oneshot, no pending map.
-    /// Server will send RepOk back via TCP but on_rep_ok ignores unknown env_seq.
+    /// Fire-and-forget: enqueue a frame with no reply correlation.
+    /// Synchronous body — the `async` signature is preserved for API
+    /// compatibility with prior code paths but contains no `.await`.
     pub(crate) async fn fire_and_forget(
         &self,
         action: Action,
@@ -266,25 +292,15 @@ impl Inner {
         frame.extend_from_slice(envelope.as_bytes());
         frame.extend_from_slice(body);
 
-        let tx = {
-            let guard = self.write_tx.lock().unwrap();
-            guard.as_ref().cloned()
-        };
-
-        match tx {
-            Some(tx) => tx.send(Bytes::from(frame)).await
-                .map_err(|_| ClientError::Disconnected),
-            None => Err(ClientError::Disconnected),
+        if self.send_frame(Bytes::from(frame)) {
+            Ok(())
+        } else {
+            Err(ClientError::Disconnected)
         }
     }
 
-    /// Send a frame with no reply expected (internal use only, e.g. Pong).
-    fn send_no_reply(
-        &self,
-        action: Action,
-        stream_id: u32,
-        body: &[u8],
-    ) {
+    /// Send a frame with no reply expected (internal use, e.g. Pong).
+    fn send_no_reply(&self, action: Action, stream_id: u32, body: &[u8]) {
         let envelope = Envelope {
             action: U16::new(action.as_u16()),
             flags: 0,
@@ -320,7 +336,7 @@ impl Inner {
             Some(Action::ListStreams) => self.on_list_streams(env.env_seq.get(), body),
             Some(Action::ListConsumers) => self.on_list_consumers(env.env_seq.get(), body),
             Some(Action::Ping) => self.on_ping(body),
-            Some(Action::Connected) => { /* handled in connect handshake */ }
+            Some(Action::Connected) => { /* handshake */ }
             _ => {
                 tracing::debug!(action = env.action.get(), "unknown server frame");
             }
@@ -337,9 +353,9 @@ impl Inner {
             Err(_) => 0,
         };
 
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(tx) = pending.remove(&env_seq) {
-            let _ = tx.send(RequestResult::Ok(ref_seq));
+        let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
+        if let Some(tx) = tx_opt {
+            tx.send(RequestResult::Ok(ref_seq));
         }
     }
 
@@ -353,15 +369,12 @@ impl Inner {
             Err(_) => ErrorCode::InternalError,
         };
 
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(tx) = pending.remove(&env_seq) {
-            let _ = tx.send(RequestResult::Error(code));
+        let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
+        if let Some(tx) = tx_opt {
+            tx.send(RequestResult::Error(code));
         }
     }
 
-    /// Deliver frame: demux to local subscribers.
-    /// Server body format: [4 consumer_id][2 subj_len][subject][payload]
-    /// Sequence comes from envelope env_seq (u32).
     fn on_deliver(self: &Arc<Self>, stream_id: u32, env_seq: u32, body: &[u8]) {
         let subs = self.subscriptions.read().unwrap();
 
@@ -398,8 +411,6 @@ impl Inner {
         }
     }
 
-    /// RepBatch frame: batch of delivered entries (may contain mixed consumers).
-    /// Body format: [4B RepBatchFixed][N × (22B entry_header + subject + payload)]
     fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
         let subs = self.subscriptions.read().unwrap();
@@ -433,21 +444,20 @@ impl Inner {
     }
 
     fn on_list_streams(&self, env_seq: u32, body: &[u8]) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(tx) = pending.remove(&env_seq) {
-            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+        let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
+        if let Some(tx) = tx_opt {
+            tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
         }
     }
 
     fn on_list_consumers(&self, env_seq: u32, body: &[u8]) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(tx) = pending.remove(&env_seq) {
-            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+        let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
+        if let Some(tx) = tx_opt {
+            tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
         }
     }
 
     fn on_ping(&self, body: &[u8]) {
-        // Reply with Pong
         let mut pong_body = [0u8; 8];
         if body.len() >= 8 {
             pong_body.copy_from_slice(&body[..8]);
@@ -455,10 +465,6 @@ impl Inner {
         self.send_no_reply(Action::Pong, 0, &pong_body);
     }
 
-    /// FanoutBatch frame: Efficient O(M) distribution using the SubjectTrie.
-    /// Indexed lookup by stream_id, then trie-match per entry across all
-    /// consumers on this stream. No consumer_id filter — the server sends
-    /// one frame per connection, client distributes to all local consumers.
     fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
         let view = RepBatchView::new(body);
         let subs = self.subscriptions.read().unwrap();
@@ -471,7 +477,6 @@ impl Inner {
 
         for entry in view.entries() {
             trie.find_matches(entry.subject, |sub_id| {
-                // Trie stores sub_id as u32; find the sub in the indexed map.
                 let sub_id_64 = sub_id as u64;
                 for entries in by_consumer.values() {
                     for &(id, ref sub) in entries {
@@ -494,12 +499,8 @@ impl Inner {
         }
     }
 
-    /// Register a new local subscription.
     pub(crate) fn add_subscription(&self, id: u64, sub: Subscription) {
         {
-            // Scoped write lock — MUST drop before rebuild_trie() which
-            // acquires subscriptions.read(); otherwise we deadlock against
-            // ourselves (write holder blocks reader on same thread).
             let mut subs = self.subscriptions.write().unwrap();
             subs.entry(sub.stream_id)
                 .or_default()
@@ -510,10 +511,8 @@ impl Inner {
         self.rebuild_trie();
     }
 
-    /// Remove a local subscription.
     pub(crate) fn remove_subscription(&self, id: u64) {
         {
-            // Scoped write lock — dropped before rebuild_trie() below.
             let mut subs = self.subscriptions.write().unwrap();
             'outer: for by_consumer in subs.values_mut() {
                 for entries in by_consumer.values_mut() {
@@ -525,5 +524,12 @@ impl Inner {
             }
         }
         self.rebuild_trie();
+    }
+
+    /// Drain all `pending` OneShot senders by dropping them. Receivers wake
+    /// with `Closed`; callers translate to `ClientError::Disconnected`.
+    /// Called by `connection_loop` on disconnect / shutdown.
+    pub(crate) fn drain_pending(&self) {
+        self.pending.lock().unwrap().clear();
     }
 }
