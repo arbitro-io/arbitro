@@ -57,11 +57,3 @@ harness = false
 [[bench]]
 name    = "chaos"
 harness = false
-
-[[bench]]
-name    = "drain_pipeline"
-harness = false
-
-[[bench]]
-name    = "trace_two"
-harness = false

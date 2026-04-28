@@ -15,9 +15,36 @@ use arbitro_proto::wire::stream::{CreateStreamFixed, DeleteStreamFixed};
 
 use crate::conn;
 use crate::consumer::Consumer;
-use crate::encode::encode_publish;
 use crate::error::ClientError;
 use crate::inner::{ConnState, Inner};
+
+/// One entry in a [`Client::publish_batch`] / [`Client::publish_batch_sync`]
+/// call.
+///
+/// The `subject` is borrowed (it is small metadata, copied into the wire
+/// header at encode time). The `payload` is an owned `Bytes` so it can
+/// travel as a separate iovec to the kernel via `write_vectored` —
+/// **no userspace copy of payload bytes past this boundary**.
+///
+/// Build payloads from any of:
+/// - `Bytes::from_static(b"…")` — true zero-copy for compile-time data.
+/// - `Bytes::from(vec)` / `BytesMut::freeze()` — Arc-wrap an existing
+///   allocation, no `memcpy`.
+/// - `Bytes::copy_from_slice(slice)` — explicit allocation + copy at
+///   the call site (last resort; you pay the copy here, not elsewhere).
+#[derive(Debug, Clone)]
+pub struct BatchEntry<'a> {
+    pub subject: &'a [u8],
+    pub payload: Bytes,
+}
+
+impl<'a> BatchEntry<'a> {
+    /// Convenience constructor.
+    #[inline]
+    pub fn new(subject: &'a [u8], payload: Bytes) -> Self {
+        Self { subject, payload }
+    }
+}
 
 /// Client for the arbitro message broker.
 #[derive(Clone)]
@@ -331,29 +358,35 @@ impl Client {
             .await
     }
 
-    /// Publish a batch of (subject, payload) pairs (fire-and-forget).
+    /// Publish a batch of `(subject, payload)` entries (fire-and-forget).
+    ///
+    /// Zero-copy: the metadata header (envelope + per-entry headers +
+    /// subjects) is built into a single `Bytes`; each entry's `payload`
+    /// is shipped as its own iovec via `write_vectored`. No payload
+    /// bytes are copied in userspace past this point.
     pub async fn publish_batch(
         &self,
         stream_name: &[u8],
-        entries: &[(&[u8], &[u8])],
+        entries: &[BatchEntry<'_>],
     ) -> Result<(), ClientError> {
         let stream_id = wire_hash_32(stream_name);
-        let body = encode_publish(entries);
         self.inner
-            .fire_and_forget(Action::Publish, stream_id, &body)
+            .fire_and_forget_publish_batch(Action::Publish, stream_id, entries)
             .await
     }
 
-    /// Publish a batch and wait for server confirmation.
-    /// Returns the first assigned sequence number.
+    /// Publish a batch and wait for server confirmation. Returns the
+    /// first assigned sequence number. Same zero-copy guarantees as
+    /// [`publish_batch`].
     pub async fn publish_batch_sync(
         &self,
         stream_name: &[u8],
-        entries: &[(&[u8], &[u8])],
+        entries: &[BatchEntry<'_>],
     ) -> Result<u64, ClientError> {
         let stream_id = wire_hash_32(stream_name);
-        let body = encode_publish(entries);
-        self.inner.request(Action::Publish, stream_id, &body).await
+        self.inner
+            .request_publish_batch(Action::Publish, stream_id, entries)
+            .await
     }
 
     // ── Connection state ─────────────────────────────────────────

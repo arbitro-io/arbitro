@@ -47,13 +47,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start = start_time;
             
             handles.push(tokio::spawn(async move {
+                use arbitro_client::BatchEntry;
+                use bytes::Bytes;
                 let client = Client::connect(&addr_clone).await.expect("prod connect");
-                let payload = vec![0u8; 128];
+                // Build the payload once as `Bytes` so every batch entry
+                // is an Arc-shared view — zero memcpy per publish.
+                let payload: Bytes = Bytes::from(vec![0u8; 128]);
                 let batch_size = 500;
-                let entries: Vec<(&[u8], &[u8])> = (0..batch_size)
-                    .map(|_| (b"endurance.stress".as_slice(), payload.as_slice()))
+                let entries: Vec<BatchEntry<'_>> = (0..batch_size)
+                    .map(|_| BatchEntry::new(b"endurance.stress", payload.clone()))
                     .collect();
-                
+
                 while start.elapsed() < duration {
                     if client.publish_batch(&stream, &entries).await.is_ok() {
                         counter.fetch_add(batch_size as u64, Ordering::Relaxed);

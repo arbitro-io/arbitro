@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -204,9 +205,17 @@ async fn run_single(
         let payload = payload.clone();
         js.spawn(async move {
             for _ in 0..msgs {
-                c.publish(&stream, b"bench.msg", &payload)
-                    .await
-                    .expect("publish");
+                // Retry on Backpressure (write ring saturated): yield and
+                // try again. Any other error is a real failure → unwrap.
+                loop {
+                    match c.publish(&stream, b"bench.msg", &payload).await {
+                        Ok(()) => break,
+                        Err(arbitro_client::ClientError::Backpressure) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(e) => panic!("publish: {e:?}"),
+                    }
+                }
             }
         });
     }
@@ -232,9 +241,13 @@ async fn run_batch(
         js.spawn(async move {
             // Pre-allocate one full-size entries Vec; reuse across batches
             // by slicing. Zero realloc on the hot loop (perf rule #5).
-            let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(batch_size);
+            let payload_bytes = Bytes::copy_from_slice(&payload[..]);
+            let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
             for _ in 0..batch_size {
-                entries.push((b"bench.msg".as_slice(), &payload[..]));
+                entries.push(BatchEntry {
+                    subject: b"bench.msg".as_slice(),
+                    payload: payload_bytes.clone(),
+                });
             }
             let batches = total.div_ceil(batch_size);
             for b in 0..batches {
@@ -242,6 +255,137 @@ async fn run_batch(
                 c.publish_batch(&stream, &entries[..size])
                     .await
                     .expect("publish_batch");
+            }
+        });
+    }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Batch publish SYNC — same shape as run_batch, but each publish_batch_sync
+//    awaits the server's RepOk reply. Time captured includes server-side
+//    parse + store.append_batch. This is the FAIR end-to-end number — when
+//    publish_batch_sync returns, the server has acknowledged the entries
+//    were stored.
+
+async fn run_batch_sync(
+    clients: &[Client],
+    stream_names: &[Vec<u8>],
+    total: usize,
+    batch_size: usize,
+    payload: &Arc<[u8]>,
+) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        let payload = payload.clone();
+        js.spawn(async move {
+            let payload_bytes = Bytes::copy_from_slice(&payload[..]);
+            let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                entries.push(BatchEntry {
+                    subject: b"bench.msg".as_slice(),
+                    payload: payload_bytes.clone(),
+                });
+            }
+            let batches = total.div_ceil(batch_size);
+            for b in 0..batches {
+                let size = batch_size.min(total - b * batch_size);
+                c.publish_batch_sync(&stream, &entries[..size])
+                    .await
+                    .expect("publish_batch_sync");
+            }
+        });
+    }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Single publish SYNC — same shape as run_single, but each
+//    publish_sync awaits the server's RepOk reply. The fair single-msg
+//    end-to-end number: time captured includes server-side parse +
+//    store.append_batch + reply roundtrip per individual message.
+
+async fn run_single_sync(
+    clients: &[Client],
+    stream_names: &[Vec<u8>],
+    msgs: u32,
+    payload: &Arc<[u8]>,
+) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        let payload = payload.clone();
+        js.spawn(async move {
+            for _ in 0..msgs {
+                c.publish_sync(&stream, b"bench.msg", &payload)
+                    .await
+                    .expect("publish_sync");
+            }
+        });
+    }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Single publish ACCUMULATE (fire-and-forget) — server-side
+//    accumulation: client sends per-msg, server batches up to
+//    1024 entries / 5ms before append_batch. Client returns as soon
+//    as the frame is enqueued (does NOT wait for the server flush).
+//    Tests how much the server accumulator helps when the client
+//    sends single-msg fire-and-forget.
+
+async fn run_single_accumulate(
+    clients: &[Client],
+    stream_names: &[Vec<u8>],
+    msgs: u32,
+    payload: &Arc<[u8]>,
+) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        let payload = payload.clone();
+        js.spawn(async move {
+            for _ in 0..msgs {
+                c.publish_accumulate(&stream, b"bench.msg", &payload)
+                    .await
+                    .expect("publish_accumulate");
+            }
+        });
+    }
+    while js.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+// ── Single publish ACCUMULATE SYNC — same as accumulate but the
+//    client awaits the server's RepOk for the flushed batch. Each
+//    publish_accumulate_sync returns a sequence number AFTER the
+//    server batched + appended this entry along with whatever else
+//    arrived in the same accumulator window.
+
+async fn run_single_accumulate_sync(
+    clients: &[Client],
+    stream_names: &[Vec<u8>],
+    msgs: u32,
+    payload: &Arc<[u8]>,
+) -> Duration {
+    let start = Instant::now();
+    let mut js = tokio::task::JoinSet::new();
+    for (i, client) in clients.iter().enumerate() {
+        let c = client.clone();
+        let stream = stream_names[i % stream_names.len()].clone();
+        let payload = payload.clone();
+        js.spawn(async move {
+            for _ in 0..msgs {
+                c.publish_accumulate_sync(&stream, b"bench.msg", &payload)
+                    .await
+                    .expect("publish_accumulate_sync");
             }
         });
     }
@@ -273,9 +417,13 @@ async fn prefill_streams(
         js.spawn(async move {
             // Pre-allocate entries Vec once at full BATCH_SIZE; truncate per
             // batch via slice. Zero realloc across batches (perf rule #5).
-            let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(BATCH_SIZE);
+            let payload_bytes = Bytes::copy_from_slice(&payload[..]);
+            let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(BATCH_SIZE);
             for _ in 0..BATCH_SIZE {
-                entries.push((b"bench.msg".as_slice(), &payload[..]));
+                entries.push(BatchEntry {
+                    subject: b"bench.msg".as_slice(),
+                    payload: payload_bytes.clone(),
+                });
             }
             for b in 0..batches {
                 let size = BATCH_SIZE.min(total - b * BATCH_SIZE);
@@ -569,6 +717,77 @@ fn main() {
             });
         }
 
+        // ── Single publish SYNC — fair single-msg end-to-end ──────────
+        // publish_sync awaits the server's RepOk reply per message, so
+        // the measurement includes server-side parse + store + roundtrip.
+        // Fewer msgs because each is a full RTT.
+        let single_sync_msgs: u32 = total_msgs.min(5_000);
+        println!("\n[ publish_single_sync — {single_sync_msgs} msgs total/iter, server-confirmed ]");
+        rt.block_on(reset_streams(&setup_client, &stream_names));
+        print_header();
+
+        for &n in &concurrency {
+            let msgs_per_client = single_sync_msgs / n as u32;
+            let clients: Vec<Client> = rt.block_on(async {
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(connect(&addr).await);
+                }
+                v
+            });
+
+            let total_msgs_per_iter = msgs_per_client as u64 * n as u64;
+            let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
+
+            rt.block_on(async {
+                let _ = tokio::time::timeout(
+                    LEVEL_TIMEOUT,
+                    run_single_sync(&clients, &stream_names, 50, &payload),
+                )
+                .await;
+
+                let rss_before = rss_kb();
+                let cpu_before = cpu_time_ns();
+                let mut total_time = Duration::ZERO;
+
+                for _ in 0..iterations {
+                    match tokio::time::timeout(
+                        LEVEL_TIMEOUT,
+                        run_single_sync(&clients, &stream_names, msgs_per_client, &payload),
+                    )
+                    .await
+                    {
+                        Ok(d) => total_time += d,
+                        Err(_) => {
+                            println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})");
+                            return;
+                        }
+                    }
+                }
+
+                let cpu_after = cpu_time_ns();
+                let rss_after = rss_kb();
+                let wall_ns = total_time.as_nanos() as u64;
+                let cpu_ns = cpu_after.saturating_sub(cpu_before);
+                let cpu_pct = if wall_ns > 0 {
+                    cpu_ns as f64 / wall_ns as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let total_msgs_all = total_msgs_per_iter * iterations as u64;
+
+                print_result(&BenchResult {
+                    label,
+                    avg: total_time / iterations,
+                    throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
+                    per_conn: total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
+                    rss: rss_after,
+                    rss_delta: rss_after.saturating_sub(rss_before),
+                    cpu_pct,
+                });
+            });
+        }
+
         // ── Batch publish ───────────────────────────────────────────
         // Same total volume as publish_single, fragmented into `batch_size`
         // batches per task.
@@ -610,6 +829,89 @@ fn main() {
                     match tokio::time::timeout(
                         LEVEL_TIMEOUT,
                         run_batch(
+                            &clients,
+                            &stream_names,
+                            msgs_per_client as usize,
+                            batch_size,
+                            &payload,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(d) => total_time += d,
+                        Err(_) => {
+                            println!("  {label:30} | TIMEOUT ({LEVEL_TIMEOUT:?})");
+                            return;
+                        }
+                    }
+                }
+
+                let cpu_after = cpu_time_ns();
+                let rss_after = rss_kb();
+                let wall_ns = total_time.as_nanos() as u64;
+                let cpu_ns = cpu_after.saturating_sub(cpu_before);
+                let cpu_pct = if wall_ns > 0 {
+                    cpu_ns as f64 / wall_ns as f64 * 100.0
+                } else {
+                    0.0
+                };
+                let total_msgs_all = total_msgs_per_iter * iterations as u64;
+
+                print_result(&BenchResult {
+                    label,
+                    avg: total_time / iterations,
+                    throughput: total_msgs_all as f64 / total_time.as_secs_f64(),
+                    per_conn: total_msgs_all as f64 / total_time.as_secs_f64() / n as f64,
+                    rss: rss_after,
+                    rss_delta: rss_after.saturating_sub(rss_before),
+                    cpu_pct,
+                });
+            });
+        }
+
+        // ── Batch publish SYNC — fair end-to-end measurement ───────────
+        // publish_batch_sync awaits the server's RepOk reply, so the
+        // measurement includes server-side parse + store.append_batch.
+        // This is what "real throughput" looks like when the publisher
+        // waits for confirmation.
+        println!("\n[ publish_batch_sync — batch={batch_size}, {total_msgs} msgs total/iter, server-confirmed ]");
+        rt.block_on(reset_streams(&setup_client, &stream_names));
+        print_header();
+
+        for &n in &concurrency {
+            let msgs_per_client = total_msgs / n as u32;
+            let clients: Vec<Client> = rt.block_on(async {
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(connect(&addr).await);
+                }
+                v
+            });
+
+            let total_msgs_per_iter = msgs_per_client as u64 * n as u64;
+            let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
+
+            rt.block_on(async {
+                let _ = tokio::time::timeout(
+                    LEVEL_TIMEOUT,
+                    run_batch_sync(
+                        &clients,
+                        &stream_names,
+                        msgs_per_client as usize,
+                        batch_size,
+                        &payload,
+                    ),
+                )
+                .await;
+
+                let rss_before = rss_kb();
+                let cpu_before = cpu_time_ns();
+                let mut total_time = Duration::ZERO;
+
+                for _ in 0..iterations {
+                    match tokio::time::timeout(
+                        LEVEL_TIMEOUT,
+                        run_batch_sync(
                             &clients,
                             &stream_names,
                             msgs_per_client as usize,
@@ -824,9 +1126,13 @@ fn main() {
                 {
                     let batch_size = 256;
                     let total = expected as usize;
-                    let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(batch_size);
+                    let payload_bytes = Bytes::copy_from_slice(&payload[..]);
+                    let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
                     for _ in 0..batch_size {
-                        entries.push((b"bench.msg".as_slice(), &payload[..]));
+                        entries.push(BatchEntry {
+                            subject: b"bench.msg".as_slice(),
+                            payload: payload_bytes.clone(),
+                        });
                     }
                     let batches = total.div_ceil(batch_size);
                     for b in 0..batches {

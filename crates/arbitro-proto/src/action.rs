@@ -4,9 +4,19 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Action {
-    // 0x01xx — Publish
-    Publish           = 0x0101,
-    PublishAccumulate = 0x0102,
+    // 0x01xx — Publish family. Specific actions per body shape — no
+    // discriminator byte inside the payload, no inner branching.
+    Publish                  = 0x0101,
+    PublishAccumulate        = 0x0102,
+    PublishBatch             = 0x0103,
+    PublishWithReply         = 0x0104, // + reply_to (RPC)
+    PublishWithHeaders       = 0x0105, // + headers (tracing/metadata)
+    PublishBatchWithHeaders  = 0x0106, // batch where every entry has headers
+
+    // 0x00xx — Handshake / control (pre-Header). Hello is *not* a v2 frame:
+    // its on-wire representation is a 8B HelloFrame starting with the v2
+    // magic, sent as the first bytes of every connection.
+    Hello                    = 0x0001,
 
     // 0x02xx — Delivery
     Deliver       = 0x0200,
@@ -55,8 +65,14 @@ impl Action {
     #[inline(always)]
     pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
+            0x0001 => Some(Self::Hello),
+
             0x0101 => Some(Self::Publish),
             0x0102 => Some(Self::PublishAccumulate),
+            0x0103 => Some(Self::PublishBatch),
+            0x0104 => Some(Self::PublishWithReply),
+            0x0105 => Some(Self::PublishWithHeaders),
+            0x0106 => Some(Self::PublishBatchWithHeaders),
 
             0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
@@ -102,15 +118,51 @@ impl Action {
         self as u16
     }
 
-    /// Hot-path actions: publish, ack, nack.
+    /// Hot-path actions: publish family, ack, nack.
     #[inline(always)]
     pub const fn is_hot(self) -> bool {
-        matches!(self, Self::Publish | Self::PublishAccumulate | Self::Ack | Self::Nack | Self::BatchAck | Self::AckSync | Self::BatchAckSync)
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+                | Self::Ack
+                | Self::Nack
+                | Self::BatchAck
+                | Self::AckSync
+                | Self::BatchAckSync
+        )
     }
 
     /// Actions that carry a subject for routing.
     #[inline(always)]
     pub const fn has_subject(self) -> bool {
-        matches!(self, Self::Publish | Self::PublishAccumulate | Self::Subscribe)
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+                | Self::Subscribe
+        )
+    }
+
+    /// Whether the action is a member of the publish family.
+    #[inline(always)]
+    pub const fn is_publish(self) -> bool {
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+        )
     }
 }

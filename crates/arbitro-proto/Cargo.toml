@@ -9,3 +9,14 @@ zerocopy = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 foldhash = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[bench]]
+name = "encode_publish"
+harness = false
+
+[[bench]]
+name = "decode_tcp"
+harness = false

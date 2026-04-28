@@ -230,8 +230,11 @@ async fn read_loop(inner: &Arc<Inner>, mut reader: TcpStream) {
             }
         }
 
-        let frame = buf.split_to(total);
-        inner.on_frame(&frame);
+        // Freeze the chunk so handlers can `Bytes::slice(range)` without
+        // copying — every per-message payload becomes an Arc-shared view
+        // into this same allocation.
+        let frame = buf.split_to(total).freeze();
+        inner.on_frame(frame);
     }
 }
 
@@ -261,6 +264,11 @@ fn write_loop(
             }
             Ok(WriteFrame::PubSingle { header, payload }) => {
                 if write_all_vectored2(&mut writer, &header, &payload).is_err() {
+                    return;
+                }
+            }
+            Ok(WriteFrame::PubBatch { chunks }) => {
+                if write_all_vectored_n(&mut writer, &chunks).is_err() {
                     return;
                 }
             }
@@ -304,6 +312,80 @@ fn write_all_vectored2(
     }
     // Header fully drained on a previous iteration boundary; flush payload.
     writer.write_all(payload)
+}
+
+/// Sync `write_vectored` for an arbitrary list of buffers. Each chunk
+/// rides its own iovec — never coalesced into a contiguous buffer in
+/// userspace — so the kernel's `write` is the only place data is copied.
+///
+/// Walks a `(slot, offset_in_slot)` cursor through the chunk list,
+/// chunking at `MAX_IOVS` per syscall (Linux `IOV_MAX` ≥ 1024; 512 is
+/// conservative and matches typical batch sizes).
+fn write_all_vectored_n(
+    writer: &mut std::net::TcpStream,
+    chunks: &[bytes::Bytes],
+) -> std::io::Result<()> {
+    use std::io::{IoSlice, Write};
+
+    const MAX_IOVS: usize = 512;
+
+    let total_slots = chunks.len();
+    if total_slots == 0 {
+        return Ok(());
+    }
+
+    // Cursor into the buffer list.
+    let mut cur_slot = 0usize;
+    let mut cur_off = 0usize;
+
+    // Reusable iovec scratch.
+    let mut bufs: Vec<IoSlice<'_>> = Vec::with_capacity(MAX_IOVS);
+
+    while cur_slot < total_slots {
+        bufs.clear();
+
+        // Skip empty leading slots to avoid wasting iovec slots.
+        while cur_slot < total_slots && chunks[cur_slot].len() == cur_off {
+            cur_slot += 1;
+            cur_off = 0;
+        }
+        if cur_slot >= total_slots {
+            return Ok(());
+        }
+
+        // Build up to MAX_IOVS slots starting at the cursor.
+        bufs.push(IoSlice::new(&chunks[cur_slot][cur_off..]));
+        let mut probe = cur_slot + 1;
+        while bufs.len() < MAX_IOVS && probe < total_slots {
+            let s = &chunks[probe][..];
+            if !s.is_empty() {
+                bufs.push(IoSlice::new(s));
+            }
+            probe += 1;
+        }
+
+        let mut n = writer.write_vectored(&bufs)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "write_vectored returned 0",
+            ));
+        }
+
+        // Drain `n` against the cursor.
+        while n > 0 && cur_slot < total_slots {
+            let remaining = chunks[cur_slot].len() - cur_off;
+            if n < remaining {
+                cur_off += n;
+                n = 0;
+            } else {
+                n -= remaining;
+                cur_slot += 1;
+                cur_off = 0;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Ack loop (OS thread) ────────────────────────────────────────────────

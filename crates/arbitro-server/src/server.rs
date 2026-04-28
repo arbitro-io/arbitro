@@ -225,6 +225,25 @@ impl ArbitroServer {
 /// One task per connection. TCP guarantees frame order within a connection,
 /// and dispatch is safe to call concurrently across connections (shard
 /// router + registry are Arc-backed). No central mpsc bottleneck.
+///
+/// ## I/O strategy: single `BytesMut` accumulator + `read_buf` + O(1) `split_to`
+///
+/// Validated by `arbitro-proto/benches/decode_tcp.rs` to be ~10× faster than
+/// the naive `read_exact ×2 + per-frame BytesMut::with_capacity` pattern at
+/// 100k frames over loopback (~24 M msg/s vs 2.3 M msg/s on tokio).
+///
+/// Key properties:
+///   - **One allocation per connection** that grows on demand via `reserve`.
+///   - **`read_buf`** writes into the spare capacity safely (no `unsafe set_len`).
+///   - **`split_to(total)`** is O(1): an Arc bump + index update; no memcpy.
+///     The peeled frame and the residual tail share the same backing buffer
+///     until the original `BytesMut` reallocates.
+///   - **Cancellation-safe**: `read_buf` honors `tokio::select!` — if shutdown
+///     fires mid-read, no bytes are silently dropped.
+///   - **Frame layout-agnostic**: only the `msg_len` field offset is hard-coded.
+///     v1 envelope: `msg_len` @ offset 8..12. When the v2 cutover lands,
+///     change to offset 4..8 and update `dispatch_frame`. The I/O machinery
+///     stays identical.
 async fn read_loop(
     conn_id: u64,
     mut reader: tokio::net::tcp::OwnedReadHalf,
@@ -233,65 +252,75 @@ async fn read_loop(
     command_log: Option<SharedCommandLog>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut header_buf = [0u8; ENVELOPE_SIZE];
+    // 64 KiB covers ~200 small frames before the first `reserve` triggers.
+    // `BytesMut::reserve` will compact and/or grow as needed.
+    const INITIAL_CAP: usize = 64 * 1024;
+    let mut acc = BytesMut::with_capacity(INITIAL_CAP);
 
-    loop {
-        // Race read against shutdown — once shutdown fires we stop dispatching
-        // immediately so callers that race shutdown with publish_sync see the
-        // expected disconnect/timeout error contract.
+    'outer: loop {
+        // ---- Fast path: drain whole frames already in the accumulator ------
+        loop {
+            if acc.len() < ENVELOPE_SIZE {
+                break;
+            }
+            // v1 envelope layout: msg_len @ bytes 8..12 LE u32.
+            // (For v2 Header this becomes bytes 4..8 — only this line changes.)
+            let msg_len = u32::from_le_bytes([
+                acc[8], acc[9], acc[10], acc[11],
+            ]) as usize;
+            let total = ENVELOPE_SIZE + msg_len;
+            if acc.len() < total {
+                break; // frame straddles — need more bytes
+            }
+
+            // O(1): bumps Arc, updates indices. `frame` owns [0..total],
+            // `acc` keeps [total..]. No memcpy, no heap alloc.
+            let frame = acc.split_to(total).freeze();
+
+            registry.touch(conn_id);
+            crate::lifecycle_trace!("01_tcp_read_header", conn_id, 0, "transport_read");
+            crate::lifecycle_trace!("02_tcp_read_body",   conn_id, 0, "transport_read");
+            crate::lifecycle_trace!("04_dispatch_enter",  conn_id, 0, "read_loop");
+            dispatch::dispatch_frame(
+                conn_id,
+                frame,
+                &server,
+                &registry,
+                command_log.as_ref(),
+            )
+            .await;
+            crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "read_loop");
+        }
+
+        // ---- Slow path: need more bytes from the socket --------------------
+        // Ensure spare capacity for at least one envelope-worth so `read_buf`
+        // has somewhere to write. `reserve` may compact and/or grow.
+        if acc.capacity() - acc.len() < ENVELOPE_SIZE {
+            acc.reserve(INITIAL_CAP);
+        }
+
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
                 tracing::debug!(conn_id, "read loop stopping (shutdown)");
-                break;
+                break 'outer;
             }
-            r = reader.read_exact(&mut header_buf) => {
+            // `read_buf` is cancellation-safe per tokio docs: if select cancels
+            // it, no bytes were consumed from the socket.
+            r = reader.read_buf(&mut acc) => {
                 match r {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    Ok(0) => {
                         tracing::debug!(conn_id, "client disconnected (EOF)");
-                        break;
+                        break 'outer;
                     }
+                    Ok(_n) => { /* loop and try to drain */ }
                     Err(e) => {
                         tracing::debug!(conn_id, error = %e, "read error");
-                        break;
+                        break 'outer;
                     }
                 }
             }
         }
-        crate::lifecycle_trace!("01_tcp_read_header", conn_id, 0, "transport_read");
-
-        // Parse msg_len from envelope (bytes 8..12, little-endian u32)
-        let msg_len =
-            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]])
-                as usize;
-
-        let total = ENVELOPE_SIZE + msg_len;
-        let mut buf = BytesMut::with_capacity(total);
-        buf.extend_from_slice(&header_buf);
-
-        if msg_len > 0 {
-            buf.resize(total, 0);
-            if let Err(e) = reader.read_exact(&mut buf[ENVELOPE_SIZE..]).await {
-                tracing::debug!(conn_id, error = %e, "read body error");
-                break;
-            }
-        }
-        crate::lifecycle_trace!("02_tcp_read_body", conn_id, 0, "transport_read");
-
-        registry.touch(conn_id);
-
-        let frame = buf.freeze();
-        crate::lifecycle_trace!("04_dispatch_enter", conn_id, 0, "read_loop");
-        dispatch::dispatch_frame(
-            conn_id,
-            frame,
-            &server,
-            &registry,
-            command_log.as_ref(),
-        )
-        .await;
-        crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "read_loop");
     }
 
     // Synthesize a Disconnect frame so all the engine bookkeeping

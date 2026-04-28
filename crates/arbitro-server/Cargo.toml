@@ -20,6 +20,9 @@ default = []
 # Enable with `cargo test --features lifecycle_trace` when you need to
 # profile end-to-end timings of a single message through the server.
 lifecycle_trace = []
+# A/B toggle: swap the Gate impl to crossbeam_channel-backed variant.
+gate_crossbeam = ["arbitro-common/gate_crossbeam"]
+gate_tokio_notify = ["arbitro-common/gate_tokio_notify"]
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
@@ -36,6 +39,8 @@ foldhash          = "0.1"
 
 [dev-dependencies]
 arbitro-client = { path = "../arbitro-client" }
+arbitro-kit    = { path = "../../../arbitro-kit" }
+libc           = "0.2"
 ahash          = "0.8"
 dashmap        = "6"
 rapidhash      = "1"
@@ -43,6 +48,7 @@ rustc-hash     = "2"
 arc-swap       = "1"
 crossbeam-channel = "0.5"
 crossbeam-queue   = "0.3"
+socket2          = "0.5"
 
 [[bench]]
 name = "lookup_strategies"
@@ -106,4 +112,32 @@ harness = false
 
 [[bench]]
 name = "drain_full_scenario"
+harness = false
+
+[[bench]]
+name = "tcp_real_publish"
+harness = false
+
+[[bench]]
+name = "writer_stack_h2h"
+harness = false
+
+[[bench]]
+name = "channel_native_h2h"
+harness = false
+
+[[bench]]
+name = "drain_slow_consumer"
+harness = false
+
+[[bench]]
+name = "client_only_frame"
+harness = false
+
+[[bench]]
+name = "writev_concurrent"
+harness = false
+
+[[bench]]
+name = "mpsc_overhead"
 harness = false

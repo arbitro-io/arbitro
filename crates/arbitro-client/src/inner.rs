@@ -1,13 +1,21 @@
 //! Inner — shared state for connection, request correlation, subscriber demux.
 //!
-//! ## Channel topology (kit-native, zero `tokio::sync::*`)
+//! ## Channel topology (kit-native on hot paths)
 //!
-//! - `write_tx`     : `kit::Mpsc<Bytes, 256>` — M:1 fan-in to write_loop (OS thread).
-//! - `ack_tx`       : `kit::Mpsc<AckCmd, 256>` — M:1 fan-in to ack_loop (OS thread).
-//! - `pending`      : `tokio::sync::oneshot<RequestResult>` — per-request reply slot.
-//!                    (async-native: `rx.await` directly, no spawn_blocking,
-//!                    no OS thread parked per in-flight request.)
-//! - `state_tx`     : `tokio::sync::watch` — kept (pub/sub many subscribers, async API).
+//! - `write_tx`     : `kit::Mpsc<WriteFrame, WRITE_RING_CAP>` — M:1 fan-in to
+//!                    write_loop (OS thread).
+//! - `ack_tx`       : `kit::Mpsc<AckCmd, ACK_RING_CAP>` — M:1 fan-in to
+//!                    ack_loop (OS thread).
+//! - `pending`      : `kit::route::OneShotAsync<RequestResult>` — per-request
+//!                    reply slot. Tokio-native (`NotifyWaiter`-backed); the
+//!                    `recv_async()` future composes with `tokio::time::timeout`.
+//!                    Dropping the producer (e.g. on timeout) wakes the
+//!                    awaiting consumer with `Err(Closed)` — same semantics
+//!                    as `tokio::sync::oneshot` but reusing the kit's
+//!                    Waiter trait machinery.
+//! - `state_tx`     : `tokio::sync::watch` — kept on the cold connection-
+//!                    state broadcast path (one event per connect/disconnect,
+//!                    fanned out to N subscribers; no kit equivalent).
 //!
 //! `MpscProducer` is `Send + !Sync`. Many concurrent call sites push frames →
 //! we wrap the producer in `Mutex<MpscProducer>` (single producer slot, M=1).
@@ -19,12 +27,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 use zerocopy::{FromBytes, IntoBytes};
 use zerocopy::byteorder::little_endian::{U16, U32};
 
 use arbitro_kit::route::{
     Mpsc, MpscConsumer, MpscProducer, MpscShutdown,
+    OneShotAsync, OneShotAsyncSender,
 };
 
 use arbitro_proto::action::Action;
@@ -62,7 +71,7 @@ pub(crate) enum RequestResult {
     Error(ErrorCode),
 }
 
-/// Write-ring item. Two variants so the publish hot path can ship the
+/// Write-ring item. Three shapes so the publish hot path can ship every
 /// user payload as a separate iovec (zero-copy via `write_vectored`),
 /// while every other frame stays in a single contiguous buffer.
 pub(crate) enum WriteFrame {
@@ -72,6 +81,15 @@ pub(crate) enum WriteFrame {
     /// `header` = `[envelope][count=1][PublishEntry][subject]`
     /// `payload` = the user's bytes (never copied past the API boundary).
     PubSingle { header: Bytes, payload: Bytes },
+    /// Interleaved iovec frame for multi-entry publish.
+    /// `chunks[0]` = `[envelope][count=N][PublishEntry_1][subject_1]`
+    /// `chunks[1]` = payload of entry 1 (Arc-shared, never copied).
+    /// `chunks[2]` = `[PublishEntry_2][subject_2]`
+    /// `chunks[3]` = payload of entry 2.  …and so on.
+    /// Shipped as one `write_vectored` (or several, for huge batches).
+    /// The interleaved order matches the broker's per-entry wire layout
+    /// `[hdr][subj][pay]`.
+    PubBatch { chunks: Vec<Bytes> },
 }
 
 
@@ -79,6 +97,25 @@ pub(crate) enum WriteFrame {
 /// be cloned across send call sites and reset on reconnect without taking
 /// down the live Inner struct.
 pub(crate) type WriteProducer = Arc<Mutex<MpscProducer<WriteFrame, WRITE_RING_CAP>>>;
+
+/// Take an Arc-shared `Bytes` view of `sub`, given that `sub` is a borrow
+/// from `parent`'s buffer. Pure pointer arithmetic — no `memcpy`. Used by
+/// the inbound dispatch path so per-message payloads share the read
+/// loop's `BytesMut` allocation via Arc reference counts instead of
+/// being copied per delivery.
+#[inline]
+fn subslice_of(parent: &Bytes, sub: &[u8]) -> Bytes {
+    let parent_ptr = parent.as_ptr() as usize;
+    let parent_end = parent_ptr + parent.len();
+    let sub_ptr = sub.as_ptr() as usize;
+    let sub_end = sub_ptr + sub.len();
+    debug_assert!(
+        sub_ptr >= parent_ptr && sub_end <= parent_end,
+        "subslice_of: child not contained in parent"
+    );
+    let offset = sub_ptr - parent_ptr;
+    parent.slice(offset..offset + sub.len())
+}
 
 /// Shared state between the connection task and the client API.
 pub(crate) struct Inner {
@@ -89,12 +126,13 @@ pub(crate) struct Inner {
     /// Connection state broadcast.
     pub(crate) state_tx: watch::Sender<ConnState>,
 
-    /// Pending request-reply correlation: env_seq → tokio oneshot sender.
-    /// Each in-flight `request*` allocates one oneshot pair; the Sender
-    /// lives here until the reply arrives or the request is cleaned up
-    /// (timeout / disconnect). Dropping the Sender wakes the parked
-    /// receiver with `Err(Closed)`.
-    pub(crate) pending: Mutex<HashMap<u32, oneshot::Sender<RequestResult>>>,
+    /// Pending request-reply correlation: env_seq → kit OneShotAsync sender.
+    /// Each in-flight `request*` allocates one OneShotAsync pair; the
+    /// Sender lives here until the reply arrives or the request is
+    /// cleaned up (timeout / disconnect). Dropping the Sender wakes the
+    /// awaiting Receiver with `Err(Closed)` via the underlying
+    /// NotifyWaiter — same semantics as `tokio::sync::oneshot`.
+    pub(crate) pending: Mutex<HashMap<u32, OneShotAsyncSender<RequestResult>>>,
 
     /// Monotonic sequence for env_seq correlation.
     pub(crate) next_seq: AtomicU32,
@@ -238,7 +276,7 @@ impl Inner {
     /// handle is actually gone (clear_write_producer happened) — never
     /// on transient backpressure.
     pub(crate) async fn enqueue(&self, mut frame: WriteFrame) -> Result<(), ClientError> {
-        const FAST_YIELDS: usize = 64;
+        const FAST_YIELDS: usize = 2048;
 
         for _ in 0..FAST_YIELDS {
             let producer = match self.current_producer() {
@@ -325,7 +363,7 @@ impl Inner {
         payload: Bytes,
     ) -> Result<u64, ClientError> {
         let seq = self.alloc_seq();
-        let (tx, rx) = oneshot::channel::<RequestResult>();
+        let (tx, rx) = OneShotAsync::<RequestResult>::new();
         self.pending.lock().unwrap().insert(seq, tx);
 
         let header = Self::build_publish_single_header(
@@ -333,12 +371,70 @@ impl Inner {
         );
 
         if let Err(e) = self.enqueue(WriteFrame::PubSingle { header, payload }).await {
+            // Drops the Sender from `pending`; receiver wakes with Closed.
             self.pending.lock().unwrap().remove(&seq);
             return Err(e);
         }
 
         let timeout_dur = self.request_timeout;
-        match tokio::time::timeout(timeout_dur, rx).await {
+        match tokio::time::timeout(timeout_dur, rx.recv_async()).await {
+            Ok(Ok(RequestResult::Ok(v))) => Ok(v),
+            Ok(Ok(RequestResult::OkBody(_))) => Ok(0),
+            Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
+            Ok(Err(_closed)) => Err(ClientError::Disconnected),
+            Err(_elapsed) => {
+                // Drop the Sender by removing from `pending`; if the
+                // reply arrives later the read loop's `pending.remove`
+                // returns `None` and the bytes are discarded.
+                self.pending.lock().unwrap().remove(&seq);
+                Err(ClientError::Timeout)
+            }
+        }
+    }
+
+    /// Fire-and-forget batch publish — zero-copy of every payload.
+    /// The metadata header is one `Bytes`; each payload is its own
+    /// iovec; all ride one `write_vectored` call (or several, if the
+    /// batch crosses `IOV_MAX`).
+    pub(crate) async fn fire_and_forget_publish_batch(
+        &self,
+        action: Action,
+        stream_id: u32,
+        entries: &[crate::client::BatchEntry<'_>],
+    ) -> Result<(), ClientError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let seq = self.alloc_seq();
+        let chunks = crate::encode::encode_publish_split(seq, action, stream_id, entries);
+        self.enqueue(WriteFrame::PubBatch { chunks }).await
+    }
+
+    /// Sync batch publish — same zero-copy iovec path as
+    /// [`fire_and_forget_publish_batch`], with reply correlation.
+    /// Returns the **first** assigned sequence number (broker semantics).
+    pub(crate) async fn request_publish_batch(
+        &self,
+        action: Action,
+        stream_id: u32,
+        entries: &[crate::client::BatchEntry<'_>],
+    ) -> Result<u64, ClientError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let seq = self.alloc_seq();
+        let (tx, rx) = OneShotAsync::<RequestResult>::new();
+        self.pending.lock().unwrap().insert(seq, tx);
+
+        let chunks = crate::encode::encode_publish_split(seq, action, stream_id, entries);
+
+        if let Err(e) = self.enqueue(WriteFrame::PubBatch { chunks }).await {
+            self.pending.lock().unwrap().remove(&seq);
+            return Err(e);
+        }
+
+        let timeout_dur = self.request_timeout;
+        match tokio::time::timeout(timeout_dur, rx.recv_async()).await {
             Ok(Ok(RequestResult::Ok(v))) => Ok(v),
             Ok(Ok(RequestResult::OkBody(_))) => Ok(0),
             Ok(Ok(RequestResult::Error(code))) => Err(ClientError::Broker(code)),
@@ -378,14 +474,15 @@ impl Inner {
         }
     }
 
-    /// Internal: build the frame, register the oneshot Sender in `pending`,
-    /// enqueue, then `rx.await` directly with a tokio timeout. No
-    /// spawn_blocking — `tokio::sync::oneshot` is async-native, so this
-    /// path consumes zero OS threads from the blocking pool regardless
-    /// of in-flight request count.
+    /// Internal: build the frame, register the OneShotAsync Sender in
+    /// `pending`, enqueue, then `rx.recv_async().await` with a tokio
+    /// timeout. No spawn_blocking — `OneShotAsync<T>` (= `OneShot<T,
+    /// NotifyWaiter>`) is async-native via the kit's Waiter abstraction
+    /// over `tokio::sync::Notify`. Zero OS threads from the blocking
+    /// pool, regardless of in-flight request count.
     ///
     /// On timeout we drop the Sender (by removing from `pending`),
-    /// which wakes `rx.await` with `Err(Closed)`.
+    /// which wakes `rx.recv_async()` with `Err(Closed)`.
     async fn do_request(
         &self,
         action: Action,
@@ -393,7 +490,7 @@ impl Inner {
         body: &[u8],
     ) -> Result<RequestResult, ClientError> {
         let seq = self.alloc_seq();
-        let (tx, rx) = oneshot::channel::<RequestResult>();
+        let (tx, rx) = OneShotAsync::<RequestResult>::new();
 
         self.pending.lock().unwrap().insert(seq, tx);
 
@@ -416,42 +513,14 @@ impl Inner {
         }
 
         let timeout_dur = self.request_timeout;
-        match tokio::time::timeout(timeout_dur, rx).await {
+        match tokio::time::timeout(timeout_dur, rx.recv_async()).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_closed)) => Err(ClientError::Disconnected),
             Err(_elapsed) => {
-                // Drop the Sender by removing it; that wakes `rx.await`
-                // with `Err(Closed)` and the future drops cleanly.
                 self.pending.lock().unwrap().remove(&seq);
                 Err(ClientError::Timeout)
             }
         }
-    }
-
-    /// Fire-and-forget: enqueue a frame with no reply correlation.
-    /// Synchronous body — the `async` signature is preserved for API
-    /// compatibility with prior code paths but contains no `.await`.
-    pub(crate) async fn fire_and_forget(
-        &self,
-        action: Action,
-        stream_id: u32,
-        body: &[u8],
-    ) -> Result<(), ClientError> {
-        let seq = self.alloc_seq();
-        let envelope = Envelope {
-            action: U16::new(action.as_u16()),
-            flags: 0,
-            _rsv: 0,
-            stream_id: U32::new(stream_id),
-            msg_len: U32::new(body.len() as u32),
-            env_seq: U32::new(seq),
-        };
-
-        let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body.len());
-        frame.extend_from_slice(envelope.as_bytes());
-        frame.extend_from_slice(body);
-
-        self.enqueue(WriteFrame::Mono(Bytes::from(frame))).await
     }
 
     /// Send a frame with no reply expected (internal use, e.g. Pong).
@@ -472,28 +541,44 @@ impl Inner {
     }
 
     /// Process an incoming frame from the server.
-    pub(crate) fn on_frame(self: &Arc<Self>, buf: &[u8]) {
-        if buf.len() < ENVELOPE_SIZE {
+    ///
+    /// `frame` is the full `[envelope][body]` Bytes chunk produced by
+    /// `read_loop`. Per-message payloads are materialized via
+    /// `frame.slice(range)` — Arc-share, no `memcpy`. The original
+    /// allocation is held alive by every outstanding `Message::payload`
+    /// slice until that message is dropped.
+    pub(crate) fn on_frame(self: &Arc<Self>, frame: Bytes) {
+        if frame.len() < ENVELOPE_SIZE {
             return;
         }
 
-        let frame = FrameView::new(buf);
-        let env = frame.envelope();
-        let action = frame.action();
-        let body = frame.body();
+        let view = FrameView::new(&frame);
+        let env = view.envelope();
+        let action = view.action();
+        let body_start = ENVELOPE_SIZE;
+        let body_end = frame.len();
+
+        // Re-derive these out of the view before the borrow ends so we can
+        // pass owned `Bytes` (sliced) into handlers.
+        let env_seq = env.env_seq.get();
+        let stream_id = env.stream_id.get();
+        let action_u16 = env.action.get();
+
+        // Borrow of `view`/`env` ends here.
+        let body = frame.slice(body_start..body_end);
 
         match action {
-            Some(Action::RepOk) => self.on_rep_ok(env.env_seq.get(), body),
-            Some(Action::RepError) => self.on_rep_error(env.env_seq.get(), body),
-            Some(Action::Deliver) => self.on_deliver(env.stream_id.get(), env.env_seq.get(), body),
-            Some(Action::RepBatch) => self.on_rep_batch(env.stream_id.get(), body),
-            Some(Action::FanoutBatch) => self.on_fanout_batch(env.stream_id.get(), body),
-            Some(Action::ListStreams) => self.on_list_streams(env.env_seq.get(), body),
-            Some(Action::ListConsumers) => self.on_list_consumers(env.env_seq.get(), body),
-            Some(Action::Ping) => self.on_ping(body),
+            Some(Action::RepOk) => self.on_rep_ok(env_seq, &body),
+            Some(Action::RepError) => self.on_rep_error(env_seq, &body),
+            Some(Action::Deliver) => self.on_deliver(stream_id, env_seq, body),
+            Some(Action::RepBatch) => self.on_rep_batch(stream_id, body),
+            Some(Action::FanoutBatch) => self.on_fanout_batch(stream_id, body),
+            Some(Action::ListStreams) => self.on_list_streams(env_seq, body),
+            Some(Action::ListConsumers) => self.on_list_consumers(env_seq, body),
+            Some(Action::Ping) => self.on_ping(&body),
             Some(Action::Connected) => { /* handshake */ }
             _ => {
-                tracing::debug!(action = env.action.get(), "unknown server frame");
+                tracing::debug!(action = action_u16, "unknown server frame");
             }
         }
     }
@@ -530,7 +615,7 @@ impl Inner {
         }
     }
 
-    fn on_deliver(self: &Arc<Self>, stream_id: u32, env_seq: u32, body: &[u8]) {
+    fn on_deliver(self: &Arc<Self>, stream_id: u32, env_seq: u32, body: Bytes) {
         let subs = self.subscriptions.read().unwrap();
 
         if body.len() < 6 {
@@ -544,8 +629,11 @@ impl Inner {
         if 6 + subj_len > body.len() {
             return;
         }
+        // Subject is small and tracked Box-of-bytes (cold-path metadata).
+        // Payload is sliced from the same Arc allocation as `body` — Arc
+        // bump only, no `memcpy`.
         let subject = &body[6..6 + subj_len];
-        let payload = &body[6 + subj_len..];
+        let payload = body.slice(6 + subj_len..);
 
         let ack_tx = self.ack_tx.read().unwrap().clone();
         if let Some(by_consumer) = subs.get(&stream_id) {
@@ -554,7 +642,7 @@ impl Inner {
                     let msg = Message {
                         seq,
                         subject: Box::from(subject),
-                        payload: Bytes::copy_from_slice(payload),
+                        payload,
                         consumer_id,
                         stream_id,
                         ack_tx,
@@ -566,8 +654,8 @@ impl Inner {
         }
     }
 
-    fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
-        let view = RepBatchView::new(body);
+    fn on_rep_batch(self: &Arc<Self>, stream_id: u32, body: Bytes) {
+        let view = RepBatchView::new(&body);
         let subs = self.subscriptions.read().unwrap();
         let ack_tx = self.ack_tx.read().unwrap().clone();
 
@@ -586,7 +674,7 @@ impl Inner {
                     let msg = Message {
                         seq: entry.seq,
                         subject: Box::from(entry.subject),
-                        payload: Bytes::copy_from_slice(entry.payload),
+                        payload: subslice_of(&body, entry.payload),
                         consumer_id: entry.consumer_id,
                         stream_id,
                         ack_tx: ack_tx.clone(),
@@ -598,17 +686,19 @@ impl Inner {
         }
     }
 
-    fn on_list_streams(&self, env_seq: u32, body: &[u8]) {
+    fn on_list_streams(&self, env_seq: u32, body: Bytes) {
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+            // `body` is already a sliced view into the read buffer's Arc
+            // allocation — pass it through without re-copying.
+            let _ = tx.send(RequestResult::OkBody(body));
         }
     }
 
-    fn on_list_consumers(&self, env_seq: u32, body: &[u8]) {
+    fn on_list_consumers(&self, env_seq: u32, body: Bytes) {
         let tx_opt = self.pending.lock().unwrap().remove(&env_seq);
         if let Some(tx) = tx_opt {
-            let _ = tx.send(RequestResult::OkBody(Bytes::copy_from_slice(body)));
+            let _ = tx.send(RequestResult::OkBody(body));
         }
     }
 
@@ -620,8 +710,8 @@ impl Inner {
         self.send_no_reply(Action::Pong, 0, &pong_body);
     }
 
-    fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: &[u8]) {
-        let view = RepBatchView::new(body);
+    fn on_fanout_batch(self: &Arc<Self>, stream_id: u32, body: Bytes) {
+        let view = RepBatchView::new(&body);
         let subs = self.subscriptions.read().unwrap();
         let by_consumer = match subs.get(&stream_id) {
             Some(m) => m,
@@ -631,6 +721,9 @@ impl Inner {
         let ack_tx = self.ack_tx.read().unwrap().clone();
 
         for entry in view.entries() {
+            // Materialize the payload Bytes once per entry; clone is an
+            // Arc bump for each delivered subscriber.
+            let payload_bytes = subslice_of(&body, entry.payload);
             trie.find_matches(entry.subject, |sub_id| {
                 let sub_id_64 = sub_id as u64;
                 for entries in by_consumer.values() {
@@ -639,7 +732,7 @@ impl Inner {
                             let msg = Message {
                                 seq: entry.seq,
                                 subject: Box::from(entry.subject),
-                                payload: Bytes::copy_from_slice(entry.payload),
+                                payload: payload_bytes.clone(),
                                 consumer_id: sub.consumer_id,
                                 stream_id,
                                 ack_tx: ack_tx.clone(),

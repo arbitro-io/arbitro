@@ -194,7 +194,7 @@ mod tests {
             ack_policy: 1,
             deliver_policy: 0,
             deliver_mode: 0,
-            discard: 0,
+            _pad: 0,
             group_len: U16::new(0),
             ack_wait_ms: U32::new(30000),
             start_seq: U64::new(0),
