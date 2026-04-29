@@ -1,0 +1,25 @@
+[package]
+name    = "arbitro-client-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+description = "Pure-tokio Arbitro client built on arbitro-kit primitives (Mpsc, OneShotAsync, Pipe, Hub) with reconnect state machine + heartbeat watchdog."
+
+[dependencies]
+arbitro-proto      = { path = "../arbitro-proto" }
+arbitro-engine-v2  = { workspace = true }
+arbitro-kit        = { path = "../../../arbitro-kit", features = ["tokio"] }
+tokio         = { workspace = true }
+tokio-util    = { version = "0.7", features = ["rt"] }
+tracing       = { workspace = true }
+bytes         = { workspace = true }
+zerocopy      = { workspace = true }
+fastrand      = "2"
+thiserror     = "1"
+
+[dev-dependencies]
+tokio          = { workspace = true }
+criterion      = { workspace = true }
+tempfile       = { workspace = true }
+arbitro-server = { path = "../arbitro-server" }

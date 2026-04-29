@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::AckPolicy;
 use arbitro_proto::config::{ConsumerConfig, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
@@ -197,7 +198,9 @@ async fn publish_batch_delivers_all() {
     let consumer = client.create_consumer(&consumer_cfg).await.unwrap();
     let mut sub = consumer.subscribe(None).await.unwrap();
 
-    let entries: Vec<(&[u8], &[u8])> = (0..50).map(|_| (&b"logs_line"[..], &b"data"[..])).collect();
+    let entries: Vec<BatchEntry<'_>> = (0..50)
+        .map(|_| BatchEntry::new(&b"logs_line"[..], Bytes::copy_from_slice(b"data")))
+        .collect();
     client.publish_batch(b"logs", &entries).await.unwrap();
 
     let mut count = 0u32;
@@ -255,7 +258,9 @@ async fn replay_deliver_all_historical() {
     client.create_stream(&stream).await.unwrap();
 
     // Publish 100 messages BEFORE any consumer exists.
-    let entries: Vec<(&[u8], &[u8])> = (0..100).map(|_| (&b"history.evt"[..], &b"data"[..])).collect();
+    let entries: Vec<BatchEntry<'_>> = (0..100)
+        .map(|_| BatchEntry::new(&b"history.evt"[..], Bytes::copy_from_slice(b"data")))
+        .collect();
     client.publish_batch(b"history", &entries).await.unwrap();
 
     // Small delay so the shard drain loop processes publish_pending_to_engine.
@@ -1065,8 +1070,8 @@ async fn queue_group_three_clients_100_msgs() {
 
     // Publish 100 messages
     let publisher = connect(&addr).await;
-    let entries: Vec<(&[u8], &[u8])> = (0..100)
-        .map(|_| (&b"q3_job"[..], &b"work"[..]))
+    let entries: Vec<BatchEntry<'_>> = (0..100)
+        .map(|_| BatchEntry::new(&b"q3_job"[..], Bytes::copy_from_slice(b"work")))
         .collect();
     publisher.publish_batch(b"q3", &entries).await.unwrap();
 
@@ -1287,18 +1292,18 @@ async fn max_subject_inflight_multiple_patterns() {
     let mut sub = consumer.subscribe(None).await.unwrap();
 
     // Single batch publish — all 11 land in one shard command, one drain sees all.
-    let entries: Vec<(&[u8], &[u8])> = vec![
-        (b"other.x", b"O0"),
-        (b"other.x", b"O1"),
-        (b"other.x", b"O2"),
-        (b"message.freemium.events", b"F0"),
-        (b"message.freemium.events", b"F1"),
-        (b"message.freemium.events", b"F2"),
-        (b"message.premium.orders", b"P0"),
-        (b"message.premium.orders", b"P1"),
-        (b"message.premium.orders", b"P2"),
-        (b"message.premium.orders", b"P3"),
-        (b"message.premium.orders", b"P4"),
+    let entries: Vec<BatchEntry<'_>> = vec![
+        BatchEntry::new(b"other.x", Bytes::copy_from_slice(b"O0")),
+        BatchEntry::new(b"other.x", Bytes::copy_from_slice(b"O1")),
+        BatchEntry::new(b"other.x", Bytes::copy_from_slice(b"O2")),
+        BatchEntry::new(b"message.freemium.events", Bytes::copy_from_slice(b"F0")),
+        BatchEntry::new(b"message.freemium.events", Bytes::copy_from_slice(b"F1")),
+        BatchEntry::new(b"message.freemium.events", Bytes::copy_from_slice(b"F2")),
+        BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P0")),
+        BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P1")),
+        BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P2")),
+        BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P3")),
+        BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P4")),
     ];
     client.publish_batch(b"msi", &entries).await.unwrap();
 

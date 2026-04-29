@@ -11,7 +11,7 @@ use arbitro_engine_v2::types::*;
 use arbitro_proto::error::ErrorCode;
 use arbitro_store::EntryRef;
 
-use crate::common::reply::{send_error, send_rep_ok};
+use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::command::*;
 use crate::shard::worker::{AccumCaller, ActiveBinding, CommandWorker, StreamAccum};
 
@@ -23,10 +23,10 @@ impl CommandWorker {
         cmd: PublishCmd,
     ) {
         if !self.engine.ctx().catalog.stream_exists(cmd.stream_id) {
-            send_error(
+            send_error_v2(
                 &self.registry,
                 cmd.conn_id,
-                cmd.env_seq,
+                cmd.env_seq as u64,
                 ErrorCode::StreamNotFound,
             );
             return;
@@ -106,10 +106,10 @@ impl CommandWorker {
                 Ok(first_seq) => {
                     let mut seq_offset = 0u64;
                     for caller in &callers {
-                        send_rep_ok(
+                        send_rep_ok_v2(
                             &self.registry,
                             caller.conn_id,
-                            caller.env_seq,
+                            caller.env_seq as u64,
                             first_seq + seq_offset,
                         );
                         seq_offset += caller.entry_count as u64;
@@ -118,10 +118,10 @@ impl CommandWorker {
                 }
                 Err(_) => {
                     for caller in &callers {
-                        send_error(
+                        send_error_v2(
                             &self.registry,
                             caller.conn_id,
-                            caller.env_seq,
+                            caller.env_seq as u64,
                             ErrorCode::StreamFull,
                         );
                     }

@@ -1,8 +1,8 @@
-//! Wire encoding helpers for outbound publish frames.
+﻿//! Wire encoding helpers for outbound publish frames.
 //!
 //! The publish hot path uses `encode_publish_split`: it builds an
 //! **interleaved iovec list** matching the broker's wire layout
-//! `[envelope][count] [hdr_1][subj_1][pay_1] … [hdr_N][subj_N][pay_N]`.
+//! `[envelope][count] [hdr_1][subj_1][pay_1] â€¦ [hdr_N][subj_N][pay_N]`.
 //! Slot 0 holds the envelope+count+first-entry-meta, slot 1 holds the
 //! first payload (Arc-shared), slot 2 holds the second entry meta,
 //! slot 3 holds the second payload, etc. The write loop ships the
@@ -28,16 +28,16 @@ use arbitro_proto::wire::publish::PublishEntry;
 
 use crate::client::BatchEntry;
 
-// ──────────────────────────────────────────────────────────────────────
-// v2 encoders — pure zerocopy, no payload memcpy.
-// ──────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// v2 encoders â€” pure zerocopy, no payload memcpy.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Stack-only prefix for a v2 single PUB frame: `[Header 16B][PubBody 8B] = 24B`.
 ///
 /// Built as ONE struct literal, emitted via ONE `as_bytes()`. The `Bytes`
 /// returned by [`encode_pub_v2`] copies this 24B prefix once (unavoidable
-/// — it must be owned to ship through the channel) but never touches the
-/// payload. Subject is small metadata (≤256B typical); payload is the
+/// â€” it must be owned to ship through the channel) but never touches the
+/// payload. Subject is small metadata (â‰¤256B typical); payload is the
 /// caller's `Bytes` cloned via Arc bump.
 #[derive(
     Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
@@ -55,13 +55,13 @@ const _: () = assert!(core::mem::size_of::<PubV2Prefix>() == 24);
 ///
 /// Zero payload memcpy: the caller's `Bytes` is cloned (Arc bump only) and
 /// shipped as a separate iovec. Subject is small metadata copied once.
-/// Prefix is a 24B stack struct → one tiny `Bytes::copy_from_slice` for
+/// Prefix is a 24B stack struct â†’ one tiny `Bytes::copy_from_slice` for
 /// channel ownership.
 ///
 /// Concatenation `prefix || subject || payload` is byte-identical to a
 /// `PubFrame` parseable by `PubFrame::ref_from_bytes`.
 #[inline(always)]
-pub(crate) fn encode_pub_v2(
+pub fn encode_pub_v2(
     seq: u64,
     stream_id: u32,
     entry_flags: u8,
@@ -89,11 +89,11 @@ pub(crate) fn encode_pub_v2(
 ///
 /// Uses [`BatchPubFrame::encode_into`] (inline canonical encoder from
 /// `arbitro-proto`) to write directly into a pre-sized `Vec<u8>`. The
-/// payload zero-copy guarantee is sacrificed here on purpose — batch is
-/// the throughput path and one syscall beats `1 + 3·N` iovecs (which can
+/// payload zero-copy guarantee is sacrificed here on purpose â€” batch is
+/// the throughput path and one syscall beats `1 + 3Â·N` iovecs (which can
 /// overflow `IOV_MAX` for large N). All payloads are memcpy'd once into
 /// the buffer; Arc allocations remain alive for the duration of the call.
-pub(crate) fn encode_pub_batch_v2(
+pub fn encode_pub_batch_v2(
     seq: u64,
     stream_id: u32,
     entry_flags: u8,
@@ -116,15 +116,15 @@ pub(crate) fn encode_pub_batch_v2(
     Bytes::from(buf)
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// v2 manager encoders — cold path, single-iovec `Bytes`.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// v2 manager encoders â€” cold path, single-iovec `Bytes`.
 //
 // Each builds one pre-sized buffer via the proto crate's inline
 // `encode_into` helpers. No payload to memcpy; just metadata + names.
-// ──────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// CreateStream request frame.
-pub(crate) fn encode_create_stream_v2(
+pub fn encode_create_stream_v2(
     seq: u64,
     name: &[u8],
     filter: &[u8],
@@ -146,7 +146,7 @@ pub(crate) fn encode_create_stream_v2(
 }
 
 /// DeleteStream request frame (8B body + name tail).
-pub(crate) fn encode_delete_stream_v2(seq: u64, name: &[u8]) -> Bytes {
+pub fn encode_delete_stream_v2(seq: u64, name: &[u8]) -> Bytes {
     let size = DeleteStreamFrame::wire_size(name.len());
     let mut buf = vec![0u8; size];
     DeleteStreamFrame::encode_into(&mut buf, seq, name);
@@ -154,7 +154,7 @@ pub(crate) fn encode_delete_stream_v2(seq: u64, name: &[u8]) -> Bytes {
 }
 
 /// GetStream request frame.
-pub(crate) fn encode_get_stream_v2(seq: u64, name: &[u8]) -> Bytes {
+pub fn encode_get_stream_v2(seq: u64, name: &[u8]) -> Bytes {
     let size = GetStreamFrame::wire_size(name.len());
     let mut buf = vec![0u8; size];
     GetStreamFrame::encode_into(&mut buf, seq, name);
@@ -162,7 +162,7 @@ pub(crate) fn encode_get_stream_v2(seq: u64, name: &[u8]) -> Bytes {
 }
 
 /// PurgeStream request frame.
-pub(crate) fn encode_purge_stream_v2(seq: u64, name: &[u8]) -> Bytes {
+pub fn encode_purge_stream_v2(seq: u64, name: &[u8]) -> Bytes {
     let size = PurgeStreamFrame::wire_size(name.len());
     let mut buf = vec![0u8; size];
     PurgeStreamFrame::encode_into(&mut buf, seq, name);
@@ -170,7 +170,7 @@ pub(crate) fn encode_purge_stream_v2(seq: u64, name: &[u8]) -> Bytes {
 }
 
 /// DrainSubject request frame.
-pub(crate) fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> Bytes {
+pub fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> Bytes {
     let size = DrainSubjectFrame::wire_size(name.len(), subject.len());
     let mut buf = vec![0u8; size];
     DrainSubjectFrame::encode_into(&mut buf, seq, name, subject);
@@ -178,13 +178,13 @@ pub(crate) fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> 
 }
 
 /// ListStreams request frame (sized).
-pub(crate) fn encode_list_streams_v2(seq: u64, offset: u32, limit: u32) -> Bytes {
+pub fn encode_list_streams_v2(seq: u64, offset: u32, limit: u32) -> Bytes {
     let f = ListStreamsFrame::new(seq, offset, limit);
     Bytes::copy_from_slice(f.as_bytes())
 }
 
 /// CreateConsumer request frame.
-pub(crate) fn encode_create_consumer_v2(
+pub fn encode_create_consumer_v2(
     seq: u64,
     stream_id: u32,
     name: &[u8],
@@ -207,13 +207,13 @@ pub(crate) fn encode_create_consumer_v2(
 }
 
 /// DeleteConsumer request frame (sized, 8B body).
-pub(crate) fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
+pub fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
     let f = DeleteConsumerFrame::new(seq, consumer_id);
     Bytes::copy_from_slice(f.as_bytes())
 }
 
 /// GetConsumer request frame.
-pub(crate) fn encode_get_consumer_v2(seq: u64, stream_id: u32, name: &[u8]) -> Bytes {
+pub fn encode_get_consumer_v2(seq: u64, stream_id: u32, name: &[u8]) -> Bytes {
     let size = GetConsumerFrame::wire_size(name.len());
     let mut buf = vec![0u8; size];
     GetConsumerFrame::encode_into(&mut buf, seq, stream_id, name);
@@ -221,7 +221,7 @@ pub(crate) fn encode_get_consumer_v2(seq: u64, stream_id: u32, name: &[u8]) -> B
 }
 
 /// ListConsumers request frame (sized).
-pub(crate) fn encode_list_consumers_v2(
+pub fn encode_list_consumers_v2(
     seq: u64,
     stream_id: u32,
     offset: u32,
@@ -231,9 +231,9 @@ pub(crate) fn encode_list_consumers_v2(
     Bytes::copy_from_slice(f.as_bytes())
 }
 
-// ──────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // v1 encoder (legacy, retired in Step 5).
-// ──────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Build a zero-copy publish frame: an interleaved iovec list.
 ///
@@ -244,14 +244,14 @@ pub(crate) fn encode_list_consumers_v2(
 /// - slot 1 = payload of entry 1 (Arc-shared, never memcpy'd),
 /// - slot 2 = `[hdr_2 12][subj_2]`,
 /// - slot 3 = payload of entry 2,
-/// - …
+/// - â€¦
 ///
 /// The total wire body length (count + per-entry hdr + subj + payload)
 /// goes into `Envelope.msg_len` so the broker can dispatch the frame.
 ///
 /// For an empty `entries` slice the result is a single-slot list with
 /// just envelope+count.
-pub(crate) fn encode_publish_split(
+pub fn encode_publish_split(
     seq: u32,
     action: Action,
     stream_id: u32,
@@ -303,7 +303,7 @@ pub(crate) fn encode_publish_split(
         chunks.push(first.payload.clone());
     }
 
-    // Remaining entries: each contributes (meta, payload) — two iovec slots.
+    // Remaining entries: each contributes (meta, payload) â€” two iovec slots.
     for entry in entries.iter().skip(1) {
         let hdr = PublishEntry {
             data_len: U32::new(entry.payload.len() as u32),
@@ -390,12 +390,12 @@ mod tests {
             payload: original.clone(),
         }];
         let chunks = encode_publish_split(1, Action::Publish, 0, &entries);
-        // Same allocation on both sides — Arc bump, no memcpy.
+        // Same allocation on both sides â€” Arc bump, no memcpy.
         // Slot 1 is the payload of entry 1.
         assert_eq!(original.as_ptr(), chunks[1].as_ptr());
     }
 
-    // ── v2 encoder tests ──────────────────────────────────────────────
+    // â”€â”€ v2 encoder tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     use arbitro_proto::v2::ingress::{BatchPubFrame as ProtoBatchPubFrame, PubFrame};
     use zerocopy::FromBytes;
@@ -406,7 +406,7 @@ mod tests {
         let (prefix, subject, payload) =
             encode_pub_v2(42, 0xCAFEBABE, 0, b"orders.eu", &original);
 
-        // The payload Bytes shares the same allocation — Arc bump only.
+        // The payload Bytes shares the same allocation â€” Arc bump only.
         assert_eq!(payload.as_ptr(), original.as_ptr());
         assert_eq!(payload.len(), original.len());
 
@@ -460,7 +460,7 @@ mod tests {
         assert_eq!(collected[2].1, vec![0xCC; 32]);
     }
 
-    // ── v1 legacy tests (kept until Step 5 cleanup) ───────────────────
+    // â”€â”€ v1 legacy tests (kept until Step 5 cleanup) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn encode_publish_split_msg_len_includes_payloads() {

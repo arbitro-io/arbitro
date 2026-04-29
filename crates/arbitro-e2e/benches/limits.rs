@@ -42,7 +42,8 @@
 
 use std::time::{Duration, Instant};
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -182,9 +183,9 @@ async fn multi_client_isolated_latency(
             // Same basic backlog shape as stage 2.
             let basic_subjects: Vec<String> =
                 (0..BASIC_BACKLOG).map(|j| format!("orders.basic.user_{j}")).collect();
-            let basic_entries: Vec<(&[u8], &[u8])> = basic_subjects
+            let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
                 .iter()
-                .map(|s| (s.as_bytes(), payload.as_slice()))
+                .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
                 .collect();
             client
                 .publish_batch(stream.as_bytes(), &basic_entries)
@@ -271,9 +272,9 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
     // ── Saturate basic: publish 100 unique basic subjects, drain without ack.
     let basic_subjects: Vec<String> =
         (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
-    let basic_entries: Vec<(&[u8], &[u8])> = basic_subjects
+    let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
         .iter()
-        .map(|s| (s.as_bytes(), payload.as_slice()))
+        .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     client.publish_batch(STREAM, &basic_entries).await.unwrap();
 
@@ -355,9 +356,9 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     // Prepare N unique subjects — one per user.
     let subjects: Vec<String> =
         (0..n_users).map(|i| format!("notif.user.{i}")).collect();
-    let entries: Vec<(&[u8], &[u8])> = subjects
+    let entries: Vec<BatchEntry<'_>> = subjects
         .iter()
-        .map(|s| (s.as_bytes(), payload.as_slice()))
+        .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
 
     // Warmup: flush any startup noise.

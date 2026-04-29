@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{
     AckPolicy, ConsumerConfig, DeliverMode, DeliverPolicy, StreamConfig,
 };
@@ -216,7 +217,9 @@ async fn publish_batched(client: &Client, stream: &[u8], n: u64) {
     let mut remaining = n as usize;
     while remaining > 0 {
         let size = remaining.min(BATCH_SIZE);
-        let entries: Vec<(&[u8], &[u8])> = (0..size).map(|_| (SUBJECT, PAYLOAD)).collect();
+        let entries: Vec<BatchEntry<'_>> = (0..size)
+            .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
+            .collect();
         client.publish_batch(stream, &entries).await.unwrap();
         remaining -= size;
     }
@@ -354,8 +357,9 @@ async fn run_distribution() {
         let mut remaining = DIST_PER_SUBJECT as usize;
         while remaining > 0 {
             let size = remaining.min(BATCH_SIZE);
-            let entries: Vec<(&[u8], &[u8])> =
-                (0..size).map(|_| (*subject, PAYLOAD)).collect();
+            let entries: Vec<BatchEntry<'_>> = (0..size)
+                .map(|_| BatchEntry::new(*subject, Bytes::copy_from_slice(PAYLOAD)))
+                .collect();
             setup.publish_batch(DIST_STREAM, &entries).await.unwrap();
             remaining -= size;
         }
@@ -458,8 +462,9 @@ async fn run_single_conn_multi_sub() {
     let mut remaining = SCMS_MSGS as usize;
     while remaining > 0 {
         let size = remaining.min(BATCH_SIZE);
-        let entries: Vec<(&[u8], &[u8])> =
-            (0..size).map(|_| (SCMS_SUBJECT, PAYLOAD)).collect();
+        let entries: Vec<BatchEntry<'_>> = (0..size)
+            .map(|_| BatchEntry::new(SCMS_SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
+            .collect();
         setup.publish_batch(SCMS_STREAM, &entries).await.unwrap();
         remaining -= size;
     }

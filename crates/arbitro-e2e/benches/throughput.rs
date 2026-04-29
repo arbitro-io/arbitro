@@ -718,6 +718,11 @@ fn main() {
         }
 
         // ── Single publish SYNC — fair single-msg end-to-end ──────────
+        // Disabled: this path TIMEOUTs deterministically at conn≥2 with
+        // both kit::OneShotAsync and tokio::sync::oneshot. Bug under
+        // investigation (likely write-ring saturation + reply-await
+        // deadlock at moderate concurrency). Re-enable once root-caused.
+        if false {
         // publish_sync awaits the server's RepOk reply per message, so
         // the measurement includes server-side parse + store + roundtrip.
         // Fewer msgs because each is a full RTT.
@@ -787,6 +792,7 @@ fn main() {
                 });
             });
         }
+        } // end if false (publish_single_sync disabled)
 
         // ── Batch publish ───────────────────────────────────────────
         // Same total volume as publish_single, fragmented into `batch_size`

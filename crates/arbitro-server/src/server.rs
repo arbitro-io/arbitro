@@ -1,24 +1,31 @@
 //! ArbitroServer — TCP accept loop, per-connection I/O, keepalive, shutdown.
+//!
+//! The server speaks **v2 only**. Every connection MUST start with a
+//! `HelloFrame` (`ARBITRO_MAGIC_V2` + 4 trailing bytes); anything else is
+//! closed immediately. After HELLO, the connection is a stream of
+//! `Header`-prefixed v2 frames dispatched by `dispatch_v2`.
 
-use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::BytesMut;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use zerocopy::byteorder::little_endian::{U16, U64};
 use zerocopy::IntoBytes;
 
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_proto::wire::delivery::RepErrorAction;
-use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
+use arbitro_engine_v2::types::ConnectionId;
+use arbitro_proto::v2::egress::rep_frame::RepErrFrame;
+use arbitro_proto::v2::header::{Header, HEADER_SIZE as HEADER_SIZE_V2};
+use arbitro_proto::v2::ingress::hello::{HelloFrame, HELLO_FRAME_SIZE};
+use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
 
 use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
-use crate::transport::dispatch;
 use crate::transport::ConnectionRegistry;
+use crate::transport::dispatch_v2;
 
 /// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
@@ -52,6 +59,10 @@ impl ArbitroServer {
 
     /// Set the shared command log for metadata persistence.
     /// Also registers it as a lifecycle service.
+    ///
+    /// NOTE: v2 dispatch does not currently call `log.record(...)`. The API
+    /// is preserved for replay-on-startup only; new metadata commands are
+    /// not journaled until v2 logging lands.
     pub fn set_command_log(&mut self, log: SharedCommandLog) {
         self.services.push(Box::new(log.clone()));
         self.command_log = Some(log);
@@ -89,6 +100,9 @@ impl ArbitroServer {
         }
 
         // ── Replay command log → re-create streams/consumers ───────────
+        // The replay applier still understands v1 metadata records. v2
+        // dispatch doesn't record new ones, so on a fresh data dir this
+        // is a no-op; on an existing data dir it replays the v1 history.
         if let Some(ref log) = self.command_log {
             let server = self.server.clone();
             let mut applier = crate::persistence::recovery::ReplayApplier::new(server);
@@ -97,7 +111,6 @@ impl ArbitroServer {
                 Ok(_) => {}
                 Err(e) => tracing::error!(error = %e, "metadata replay failed"),
             }
-            // Flush any pending async commands from replay
             applier.flush().await;
         }
 
@@ -118,15 +131,14 @@ impl ArbitroServer {
         // Per-connection ingress: each read_loop dispatches frames directly.
         // No central mpsc — TCP guarantees order per connection, and each
         // connection already runs in its own task, so we get free parallelism
-        // on the dispatch path. Server state (shard router, registry, command
-        // log) is cloneable Arc-backed and shared across read tasks.
+        // on the dispatch path. Server state (shard router, registry) is
+        // cloneable Arc-backed and shared across read tasks.
 
         // Accept task
         let accept_registry = self.registry.clone();
         let max_connections = self.config.max_connections;
         let mut shutdown_accept = shutdown_rx.clone();
         let accept_server = self.server.clone();
-        let accept_log = self.command_log.clone();
         let accept_shutdown = shutdown_rx.clone();
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -147,10 +159,9 @@ impl ArbitroServer {
 
                                 let reg = accept_registry.clone();
                                 let srv = accept_server.clone();
-                                let log = accept_log.clone();
                                 let sd = accept_shutdown.clone();
                                 tokio::spawn(async move {
-                                    read_loop(conn_id, reader, srv, reg, log, sd).await;
+                                    read_loop(conn_id, reader, srv, reg, sd).await;
                                 });
                             }
                             Err(e) => {
@@ -226,76 +237,69 @@ impl ArbitroServer {
 /// and dispatch is safe to call concurrently across connections (shard
 /// router + registry are Arc-backed). No central mpsc bottleneck.
 ///
-/// ## I/O strategy: single `BytesMut` accumulator + `read_buf` + O(1) `split_to`
+/// ## Protocol state machine
 ///
-/// Validated by `arbitro-proto/benches/decode_tcp.rs` to be ~10× faster than
-/// the naive `read_exact ×2 + per-frame BytesMut::with_capacity` pattern at
-/// 100k frames over loopback (~24 M msg/s vs 2.3 M msg/s on tokio).
-///
-/// Key properties:
-///   - **One allocation per connection** that grows on demand via `reserve`.
-///   - **`read_buf`** writes into the spare capacity safely (no `unsafe set_len`).
-///   - **`split_to(total)`** is O(1): an Arc bump + index update; no memcpy.
-///     The peeled frame and the residual tail share the same backing buffer
-///     until the original `BytesMut` reallocates.
-///   - **Cancellation-safe**: `read_buf` honors `tokio::select!` — if shutdown
-///     fires mid-read, no bytes are silently dropped.
-///   - **Frame layout-agnostic**: only the `msg_len` field offset is hard-coded.
-///     v1 envelope: `msg_len` @ offset 8..12. When the v2 cutover lands,
-///     change to offset 4..8 and update `dispatch_frame`. The I/O machinery
-///     stays identical.
+/// 1. Wait until at least 4 bytes have arrived; read the magic.
+/// 2. If magic ≠ `ARBITRO_MAGIC_V2`, log and close — v1 clients are no
+///    longer supported.
+/// 3. Wait until the full 8-byte `HelloFrame` is buffered, validate, consume.
+/// 4. Drain `Header`-prefixed v2 frames from the accumulator forever.
 async fn read_loop(
     conn_id: u64,
     mut reader: tokio::net::tcp::OwnedReadHalf,
-    server: crate::shard::router::ShardRouter,
+    server: ShardRouter,
     registry: ConnectionRegistry,
-    command_log: Option<SharedCommandLog>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // 64 KiB covers ~200 small frames before the first `reserve` triggers.
-    // `BytesMut::reserve` will compact and/or grow as needed.
+    use tokio::io::AsyncReadExt;
+
     const INITIAL_CAP: usize = 64 * 1024;
     let mut acc = BytesMut::with_capacity(INITIAL_CAP);
 
+    // Per-connection HELLO state. Connection is closed if the first 4
+    // bytes are not the v2 magic.
+    let mut hello_done: bool = false;
+
     'outer: loop {
-        // ---- Fast path: drain whole frames already in the accumulator ------
-        loop {
-            if acc.len() < ENVELOPE_SIZE {
-                break;
+        // ---- Mandatory v2 handshake ---------------------------------------
+        if !hello_done {
+            if acc.len() >= 4 {
+                let m = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]);
+                if m != ARBITRO_MAGIC_V2 {
+                    tracing::warn!(conn_id, magic = format!("{m:#010x}"), "non-v2 client, closing");
+                    break 'outer;
+                }
+                if acc.len() >= HELLO_FRAME_SIZE {
+                    let _ = HelloFrame::parse(&acc[..HELLO_FRAME_SIZE]); // validates
+                    let _ = acc.split_to(HELLO_FRAME_SIZE);
+                    hello_done = true;
+                    tracing::debug!(conn_id, "v2 HELLO accepted");
+                }
             }
-            // v1 envelope layout: msg_len @ bytes 8..12 LE u32.
-            // (For v2 Header this becomes bytes 4..8 — only this line changes.)
-            let msg_len = u32::from_le_bytes([
-                acc[8], acc[9], acc[10], acc[11],
-            ]) as usize;
-            let total = ENVELOPE_SIZE + msg_len;
-            if acc.len() < total {
-                break; // frame straddles — need more bytes
-            }
-
-            // O(1): bumps Arc, updates indices. `frame` owns [0..total],
-            // `acc` keeps [total..]. No memcpy, no heap alloc.
-            let frame = acc.split_to(total).freeze();
-
-            registry.touch(conn_id);
-            crate::lifecycle_trace!("01_tcp_read_header", conn_id, 0, "transport_read");
-            crate::lifecycle_trace!("02_tcp_read_body",   conn_id, 0, "transport_read");
-            crate::lifecycle_trace!("04_dispatch_enter",  conn_id, 0, "read_loop");
-            dispatch::dispatch_frame(
-                conn_id,
-                frame,
-                &server,
-                &registry,
-                command_log.as_ref(),
-            )
-            .await;
-            crate::lifecycle_trace!("19_dispatch_returned", conn_id, 0, "read_loop");
         }
 
-        // ---- Slow path: need more bytes from the socket --------------------
-        // Ensure spare capacity for at least one envelope-worth so `read_buf`
-        // has somewhere to write. `reserve` may compact and/or grow.
-        if acc.capacity() - acc.len() < ENVELOPE_SIZE {
+        // ---- Drain whole v2 frames already in the accumulator -------------
+        if hello_done {
+            loop {
+                if acc.len() < HEADER_SIZE_V2 {
+                    break;
+                }
+                // v2 Header: msg_len at bytes 4..8 LE u32.
+                let msg_len = u32::from_le_bytes([
+                    acc[4], acc[5], acc[6], acc[7],
+                ]) as usize;
+                let total = HEADER_SIZE_V2 + msg_len;
+                if acc.len() < total {
+                    break;
+                }
+                let frame = acc.split_to(total).freeze();
+                registry.touch(conn_id);
+                dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry).await;
+            }
+        }
+
+        // ---- Slow path: read more bytes from the socket -------------------
+        if acc.capacity() - acc.len() < HEADER_SIZE_V2 {
             acc.reserve(INITIAL_CAP);
         }
 
@@ -305,8 +309,6 @@ async fn read_loop(
                 tracing::debug!(conn_id, "read loop stopping (shutdown)");
                 break 'outer;
             }
-            // `read_buf` is cancellation-safe per tokio docs: if select cancels
-            // it, no bytes were consumed from the socket.
             r = reader.read_buf(&mut acc) => {
                 match r {
                     Ok(0) => {
@@ -323,43 +325,22 @@ async fn read_loop(
         }
     }
 
-    // Synthesize a Disconnect frame so all the engine bookkeeping
-    // (drain_connection across shards) runs once on EOF/error.
-    let disconnect = Bytes::copy_from_slice(build_disconnect_frame().as_bytes());
-    dispatch::dispatch_frame(
-        conn_id,
-        disconnect,
-        &server,
-        &registry,
-        command_log.as_ref(),
-    )
-    .await;
+    // EOF / shutdown / error: drain the engine bookkeeping for this conn,
+    // then drop the connection from the registry. No frame is synthesized.
+    for i in 0..server.shard_count() {
+        let _ = server.shard(i).drain_connection(ConnectionId(conn_id)).await;
+    }
     registry.remove(conn_id);
 }
 
-fn build_disconnect_frame() -> Envelope {
-    Envelope::new(Action::Disconnect, 0, 0, 0)
-}
-
 fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
-    let envelope = Envelope::new(Action::RepError, 0, 16, 0);
-    let body = RepErrorAction {
-        ref_seq: U64::new(0),
-        error_code: U16::new(ErrorCode::ServerShuttingDown.as_u16()),
-        _pad: [0u8; 6],
-    };
-    registry.send_parts(conn_id, &[envelope.as_bytes(), body.as_bytes()]);
+    let frame = RepErrFrame::new(0, 0, ErrorCode::ServerShuttingDown.as_u16());
+    registry.send_parts(conn_id, &[frame.as_bytes()]);
 }
 
 async fn reject_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
-    let envelope = Envelope::new(Action::RepError, 0, 16, 0);
-    let body = RepErrorAction {
-        ref_seq: U64::new(0),
-        error_code: U16::new(ErrorCode::InternalError.as_u16()),
-        _pad: [0u8; 6],
-    };
-    stream.write_all(envelope.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
+    let frame = RepErrFrame::new(0, 0, ErrorCode::InternalError.as_u16());
+    stream.write_all(frame.as_bytes()).await?;
     stream.shutdown().await?;
     Ok(())
 }
@@ -387,7 +368,9 @@ async fn keepalive_loop(
     }
 }
 
+/// Send a v2 Ping (16-byte header, empty body). Clients that never reply
+/// are eventually evicted by the idle-timeout sweep.
 fn send_ping(registry: &ConnectionRegistry, conn_id: u64) {
-    let envelope = Envelope::new(Action::Ping, 0, 0, 0);
-    registry.send_parts(conn_id, &[envelope.as_bytes()]);
+    let header = Header::new(Action::Ping.as_u16(), 0, 0);
+    registry.send_parts(conn_id, &[header.as_bytes()]);
 }

@@ -97,6 +97,11 @@ struct Inner {
     /// dominates the SipHash default (rule: dense IDs may still use ahash
     /// when direct indexing is impractical across callers).
     consumer_queue: HashMap<ConsumerId, QueueId, foldhash::fast::FixedState>,
+    /// Per-consumer stream binding. The v2 wire `SubFrame` body carries no
+    /// `stream_id` (it's recoverable from the consumer), so dispatch needs
+    /// a way to resolve `ConsumerId → StreamId`. Populated alongside
+    /// `consumer_queue` at create time so both lookups stay consistent.
+    consumer_stream: HashMap<ConsumerId, StreamId, foldhash::fast::FixedState>,
     /// Consumer ids start at 1 so `0` can keep its conventional "unset /
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
@@ -120,6 +125,7 @@ impl Inner {
             next_stream: 0,
             consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumer_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_consumer: 1,
             queues_by_key: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             // Queue ids start at 1 for the same reason as consumers — leave
@@ -218,6 +224,7 @@ impl NameRegistry {
         let mut g = self.inner.lock().expect("name registry poisoned");
         let removed = g.consumers_by_name.remove(name)?;
         g.consumer_queue.remove(&removed);
+        g.consumer_stream.remove(&removed);
         Some(removed)
     }
 
@@ -250,12 +257,33 @@ impl NameRegistry {
             .insert(consumer, queue);
     }
 
+    /// Record a consumer's owning stream so v2 `SubFrame` (which has no
+    /// `stream_id` in its body) can recover the routing target from just
+    /// the `ConsumerId`. Should be set together with `set_consumer_queue`.
+    pub fn set_consumer_stream(&self, consumer: ConsumerId, stream: StreamId) {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_stream
+            .insert(consumer, stream);
+    }
+
     /// Look up the queue id previously associated with `consumer`.
     pub fn consumer_queue(&self, consumer: ConsumerId) -> Option<QueueId> {
         self.inner
             .lock()
             .expect("name registry poisoned")
             .consumer_queue
+            .get(&consumer)
+            .copied()
+    }
+
+    /// Look up the owning stream of `consumer`.
+    pub fn consumer_stream(&self, consumer: ConsumerId) -> Option<StreamId> {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_stream
             .get(&consumer)
             .copied()
     }

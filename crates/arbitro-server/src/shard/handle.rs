@@ -12,7 +12,7 @@ use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::common::Gate;
-use crate::common::reply::send_rep_ok;
+use crate::common::reply_v2::send_rep_ok_v2;
 use crate::shard::command::*;
 use crate::shard::router::SharedStore;
 use crate::transport::ConnectionRegistry;
@@ -88,7 +88,7 @@ impl ShardHandle {
             .append_batch(&store_entries, now_ms)
             .map_err(|_| SendError::SHARD_DOWN)?;
 
-        send_rep_ok(&self.registry, conn_id, env_seq, first_seq);
+        send_rep_ok_v2(&self.registry, conn_id, env_seq as u64, first_seq);
         self.gate.release();
         self.shard_thread.unpark();
         Ok(())

@@ -6,7 +6,8 @@
 
 use std::time::Duration;
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -119,8 +120,8 @@ async fn test_publish_ack_cycle() {
     let mut sub = consumer.subscribe(None).await.unwrap();
 
     // Publish 100 messages
-    let entries: Vec<(&[u8], &[u8])> = (0..100)
-        .map(|_| (b"orders.new".as_slice(), b"test-payload".as_slice()))
+    let entries: Vec<BatchEntry<'_>> = (0..100)
+        .map(|_| BatchEntry::new(b"orders.new".as_slice(), Bytes::copy_from_slice(b"test-payload")))
         .collect();
     client.publish_batch(b"orders", &entries).await.unwrap();
 
@@ -141,8 +142,8 @@ async fn test_publish_batch() {
         .await
         .unwrap();
 
-    let entries: Vec<(&[u8], &[u8])> = (0..1000)
-        .map(|_| (b"batch.msg".as_slice(), b"data".as_slice()))
+    let entries: Vec<BatchEntry<'_>> = (0..1000)
+        .map(|_| BatchEntry::new(b"batch.msg".as_slice(), Bytes::copy_from_slice(b"data")))
         .collect();
     client.publish_batch(b"batch", &entries).await.unwrap();
 }
@@ -249,8 +250,8 @@ async fn test_replay_publish_then_subscribe() {
         .unwrap();
 
     // 2. Publish 500 messages before anyone subscribes
-    let entries: Vec<(&[u8], &[u8])> = (0..500)
-        .map(|_| (b"replay.evt".as_slice(), b"data".as_slice()))
+    let entries: Vec<BatchEntry<'_>> = (0..500)
+        .map(|_| BatchEntry::new(b"replay.evt".as_slice(), Bytes::copy_from_slice(b"data")))
         .collect();
     client.publish_batch(b"replay", &entries).await.unwrap();
 

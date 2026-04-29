@@ -48,7 +48,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -226,8 +227,9 @@ async fn main() {
     // ── Publish ────────────────────────────────────────────────────────
     let pub_start = Instant::now();
     let payload = vec![0xABu8; PAYLOAD_SIZE];
-    let entries: Vec<(&[u8], &[u8])> =
-        (0..msgs).map(|_| (SUBJECT, payload.as_slice())).collect();
+    let entries: Vec<BatchEntry<'_>> = (0..msgs)
+        .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(payload.as_slice())))
+        .collect();
     manager.publish_batch(STREAM, &entries).await.expect("publish_batch");
     let pub_elapsed = pub_start.elapsed();
     println!(

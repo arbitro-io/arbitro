@@ -142,4 +142,8 @@ pub struct Event {
     pub conn_id: u64,
     pub seq: u64,
     pub thread: &'static str,
+    /// Present so that consumers (like the lifecycle_flow e2e test) compile
+    /// without the feature; the field is never populated in stub mode because
+    /// `take()` always returns an empty vec.
+    pub at: std::time::Instant,
 }

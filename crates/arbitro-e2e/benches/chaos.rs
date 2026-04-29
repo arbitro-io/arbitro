@@ -46,7 +46,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -168,8 +169,8 @@ async fn producer_task(
 
     let mut next_tick = Instant::now();
     while !stop.load(Relaxed) {
-        let entries: Vec<(&[u8], &[u8])> = (0..BATCH_SIZE)
-            .map(|_| (subject.as_bytes(), payload.as_slice()))
+        let entries: Vec<BatchEntry<'_>> = (0..BATCH_SIZE)
+            .map(|_| BatchEntry::new(subject.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
             .collect();
         if client.publish_batch(STREAM, &entries).await.is_err() {
             break;

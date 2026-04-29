@@ -885,8 +885,40 @@ mod chunked_mpmc {
     use std::cell::UnsafeCell;
     use std::mem::MaybeUninit;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use arbitro_kit::gate::Park;
+    use std::sync::{Arc, Mutex};
+    use std::thread::Thread;
+
+    // Local replacement for the removed `arbitro_kit::gate::Park`. Identical
+    // semantics for this bench: one consumer thread parks until a producer
+    // calls `wake()` or the predicate becomes true.
+    pub(super) struct Park {
+        worker: Mutex<Option<Thread>>,
+    }
+
+    impl Park {
+        pub fn new() -> Self {
+            Self { worker: Mutex::new(None) }
+        }
+
+        pub fn set_worker(&self, t: Thread) {
+            *self.worker.lock().unwrap() = Some(t);
+        }
+
+        /// Block the *current* thread until `pred()` returns true. The
+        /// producer calls `wake()` to unpark; spurious wake-ups are
+        /// tolerated because we re-check `pred()` after each unpark.
+        pub fn wait_until<F: FnMut() -> bool>(&self, mut pred: F) {
+            while !pred() {
+                std::thread::park();
+            }
+        }
+
+        pub fn wake(&self) {
+            if let Some(t) = self.worker.lock().unwrap().as_ref() {
+                t.unpark();
+            }
+        }
+    }
 
     #[repr(align(64))]
     struct PRing<T, const CAP: usize> {

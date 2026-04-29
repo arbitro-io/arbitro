@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arbitro_client::Client;
+use arbitro_client::{BatchEntry, Client};
+use bytes::Bytes;
 use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
@@ -94,7 +95,9 @@ async fn setup(
     let sub = consumer.subscribe(None).await.unwrap();
 
     // Publish total msgs via a single batch publish.
-    let entries: Vec<(&[u8], &[u8])> = (0..total).map(|_| (SUBJECT, PAYLOAD)).collect();
+    let entries: Vec<BatchEntry<'_>> = (0..total)
+        .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
+        .collect();
     client.publish_batch(&stream_name, &entries).await.unwrap();
 
     sub
@@ -227,7 +230,9 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Publisher: 1 batch of `total` msgs.
-    let entries: Vec<(&[u8], &[u8])> = (0..total).map(|_| (SUBJECT, PAYLOAD)).collect();
+    let entries: Vec<BatchEntry<'_>> = (0..total)
+        .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
+        .collect();
     let start = Instant::now();
     control.publish_batch(&stream_name, &entries).await.unwrap();
 
@@ -252,8 +257,13 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
 /// they arrive. Stale pendings would block redelivery because max_inflight
 /// would already be saturated.
 async fn correctness_probe(addr: &str, client: &Client, stream: &[u8], probe_count: u32) -> u32 {
-    let entries: Vec<(&[u8], &[u8])> = (0..probe_count)
-        .map(|_| (b"ack.bench.probe".as_slice(), b"p".as_slice()))
+    let entries: Vec<BatchEntry<'_>> = (0..probe_count)
+        .map(|_| {
+            BatchEntry::new(
+                b"ack.bench.probe".as_slice(),
+                Bytes::copy_from_slice(b"p"),
+            )
+        })
         .collect();
     client.publish_batch(stream, &entries).await.unwrap();
 

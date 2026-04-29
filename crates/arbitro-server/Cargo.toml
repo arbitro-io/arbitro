@@ -38,7 +38,6 @@ papaya            = "0.2"
 foldhash          = "0.1"
 
 [dev-dependencies]
-arbitro-client = { path = "../arbitro-client" }
 arbitro-kit    = { path = "../../../arbitro-kit" }
 libc           = "0.2"
 ahash          = "0.8"

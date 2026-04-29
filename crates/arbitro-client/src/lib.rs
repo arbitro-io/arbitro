@@ -1,7 +1,7 @@
 pub mod client;
 pub mod conn;
 pub mod consumer;
-pub(crate) mod encode;
+pub mod encode;
 pub mod error;
 pub mod inner;
 pub mod message;
