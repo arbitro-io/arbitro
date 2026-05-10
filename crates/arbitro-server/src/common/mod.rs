@@ -1,9 +1,11 @@
 //! common/ — shared primitives used across shard, transport and persistence.
 //!
-//! `gate` and `name_registry` live in the shared `arbitro-common` crate so
+//! `Gate` and `NameRegistry` live in the shared `arbitro-common` crate so
 //! the kernel drainer can reach for them without depending on
 //! `arbitro-server`. They are re-exported here to keep server-internal
 //! call sites stable.
+//!
+//! Gate uses kit SignalSet (thread::park/unpark) internally — 0% CPU when idle.
 //!
 //! `reply_v2` and `session` remain server-local:
 //! - `reply_v2` depends on `crate::transport::ConnectionRegistry`.

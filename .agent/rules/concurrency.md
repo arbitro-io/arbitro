@@ -101,42 +101,39 @@ std::thread::Builder::new()
 
 Never use unnamed threads (`std::thread::spawn`).
 
-## DRAIN DELIVERY — ON SHARD THREAD VIA GATE
+## DRAIN DELIVERY — ON DRAIN THREAD VIA GATE
 
-Delivery runs **directly on the shard thread** — no async drain task, no middleman.
+Delivery runs on a **dedicated drain OS thread** (`drain-N`) — no async task, no middleman.
 
-The shard thread serves **two wakeup sources** in a unified loop:
-1. **mpsc commands** — publish, ack, nack, subscribe, etc. (`try_recv`)
-2. **Gate signal** — "drain work available, deliver now" (`gate.is_open()`)
-
-The shard parks when **both** are idle. Either source wakes it:
-- `ShardHandle.send()` sends command + calls `shard_thread.unpark()`
-- `gate.release()` sets locked=false + calls `shard_thread.unpark()`
+The drain thread blocks on `gate.acquire()` (kit SignalSet + thread::park, 0% CPU).
+When signalled, it loops on `gate.is_open()` running drain_cycle until exhausted.
 
 ```
-Shard loop:  try_recv commands → gate.is_open? → handle_drain_deliver → park
+Drain loop:  gate.acquire() → while gate.is_open() { drain_cycle() } → park (thread::park)
 Gate opens:  publish (new messages), ack (freed inflight), nack (requeued), subscribe/bind
-Gate closes: handle_drain_deliver found nothing to deliver
+Gate closes: drain_cycle found nothing to deliver
 ```
 
-### Gate (`crate::gate::Gate`)
+### Gate (`arbitro_common::Gate`)
+
+Wraps `arbitro_kit::gate::SignalSet<ParkWaiter>` with a single signal (bit 0).
 
 ```rust
-#[repr(align(64))]
+#[repr(transparent)]
 pub struct Gate {
-    locked: AtomicBool,     // true = no work pending
-    parked: AtomicBool,     // true = shard thread is parked
-    worker: UnsafeCell<Option<std::thread::Thread>>,
+    inner: SignalSet,  // kit SignalSet — atomic bitmap + ParkWaiter (thread::park/unpark)
 }
 ```
 
-- Lives inside `ShardWorker` — one per shard thread. **Not Clone, not Arc.**
-- External callers (ShardHandle) wake the shard via `shard_thread.unpark()`, not gate.
-- Gate is internal to the shard thread's own delivery scheduling.
+- Shared via `Arc<Gate>` between drain thread, command task, and ShardHandle.
+- `release()` → `inner.release(bit_0)` — atomic `fetch_or` + `thread::unpark` (coalescing via OR).
+- `acquire()` → `inner.acquire()` — fast-paths on bitmap load, falls to `thread::park` (0% CPU) if empty.
+- `lock()` → `inner.lock(bit_0)` — atomic `fetch_and` clears the bit.
+- `set_worker(thread)` registers the drain thread for `unpark` — **must be called before any release()**.
 
 ### Rules
 
-1. **No async drain task.** Delivery runs on the shard thread via Gate.
-2. **`try_recv` is not spinning.** Shard parks when both mpsc and gate are idle.
-3. **Spurious unpark is safe.** Extra loop iteration (~5ns), no harm.
-4. **Gate.release() from shard handlers only.** Called after publish/ack/nack/subscribe/bind.
+1. **No async drain task.** Delivery runs on the drain OS thread via Gate.
+2. **0% CPU idle.** Drain blocks via `thread::park` (futex on Linux), not spin.
+3. **Coalescing is safe.** Multiple releases between acquires are merged (bit-OR).
+4. **Gate.release() from shard handlers + ShardHandle.** Called after publish/ack/nack/subscribe/bind.
