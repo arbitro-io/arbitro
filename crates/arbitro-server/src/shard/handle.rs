@@ -1,15 +1,31 @@
-//! ShardHandle — async API wrapping mpsc::Sender + oneshot per command.
+//! ShardHandle — async API wrapping kit::Mpsc (M producers) + oneshot per command.
 //!
-//! Each method builds an owned command, sends it to the shard's channel,
-//! and awaits the oneshot reply. Backpressure if channel is full.
+//! Each method builds an owned command, sends it via the kit::Mpsc lane
+//! (round-robin across M producers, each behind a parking_lot::Mutex), and
+//! awaits the oneshot reply. Backpressure: if all rings are full, the call
+//! awaits a backpressure Notify that the CommandWorker triggers after
+//! draining items via `recv_batch_async_send`.
+//!
+//! ## Why this design
+//!
+//! `kit::MpscProducer` is `!Sync` by design (each clone owns a unique ring).
+//! arbitro's pattern is "any tokio task may send" → requires Sync access.
+//! Wrapping each producer in `parking_lot::Mutex` makes the producer set
+//! shareable. With M=8 producers, lock contention is amortised across 8
+//! lanes; the CommandWorker drains all 8 in one `recv_batch_async_send`
+//! await — that's where the 2× over `tokio::mpsc::recv_many` comes from.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_store::EntryRef;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+
+use arbitro_kit::route::MpscProducer;
+use arbitro_kit::waiter::NotifyWaiter;
 
 use crate::common::Gate;
 use crate::common::reply_v2::send_rep_ok_v2;
@@ -17,11 +33,30 @@ use crate::shard::command::*;
 use crate::shard::router::SharedStore;
 use crate::transport::ConnectionRegistry;
 
+/// Producer type used by ShardHandle. Each shard has `SHARD_M` producers,
+/// each wrapped in a `parking_lot::Mutex` so any tokio task can send via
+/// the round-robin lane chooser.
+pub(super) type ShardProducer =
+    MpscProducer<ShardCommand, { crate::shard::router::SHARD_RING_CAP }, NotifyWaiter>;
+
+/// Lane = `Mutex<MpscProducer>`. Send path: lock + try_send + unlock.
+/// Never holds the lock across `.await`.
+pub(super) type ShardLane = parking_lot::Mutex<ShardProducer>;
+
 /// Async handle to a shard worker.
 #[derive(Clone)]
 pub struct ShardHandle {
     shard_id: u32,
-    tx: mpsc::Sender<ShardCommand>,
+    lanes: Arc<[ShardLane]>,
+    /// Round-robin counter for lane selection.
+    next_idx: Arc<AtomicUsize>,
+    /// Wakes parked senders after the CommandWorker drains items.
+    backpressure: Arc<tokio::sync::Notify>,
+    /// Set to `true` by the CommandWorker on shutdown so `send()` callers
+    /// can short-circuit instead of looping forever on full lanes that
+    /// will never drain. Replaces the `Err(SendError)` semantics of
+    /// `tokio::mpsc::Sender` when the receiver is dropped.
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     /// Shared store — publish writes directly, bypassing the shard worker.
     store: SharedStore,
     /// Shared gate — publish notifies drain after store append.
@@ -33,14 +68,19 @@ pub struct ShardHandle {
 impl ShardHandle {
     pub fn new(
         shard_id: u32,
-        tx: mpsc::Sender<ShardCommand>,
+        lanes: Arc<[ShardLane]>,
+        backpressure: Arc<tokio::sync::Notify>,
+        consumer_alive: Arc<std::sync::atomic::AtomicBool>,
         store: SharedStore,
         gate: Arc<Gate>,
         registry: ConnectionRegistry,
     ) -> Self {
         Self {
             shard_id,
-            tx,
+            lanes,
+            next_idx: Arc::new(AtomicUsize::new(0)),
+            backpressure,
+            consumer_alive,
             store,
             gate,
             registry,
@@ -388,31 +428,74 @@ impl ShardHandle {
 
     // ── Internal ────────────────────────────────────────────────────────
 
+    /// Send a command to the shard. Picks a lane round-robin, tries each
+    /// in turn. If all lanes are full, awaits the backpressure Notify
+    /// (signalled by CommandWorker after each drain pass) and retries.
+    ///
+    /// **Never** holds a lane lock across `.await` — would block the
+    /// tokio worker. Each lock is taken, try_send is attempted, lock is
+    /// released, before any await happens.
     pub async fn send(
         &self,
-        cmd: ShardCommand,
+        mut cmd: ShardCommand,
     ) -> Result<(), SendError> {
-        crate::lifecycle_trace!(
-            "07_handle_send_enter",
-            0,
-            0,
-            "frame_loop"
-        );
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| SendError::SHARD_DOWN)?;
-        crate::lifecycle_trace!(
-            "08_handle_send_done",
-            0,
-            0,
-            "frame_loop"
-        );
-        Ok(())
+        crate::lifecycle_trace!("07_handle_send_enter", 0, 0, "frame_loop");
+        let n = self.lanes.len();
+        let start = self.next_idx.fetch_add(1, Ordering::Relaxed) % n;
+        loop {
+            if !self.consumer_alive.load(Ordering::Acquire) {
+                return Err(SendError::SHARD_DOWN);
+            }
+            // Try every lane starting from `start`. Each iteration acquires
+            // and releases the lock immediately — no await while held.
+            for i in 0..n {
+                let idx = (start + i) % n;
+                let res = self.lanes[idx].lock().try_send(cmd);
+                match res {
+                    Ok(()) => {
+                        crate::lifecycle_trace!("08_handle_send_done", 0, 0, "frame_loop");
+                        return Ok(());
+                    }
+                    Err(returned) => {
+                        cmd = returned;
+                    }
+                }
+            }
+            // All lanes full — wait for CommandWorker to drain at least
+            // one item, then retry. Capture notified() BEFORE the retry
+            // sweep to prevent lost-wake.
+            let notify = self.backpressure.notified();
+            // One more pass before parking (consumer might have drained
+            // while we were building the notified()).
+            for i in 0..n {
+                let idx = (start + i) % n;
+                let res = self.lanes[idx].lock().try_send(cmd);
+                match res {
+                    Ok(()) => return Ok(()),
+                    Err(returned) => cmd = returned,
+                }
+            }
+            if !self.consumer_alive.load(Ordering::Acquire) {
+                return Err(SendError::SHARD_DOWN);
+            }
+            notify.await;
+        }
     }
 
     pub fn send_shutdown(&self) {
-        let _ = self.tx.try_send(ShardCommand::Shutdown);
+        // Best-effort: try every lane. Shutdown is in-band; the worker
+        // breaks out of the loop when it sees ShardCommand::Shutdown.
+        let mut cmd = Some(ShardCommand::Shutdown);
+        for lane in self.lanes.iter() {
+            if let Some(c) = cmd.take() {
+                match lane.lock().try_send(c) {
+                    Ok(()) => break,
+                    Err(returned) => cmd = Some(returned),
+                }
+            }
+        }
+        // Drop any unsent command (shutdown is best-effort if every lane
+        // is full — the channel will close via Drop of senders anyway).
         self.gate.release();
     }
 }

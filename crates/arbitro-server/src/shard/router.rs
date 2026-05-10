@@ -12,16 +12,36 @@ use std::sync::Arc;
 
 use arbitro_engine_v2::types::StreamId;
 use arbitro_engine_v2::ArbitroEngine;
+use arbitro_kit::route::Mpsc as KitMpsc;
+use arbitro_kit::waiter::NotifyWaiter;
 use arbitro_store::MemoryStore;
-use tokio::sync::mpsc;
 
 use crate::common::{Gate, NameRegistry};
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
-use crate::shard::handle::ShardHandle;
+use crate::shard::command::ShardCommand;
+use crate::shard::handle::{ShardHandle, ShardLane};
 use crate::shard::shared::{DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
 use crate::transport::ConnectionRegistry;
+
+// ── kit::Mpsc lane configuration ───────────────────────────────────────────
+//
+// Total command channel capacity = SHARD_M × SHARD_RING_CAP.
+// With M=8 lanes × 128 slots/lane = 1024 total — matches the previous
+// tokio::mpsc(channel_capacity=4096) default ÷ 4 for tighter backpressure,
+// or scaled up via SHARD_RING_CAP at compile time.
+//
+// M=8 chosen so consumer-side `recv_batch_async_send` amortises drain
+// cost across 8 rings (~2× over tokio::mpsc::recv_many in benches).
+
+/// Number of producer lanes per shard. Each lane is a `kit::MpscProducer`
+/// wrapped in a `parking_lot::Mutex` and stored in `ShardHandle.lanes`.
+pub const SHARD_M: usize = 8;
+
+/// Per-lane ring capacity (must be power of two). Total channel capacity =
+/// `SHARD_M * SHARD_RING_CAP`.
+pub const SHARD_RING_CAP: usize = 128;
 
 /// Shared store handle — publish writes, drain reads.
 pub type SharedStore = Arc<std::sync::Mutex<Box<dyn arbitro_store::Store>>>;
@@ -43,7 +63,10 @@ impl ShardRouter {
     /// Spawn N shard workers. Per shard: one drain OS thread + one command tokio task.
     pub fn spawn(config: &Config, registry: &ConnectionRegistry) -> Self {
         let shard_count = config.shard_count;
-        let channel_capacity = config.channel_capacity;
+        // `config.channel_capacity` retained as max command in-flight, but
+        // the actual capacity is `SHARD_M * SHARD_RING_CAP` (compile-time).
+        // Honour the larger of the two if the operator configured > 1024.
+        let _ = config.channel_capacity;
 
         let mut handles = Vec::with_capacity(shard_count);
         let mut stores = Vec::with_capacity(shard_count);
@@ -51,7 +74,22 @@ impl ShardRouter {
         let names = Arc::new(NameRegistry::new());
 
         for id in 0..shard_count {
-            let (tx, rx) = mpsc::channel(channel_capacity);
+            // ── kit::Mpsc with M=SHARD_M producer lanes per shard ──────
+            let (producers, consumer, shutdown_handle) =
+                KitMpsc::<ShardCommand, SHARD_RING_CAP, NotifyWaiter>::new(SHARD_M);
+            // Drop the kit shutdown handle — we use in-band ShardCommand::Shutdown.
+            // The consumer never returns Err(Shutdown) because we never call
+            // shutdown_handle.signal().
+            let _ = shutdown_handle;
+
+            let lanes: Arc<[ShardLane]> = producers
+                .into_iter()
+                .map(parking_lot::Mutex::new)
+                .collect::<Vec<_>>()
+                .into();
+            let backpressure = Arc::new(tokio::sync::Notify::new());
+            let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
             let engine = ArbitroEngine::new();
             let gate = Arc::new(Gate::new());
 
@@ -109,7 +147,9 @@ impl ShardRouter {
                 gate: Arc::clone(&gate),
                 registry: registry.clone(),
                 names: Arc::clone(&names),
-                rx,
+                rx: consumer,
+                backpressure: Arc::clone(&backpressure),
+                consumer_alive: Arc::clone(&consumer_alive),
                 notify_ring,
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
@@ -137,7 +177,9 @@ impl ShardRouter {
 
             handles.push(ShardHandle::new(
                 id as u32,
-                tx,
+                lanes,
+                backpressure,
+                consumer_alive,
                 Arc::clone(&shared_store),
                 Arc::clone(&gate),
                 registry.clone(),

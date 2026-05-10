@@ -142,6 +142,7 @@ dependencies = [
  "foldhash",
  "libc",
  "papaya",
+ "parking_lot",
  "rapidhash",
  "rustc-hash",
  "rustls-pemfile",
