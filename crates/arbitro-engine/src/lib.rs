@@ -389,6 +389,7 @@ mod engine_tests {
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
                 max_inflight: 1000,
+                ack_wait_ms: 0,
             })
             .unwrap();
 
@@ -467,6 +468,7 @@ mod engine_tests {
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
                 max_inflight: 100,
+                ack_wait_ms: 0,
             })
             .unwrap();
         engine
@@ -508,6 +510,7 @@ mod engine_tests {
                 durable: true,
                 ack_policy: AckPolicy::Explicit,
                 max_inflight: 100,
+                ack_wait_ms: 0,
             })
             .unwrap();
         engine

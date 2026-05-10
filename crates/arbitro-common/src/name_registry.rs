@@ -102,6 +102,9 @@ struct Inner {
     /// a way to resolve `ConsumerId → StreamId`. Populated alongside
     /// `consumer_queue` at create time so both lookups stay consistent.
     consumer_stream: HashMap<ConsumerId, StreamId, foldhash::fast::FixedState>,
+    /// Per-consumer deliver policy (0=All, 1=New, 2=ByStartSeq) + start_seq.
+    /// Set at CreateConsumer time, consumed at Subscribe time for cursor positioning.
+    consumer_deliver: HashMap<ConsumerId, (u8, u64), foldhash::fast::FixedState>,
     /// Consumer ids start at 1 so `0` can keep its conventional "unset /
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
@@ -126,6 +129,7 @@ impl Inner {
             consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumer_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumer_deliver: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_consumer: 1,
             queues_by_key: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             // Queue ids start at 1 for the same reason as consumers — leave
@@ -284,6 +288,30 @@ impl NameRegistry {
             .lock()
             .expect("name registry poisoned")
             .consumer_stream
+            .get(&consumer)
+            .copied()
+    }
+
+    /// Store deliver policy for a consumer (set at CreateConsumer time).
+    pub fn set_consumer_deliver_policy(
+        &self,
+        consumer: ConsumerId,
+        deliver_policy: u8,
+        start_seq: u64,
+    ) {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_deliver
+            .insert(consumer, (deliver_policy, start_seq));
+    }
+
+    /// Look up the deliver policy for a consumer. Returns `(policy, start_seq)`.
+    pub fn consumer_deliver_policy(&self, consumer: ConsumerId) -> Option<(u8, u64)> {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_deliver
             .get(&consumer)
             .copied()
     }

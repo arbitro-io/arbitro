@@ -4,17 +4,18 @@
 //! enforces it). All subsequent traffic is `Header`-prefixed v2 frames.
 //!
 //! Scope:
-//!   * Hot path:  Publish, PublishBatch, Ack, BatchAck, Subscribe, Unsubscribe
+//!   * Hot path:  Publish, PublishBatch, PublishWithReply, Ack, BatchAck, Subscribe, Unsubscribe
 //!   * Mgmt:      CreateStream/DeleteStream/GetStream/PurgeStream/DrainSubject/ListStreams
 //!                CreateConsumer/DeleteConsumer/GetConsumer/ListConsumers
 //!   * System:    Disconnect, Ping, Pong (no-op or trivial reply)
 //!
 //! ## Dropped (intentional v1→v2 regression)
 //!
-//!   * `Nack`           — no v2 frame yet, returns `UnknownAction`.
+//!   * `Nack`/`BatchNack` — now implemented (Action::Nack/BatchNack handlers).
 //!   * `AckSync`/`BatchAckSync` — collapsed into fire-and-forget Ack/BatchAck.
 //!   * `PublishAccumulate` — accumulator path is v1-only for now.
-//!   * `PublishWithReply` / `PublishWithHeaders` — not implemented.
+//!   * `PublishWithReply` — now implemented (request/reply RPC).
+//!   * `PublishWithHeaders` — not implemented.
 //!
 //! ## Notable wire-shape compromises
 //!
@@ -33,8 +34,10 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
+use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
+use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::{
     CreateConsumerFrame, DeleteConsumerFrame, GetConsumerFrame, ListConsumersFrame,
@@ -50,6 +53,11 @@ use zerocopy::IntoBytes;
 use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::router::ShardRouter;
 use crate::transport::ConnectionRegistry;
+
+use arbitro_proto::metadata::{
+    build_create_stream, build_delete_stream,
+    build_create_consumer, build_delete_consumer,
+};
 
 /// Dispatch one v2 frame. `frame` covers `[Header(16) || body(msg_len)]`.
 pub async fn dispatch_frame_v2(
@@ -76,10 +84,13 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish        => v2_publish(conn_id, req_seq, &frame, server, registry),
-        Action::PublishBatch   => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
+        Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry),
+        Action::PublishBatch     => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
+        Action::PublishWithReply => v2_publish_with_reply(conn_id, req_seq, &frame, server, registry),
         Action::Ack            => v2_ack(&frame, server).await,
         Action::BatchAck       => v2_batch_ack(&frame, server).await,
+        Action::Nack           => v2_nack(&frame, server).await,
+        Action::BatchNack      => v2_batch_nack(&frame, server).await,
         Action::Subscribe      => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
         Action::Unsubscribe    => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
 
@@ -105,7 +116,7 @@ pub async fn dispatch_frame_v2(
             // v2 has no Connect — HELLO is the handshake. Ack quietly.
         }
 
-        // Anything else (Nack, AckSync, accumulators, with-reply/with-headers, ...)
+        // Anything else (AckSync, accumulators, with-headers, ...)
         // is unsupported in this iteration.
         _ => send_error_v2(registry, conn_id, req_seq, ErrorCode::UnknownAction),
     }
@@ -143,7 +154,62 @@ fn v2_publish(
         .as_millis() as u64;
 
     let shared_store = server.store_for(seq_stream);
-    let first_seq = match shared_store.lock().unwrap().append_batch(&entries, now_ms) {
+    let first_seq = match tokio::task::block_in_place(|| {
+        shared_store.lock().unwrap().append_batch(&entries, now_ms)
+    }) {
+        Ok(seq) => seq,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+            return;
+        }
+    };
+
+    send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
+    server.gate_for(seq_stream).release();
+}
+
+fn v2_publish_with_reply(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match PubWithReplyFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let wire_stream = f.body.stream_id.get();
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+    };
+
+    // Encode reply_to into the payload prefix: [reply_len:u16 LE][reply_to][payload].
+    // The drain extracts this using the HAS_REPLY_TO flag.
+    let reply_to = f.reply_to();
+    let payload = f.payload();
+    let mut combined_payload = Vec::with_capacity(2 + reply_to.len() + payload.len());
+    combined_payload.extend_from_slice(&(reply_to.len() as u16).to_le_bytes());
+    combined_payload.extend_from_slice(reply_to);
+    combined_payload.extend_from_slice(payload);
+
+    let entries = [arbitro_store::EntryRef {
+        stream_id: seq_stream.raw(),
+        subject: f.subject(),
+        payload: &combined_payload,
+        flags: arbitro_store::flags::HAS_REPLY_TO,
+    }];
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let shared_store = server.store_for(seq_stream);
+    let first_seq = match tokio::task::block_in_place(|| {
+        shared_store.lock().unwrap().append_batch(&entries, now_ms)
+    }) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -190,7 +256,9 @@ fn v2_publish_batch(
         .as_millis() as u64;
 
     let shared_store = server.store_for(seq_stream);
-    let first_seq = match shared_store.lock().unwrap().append_batch(&entries, now_ms) {
+    let first_seq = match tokio::task::block_in_place(|| {
+        shared_store.lock().unwrap().append_batch(&entries, now_ms)
+    }) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -240,6 +308,54 @@ async fn v2_batch_ack(frame: &Bytes, server: &ShardRouter) {
     let _ = shard.ack(consumer_id, entries).await;
 }
 
+/// Single-entry NACK — fire-and-forget, no reply. Always immediate (delay=0).
+async fn v2_nack(frame: &Bytes, server: &ShardRouter) {
+    let f = match NackFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let seq_stream = match server.names().consumer_stream(consumer_id) {
+        Some(s) => s,
+        None => return, // consumer unknown — fire-and-forget, no reply
+    };
+    let shard = server.shard_for(seq_stream);
+    let _ = shard
+        .nack(
+            consumer_id,
+            vec![AckEntry { stream_id: seq_stream, seq: f.body.nack_seq.get() }],
+            0, // single nack frame has no delay field
+        )
+        .await;
+}
+
+/// Batch NACK — fire-and-forget, no reply. Supports per-batch delay_ms.
+async fn v2_batch_nack(frame: &Bytes, server: &ShardRouter) {
+    let f = match BatchNackFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let seq_stream = match server.names().consumer_stream(consumer_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let shard = server.shard_for(seq_stream);
+    let entries: Vec<AckEntry> = f
+        .entries()
+        .iter()
+        .map(|e| AckEntry { stream_id: seq_stream, seq: e.seq.get() })
+        .collect();
+    // All entries in a batch share the same delay — take max from all entries.
+    let delay_ms = f
+        .entries()
+        .iter()
+        .map(|e| e.delay_ms.get())
+        .max()
+        .unwrap_or(0);
+    let _ = shard.nack(consumer_id, entries, delay_ms).await;
+}
+
 async fn v2_subscribe(
     conn_id: u64,
     req_seq: u64,
@@ -265,6 +381,14 @@ async fn v2_subscribe(
     let filter = f.filter().to_vec();
     let filters = if filter.is_empty() { vec![] } else { vec![filter] };
 
+    // deliver_policy from consumer config (stored at CreateConsumer time).
+    // Default: 0 = All (replay from beginning). The NameRegistry can hold
+    // per-consumer deliver_policy for management-API consumers.
+    let (deliver_policy, start_seq) = server
+        .names()
+        .consumer_deliver_policy(consumer_id)
+        .unwrap_or((0, 0));
+
     let reply = shard
         .subscribe(
             StreamConfig { id: seq_stream, name: vec![] },
@@ -276,6 +400,7 @@ async fn v2_subscribe(
                 // v2 SubFrame body has no ack-policy field; default to Explicit.
                 ack_policy: AckPolicy::Explicit,
                 max_inflight: u32::MAX,
+                ack_wait_ms: 0,
             },
             SubscriptionConfig {
                 id: SubscriptionId(consumer_id.0),
@@ -284,6 +409,8 @@ async fn v2_subscribe(
                 filters,
             },
             ConnectionId(conn_id),
+            deliver_policy,
+            start_seq,
         )
         .await;
 
@@ -336,11 +463,29 @@ async fn v2_create_stream(
     let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
     let shard = server.shard_for(seq_stream);
 
+    let max_msgs   = f.body.max_msgs.get();
+    let max_bytes  = f.body.max_bytes.get();
+    let max_age_ms = f.body.max_age_secs.get().saturating_mul(1_000);
+
     match shard
-        .create_stream(StreamConfig { id: seq_stream, name: name.to_vec() })
+        .create_stream(
+            StreamConfig { id: seq_stream, name: name.to_vec() },
+            max_msgs,
+            max_bytes,
+            max_age_ms,
+        )
         .await
     {
-        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64),
+        Ok(true) => {
+            // Persist to command log on cold path — idempotent on replay.
+            if let Some(log) = server.command_log() {
+                let cmd = build_create_stream(&frame[HEADER_SIZE..]);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::warn!(error = %e, "command log: create_stream record failed");
+                }
+            }
+            send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64)
+        }
         Ok(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists),
         Err(_)   => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
@@ -368,6 +513,12 @@ async fn v2_delete_stream(
     match shard.delete_stream(seq_stream, true).await {
         Ok(_) => {
             server.names().remove_stream(wire_stream);
+            if let Some(log) = server.command_log() {
+                let cmd = build_delete_stream(&frame[HEADER_SIZE..]);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::warn!(error = %e, "command log: delete_stream record failed");
+                }
+            }
             send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
         }
         Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
@@ -406,9 +557,14 @@ async fn v2_purge_stream(
     };
     let name = f.name();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
-    match server.names().stream_seq(wire_stream) {
-        Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
-        None    => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None    => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+    };
+    let shard = server.shard_for(seq_stream);
+    match shard.purge_stream(seq_stream).await {
+        Ok(deleted) => send_rep_ok_v2(registry, conn_id, req_seq, deleted),
+        Err(_)      => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -424,10 +580,16 @@ async fn v2_drain_subject(
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
     let name = f.name();
+    let subject = f.subject().to_vec();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
-    match server.names().stream_seq(wire_stream) {
-        Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
-        None    => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None    => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+    };
+    let shard = server.shard_for(seq_stream);
+    match shard.drain_subject(seq_stream, subject).await {
+        Ok(deleted) => send_rep_ok_v2(registry, conn_id, req_seq, deleted),
+        Err(_)      => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -487,6 +649,11 @@ async fn v2_create_consumer(
     let queue_id = server.names().get_or_create_queue(seq_stream, group);
     server.names().set_consumer_queue(seq_consumer, queue_id);
     server.names().set_consumer_stream(seq_consumer, seq_stream);
+    server.names().set_consumer_deliver_policy(
+        seq_consumer,
+        f.body.deliver_policy,
+        f.body.start_seq.get(),
+    );
 
     let ack_policy = match f.body.ack_policy {
         0 => AckPolicy::None,
@@ -506,12 +673,21 @@ async fn v2_create_consumer(
                 } else {
                     f.body.max_inflight.get() as u32
                 },
+                ack_wait_ms: f.body.ack_wait_ms.get(),
             },
             Vec::new(),
         )
         .await
     {
-        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64),
+        Ok(true) => {
+            if let Some(log) = server.command_log() {
+                let cmd = build_create_consumer(&frame[HEADER_SIZE..]);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::warn!(error = %e, "command log: create_consumer record failed");
+                }
+            }
+            send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64)
+        }
         Ok(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists),
         Err(_)   => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
@@ -532,6 +708,12 @@ async fn v2_delete_consumer(
 
     for i in 0..server.shard_count() {
         if let Ok(_) = server.shard(i).delete_consumer(consumer_id).await {
+            if let Some(log) = server.command_log() {
+                let cmd = build_delete_consumer(&frame[HEADER_SIZE..]);
+                if let Err(e) = log.record(&cmd) {
+                    tracing::warn!(error = %e, "command log: delete_consumer record failed");
+                }
+            }
             send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
             return;
         }
@@ -550,9 +732,11 @@ async fn v2_get_consumer(
         Ok(f) => f,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let _stream_id = f.body.stream_id.get();
-    let _name = f.name();
-    send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
+    let name = f.name();
+    match server.names().consumer_id(name) {
+        Some(id) => send_rep_ok_v2(registry, conn_id, req_seq, id.0 as u64),
+        None     => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
+    }
 }
 
 async fn v2_list_consumers(
@@ -566,7 +750,16 @@ async fn v2_list_consumers(
         Ok(f) => f,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let _filter_stream = f.body.stream_id.get();
+    // Wire stream_id is the client-side hash; 0 = list all consumers.
+    // Translate to the sequential engine id used inside the shard reply.
+    let wire_filter = f.body.stream_id.get();
+    // None = no filter (return all); Some(seq) = filter by engine seq_id.
+    // Unknown wire hash → Some(u32::MAX) which matches nothing → empty list.
+    let seq_filter: Option<u32> = if wire_filter == 0 {
+        None  // no filter
+    } else {
+        Some(server.names().stream_seq(wire_filter).map(|s| s.raw()).unwrap_or(u32::MAX))
+    };
 
     let mut all_consumers: Vec<(u32, u32, u32, bool)> = Vec::new();
     for i in 0..server.shard_count() {
@@ -575,15 +768,24 @@ async fn v2_list_consumers(
         }
     }
 
+    // Apply stream filter when the client requested it.
+    let filtered: Vec<(u32, u32, u32, bool)> = match seq_filter {
+        None      => all_consumers,
+        Some(seq) => all_consumers
+            .into_iter()
+            .filter(|(_, sid, _, _)| *sid == seq)
+            .collect(),
+    };
+
     let entry_size = 13;
-    let body_len = 4 + all_consumers.len() * entry_size;
+    let body_len = 4 + filtered.len() * entry_size;
     let total = HEADER_SIZE + body_len;
     let mut buf = BytesMut::with_capacity(total);
 
     let header = Header::new(Action::ListConsumers.as_u16(), body_len as u32, req_seq);
     buf.extend_from_slice(header.as_bytes());
-    buf.extend_from_slice(&(all_consumers.len() as u32).to_le_bytes());
-    for (consumer_id, stream_id, queue_id, paused) in &all_consumers {
+    buf.extend_from_slice(&(filtered.len() as u32).to_le_bytes());
+    for (consumer_id, stream_id, queue_id, paused) in &filtered {
         buf.extend_from_slice(&consumer_id.to_le_bytes());
         buf.extend_from_slice(&stream_id.to_le_bytes());
         buf.extend_from_slice(&queue_id.to_le_bytes());

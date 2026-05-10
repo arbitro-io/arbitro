@@ -20,15 +20,15 @@ default = []
 # Enable with `cargo test --features lifecycle_trace` when you need to
 # profile end-to-end timings of a single message through the server.
 lifecycle_trace = []
-# A/B toggle: swap the Gate impl to crossbeam_channel-backed variant.
-gate_crossbeam = ["arbitro-common/gate_crossbeam"]
-gate_tokio_notify = ["arbitro-common/gate_tokio_notify"]
+# TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
 arbitro-common    = { workspace = true }
 arbitro-proto     = { path = "../arbitro-proto" }
 arbitro-store     = { path = "../arbitro-store" }
+arbitro-kit       = { workspace = true }
 tokio             = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -36,9 +36,11 @@ bytes             = { workspace = true }
 zerocopy          = { workspace = true }
 papaya            = "0.2"
 foldhash          = "0.1"
+# TLS (optional)
+tokio-rustls      = { version = "0.26", optional = true }
+rustls-pemfile    = { version = "2", optional = true }
 
 [dev-dependencies]
-arbitro-kit    = { path = "../../../arbitro-kit" }
 libc           = "0.2"
 ahash          = "0.8"
 dashmap        = "6"

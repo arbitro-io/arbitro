@@ -5,6 +5,8 @@
 //! closed immediately. After HELLO, the connection is a stream of
 //! `Header`-prefixed v2 frames dispatched by `dispatch_v2`.
 
+use std::sync::Arc;
+
 use bytes::BytesMut;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -24,6 +26,7 @@ use arbitro_proto::lifecycle::LifeCycle;
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
+use crate::transport::registry::{BoxedReader, BoxedWriter};
 use crate::transport::ConnectionRegistry;
 use crate::transport::dispatch_v2;
 
@@ -58,12 +61,11 @@ impl ArbitroServer {
     }
 
     /// Set the shared command log for metadata persistence.
-    /// Also registers it as a lifecycle service.
-    ///
-    /// NOTE: v2 dispatch does not currently call `log.record(...)`. The API
-    /// is preserved for replay-on-startup only; new metadata commands are
-    /// not journaled until v2 logging lands.
+    /// Also registers it as a lifecycle service and wires it into the shard
+    /// router so v2 dispatch records metadata mutations (create/delete
+    /// stream/consumer) on the cold path.
     pub fn set_command_log(&mut self, log: SharedCommandLog) {
+        self.server.set_command_log(log.clone());
         self.services.push(Box::new(log.clone()));
         self.command_log = Some(log);
     }
@@ -117,6 +119,16 @@ impl ArbitroServer {
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         tracing::info!(addr = %self.config.listen_addr, "listening");
 
+        // ── TLS acceptor (optional) ────────────────────────────────────
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self.config.tls_cert.as_ref().map(|cert| {
+            let key = self.config.tls_key.as_ref()
+                .expect("ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set");
+            let acceptor = crate::transport::tls::build_acceptor(cert, key);
+            tracing::info!("TLS enabled");
+            acceptor
+        });
+
         // Internal shutdown signal
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -140,6 +152,14 @@ impl ArbitroServer {
         let mut shutdown_accept = shutdown_rx.clone();
         let accept_server = self.server.clone();
         let accept_shutdown = shutdown_rx.clone();
+
+        #[cfg(feature = "tls")]
+        let tls_acceptor_shared = tls_acceptor.map(std::sync::Arc::new);
+
+        let auth_token_shared: Option<Arc<str>> = self.config.auth_token
+            .as_deref()
+            .map(|s| Arc::from(s));
+
         let accept_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -153,15 +173,47 @@ impl ArbitroServer {
                                 }
 
                                 let _ = stream.set_nodelay(true);
-                                let (reader, writer) = stream.into_split();
-                                let conn_id = accept_registry.register(std::sync::Arc::new(writer));
+
+                                // Split into reader/writer — boxed for TLS/plain uniformity.
+                                let (reader, writer): (BoxedReader, BoxedWriter);
+
+                                #[cfg(feature = "tls")]
+                                {
+                                    if let Some(ref acceptor) = tls_acceptor_shared {
+                                        match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                let (r, w) = tokio::io::split(tls_stream);
+                                                reader = Box::new(r);
+                                                writer = Box::new(w);
+                                            }
+                                            Err(e) => {
+                                                tracing::debug!(%addr, error = %e, "TLS handshake failed");
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        let (r, w) = stream.into_split();
+                                        reader = Box::new(r);
+                                        writer = Box::new(w);
+                                    }
+                                }
+
+                                #[cfg(not(feature = "tls"))]
+                                {
+                                    let (r, w) = stream.into_split();
+                                    reader = Box::new(r);
+                                    writer = Box::new(w);
+                                }
+
+                                let conn_id = accept_registry.register(writer);
                                 tracing::debug!(conn_id, %addr, "accepted");
 
                                 let reg = accept_registry.clone();
                                 let srv = accept_server.clone();
                                 let sd = accept_shutdown.clone();
+                                let auth = auth_token_shared.clone();
                                 tokio::spawn(async move {
-                                    read_loop(conn_id, reader, srv, reg, sd).await;
+                                    read_loop(conn_id, reader, srv, reg, sd, auth).await;
                                 });
                             }
                             Err(e) => {
@@ -187,6 +239,28 @@ impl ArbitroServer {
         // Wait for shutdown signal — all real work happens in per-connection
         // read tasks now.
         let mut shutdown_process = shutdown_rx.clone();
+
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = shutdown_process.changed() => {
+                    tracing::info!("shutdown signal received");
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("SIGINT received, initiating shutdown");
+                    let _ = shutdown_tx.send(true);
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received, initiating shutdown");
+                    let _ = shutdown_tx.send(true);
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
         tokio::select! {
             _ = shutdown_process.changed() => {
                 tracing::info!("shutdown signal received");
@@ -246,10 +320,11 @@ impl ArbitroServer {
 /// 4. Drain `Header`-prefixed v2 frames from the accumulator forever.
 async fn read_loop(
     conn_id: u64,
-    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut reader: BoxedReader,
     server: ShardRouter,
     registry: ConnectionRegistry,
     mut shutdown: watch::Receiver<bool>,
+    auth_token: Option<Arc<str>>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -259,6 +334,7 @@ async fn read_loop(
     // Per-connection HELLO state. Connection is closed if the first 4
     // bytes are not the v2 magic.
     let mut hello_done: bool = false;
+    let mut auth_done: bool = auth_token.is_none(); // skip auth if no token configured
 
     'outer: loop {
         // ---- Mandatory v2 handshake ---------------------------------------
@@ -278,8 +354,37 @@ async fn read_loop(
             }
         }
 
+        // ---- Auth check (first frame after Hello must be Auth) ------------
+        if hello_done && !auth_done {
+            if acc.len() >= HEADER_SIZE_V2 {
+                let msg_len = u32::from_le_bytes([
+                    acc[4], acc[5], acc[6], acc[7],
+                ]) as usize;
+                let total = HEADER_SIZE_V2 + msg_len;
+                if acc.len() >= total {
+                    let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
+                    if action_raw != Action::Auth.as_u16() {
+                        tracing::warn!(conn_id, "auth required but first frame is not Auth, closing");
+                        send_shutdown_frame(&registry, conn_id);
+                        break 'outer;
+                    }
+                    // Token is the body (after 16-byte header)
+                    let token_bytes = &acc[HEADER_SIZE_V2..total];
+                    let expected = auth_token.as_ref().unwrap();
+                    if token_bytes != expected.as_bytes() {
+                        tracing::warn!(conn_id, "auth failed: invalid token");
+                        send_shutdown_frame(&registry, conn_id);
+                        break 'outer;
+                    }
+                    let _ = acc.split_to(total);
+                    auth_done = true;
+                    tracing::debug!(conn_id, "auth accepted");
+                }
+            }
+        }
+
         // ---- Drain whole v2 frames already in the accumulator -------------
-        if hello_done {
+        if hello_done && auth_done {
             loop {
                 if acc.len() < HEADER_SIZE_V2 {
                     break;

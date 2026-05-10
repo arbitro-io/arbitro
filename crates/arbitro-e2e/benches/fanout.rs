@@ -8,8 +8,7 @@
 //!   - replay  : publish first, then one consumer joins with
 //!               DeliverPolicy::All → drain walks the backlog. Single
 //!               consumer because the shard rewinds the global cursor on
-//!               every subscribe, so concurrent replay subscribers would
-//!               just produce duplicate deliveries.
+//!               every subscribe.
 //!   - single  : one `publish()` per message.
 //!   - batch   : `publish_batch(BATCH_SIZE)`.
 //!
@@ -18,24 +17,7 @@
 //! ## Section 2 — distribution check
 //!
 //! 4 fanout subscriptions on the same stream with different filters,
-//! `DIST_TOTAL` (300k) messages spread across 3 subject shapes (100k each)
-//! chosen so the expected per-filter counts are unambiguous given
-//! arbitro's wildcard semantics (`*` = exactly one token, `>` = one or
-//! more tokens, must be last):
-//!
-//!   sub  filter                       expected
-//!   ─────────────────────────────────────────
-//!   c0   None  (catch-all `>`)        300_000
-//!   c1   message.*.vip                200_000
-//!   c2   message.client.vip.>         100_000
-//!   c3   ignore.me                          0
-//!
-//! Subjects published (100k each):
-//!   - message.client.vip.alert  (4 tokens) → catch-all + client.vip.>
-//!   - message.acme.vip          (3 tokens) → catch-all + *.vip
-//!   - message.client.vip        (3 tokens) → catch-all + *.vip
-//!
-//! Reports per-subscription got vs expected and exits non-zero on mismatch.
+//! `DIST_TOTAL` (300k) messages spread across 3 subject shapes (100k each).
 //!
 //! Rule: compile from /mnt, run from /tmp/arbitro, timeout 120, tee log.
 
@@ -43,11 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arbitro_client::{BatchEntry, Client};
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, SubscriptionHandle};
 use bytes::Bytes;
-use arbitro_proto::config::{
-    AckPolicy, ConsumerConfig, DeliverMode, DeliverPolicy, StreamConfig,
-};
 use arbitro_server::{ArbitroServer, Config};
 
 const N_CONSUMERS_PUBSUB: usize = 4;
@@ -70,23 +49,19 @@ const DIST_SUBJECTS: &[&[u8]] = &[
 
 struct DistSub {
     label: &'static str,
-    filter: Option<&'static [u8]>,
+    filter: &'static [u8],
     expected: u64,
 }
 
 const DIST_SUBS: &[DistSub] = &[
-    DistSub { label: "catch-all  (>)",       filter: None,                          expected: 3 * DIST_PER_SUBJECT },
-    DistSub { label: "message.*.vip",        filter: Some(b"message.*.vip"),        expected: 2 * DIST_PER_SUBJECT },
-    DistSub { label: "message.client.vip.>", filter: Some(b"message.client.vip.>"), expected: 1 * DIST_PER_SUBJECT },
-    DistSub { label: "ignore.me",            filter: Some(b"ignore.me"),            expected: 0 },
+    DistSub { label: "catch-all  (>)",       filter: b"",                           expected: 3 * DIST_PER_SUBJECT },
+    DistSub { label: "message.*.vip",        filter: b"message.*.vip",              expected: 2 * DIST_PER_SUBJECT },
+    DistSub { label: "message.client.vip.>", filter: b"message.client.vip.>",      expected: 1 * DIST_PER_SUBJECT },
+    DistSub { label: "ignore.me",            filter: b"ignore.me",                 expected: 0 },
 ];
 
 // ── Single-connection multi-subscription stage ──────────────────────────
 
-// One TCP connection, N fanout consumers on it, all receiving every msg.
-// This is the shape where broadcast collapse yields linear savings:
-// today the server emits one wire entry per (msg, consumer) — this stage
-// measures that directly against the logical delivery count.
 const SCMS_N_CONSUMERS: usize = 4;
 const SCMS_MSGS: u64 = 50_000;
 const SCMS_STREAM: &[u8] = b"fanout_scms";
@@ -110,6 +85,12 @@ async fn spawn_server() -> String {
     addr
 }
 
+async fn connect(addr: &str) -> Client {
+    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
+        .await
+        .unwrap()
+}
+
 struct ConsumerStats {
     name: String,
     count: Arc<AtomicU64>,
@@ -117,87 +98,91 @@ struct ConsumerStats {
     last_msg_at: Arc<tokio::sync::Mutex<Option<Instant>>>,
 }
 
-/// Create `N_CONSUMERS` consumers on the given stream, each on its own
-/// `Client` (separate TCP connection). Registration runs in parallel so
-/// the shard's cursor rewinds (one per subscribe under
-/// `DeliverPolicy::All`) overlap instead of serializing into N full
-/// walks — otherwise each existing consumer would receive N − 1 worth
-/// of duplicates before the last subscriber catches up.
+/// Create `n` consumers on the given stream. Each consumer runs a background
+/// tokio task that loops `sub.recv()` and increments atomic counters.
+/// Returns stats vec, join handles (keep alive), and subscription handles (keep alive).
+///
+/// AckPolicy::None=0, DeliverPolicy::New=1, DeliverPolicy::All=0
+/// DeliverMode::Push/Fanout=0
 async fn spawn_consumers(
     addr: &str,
-    stream: &[u8],
-    policy: DeliverPolicy,
+    stream_id: u32,
+    deliver_policy: u8, // 0=All, 1=New
     n: usize,
 ) -> (
     Vec<ConsumerStats>,
-    Vec<arbitro_client::subscription::CallbackHandle>,
+    Vec<tokio::task::JoinHandle<()>>,
+    Vec<SubscriptionHandle>,
     Vec<Client>,
 ) {
-    // Connect all clients first (serial — cheap, TCP accept is fast).
     let mut clients = Vec::with_capacity(n);
     for _ in 0..n {
-        clients.push(Client::connect(addr).await.unwrap());
+        clients.push(connect(addr).await);
     }
 
-    let mut subscribe_futures = Vec::with_capacity(n);
+    let mut stats = Vec::with_capacity(n);
+    let mut join_handles = Vec::with_capacity(n);
+    let sub_handles: Vec<_> = Vec::with_capacity(n);
+
     for (i, client) in clients.iter().enumerate() {
         let name = format!("c{i}");
-        let stream_v = stream.to_vec();
-        let client = client.clone();
-        subscribe_futures.push(async move {
-            // Each fanout consumer needs its OWN queue group to avoid
-            // the drain's shared-queue dedup. Without this they all fall
-            // into the default group (= stream name) and the drain
-            // delivers each message to only one of them.
-            let group_name = format!("fanout_g{i}");
-            let ccfg = ConsumerConfig::new(name.as_bytes(), &stream_v)
-                .deliver_mode(DeliverMode::Fanout)
-                .deliver_policy(policy)
-                .ack_policy(AckPolicy::None)
-                .group(group_name.as_bytes())
-                .build()
-                .unwrap();
-            let consumer = client.create_consumer(&ccfg).await.unwrap();
-
-            let count = Arc::new(AtomicU64::new(0));
-            let first = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
-            let last = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
-
-            let cc = count.clone();
-            let cf = first.clone();
-            let cl = last.clone();
-            let handle = consumer
-                .subscribe_callback(None, move |_msg| {
-                    let now = Instant::now();
-                    let was = cc.fetch_add(1, Relaxed);
-                    if was == 0 {
-                        if let Ok(mut g) = cf.try_lock() { *g = Some(now); }
-                    }
-                    if let Ok(mut g) = cl.try_lock() { *g = Some(now); }
-                })
-                .await
-                .unwrap();
-
-            (
-                ConsumerStats { name, count, first_msg_at: first, last_msg_at: last },
-                handle,
+        let group_name = format!("fanout_g{i}");
+        let resp = client
+            .create_consumer(
+                stream_id,
+                name.as_bytes(),
+                group_name.as_bytes(),
+                b"",
+                u16::MAX,
+                0,              // ack_policy = None
+                deliver_policy, // deliver_policy
+                0,              // deliver_mode = Push/Fanout
+                30_000,
+                0,
             )
+            .await
+            .unwrap();
+        let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+
+        let sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+        let count = Arc::new(AtomicU64::new(0));
+        let first = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+        let last = Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+
+        let cc = count.clone();
+        let cf = first.clone();
+        let cl = last.clone();
+
+        // Spawn a task that drains messages via recv().
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // We don't need the sender — the sub handle lives in sub_handles.
+        drop(tx);
+
+        // Move sub into the task and drain it.
+        let mut sub_owned = sub;
+        let handle = tokio::spawn(async move {
+            while let Some(_msg) = sub_owned.recv().await {
+                let now = Instant::now();
+                let was = cc.fetch_add(1, Relaxed);
+                if was == 0 {
+                    if let Ok(mut g) = cf.try_lock() { *g = Some(now); }
+                }
+                if let Ok(mut g) = cl.try_lock() { *g = Some(now); }
+            }
+            // rx kept alive so the task doesn't exit early
+            drop(rx);
         });
+
+        stats.push(ConsumerStats { name, count, first_msg_at: first, last_msg_at: last });
+        join_handles.push(handle);
+        // sub_handles now empty — sub was moved into task
     }
 
-    let results = futures::future::join_all(subscribe_futures).await;
-    let mut stats = Vec::with_capacity(n);
-    let mut handles = Vec::with_capacity(n);
-    for (s, h) in results {
-        stats.push(s);
-        handles.push(h);
-    }
-
-    (stats, handles, clients)
+    (stats, join_handles, sub_handles, clients)
 }
 
-/// Wait until every consumer has received `target` messages, or `timeout`
-/// expires. Returns the wall-clock duration measured from `start`.
+/// Wait until every consumer has received `target` messages, or `timeout` expires.
 async fn wait_for_all(stats: &[ConsumerStats], target: u64, start: Instant, timeout: Duration) -> Duration {
     loop {
         let all_done = stats.iter().all(|s| s.count.load(Relaxed) >= target);
@@ -207,20 +192,36 @@ async fn wait_for_all(stats: &[ConsumerStats], target: u64, start: Instant, time
     }
 }
 
-async fn publish_single(client: &Client, stream: &[u8], n: u64) {
+async fn publish_single(client: &Client, stream_id: u32, n: u64) {
     for _ in 0..n {
-        client.publish(stream, SUBJECT, PAYLOAD).await.unwrap();
+        loop {
+            match client.publish(stream_id, SUBJECT, Bytes::copy_from_slice(PAYLOAD)) {
+                Ok(()) => break,
+                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => panic!("publish: {e:?}"),
+            }
+        }
     }
 }
 
-async fn publish_batched(client: &Client, stream: &[u8], n: u64) {
+async fn publish_batched(client: &Client, stream_id: u32, n: u64) {
     let mut remaining = n as usize;
     while remaining > 0 {
         let size = remaining.min(BATCH_SIZE);
         let entries: Vec<BatchEntry<'_>> = (0..size)
             .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
             .collect();
-        client.publish_batch(stream, &entries).await.unwrap();
+        loop {
+            match client.publish_batch(stream_id, &entries) {
+                Ok(()) => break,
+                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => panic!("publish_batch: {e:?}"),
+            }
+        }
         remaining -= size;
     }
 }
@@ -235,40 +236,46 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
     let addr = spawn_server().await;
 
     // Setup: stream.
-    let setup = Client::connect(&addr).await.unwrap();
-    setup
-        .create_stream(&StreamConfig::new(STREAM, b">").build())
+    let setup = connect(&addr).await;
+    let resp = setup
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
         .await
         .unwrap();
+    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     let n_consumers = match mode {
         Mode::PubSub => N_CONSUMERS_PUBSUB,
         Mode::Replay => N_CONSUMERS_REPLAY,
     };
 
-    let (stats, _handles, _clients) = match mode {
+    let deliver_policy = match mode {
+        Mode::PubSub => 1u8, // New
+        Mode::Replay => 0u8, // All
+    };
+
+    let (stats, _handles, _subs, _clients) = match mode {
         Mode::PubSub => {
             // Subscribe first, then publish.
-            let s = spawn_consumers(&addr, STREAM, DeliverPolicy::New, n_consumers).await;
-            tokio::time::sleep(Duration::from_millis(200)).await; // settle bindings
+            let s = spawn_consumers(&addr, stream_id, deliver_policy, n_consumers).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             s
         }
         Mode::Replay => {
             // Publish first, then subscribe.
             match pub_mode {
-                Pub::Single => publish_single(&setup, STREAM, MSGS).await,
-                Pub::Batch => publish_batched(&setup, STREAM, MSGS).await,
+                Pub::Single => publish_single(&setup, stream_id, MSGS).await,
+                Pub::Batch => publish_batched(&setup, stream_id, MSGS).await,
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
-            spawn_consumers(&addr, STREAM, DeliverPolicy::All, n_consumers).await
+            spawn_consumers(&addr, stream_id, deliver_policy, n_consumers).await
         }
     };
 
     let start = Instant::now();
     if let Mode::PubSub = mode {
         match pub_mode {
-            Pub::Single => publish_single(&setup, STREAM, MSGS).await,
-            Pub::Batch => publish_batched(&setup, STREAM, MSGS).await,
+            Pub::Single => publish_single(&setup, stream_id, MSGS).await,
+            Pub::Batch => publish_batched(&setup, stream_id, MSGS).await,
         }
     }
     let publish_done_at = start.elapsed();
@@ -311,40 +318,57 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
 
 async fn run_distribution() {
     let addr = spawn_server().await;
-    let setup = Client::connect(&addr).await.unwrap();
-    setup
-        .create_stream(&StreamConfig::new(DIST_STREAM, b">").build())
+    let setup = connect(&addr).await;
+    let resp = setup
+        .create_stream(DIST_STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
         .await
         .unwrap();
+    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     let mut counts: Vec<Arc<AtomicU64>> = Vec::with_capacity(DIST_SUBS.len());
     let mut _handles = Vec::with_capacity(DIST_SUBS.len());
     let mut _clients = Vec::with_capacity(DIST_SUBS.len());
 
     for (i, s) in DIST_SUBS.iter().enumerate() {
-        let client = Client::connect(&addr).await.unwrap();
+        let client = connect(&addr).await;
         let cname = format!("c{i}");
         let group = format!("dist_g{i}");
-        let ccfg = ConsumerConfig::new(cname.as_bytes(), DIST_STREAM)
-            .deliver_mode(DeliverMode::Fanout)
-            .deliver_policy(DeliverPolicy::New)
-            .ack_policy(AckPolicy::None)
-            .group(group.as_bytes())
-            .build()
+        // DeliverPolicy::New = 1
+        let resp = client
+            .create_consumer(
+                stream_id,
+                cname.as_bytes(),
+                group.as_bytes(),
+                b"",
+                u16::MAX,
+                0, // ack_policy = None
+                1, // deliver_policy = New
+                0, // deliver_mode = Push/Fanout
+                30_000,
+                0,
+            )
+            .await
             .unwrap();
-        let consumer = client.create_consumer(&ccfg).await.unwrap();
+        let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-        let count = Arc::new(AtomicU64::new(0));
-        let cc = count.clone();
-        let h = consumer
-            .subscribe_callback(s.filter, move |_msg| {
-                cc.fetch_add(1, Relaxed);
-            })
+        // Subscribe with per-consumer filter.
+        let sub = client
+            .subscribe(stream_id, consumer_id, s.filter)
             .await
             .unwrap();
 
+        let count = Arc::new(AtomicU64::new(0));
+        let cc = count.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut sub_owned = sub;
+            while let Some(_msg) = sub_owned.recv().await {
+                cc.fetch_add(1, Relaxed);
+            }
+        });
+
         counts.push(count);
-        _handles.push(h);
+        _handles.push(handle);
         _clients.push(client);
     }
 
@@ -360,7 +384,15 @@ async fn run_distribution() {
             let entries: Vec<BatchEntry<'_>> = (0..size)
                 .map(|_| BatchEntry::new(*subject, Bytes::copy_from_slice(PAYLOAD)))
                 .collect();
-            setup.publish_batch(DIST_STREAM, &entries).await.unwrap();
+            loop {
+                match setup.publish_batch(stream_id, &entries) {
+                    Ok(()) => break,
+                    Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(e) => panic!("publish_batch dist: {e:?}"),
+                }
+            }
             remaining -= size;
         }
     }
@@ -415,43 +447,57 @@ async fn run_distribution() {
 
 async fn run_single_conn_multi_sub() {
     let addr = spawn_server().await;
-    let setup = Client::connect(&addr).await.unwrap();
-    setup
-        .create_stream(&StreamConfig::new(SCMS_STREAM, b">").build())
+    let setup = connect(&addr).await;
+    let resp = setup
+        .create_stream(SCMS_STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
         .await
         .unwrap();
+    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-    // ONE TCP connection for all N consumers — this is the whole point.
-    let sub_client = Client::connect(&addr).await.unwrap();
+    // ONE TCP connection for all N consumers.
+    let sub_client = connect(&addr).await;
 
     let mut counts: Vec<Arc<AtomicU64>> = Vec::with_capacity(SCMS_N_CONSUMERS);
     let mut _handles = Vec::with_capacity(SCMS_N_CONSUMERS);
 
     for i in 0..SCMS_N_CONSUMERS {
         let cname = format!("scms_c{i}");
-        // Unique group so each consumer is a real fanout subscriber,
-        // not a queue worker sharing deliveries with its peers.
         let group = format!("scms_g{i}");
-        let ccfg = ConsumerConfig::new(cname.as_bytes(), SCMS_STREAM)
-            .deliver_mode(DeliverMode::Fanout)
-            .deliver_policy(DeliverPolicy::New)
-            .ack_policy(AckPolicy::None)
-            .group(group.as_bytes())
-            .build()
+        // DeliverPolicy::New = 1
+        let resp = sub_client
+            .create_consumer(
+                stream_id,
+                cname.as_bytes(),
+                group.as_bytes(),
+                b"",
+                u16::MAX,
+                0, // ack_policy = None
+                1, // deliver_policy = New
+                0, // deliver_mode = Push/Fanout
+                30_000,
+                0,
+            )
+            .await
             .unwrap();
-        let consumer = sub_client.create_consumer(&ccfg).await.unwrap();
+        let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-        let count = Arc::new(AtomicU64::new(0));
-        let cc = count.clone();
-        let h = consumer
-            .subscribe_callback(None, move |_msg| {
-                cc.fetch_add(1, Relaxed);
-            })
+        let sub = sub_client
+            .subscribe(stream_id, consumer_id, b"")
             .await
             .unwrap();
 
+        let count = Arc::new(AtomicU64::new(0));
+        let cc = count.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut sub_owned = sub;
+            while let Some(_msg) = sub_owned.recv().await {
+                cc.fetch_add(1, Relaxed);
+            }
+        });
+
         counts.push(count);
-        _handles.push(h);
+        _handles.push(handle);
     }
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -465,7 +511,15 @@ async fn run_single_conn_multi_sub() {
         let entries: Vec<BatchEntry<'_>> = (0..size)
             .map(|_| BatchEntry::new(SCMS_SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
             .collect();
-        setup.publish_batch(SCMS_STREAM, &entries).await.unwrap();
+        loop {
+            match setup.publish_batch(stream_id, &entries) {
+                Ok(()) => break,
+                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(e) => panic!("publish_batch scms: {e:?}"),
+            }
+        }
         remaining -= size;
     }
     let pub_dur = pub_start.elapsed();

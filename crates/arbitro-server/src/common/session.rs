@@ -1,34 +1,25 @@
 //! Session — per-connection transport handle.
 //!
-//! The engine owns connection lifecycle (open/drain/bindings/pending).
-//! Session is ONLY the TCP transport layer: shared writer handle +
-//! keepalive timer. The drain writes directly via `try_write` and waits
-//! on tokio's `writable()` notifications (backed by the reactor) when
-//! the kernel buffer fills — no intermediate mpsc channel, no writer task.
+//! Each connection owns a dedicated async writer task that drains an
+//! MPSC channel of pre-encoded `Bytes` frames and calls `write_all`
+//! on `OwnedWriteHalf`. All send paths (dispatch, drain, keepalive) are
+//! non-blocking `try_send` — backpressure drops the frame if the per-conn
+//! queue is full, preventing deadlocks in the shared tokio runtime.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use tokio::net::tcp::OwnedWriteHalf;
+use bytes::Bytes;
+use tokio::sync::mpsc;
+
+/// Outbound frame queue capacity per connection.
+pub const CONN_WRITE_CAP: usize = 4096;
 
 /// Per-connection transport handle. NOT lifecycle — engine owns that.
 pub struct Session {
-    /// Shared owned write-half of the TCP socket. Both the registry
-    /// (admin replies) and the drain (RepBatch frames) hold Arc clones
-    /// and call `try_write` / `writable()` directly.
-    pub writer: Arc<OwnedWriteHalf>,
-    /// Per-connection write serialization. `OwnedWriteHalf::try_write`
-    /// accepts `&self`, so two threads can race on the same socket and
-    /// interleave bytes of different frames mid-write (panic at
-    /// `delivery.rs:322` on the client side once the reader decodes
-    /// garbage as a `DeliveryEntryHeader`). The write_lock is held for
-    /// the duration of a full frame to guarantee wire atomicity.
-    ///
-    /// Contention only appears when ≥2 shards drain to the same conn
-    /// simultaneously (setup with multiple consumers on one client).
-    /// Uncontended in the common case — cost ≈ one atomic CAS per frame.
-    pub write_lock: Arc<Mutex<()>>,
+    /// Sender half of the per-connection frame queue. Non-blocking
+    /// `try_send` pushes frames; the writer task drains them.
+    pub write_tx: mpsc::Sender<Bytes>,
     /// Last activity timestamp — for idle timeout / keepalive.
     pub last_activity: Instant,
 }

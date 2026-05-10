@@ -25,11 +25,10 @@ use arbitro_engine_v2::catalog::wire_hash_32;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
 use arbitro_store::Store;
-use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
-use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
+use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, NotifyRing, SharedCounters};
 use crate::shard::worker::ActiveBinding;
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -156,7 +155,7 @@ pub(in crate::shard) fn drain_cycle(
     names: &Arc<crate::common::NameRegistry>,
     cfg: &DrainConfig,
     scratch: &mut DrainScratch,
-    notify_tx: &mpsc::Sender<DrainNotification>,
+    notify_tx: &NotifyRing,
     now_ms: u64,
 ) {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
@@ -198,13 +197,20 @@ pub(in crate::shard) fn drain_cycle(
     // Phase 1 — walk the store, accumulate into per-connection buckets.
     store
         .for_each(start, end, &mut |entry| {
+            // Per-stream max_age_ms takes precedence over the global default;
+            // falls back to global cfg if the stream has no specific limit.
+            let stream_max_age = snap.stream_max_age_ms
+                .get(entry.stream_id as usize)
+                .copied()
+                .filter(|&v| v > 0)
+                .unwrap_or(cfg.max_age_ms);
             process_drain_entry(
                 counters,
                 snap,
                 entry,
                 scratch,
                 now_ms,
-                cfg.max_age_ms,
+                stream_max_age,
                 &mut more_pending,
                 &mut lowest_skipped,
             );
@@ -214,7 +220,15 @@ pub(in crate::shard) fn drain_cycle(
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
     // Results are captured into a small Vec so Phase 3 can do ack
     // bookkeeping without borrowing scratch inside the for_each closure.
-    let mut flush_results: Vec<(ConnectionId, bool)> = Vec::with_capacity(8);
+    //
+    // FlushOutcome distinguishes between three cases:
+    //  - Ok:             frame sent successfully
+    //  - Backpressured:  channel full (transient), retry next cycle
+    //  - WriterGone:     writer not found (permanent), mark dead
+    #[derive(Clone, Copy)]
+    enum FlushOutcome { Ok, Backpressured(u64), WriterGone }
+
+    let mut flush_results: Vec<(ConnectionId, FlushOutcome)> = Vec::with_capacity(8);
     {
         let writers_by_conn = &snap.writers_by_conn;
         scratch.acc.for_each(names, |frame| {
@@ -222,6 +236,9 @@ pub(in crate::shard) fn drain_cycle(
             // ConnectionId is unbounded-dense, sorted Vec + binary search
             // is the canonical structure for this workload.
             let Some(writer) = find_writer(writers_by_conn, frame.connection_id.0) else {
+                // Writer not found → connection truly gone (removed from
+                // registry). Mark dead so the engine retires bindings.
+                flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
                 return false;
             };
             crate::lifecycle_trace!(
@@ -231,12 +248,7 @@ pub(in crate::shard) fn drain_cycle(
                 "shard"
             );
 
-            let ok = crate::transport::registry::write_all_blocking(
-                &writer.writer,
-                &writer.write_lock,
-                &frame.bytes,
-                &writer.runtime,
-            );
+            let ok = writer.write_tx.try_send(frame.bytes.clone()).is_ok();
 
             if ok {
                 crate::lifecycle_trace!(
@@ -245,8 +257,15 @@ pub(in crate::shard) fn drain_cycle(
                     frame.count as u64,
                     "shard"
                 );
+                flush_results.push((frame.connection_id, FlushOutcome::Ok));
+            } else {
+                // Channel full → backpressure, NOT dead. Record first_seq
+                // so the cursor doesn't advance past undelivered entries.
+                flush_results.push((
+                    frame.connection_id,
+                    FlushOutcome::Backpressured(frame.first_seq),
+                ));
             }
-            flush_results.push((frame.connection_id, ok));
             ok
         });
     }
@@ -264,10 +283,21 @@ pub(in crate::shard) fn drain_cycle(
             foldhash::fast::FixedState::default(),
         );
 
-    for &(conn, ok) in &flush_results {
-        flush_ok.insert(conn, ok);
-        if !ok {
-            scratch.dead_connections.push(conn);
+    for &(conn, outcome) in &flush_results {
+        match outcome {
+            FlushOutcome::Ok => {
+                flush_ok.insert(conn, true);
+            }
+            FlushOutcome::Backpressured(first_seq) => {
+                flush_ok.insert(conn, false);
+                // Treat as skipped — cursor won't advance past these entries.
+                track_skipped(&mut lowest_skipped, first_seq);
+                more_pending = true;
+            }
+            FlushOutcome::WriterGone => {
+                flush_ok.insert(conn, false);
+                scratch.dead_connections.push(conn);
+            }
         }
     }
     for d in &scratch.deliveries {
@@ -293,7 +323,9 @@ pub(in crate::shard) fn drain_cycle(
         more_pending = true;
     }
 
-    // Notify command thread of dead connections.
+    // Notify command thread of truly dead connections (writer gone from
+    // registry — permanent). Backpressured channels are NOT reported here;
+    // they're transient and retried on the next cycle.
     for conn_id in scratch.dead_connections.drain(..) {
         let _ = notify_tx.try_send(DrainNotification::ConnectionDead(conn_id));
     }
@@ -510,6 +542,24 @@ fn dispatch_recipients(
         // that lives in `scratch.deliveries` below, gated on
         // `!fire_and_forget`.
 
+        // Extract reply_to from payload when HAS_REPLY_TO flag is set.
+        // Store format: [reply_len:u16 LE][reply_to bytes][actual payload].
+        let (reply_to, actual_payload): (&[u8], &[u8]) =
+            if entry.flags & arbitro_store::flags::HAS_REPLY_TO != 0 && entry.payload.len() >= 2 {
+                let reply_len =
+                    u16::from_le_bytes([entry.payload[0], entry.payload[1]]) as usize;
+                if entry.payload.len() >= 2 + reply_len {
+                    (
+                        &entry.payload[2..2 + reply_len],
+                        &entry.payload[2 + reply_len..],
+                    )
+                } else {
+                    (&[], entry.payload)
+                }
+            } else {
+                (&[], entry.payload)
+            };
+
         let fire_and_forget = binding.fire_and_forget;
         scratch.acc.add(
             connection_id,
@@ -518,7 +568,8 @@ fn dispatch_recipients(
             entry.seq,
             entry.subject,
             subject_hash,
-            entry.payload,
+            reply_to,
+            actual_payload,
         );
 
         if !fire_and_forget {
@@ -554,7 +605,7 @@ fn dispatch_recipients(
 /// `Binding.pending` and `InFlightCounters` — the single source of
 /// truth for ack-matching.
 fn notify_delivered_grouped(
-    notify_tx: &mpsc::Sender<DrainNotification>,
+    notify_tx: &NotifyRing,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
     flush_ok: &std::collections::HashMap<ConnectionId, bool, foldhash::fast::FixedState>,

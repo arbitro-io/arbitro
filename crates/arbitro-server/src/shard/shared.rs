@@ -303,18 +303,17 @@ pub struct DrainSnapshot {
     /// `MatchEntry.binding_idx` is stamped with the server-layer
     /// binding index during rebuild.
     pub match_tables: Vec<Option<MatchTable>>,
+    /// Per-stream age eviction limit (milliseconds). Indexed by StreamId.raw().
+    /// 0 = no age limit for that stream. Populated by CommandWorker from
+    /// `stream_retention` on snapshot rebuild.
+    pub stream_max_age_ms: Vec<u64>,
 }
 
 /// Per-connection writer handle, deduplicated from bindings (one entry
 /// per connection even if multiple consumers live on the same conn).
 #[derive(Clone)]
 pub struct WriterIndexEntry {
-    pub writer: std::sync::Arc<tokio::net::tcp::OwnedWriteHalf>,
-    /// Per-connection write lock. Serializes full frames across threads
-    /// so `try_write` loops from different shards don't interleave bytes
-    /// on the wire. See `transport::registry::write_all_blocking`.
-    pub write_lock: std::sync::Arc<std::sync::Mutex<()>>,
-    pub runtime: tokio::runtime::Handle,
+    pub write_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }
 
 impl DrainSnapshot {
@@ -323,6 +322,7 @@ impl DrainSnapshot {
             bindings: Vec::new(),
             writers_by_conn: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::new(),
+            stream_max_age_ms: Vec::new(),
         }
     }
 }
@@ -368,9 +368,14 @@ impl<T> SnapshotSwap<T> {
 
 // ── DrainNotification ──────────────────────────────────────────────────────
 
+/// SPSC notification ring: drain OS thread (producer) → command tokio task (consumer).
+/// Capacity is power-of-two (8192 = 2^13). Drain uses `try_send` (non-blocking),
+/// command uses `recv_async` (async) + `try_recv` (batch drain).
+pub type NotifyRing = arbitro_kit::stream::Ring<DrainNotification, 8192, arbitro_kit::NotifyWaiter>;
+
 /// Messages from drain thread → command thread.
 ///
-/// Sent via `tokio::sync::mpsc` (drain uses `try_send`, command uses `recv`).
+/// Sent via SPSC `Ring` (drain uses `try_send`, command uses `recv_async`).
 /// Preserves ordering: all deliveries before a `ConnectionDead` are guaranteed
 /// to be processed first — so `retire_binding` sees complete pending data.
 pub enum DrainNotification {

@@ -317,7 +317,7 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
     let e = encode_v2_raw(subject, &payload);
     assert_eq!(a, b, "piecewise vs fixed_struct mismatch");
     assert_eq!(a, c, "piecewise vs inplace mismatch");
-    assert_eq!(d.len(), 16 + 10 + subject.len() + payload.len(),
+    assert_eq!(d.len(), 16 + 8 + subject.len() + payload.len(),
                "v2 pubframe wire size mismatch");
     assert_eq!(d, e, "v2_pubframe (zerocopy) vs v2_raw (unsafe ptr) mismatch");
 

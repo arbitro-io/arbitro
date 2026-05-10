@@ -98,12 +98,37 @@ impl BatchPubFrame {
         stream_id: u32,
         flags: u8,
         entry_flags: u8,
-        entries: &[(&[u8], &[u8])],
+        entries: &[(&'a [u8], &'a [u8])],
     ) -> &'a mut Self {
         let mut tail_bytes: usize = 0;
         for (s, p) in entries {
             tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + p.len();
         }
+        Self::encode_into_iter(
+            out, seq, stream_id, flags, entry_flags,
+            entries.len() as u32, tail_bytes,
+            entries.iter().copied(),
+        )
+    }
+
+    /// Like `encode_into` but accepts any iterator — avoids an intermediate
+    /// `Vec` when the caller already holds entries in a different form.
+    ///
+    /// `count` and `tail_bytes` must be pre-computed by the caller.
+    /// `out.len()` must equal `wire_size(tail_bytes)`.
+    pub fn encode_into_iter<'a, I>(
+        out: &'a mut [u8],
+        seq: u64,
+        stream_id: u32,
+        flags: u8,
+        entry_flags: u8,
+        count: u32,
+        tail_bytes: usize,
+        entries: I,
+    ) -> &'a mut Self
+    where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
         debug_assert_eq!(out.len(), Self::wire_size(tail_bytes));
 
         let msg_len = (BATCH_PUB_BODY_FIXED + tail_bytes) as u32;
@@ -113,7 +138,7 @@ impl BatchPubFrame {
             .with_entry_flags(entry_flags);
         frame.body = BatchPubBody {
             stream_id: U32::new(stream_id),
-            count:     U32::new(entries.len() as u32),
+            count:     U32::new(count),
         };
 
         let mut off = 0usize;

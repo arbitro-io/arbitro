@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
-pub(crate) struct SeqAllocator(AtomicU64);
+pub struct SeqAllocator(AtomicU64);
 
 impl SeqAllocator {
     pub fn new() -> Self {

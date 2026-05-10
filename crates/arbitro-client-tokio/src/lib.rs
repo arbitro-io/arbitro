@@ -38,8 +38,24 @@ pub(crate) mod publish;
 pub(crate) mod state;
 pub(crate) mod transport;
 
+#[doc(hidden)]
+pub mod bench_helpers {
+    pub use crate::state::seq::SeqAllocator;
+}
+
+/// Internal transport types exposed for benchmarking only.
+/// Not part of the public API — may change without notice.
+#[doc(hidden)]
+pub mod transport_internal {
+    pub use crate::transport::frame::{WriteFrame, INLINE_CAP, WRITE_QUEUE_CAP};
+}
+
 // Public re-exports — keep the surface symmetric with `arbitro-client`
 // so a switch is a `Cargo.toml` line + import-path swap.
-pub use client::Client;
+pub use client::{Client, BatchEntry};
 pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
+pub use consume::SubscriptionHandle;
+pub use consume::message::Message;
 pub use error::{ClientError, RequestResult};
+pub use publish::PUBLISH_BATCH_MAX;
+

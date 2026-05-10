@@ -1,21 +1,27 @@
-//! ConnectionRegistry — shared handles to per-connection TCP sockets.
+//! ConnectionRegistry — shared handles to per-connection outbound queues.
 //!
-//! Each connection stores an `Arc<OwnedWriteHalf>` — no intermediate
-//! channel, no writer task. The drain and admin reply paths use
-//! `try_write` + `Handle::block_on(writable())` to cooperate with the
-//! tokio reactor when the kernel send buffer is full.
+//! Each connection gets a dedicated async writer task that owns the
+//! writer half (plain TCP or TLS) and drains an `mpsc::channel<Bytes>`.
+//! All send paths use non-blocking `try_send` — no `block_in_place`, no
+//! mutex around the socket. If the queue is full the frame is dropped
+//! (connection too slow); the tokio reactor is never starved.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::runtime::Handle;
+use bytes::Bytes;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 
 use arbitro_proto::lifecycle::LifeCycle;
 
-use crate::common::session::{ConnIdGen, Session};
+use crate::common::session::{ConnIdGen, Session, CONN_WRITE_CAP};
+
+/// Trait-object writer — works for both plain TCP and TLS.
+pub type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+/// Trait-object reader — works for both plain TCP and TLS.
+pub type BoxedReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
 
 /// TCP transport. Clone-friendly — backed by Arc.
 #[derive(Clone)]
@@ -24,53 +30,39 @@ pub struct ConnectionRegistry {
 }
 
 struct Inner {
-    // conn_id is unbounded-dense (ConnIdGen monotonic counter). Memory
-    // footprint of a Vec<Option<Session>> would grow without bound, so we
-    // use HashMap + foldhash per the dense/sparse rule (performance.md).
     sessions: Mutex<HashMap<u64, Session, foldhash::fast::FixedState>>,
     conn_id_gen: ConnIdGen,
-    #[allow(dead_code)]
-    write_buffer_cap: usize,
-    /// Tokio runtime handle — cached at construction so non-async callers
-    /// (drain OS thread, admin replies) can `block_on(writable())` without
-    /// capturing the handle per call.
-    runtime: Handle,
 }
 
 impl ConnectionRegistry {
-    pub fn new(write_buffer_cap: usize) -> Self {
-        let runtime = Handle::try_current()
-            .expect("ConnectionRegistry::new must be called inside a tokio runtime");
+    pub fn new(_write_buffer_cap: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
                 sessions: Mutex::new(HashMap::with_hasher(foldhash::fast::FixedState::default())),
                 conn_id_gen: ConnIdGen::new(),
-                write_buffer_cap,
-                runtime,
             }),
         }
     }
 
-    /// Register a new connection. Caller supplies the shared writer half.
-    pub fn register(&self, writer: Arc<OwnedWriteHalf>) -> u64 {
+    /// Register a new connection. Spawns a writer task that owns `writer`
+    /// and drains the per-connection frame queue. Returns the `conn_id`.
+    ///
+    /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
+    pub fn register(&self, writer: BoxedWriter) -> u64 {
         let conn_id = self.inner.conn_id_gen.next();
+        let (tx, rx) = mpsc::channel::<Bytes>(CONN_WRITE_CAP);
+        tokio::spawn(conn_writer_task(rx, writer));
         let session = Session {
-            writer,
-            write_lock: Arc::new(Mutex::new(())),
+            write_tx: tx,
             last_activity: Instant::now(),
         };
-        self.inner
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(conn_id, session);
+        self.inner.sessions.lock().unwrap().insert(conn_id, session);
         conn_id
     }
 
-    /// Remove a session.
+    /// Remove a session — drops the Sender, which closes the writer task.
     pub fn remove(&self, conn_id: u64) {
-        let mut sessions = self.inner.sessions.lock().unwrap();
-        sessions.remove(&conn_id);
+        self.inner.sessions.lock().unwrap().remove(&conn_id);
     }
 
     /// Update last activity timestamp.
@@ -81,31 +73,11 @@ impl ConnectionRegistry {
         }
     }
 
-    /// Clone the shared writer half for a connection. O(1) — one Arc
-    /// refcount bump. Used by the shard worker to cache the writer in
-    /// `ActiveBinding` at subscribe time so the drainer hot path can
-    /// write directly without touching the registry Mutex.
-    pub fn get_writer(&self, conn_id: u64) -> Option<Arc<OwnedWriteHalf>> {
+    /// Clone the write sender for a connection. Used by the shard to cache
+    /// the sender in `ActiveBinding` at subscribe time.
+    pub fn get_write_tx(&self, conn_id: u64) -> Option<mpsc::Sender<Bytes>> {
         let sessions = self.inner.sessions.lock().unwrap();
-        sessions.get(&conn_id).map(|s| Arc::clone(&s.writer))
-    }
-
-    /// Clone both the writer half and the per-connection write lock. O(1)
-    /// — two Arc refcount bumps. The lock must be held around any
-    /// full-frame write to guarantee wire atomicity across threads.
-    pub fn get_writer_locked(
-        &self,
-        conn_id: u64,
-    ) -> Option<(Arc<OwnedWriteHalf>, Arc<Mutex<()>>)> {
-        let sessions = self.inner.sessions.lock().unwrap();
-        sessions
-            .get(&conn_id)
-            .map(|s| (Arc::clone(&s.writer), Arc::clone(&s.write_lock)))
-    }
-
-    /// Clone the cached tokio runtime handle (cheap — Arc bump).
-    pub fn runtime_handle(&self) -> Handle {
-        self.inner.runtime.clone()
+        sessions.get(&conn_id).map(|s| s.write_tx.clone())
     }
 
     /// Number of active sessions.
@@ -138,104 +110,52 @@ impl ConnectionRegistry {
         sessions.keys().copied().collect()
     }
 
-    /// Send frame parts to a connection. Exactly ONE alloc+copy.
+    /// Enqueue frame parts as a single `Bytes`. Non-blocking — drops if full.
     #[inline]
     pub fn send_parts(&self, conn_id: u64, parts: &[&[u8]]) -> bool {
         let total: usize = parts.iter().map(|p| p.len()).sum();
-        let mut buf = BytesMut::with_capacity(total);
+        let mut buf = bytes::BytesMut::with_capacity(total);
         for part in parts {
             buf.extend_from_slice(part);
         }
-        self.write_to(conn_id, &buf.freeze())
+        self.enqueue(conn_id, buf.freeze())
     }
 
-    /// Zero-copy send — writes an already-built `Bytes`.
+    /// Enqueue an already-built `Bytes`. Non-blocking — drops if full.
     #[inline]
     pub fn send_bytes(&self, conn_id: u64, data: Bytes) -> bool {
-        self.write_to(conn_id, &data)
+        self.enqueue(conn_id, data)
     }
 
-    /// Blocking send — used by the shard worker for acks and replies.
-    /// Applies natural backpressure via `writable().await` when the kernel
-    /// buffer is full. Returns `false` on closed / dead connection.
     #[inline]
-    pub fn send_bytes_blocking(&self, conn_id: u64, data: Bytes) -> bool {
-        self.write_to(conn_id, &data)
-    }
-
-    fn write_to(&self, conn_id: u64, frame: &[u8]) -> bool {
-        let (writer, write_lock) = {
-            let sessions = self.inner.sessions.lock().unwrap();
-            match sessions.get(&conn_id) {
-                Some(s) => (Arc::clone(&s.writer), Arc::clone(&s.write_lock)),
-                None => return false,
-            }
-        };
-        write_all_blocking(&writer, &write_lock, frame, &self.inner.runtime)
+    fn enqueue(&self, conn_id: u64, frame: Bytes) -> bool {
+        let sessions = self.inner.sessions.lock().unwrap();
+        match sessions.get(&conn_id) {
+            Some(s) => s.write_tx.try_send(frame).is_ok(),
+            None => false,
+        }
     }
 }
 
-/// Write every byte of `frame` to the socket. Non-blocking `try_write`
-/// until `WouldBlock`; then `Handle::block_on(writer.writable())` to park
-/// the caller in the tokio reactor until the kernel buffer has space.
-///
-/// `write_lock` is held for the entire duration of the frame write.
-/// `OwnedWriteHalf::try_write(&self, ..)` allows concurrent callers, but
-/// a multi-syscall write loop is NOT atomic across threads — two
-/// concurrent writers would interleave bytes on the wire, corrupting
-/// the length-prefixed framing. The lock serializes full frames.
-///
-/// Returns `false` on a non-recoverable error (closed / reset socket).
-/// Safe to call from any thread — including OS threads not owned by the
-/// tokio runtime (the `Handle::block_on` drives the reactor for us).
-pub fn write_all_blocking(
-    writer: &OwnedWriteHalf,
-    write_lock: &Mutex<()>,
-    frame: &[u8],
-    handle: &Handle,
-) -> bool {
-    let _guard = write_lock.lock().unwrap_or_else(|poisoned| {
-        // A previous writer panicked mid-frame. The socket may have
-        // partial bytes from that frame already flushed — there is no
-        // recovery; but holding the lock lets this caller at least stop
-        // the wire from compounding corruption.
-        poisoned.into_inner()
-    });
-    let mut off = 0;
-    while off < frame.len() {
-        match writer.try_write(&frame[off..]) {
-            Ok(0) => return false,
-            Ok(n) => off += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // If called from inside a tokio worker (admin replies, pings,
-                // keepalive), `Handle::block_on` would panic — use
-                // `block_in_place` to temporarily move the thread out of the
-                // worker pool. From the drain OS thread, `try_current` fails
-                // and we use `block_on` directly.
-                let res = if Handle::try_current().is_ok() {
-                    tokio::task::block_in_place(|| handle.block_on(writer.writable()))
-                } else {
-                    handle.block_on(writer.writable())
-                };
-                if res.is_err() {
-                    return false;
-                }
-            }
-            Err(_) => return false,
+/// Per-connection writer task — owns the writer (plain TCP or TLS), drains the channel.
+async fn conn_writer_task(mut rx: mpsc::Receiver<Bytes>, mut w: BoxedWriter) {
+    while let Some(frame) = rx.recv().await {
+        if w.write_all(&frame).await.is_err() {
+            break;
         }
     }
-    true
+    let _ = w.shutdown().await;
 }
 
 impl LifeCycle for ConnectionRegistry {
     fn on_init(&mut self) {
-        tracing::info!("ConnectionRegistry: init (direct-write, no channel)");
+        tracing::info!("ConnectionRegistry: init (async per-conn writer tasks)");
     }
 
     fn on_shutdown(&mut self) {
         let mut sessions = self.inner.sessions.lock().unwrap();
         let count = sessions.len();
-        sessions.clear();
+        sessions.clear(); // drops all Senders → writer tasks exit
         tracing::info!(
             "ConnectionRegistry: shutdown, closed {} sessions",
             count

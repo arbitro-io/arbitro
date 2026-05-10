@@ -28,6 +28,12 @@ pub struct Config {
     pub drain_batch_size: u16,
     /// Data directory for persistence (None = in-memory only).
     pub data_dir: Option<String>,
+    /// TLS certificate PEM file path (None = plaintext TCP).
+    pub tls_cert: Option<String>,
+    /// TLS private key PEM file path (required if tls_cert is set).
+    pub tls_key: Option<String>,
+    /// Auth token — if set, clients must send this in Hello frame (None = no auth).
+    pub auth_token: Option<String>,
 }
 
 impl Config {
@@ -47,6 +53,9 @@ impl Config {
             keepalive_interval: Duration::from_secs(env_parse("ARBITRO_KEEPALIVE_INTERVAL", 30)),
             shutdown_timeout: Duration::from_secs(env_parse("ARBITRO_SHUTDOWN_TIMEOUT", 10)),
             data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
+            tls_cert: std::env::var("ARBITRO_TLS_CERT").ok(),
+            tls_key: std::env::var("ARBITRO_TLS_KEY").ok(),
+            auth_token: std::env::var("ARBITRO_AUTH_TOKEN").ok(),
         }
     }
 
@@ -115,6 +124,9 @@ impl Default for Config {
             keepalive_interval: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
             data_dir: None,
+            tls_cert: None,
+            tls_key: None,
+            auth_token: None,
         }
     }
 }

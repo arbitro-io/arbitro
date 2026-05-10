@@ -74,3 +74,44 @@ impl Pending {
         self.map.lock().unwrap().len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use bytes::Bytes;
+    use crate::error::ClientError;
+
+    #[tokio::test]
+    async fn insert_remove_does_not_dangle() {
+        let p = Pending::new();
+        let rx = p.register(1);
+        assert_eq!(p.len(), 1);
+        p.complete_ok(1, Bytes::from_static(b"pong"));
+        let val = rx.recv_async().await.unwrap().unwrap();
+        assert_eq!(&val[..], b"pong");
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_on_disconnect_wakes_all_with_disconnected() {
+        let p = Arc::new(Pending::new());
+        let rxs: Vec<_> = (1u64..=8).map(|seq| p.register(seq)).collect();
+        assert_eq!(p.len(), 8);
+
+        let p2 = Arc::clone(&p);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            p2.drain_disconnected();
+        });
+
+        for rx in rxs {
+            let result = rx.recv_async().await.unwrap();
+            assert!(
+                matches!(result, Err(ClientError::Disconnected)),
+                "expected Disconnected, got {result:?}"
+            );
+        }
+        assert_eq!(p.len(), 0);
+    }
+}

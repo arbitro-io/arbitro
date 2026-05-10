@@ -9,21 +9,19 @@
 use bytes::Bytes;
 use zerocopy::IntoBytes;
 
-use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
+use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
+use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::ingress::{
-    BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubFrame, PUB_BODY_FIXED, PubBody,
+    BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubFrame,
 };
 use arbitro_proto::v2::manager::{
     CreateConsumerFrame, CreateStreamFrame, DeleteConsumerFrame, DeleteStreamFrame,
     DrainSubjectFrame, GetConsumerFrame, GetStreamFrame, ListConsumersFrame, ListStreamsFrame,
     PurgeStreamFrame,
 };
-use arbitro_proto::action::Action;
-
-use zerocopy::byteorder::little_endian::{U16, U32};
 
 // ─── BatchEntry ───────────────────────────────────────────────────────
 
@@ -46,50 +44,6 @@ impl<'a> BatchEntry<'a> {
 
 // ─── v2 publish encoders ──────────────────────────────────────────────
 
-/// Stack-only prefix for a v2 single PUB frame: `[Header 16B][PubBody 8B] = 24B`.
-#[derive(
-    Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable,
-    zerocopy::KnownLayout, zerocopy::Unaligned,
-)]
-#[repr(C)]
-struct PubV2Prefix {
-    header: Header,
-    body:   PubBody,
-}
-const _: () = assert!(core::mem::size_of::<PubV2Prefix>() == HEADER_SIZE + PUB_BODY_FIXED);
-const _: () = assert!(core::mem::size_of::<PubV2Prefix>() == 24);
-
-/// Build a v2 PUB frame as 3 iovecs: `[prefix 24B][subject][payload]`.
-///
-/// Zero payload memcpy: the caller's `Bytes` is cloned (Arc bump only)
-/// and shipped as a separate iovec. Subject is small metadata copied
-/// once. Prefix is a 24B stack struct — one tiny `Bytes::copy_from_slice`
-/// for channel ownership.
-#[inline(always)]
-pub(crate) fn encode_pub_v2(
-    seq: u64,
-    stream_id: u32,
-    entry_flags: u8,
-    subject: &[u8],
-    payload: &Bytes,
-) -> (Bytes /* prefix 24B */, Bytes /* subject */, Bytes /* payload */) {
-    let msg_len = (PUB_BODY_FIXED + subject.len() + payload.len()) as u32;
-    let prefix = PubV2Prefix {
-        header: Header::new(Action::Publish.as_u16(), msg_len, seq)
-            .with_entry_flags(entry_flags),
-        body: PubBody {
-            stream_id:   U32::new(stream_id),
-            subject_len: U16::new(subject.len() as u16),
-            _pad:        U16::new(0),
-        },
-    };
-    (
-        Bytes::copy_from_slice(prefix.as_bytes()),
-        Bytes::copy_from_slice(subject),
-        payload.clone(),
-    )
-}
-
 /// Build a v2 BATCH-PUB frame in one contiguous `Bytes` (single iovec).
 pub(crate) fn encode_pub_batch_v2(
     seq: u64,
@@ -104,13 +58,25 @@ pub(crate) fn encode_pub_batch_v2(
     let size = BatchPubFrame::wire_size(tail_bytes);
     let mut buf = vec![0u8; size];
 
-    // Adapt to encode_into's `&[(subject, payload)]`.
-    let tuples: Vec<(&[u8], &[u8])> = entries
-        .iter()
-        .map(|e| (e.subject, &e.payload[..]))
-        .collect();
+    BatchPubFrame::encode_into_iter(
+        &mut buf, seq, stream_id, 0, entry_flags,
+        entries.len() as u32, tail_bytes,
+        entries.iter().map(|e| (e.subject, e.payload.as_ref())),
+    );
+    Bytes::from(buf)
+}
 
-    BatchPubFrame::encode_into(&mut buf, seq, stream_id, 0, entry_flags, &tuples);
+/// Build a v2 PUB-WITH-REPLY frame in one contiguous `Bytes`.
+pub(crate) fn encode_pub_with_reply_v2(
+    seq: u64,
+    stream_id: u32,
+    subject: &[u8],
+    reply_to: &[u8],
+    payload: &[u8],
+) -> Bytes {
+    let size = PubWithReplyFrame::wire_size(subject.len(), reply_to.len(), payload.len());
+    let mut buf = vec![0u8; size];
+    PubWithReplyFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, reply_to, payload);
     Bytes::from(buf)
 }
 
@@ -247,6 +213,89 @@ pub(crate) fn encode_batch_ack_v2(
     let size = BatchAckFrame::wire_size(entries.len());
     let mut buf = vec![0u8; size];
     BatchAckFrame::encode_into(&mut buf, seq, consumer_id, entries);
+    Bytes::from(buf)
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
+    use arbitro_proto::action::Action;
+
+    /// Encode a single-pub frame; verify wire size and action byte.
+    #[test]
+    fn pub_single_v2_roundtrip() {
+        let subject = b"orders.created";
+        let payload = b"hello world";
+        let expected_size = PubFrame::wire_size(subject.len(), payload.len());
+
+        let mut data = vec![0u8; expected_size];
+        PubFrame::encode_into(&mut data, 1, 42, 0, 0, subject, payload);
+
+        // Action bytes [0..2] must be Publish = 0x0101 (little-endian)
+        assert_eq!(u16::from_le_bytes([data[0], data[1]]), Action::Publish.as_u16());
+        // frame length must match wire_size
+        assert_eq!(data.len(), expected_size);
+        // payload appears at the end
+        let payload_off = data.len() - payload.len();
+        assert_eq!(&data[payload_off..], payload);
+    }
+
+    /// Encode a batch-pub frame with 3 entries; verify total size and action.
+    #[test]
+    fn pub_batch_v2_roundtrip() {
+        let entries = vec![
+            BatchEntry::new(b"a.b", Bytes::from_static(b"p1")),
+            BatchEntry::new(b"c.d", Bytes::from_static(b"payload2")),
+            BatchEntry::new(b"e.f.g", Bytes::from_static(b"x")),
+        ];
+        let frame = encode_pub_batch_v2(7, 1, 0, &entries);
+
+        // Action = PublishBatch = 0x0103
+        assert_eq!(
+            u16::from_le_bytes([frame[0], frame[1]]),
+            Action::PublishBatch.as_u16()
+        );
+        // Frame must not be empty and must contain all payloads
+        assert!(frame.len() > 32);
+        assert!(frame.windows(2).any(|w| w == b"p1"));
+        assert!(frame.windows(8).any(|w| w == b"payload2"));
+    }
+}
+
+/// Single nack — same wire layout as `encode_ack_v2`, action = Nack.
+#[inline]
+pub(crate) fn encode_nack_v2(seq: u64, consumer_id: u32, nack_seq: u64, subject_hash: u32) -> Bytes {
+    let f = NackFrame::new(seq, consumer_id, nack_seq, subject_hash);
+    Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&f))
+}
+
+/// Batch nack — entries are `(seq, subject_hash, delay_ms)`.
+pub(crate) fn encode_batch_nack_v2(
+    seq: u64,
+    consumer_id: u32,
+    entries: &[(u64, u32, u32)],
+) -> Bytes {
+    let size = BatchNackFrame::wire_size(entries.len());
+    let mut buf = vec![0u8; size];
+    BatchNackFrame::encode_into(&mut buf, seq, consumer_id, entries);
+    Bytes::from(buf)
+}
+
+/// Unsubscribe frame — same body shape as SubFrame, action = Unsubscribe,
+/// filter is empty. Server routes by `consumer_id` only. Total: 28B (≤ INLINE_CAP).
+#[inline]
+pub(crate) fn encode_unsub_v2(seq: u64, consumer_id: u32) -> Bytes {
+    // Wire layout: [Header 16B][SubBody 12B] — filter_len = 0, no tail bytes.
+    let size = SubFrame::wire_size(0);
+    let mut buf = vec![0u8; size];
+    // Re-use SubFrame::encode_into which writes Action::Subscribe, then patch action.
+    SubFrame::encode_into(&mut buf, seq, 0, consumer_id, 0, b"");
+    // Patch the action bytes (LE u16 at offset 0) to Unsubscribe = 0x0302.
+    let action = arbitro_proto::action::Action::Unsubscribe.as_u16();
+    buf[0..2].copy_from_slice(&action.to_le_bytes());
     Bytes::from(buf)
 }
 

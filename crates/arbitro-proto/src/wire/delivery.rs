@@ -93,12 +93,14 @@ pub struct RepBatchFixed {
 pub const REP_BATCH_FIXED_SIZE: usize = core::mem::size_of::<RepBatchFixed>();
 const _: () = assert!(REP_BATCH_FIXED_SIZE == 4);
 
-/// 18B — Per-entry header inside a RepBatch.
+/// 24B — Per-entry header inside a RepBatch.
 ///
 /// ```text
-/// [8 seq][2 subj_len][4 data_len][4 subject_hash]
+/// [4 consumer_id][8 seq][2 subj_len][2 reply_len][4 data_len][4 subject_hash]
 /// ```
-/// * `data_len` = subj_len + payload_len (total variable bytes after this header).
+/// * `data_len` = subj_len + reply_len + payload_len (total variable bytes).
+/// * `reply_len` = length of the reply_to subject (0 for non-RPC messages).
+///   When > 0, the data section is `[subject][reply_to][payload]`.
 /// * `subject_hash` = FNV-1a u32 of the subject bytes. Client echoes this
 ///   back in the ack frame so the server performs O(1) credit arithmetic
 ///   on ack without touching the store.
@@ -108,11 +110,12 @@ pub struct DeliveryEntryHeader {
     pub consumer_id: U32,
     pub seq: U64,
     pub subj_len: U16,
+    pub reply_len: U16,
     pub data_len: U32,
     pub subject_hash: U32,
 }
 pub const DELIVERY_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<DeliveryEntryHeader>();
-const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 22);
+const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 24);
 
 // ── Lazy views ──────────────────────────────────────────────────────────────
 
@@ -296,6 +299,8 @@ pub struct RepBatchEntry<'a> {
     pub seq: u64,
     pub subject_hash: u32,
     pub subject: &'a [u8],
+    /// Reply-to subject for request/reply. Empty slice when not an RPC message.
+    pub reply_to: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -313,15 +318,18 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let consumer_id = header.consumer_id.get();
         let seq = header.seq.get();
         let subj_len = header.subj_len.get() as usize;
+        let reply_len = header.reply_len.get() as usize;
         let data_len = header.data_len.get() as usize;
         let subject_hash = header.subject_hash.get();
         self.offset += DELIVERY_ENTRY_HEADER_SIZE;
 
         let subject = &self.buf[self.offset..self.offset + subj_len];
-        let payload_len = data_len - subj_len;
-        let payload = &self.buf[self.offset + subj_len..self.offset + subj_len + payload_len];
+        let reply_to = &self.buf[self.offset + subj_len..self.offset + subj_len + reply_len];
+        let payload_start = self.offset + subj_len + reply_len;
+        let payload_len = data_len - subj_len - reply_len;
+        let payload = &self.buf[payload_start..payload_start + payload_len];
         self.offset += data_len;
 
-        Some(RepBatchEntry { consumer_id, seq, subject_hash, subject, payload })
+        Some(RepBatchEntry { consumer_id, seq, subject_hash, subject, reply_to, payload })
     }
 }

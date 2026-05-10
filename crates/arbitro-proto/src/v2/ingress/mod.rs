@@ -13,6 +13,7 @@
 pub mod ack_frame;
 pub mod batch_pub_frame;
 pub mod hello;
+pub mod nack_frame;
 pub mod pub_frame;
 pub mod pub_with_headers;
 pub mod pub_with_reply;
@@ -21,6 +22,10 @@ pub mod sub_frame;
 pub use ack_frame::{
     ACK_BODY_SIZE, AckBody, AckFrame, BATCH_ACK_BODY_FIXED, BATCH_ACK_ENTRY_SIZE, BatchAckBody,
     BatchAckEntry, BatchAckFrame,
+};
+pub use nack_frame::{
+    NACK_BODY_SIZE, NackBody, NackFrame, BATCH_NACK_BODY_FIXED, BATCH_NACK_ENTRY_SIZE,
+    BatchNackBody, BatchNackEntry, BatchNackFrame,
 };
 pub use batch_pub_frame::{
     BATCH_PUB_BODY_FIXED, BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubBody, BatchPubEntryHeader,

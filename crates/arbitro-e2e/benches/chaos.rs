@@ -1,525 +1,498 @@
-//! Chaos bench — sustained concurrent load on a tolerant (disk-backed) stream,
-//! verifying zero message loss end-to-end.
+//! Chaos bench — correctness under real fault injection.
 //!
-//! ## Shape
+//! ## Disasters simulated (inline in the main ticker loop)
 //!
-//! - **Stream**: `JournalKind::Tolerant` under `/tmp/arbitro-chaos-<pid>`.
-//! - **Producers**: `BENCH_CHAOS_PRODUCERS` (default 4) tokio tasks, each
-//!   publishing to a unique subject (`prod.{id}.evt`) at a target rate of
-//!   `BENCH_CHAOS_RATE` (default 1000 msgs/s **per producer**).
-//!   Rate-limited with a simple sleep loop so the consumer always keeps up.
-//! - **Consumer**: single `AckPolicy::Explicit`, `DeliverPolicy::All`,
-//!   `max_inflight = 65_535`. Client's ack_loop coalesces acks into
-//!   BatchAck frames automatically.
-//! - **Duration**: `BENCH_CHAOS_SECS` (default 10). Producers stop after
-//!   the timer; consumer keeps draining until the published seq range is
-//!   fully covered or a stall window elapses.
+//! | t  | Event |
+//! |----|-------|
+//! | 4s | Server kill |
+//! | 5s | Server restart on a new port; producers reconnect |
+//! | 8s | Consumer force-disconnect + reconnect |
+//! | 12s| Server kill |
+//! | 13s| Server restart on a new port; producers reconnect |
 //!
-//! ## Loss verification
+//! ## Why inline (not spawned tasks)?
 //!
-//! Every message the server stores gets a unique monotonic `seq` from the
-//! journal. The consumer records which seqs it has received in a
-//! `HashSet<u64>`. At the end we assert:
+//! Management methods (`create_stream`, `create_consumer`, etc.) are
+//! `async fn(&self)` — their futures borrow `&Client` across `.await`.
+//! Since `Client: !Sync`, `&Client: !Send`, so those futures are `!Send`.
+//! `tokio::spawn` requires `Future: Send`.  Only `publish_sync` and
+//! `subscribe` are designed as `fn(&self) -> impl Future + Send`.
 //!
-//!   - `received_count == published` (counts match — no loss)
-//!   - `received_unique == published` (no duplicates)
-//!   - `seq range is 1..=published` (no gaps)
+//! Running chaos logic inline in `main` (which uses `block_on`, no `Send`
+//! requirement) sidesteps the issue entirely.
 //!
-//! ## Cleanup
+//! ## Loss invariant
 //!
-//! Startup kills any lingering bench processes AND wipes
-//! `/tmp/arbitro-chaos-*` dirs from previous runs. On exit the bench
-//! removes its own data dir (even on panic, via best-effort cleanup).
-//!
-//! ## Run
-//!
-//! ```bash
-//! wsl bash -lc "cd /mnt/.../arbitro && \
-//!   cargo bench --bench chaos --no-run 2>&1"
-//! wsl bash -lc "cp .../target/release/deps/chaos-* /tmp/arbitro-bench/ && \
-//!   cd /tmp/arbitro-bench && timeout 60 ./chaos-* --bench"
-//! ```
+//! `acked_seqs ⊆ received_seqs` — every server-confirmed message eventually
+//! delivered. Duplicates (redelivery after reconnect) are expected and handled
+//! by the `HashSet` deduplication.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use arbitro_client::{BatchEntry, Client};
+use arbitro_client_tokio::{Client, ClientConfig, ReconnectPolicy};
 use bytes::Bytes;
-use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, JournalKind, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
+use tokio::sync::watch;
 
-const DEFAULT_SECS: u64 = 10;
-const DEFAULT_PRODUCERS: u64 = 4;
-const DEFAULT_CONSUMERS: u64 = 1;
-/// Per-producer target rate (msgs/second).
-const DEFAULT_RATE: u64 = 1_000;
-const BATCH_SIZE: usize = 32;
-const PAYLOAD_SIZE: usize = 64;
-const STREAM: &[u8] = b"chaos_stream";
+// ── Tunables ──────────────────────────────────────────────────────────────────
 
-fn env_u64(var: &str, fallback: u64) -> u64 {
-    std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
-}
+const RUN_SECS:        u64 = 18;
+const N_PRODUCERS:     u64 = 4;
+const RATE:            u64 = 150;   // target publish_sync msg/s per producer
+const JOURNAL_DISK:    u8  = 1;
+const STREAM:          &[u8] = b"chaos";
+const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
-// ── Metrics helpers ─────────────────────────────────────────────────────────
-
-/// Resident set size (KB) of the current process. Linux only.
-fn rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4)
-        .unwrap_or(0)
-}
-
-/// Total CPU time (user + kernel) consumed by the process in nanoseconds.
-#[cfg(target_os = "linux")]
-fn cpu_time_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cpu_time_ns() -> u64 {
-    0
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn portpicker() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
 }
 
-/// Best-effort wipe of any stale `/tmp/arbitro-chaos-*` dirs from previous runs.
-fn prune_stale_tmp() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for ent in entries.flatten() {
-        let path = ent.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.starts_with("arbitro-chaos-") {
-            let _ = std::fs::remove_dir_all(&path);
+fn prune_stale() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.file_name().and_then(|n| n.to_str())
+            .map(|n| n.starts_with("arbitro-chaos-")).unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(&p);
         }
     }
 }
 
 fn make_data_dir() -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push(format!("arbitro-chaos-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create tmp data dir");
-    dir
+    let mut d = std::env::temp_dir();
+    d.push(format!("arbitro-chaos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
-/// Cleanup guard — removes the data dir when dropped (even on panic).
-struct DataDirCleanup(PathBuf);
-impl Drop for DataDirCleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+struct Cleanup(PathBuf);
+impl Drop for Cleanup {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+fn make_cfg(addr: &str) -> ClientConfig {
+    ClientConfig {
+        addr: addr.to_string(),
+        reconnect: ReconnectPolicy {
+            base:         Duration::from_millis(100),
+            cap:          Duration::from_millis(1_000),
+            max_attempts: None,
+        },
+        ..ClientConfig::default()
     }
 }
 
-async fn spawn_server(data_dir: &Path) -> String {
-    let port = portpicker();
-    let addr = format!("127.0.0.1:{port}");
-    let config = Config::default()
-        .listen_addr(addr.clone())
+/// Spawn a server and wait until it actually accepts TCP connections.
+async fn spawn_server(addr: &str, data_dir: &Path) -> watch::Sender<bool> {
+    let (tx, rx) = watch::channel(false);
+    let cfg = Config::default()
+        .listen_addr(addr)
         .max_connections(64)
         .shard_count(1)
-        .write_buffer_cap(4 * 1024 * 1024)
         .data_dir(data_dir.to_string_lossy().into_owned());
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run().await;
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    addr
+    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run_with_shutdown(rx).await; });
+    // Poll until the port is accepting connections.
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if std::net::TcpStream::connect(addr).is_ok() { break; }
+    }
+    tx
 }
 
-async fn connect(addr: &str) -> Client {
-    Client::connect_with_timeout(addr, Duration::from_secs(5))
-        .await
-        .expect("client connects")
+/// Connect, retrying until success.
+async fn connect_retry(addr: &str) -> Client {
+    loop {
+        match Client::connect(make_cfg(addr)).await {
+            Ok(c)  => return c,
+            Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
 }
 
-async fn producer_task(
-    id: u64,
-    addr: String,
-    rate_per_sec: u64,
-    stop: Arc<AtomicBool>,
-    published: Arc<AtomicU64>,
+/// Create (or re-confirm) the chaos stream on the current server.
+/// Returns (stream_id, consumer_id).
+async fn ensure_stream_and_consumer(addr: &str) -> (u32, u32) {
+    let c = connect_retry(addr).await;
+    let resp = c.create_stream(STREAM, b">", 0, 0, 0, 1, JOURNAL_DISK, 0, 0)
+        .await.expect("create_stream");
+    let sid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+
+    let resp = c.create_consumer(sid, b"chaos-c", b"chaos-grp", b"",
+                                 u16::MAX, 1u8, 0u8, 0u8, 30_000u32, 0u64)
+        .await.expect("create_consumer");
+    let cid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+    (sid, cid)
+}
+
+#[cfg(target_os = "linux")]
+fn rss_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/statm").ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map(|p| p as f64 * 4.0 / 1024.0)
+        .unwrap_or(0.0)
+}
+#[cfg(not(target_os = "linux"))]
+fn rss_mb() -> f64 { 0.0 }
+
+// ── Producer ──────────────────────────────────────────────────────────────────
+//
+// Only calls `publish_sync` (impl Future + Send) and `connect_retry` (free fn).
+// NO management async fn(&self) calls — those require Client: Sync.
+
+async fn producer(
+    id:       u64,
+    cur_addr: Arc<RwLock<String>>,
+    cur_sid:  Arc<AtomicU32>,
+    stop:     Arc<AtomicBool>,
+    acked:    Arc<std::sync::Mutex<HashSet<u64>>>,
+    ok_cnt:   Arc<AtomicU64>,
+    err_cnt:  Arc<AtomicU64>,
 ) {
-    let client = connect(&addr).await;
-    let subject = format!("prod.{id}.evt");
-    let payload = vec![0xABu8; PAYLOAD_SIZE];
+    let subj     = format!("prod.{id}");
+    let payload  = vec![id as u8; 32];
+    let interval = Duration::from_nanos(1_000_000_000 / RATE.max(1));
 
-    // One batch of BATCH_SIZE msgs every `batch_period` seconds gives
-    // BATCH_SIZE / batch_period = rate_per_sec effective throughput.
-    let batch_period = Duration::from_nanos(
-        (BATCH_SIZE as u64 * 1_000_000_000 / rate_per_sec.max(1)).max(1),
-    );
+    // Option<Client> lets us drop the client eagerly when the server goes down.
+    let mut client: Option<Client> = None;
+    let mut last_addr = String::new();
+    let mut tick      = Instant::now();
 
-    let mut next_tick = Instant::now();
     while !stop.load(Relaxed) {
-        let entries: Vec<BatchEntry<'_>> = (0..BATCH_SIZE)
-            .map(|_| BatchEntry::new(subject.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
-            .collect();
-        if client.publish_batch(STREAM, &entries).await.is_err() {
-            break;
-        }
-        published.fetch_add(BATCH_SIZE as u64, Relaxed);
+        let sid = cur_sid.load(Relaxed);
 
-        next_tick += batch_period;
-        let now = Instant::now();
-        if next_tick > now {
-            tokio::time::sleep(next_tick - now).await;
-        } else {
-            // We fell behind; resync to avoid burst-catch-up.
-            next_tick = now;
+        // ── Server is down: drop client, wait ────────────────────────────
+        if sid == 0 {
+            client = None; // release connection to dead server
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         }
+
+        // ── Addr changed or no client yet: reconnect immediately ─────────
+        let cur = cur_addr.read().unwrap().clone();
+        if client.is_none() || cur != last_addr {
+            last_addr = cur.clone();
+            client    = Some(connect_retry(&cur).await);
+            tick      = Instant::now();
+        }
+
+        // publish_sync(&self) -> impl Future + 'static + Send — borrow ends
+        // after the call; future is self-contained (no &Client held across .await).
+        let fut = client.as_ref().unwrap()
+            .publish_sync(sid, subj.as_bytes(), Bytes::copy_from_slice(&payload));
+        let result = tokio::time::timeout(PUBLISH_TIMEOUT, fut).await;
+
+        match result {
+            Ok(Ok(b)) => {
+                let seq = u64::from_le_bytes(b[..8].try_into().unwrap());
+                acked.lock().unwrap().insert(seq);
+                ok_cnt.fetch_add(1, Relaxed);
+            }
+            _ => {
+                err_cnt.fetch_add(1, Relaxed);
+                // Drop client; next iteration will reconnect to cur_addr.
+                client = None;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                tick = Instant::now();
+                continue;
+            }
+        }
+
+        tick += interval;
+        let now = Instant::now();
+        if tick > now { tokio::time::sleep(tick - now).await; }
+        else          { tick = now; }
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() {
-    let secs = env_u64("BENCH_CHAOS_SECS", DEFAULT_SECS);
-    let n_producers = env_u64("BENCH_CHAOS_PRODUCERS", DEFAULT_PRODUCERS);
-    let n_consumers = env_u64("BENCH_CHAOS_CONSUMERS", DEFAULT_CONSUMERS);
-    let rate = env_u64("BENCH_CHAOS_RATE", DEFAULT_RATE);
+// ── Consumer ──────────────────────────────────────────────────────────────────
+//
+// Only calls `subscribe` (impl Future + Send) and `connect_retry` (free fn).
 
-    // ── Pre-run cleanup ─────────────────────────────────────────────────
-    prune_stale_tmp();
+async fn consumer_loop(
+    cur_addr:        Arc<RwLock<String>>,
+    cur_sid:         Arc<AtomicU32>,
+    cur_cid:         Arc<AtomicU32>,
+    stop:            Arc<AtomicBool>,
+    force_reconnect: Arc<AtomicBool>,
+    recv_seqs:       Arc<std::sync::Mutex<HashSet<u64>>>,
+    recv_total:      Arc<AtomicU64>,
+    reconnect_cnt:   Arc<AtomicU64>,
+) {
+    while !stop.load(Relaxed) {
+        let sid = cur_sid.load(Relaxed);
+        let cid = cur_cid.load(Relaxed);
+        if sid == 0 || cid == 0 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
 
-    let data_dir = make_data_dir();
-    let _cleanup_guard = DataDirCleanup(data_dir.clone());
+        let addr   = cur_addr.read().unwrap().clone();
+        let client = connect_retry(&addr).await;
 
-    let total_target_rate = rate * n_producers;
-    let expected_total = total_target_rate * secs;
+        // subscribe returns impl Future + Send — safe in spawn.
+        let sub = client.subscribe(sid, cid, b"").await;
+        let mut sub = match sub {
+            Ok(s)  => s,
+            Err(_) => { tokio::time::sleep(Duration::from_millis(200)).await; continue; }
+        };
 
-    println!();
-    println!("========================================================");
-    println!("                      Chaos bench");
-    println!("========================================================");
-    println!("  duration={secs}s   producers={n_producers}   consumers={n_consumers}   rate={rate} msg/s/producer");
-    println!("  total target: {total_target_rate} msg/s  ~  {expected_total} msgs");
-    println!("  batch={BATCH_SIZE}   payload={PAYLOAD_SIZE}B");
-    println!("  journal=Tolerant   data_dir={}", data_dir.display());
-    println!();
-
-    let addr = spawn_server(&data_dir).await;
-
-    // ── Stream + consumer setup ─────────────────────────────────────────
-    let control_client = connect(&addr).await;
-    let stream_cfg = StreamConfig::new(STREAM, b">")
-        .journal_kind(JournalKind::Tolerant)
-        .build();
-    control_client.create_stream(&stream_cfg).await.expect("create stream");
-
-    // Create N consumers, each with a UNIQUE name + UNIQUE group so they
-    // form independent fanout streams — every msg must reach every consumer.
-    // BENCH_CHAOS_CONSUMERS=1 keeps the original single-consumer behaviour.
-    for i in 0..n_consumers {
-        let name = format!("chaos-{i}");
-        let group = format!("chaos-grp-{i}");
-        let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
-            .group(group.as_bytes())
-            .filter(b">")
-            .ack_policy(AckPolicy::Explicit)
-            .max_inflight(u16::MAX)
-            .deliver_policy(DeliverPolicy::All)
-            .build()
-            .unwrap();
-        control_client.create_consumer(&cfg).await.unwrap();
-    }
-
-    // ── Consumer tasks — N parallel TCP connections drain concurrently ───
-    // Each consumer has its own HashSet of received seqs (to verify
-    // per-consumer no-loss) and its own counter. Under fanout semantics
-    // each consumer must receive every msg published.
-    //
-    // Subscribers start BEFORE producers so every consumer's subscribe
-    // RPC has landed on the server by the time the first publish happens.
-    // Otherwise early msgs race the subscribe and — despite
-    // DeliverPolicy::All — risk being filed before the binding is live.
-    let consumer_stop = Arc::new(AtomicBool::new(false));
-    let per_consumer_seqs: Vec<Arc<std::sync::Mutex<HashSet<u64>>>> = (0..n_consumers)
-        .map(|_| {
-            Arc::new(std::sync::Mutex::new(HashSet::with_capacity(
-                expected_total as usize,
-            )))
-        })
-        .collect();
-    let per_consumer_count: Vec<Arc<AtomicU64>> =
-        (0..n_consumers).map(|_| Arc::new(AtomicU64::new(0))).collect();
-
-    let mut recv_tasks = Vec::new();
-    for i in 0..n_consumers {
-        let addr = addr.clone();
-        let consumer_stop = Arc::clone(&consumer_stop);
-        let seqs = Arc::clone(&per_consumer_seqs[i as usize]);
-        let counter = Arc::clone(&per_consumer_count[i as usize]);
-
-        recv_tasks.push(tokio::spawn(async move {
-            // Each consumer gets its own Client = its own TCP connection.
-            let client = connect(&addr).await;
-            let name = format!("chaos-{i}");
-            let group = format!("chaos-grp-{i}");
-            let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
-                .group(group.as_bytes())
-                .filter(b">")
-                .ack_policy(AckPolicy::Explicit)
-                .max_inflight(u16::MAX)
-                .deliver_policy(DeliverPolicy::All)
-                .build()
-                .unwrap();
-            let consumer = client.create_consumer(&cfg).await.unwrap();
-            let mut sub = consumer.subscribe(None).await.unwrap();
-
-            loop {
-                match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
-                    Ok(Some(msg)) => {
-                        let seq = msg.seq;
-                        msg.ack();
-                        seqs.lock().unwrap().insert(seq);
-                        counter.fetch_add(1, Relaxed);
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
+                Ok(Some(msg)) => {
+                    recv_seqs.lock().unwrap().insert(msg.seq);
+                    recv_total.fetch_add(1, Relaxed);
+                    msg.ack();
+                    if force_reconnect.swap(false, Relaxed) {
+                        reconnect_cnt.fetch_add(1, Relaxed);
+                        break;
                     }
-                    Ok(None) => break,
-                    Err(_) => {
-                        if consumer_stop.load(Relaxed) {
-                            break;
-                        }
+                }
+                Ok(None) => {
+                    reconnect_cnt.fetch_add(1, Relaxed);
+                    break;
+                }
+                Err(_timeout) => {
+                    if stop.load(Relaxed) { return; }
+                    if force_reconnect.swap(false, Relaxed) {
+                        reconnect_cnt.fetch_add(1, Relaxed);
+                        break;
+                    }
+                    // addr changed? reconnect.
+                    let new_addr = cur_addr.read().unwrap().clone();
+                    if new_addr != addr {
+                        reconnect_cnt.fetch_add(1, Relaxed);
+                        break;
                     }
                 }
             }
-        }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
 
-    // Give every subscriber a moment to complete `subscribe()` on the
-    // server before producers start. 200 ms is plenty for loopback; if
-    // this races on a slower box, raise BENCH_CHAOS_SETTLE_MS.
-    let settle_ms = env_u64("BENCH_CHAOS_SETTLE_MS", 200);
-    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+// ── Main (chaos events inline) ────────────────────────────────────────────────
 
-    // ── Kick off producers (after subscribers are ready) ───────────────
-    let stop = Arc::new(AtomicBool::new(false));
-    let published = Arc::new(AtomicU64::new(0));
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() {
+    prune_stale();
+    let data_dir = make_data_dir();
+    let _cleanup = Cleanup(data_dir.clone());
 
-    let producer_handles: Vec<_> = (0..n_producers)
-        .map(|id| {
-            let addr = addr.clone();
-            let stop = Arc::clone(&stop);
-            let published = Arc::clone(&published);
-            tokio::spawn(producer_task(id, addr, rate, stop, published))
-        })
-        .collect();
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║                    Chaos bench                           ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!("  producers={N_PRODUCERS}   rate≈{RATE} msg/s each   run={RUN_SECS}s");
+    println!("  journal=Disk");
+    println!("  chaos events:");
+    println!("    t= 4s — server kill");
+    println!("    t= 5s — server restart (new port)");
+    println!("    t= 8s — consumer force-disconnect + reconnect");
+    println!("    t=12s — server kill");
+    println!("    t=13s — server restart (new port)");
+    println!("  publish_sync timeout={PUBLISH_TIMEOUT:?}  producer reconnects after 3 errors");
+    println!();
 
-    // ── Baseline metrics BEFORE the run ────────────────────────────────
-    let rss_start_kb = rss_kb();
-    let cpu_start_ns = cpu_time_ns();
+    // ── Initial server ─────────────────────────────────────────────────────
+    let addr0 = format!("127.0.0.1:{}", portpicker());
+    let mut srv_tx = spawn_server(&addr0, &data_dir).await;
+    println!("[chaos] server up on {addr0}");
 
-    // Peak RSS tracker — sampled every 100ms by a side task.
-    let peak_rss = Arc::new(AtomicU64::new(rss_start_kb));
-    let sampler_stop = Arc::new(AtomicBool::new(false));
-    let sampler_task = {
-        let peak_rss = Arc::clone(&peak_rss);
-        let sampler_stop = Arc::clone(&sampler_stop);
-        tokio::spawn(async move {
-            while !sampler_stop.load(Relaxed) {
-                let cur = rss_kb();
-                peak_rss.fetch_max(cur, Relaxed);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
+    let (sid0, cid0) = ensure_stream_and_consumer(&addr0).await;
+    println!("[chaos] stream_id={sid0}  consumer_id={cid0}");
+    println!();
 
-    // ── Timer: let the chaos run; print progress every second ─────────
+    // ── Shared state ───────────────────────────────────────────────────────
+    let cur_addr  = Arc::new(RwLock::new(addr0.clone()));
+    let cur_sid   = Arc::new(AtomicU32::new(sid0));
+    let cur_cid   = Arc::new(AtomicU32::new(cid0));
+
+    let prod_stop       = Arc::new(AtomicBool::new(false));
+    let cons_stop       = Arc::new(AtomicBool::new(false));
+    let force_reconnect = Arc::new(AtomicBool::new(false));
+
+    let acked_seqs  = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let ok_cnt      = Arc::new(AtomicU64::new(0));
+    let err_cnt     = Arc::new(AtomicU64::new(0));
+    let recv_seqs   = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let recv_total  = Arc::new(AtomicU64::new(0));
+    let reconnect_cnt = Arc::new(AtomicU64::new(0));
+
+    // ── Consumer task ──────────────────────────────────────────────────────
+    tokio::spawn(consumer_loop(
+        Arc::clone(&cur_addr), Arc::clone(&cur_sid), Arc::clone(&cur_cid),
+        Arc::clone(&cons_stop), Arc::clone(&force_reconnect),
+        Arc::clone(&recv_seqs), Arc::clone(&recv_total), Arc::clone(&reconnect_cnt),
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // ── Producer tasks ─────────────────────────────────────────────────────
+    let prod_handles: Vec<_> = (0..N_PRODUCERS).map(|id| {
+        tokio::spawn(producer(
+            id,
+            Arc::clone(&cur_addr), Arc::clone(&cur_sid),
+            Arc::clone(&prod_stop),
+            Arc::clone(&acked_seqs), Arc::clone(&ok_cnt), Arc::clone(&err_cnt),
+        ))
+    }).collect();
+
+    // ── Main ticker + inline chaos events ─────────────────────────────────
     let run_start = Instant::now();
-    for elapsed in 1..=secs {
+
+    for t in 1u64..=RUN_SECS {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let pub_total = published.load(Relaxed);
-        // Aggregate received across all consumers (for the progress line).
-        let recv_total: u64 = per_consumer_count
-            .iter()
-            .map(|c| c.load(Relaxed))
-            .sum();
-        let min_recv = per_consumer_count
-            .iter()
-            .map(|c| c.load(Relaxed))
-            .min()
-            .unwrap_or(0);
-        let rss_now_mb = rss_kb() / 1024;
+
+        // ── Chaos: kill server at t=4 ──────────────────────────────────
+        if t == 4 {
+            println!("\n  [chaos] ⚡ t=4s: killing server ...");
+            let _ = srv_tx.send(true);
+            // cur_sid = 0 so producers pause immediately
+            cur_sid.store(0, Relaxed);
+            cur_cid.store(0, Relaxed);
+        }
+
+        // ── Chaos: restart server at t=5 ───────────────────────────────
+        if t == 5 {
+            let new_addr = format!("127.0.0.1:{}", portpicker());
+            println!("  [chaos] ↩  t=5s: restarting on {new_addr} ...");
+            srv_tx = spawn_server(&new_addr, &data_dir).await;
+            let (s, c) = ensure_stream_and_consumer(&new_addr).await;
+            *cur_addr.write().unwrap() = new_addr.clone();
+            cur_sid.store(s, Relaxed);
+            cur_cid.store(c, Relaxed);
+            println!("  [chaos] ✓  t=5s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
+                reconnect_cnt.load(Relaxed));
+        }
+
+        // ── Chaos: consumer force-disconnect at t=8 ────────────────────
+        if t == 8 {
+            println!("\n  [chaos] ⚡ t=8s: force-disconnecting consumer ...");
+            force_reconnect.store(true, Relaxed);
+            // consumer_loop will detect on next timeout (~400ms)
+        }
+
+        // ── Chaos: kill server at t=12 ─────────────────────────────────
+        if t == 12 {
+            println!("\n  [chaos] ⚡ t=12s: killing server ...");
+            let _ = srv_tx.send(true);
+            cur_sid.store(0, Relaxed);
+            cur_cid.store(0, Relaxed);
+        }
+
+        // ── Chaos: restart server at t=13 ──────────────────────────────
+        if t == 13 {
+            let new_addr = format!("127.0.0.1:{}", portpicker());
+            println!("  [chaos] ↩  t=13s: restarting on {new_addr} ...");
+            srv_tx = spawn_server(&new_addr, &data_dir).await;
+            let (s, c) = ensure_stream_and_consumer(&new_addr).await;
+            *cur_addr.write().unwrap() = new_addr.clone();
+            cur_sid.store(s, Relaxed);
+            cur_cid.store(c, Relaxed);
+            println!("  [chaos] ✓  t=13s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
+                reconnect_cnt.load(Relaxed));
+        }
+
+        let pub_n  = ok_cnt.load(Relaxed);
+        let err_n  = err_cnt.load(Relaxed);
+        let recv_n = recv_total.load(Relaxed);
+        let uniq_n = recv_seqs.lock().unwrap().len();
+        let rc_n   = reconnect_cnt.load(Relaxed);
         println!(
-            "  [t={elapsed:>2}s] published={pub_total:>6} received={recv_total:>6} min_per_consumer={min_recv:>5} rss={rss_now_mb:>4} MB",
+            "  [t={t:>2}s] published={pub_n:>5}  received={recv_n:>5} (uniq={uniq_n:>5})  \
+             errors={err_n:>4}  consumer_reconnects={rc_n}  rss={:.1}MB",
+            rss_mb()
         );
     }
+    drop(srv_tx);
 
-    // ── Stop producers and wait for them to finish publishing ──────────
-    stop.store(true, Relaxed);
-    for h in producer_handles {
-        let _ = h.await;
-    }
-    let pub_total_final = published.load(Relaxed);
-    let pub_elapsed = run_start.elapsed();
+    // ── Stop producers ─────────────────────────────────────────────────────
+    prod_stop.store(true, Relaxed);
+    for h in prod_handles { let _ = h.await; }
+    let pub_total = ok_cnt.load(Relaxed);
+    let err_total = err_cnt.load(Relaxed);
     println!();
-    println!(
-        "  producers stopped: {pub_total_final} msgs in {:.2?} ({:.0} msg/s)",
-        pub_elapsed,
-        pub_total_final as f64 / pub_elapsed.as_secs_f64()
-    );
+    println!("  producers stopped: {pub_total} acked  {err_total} errors  elapsed={:.2?}",
+        run_start.elapsed());
 
-    // ── Wait for every consumer to catch the tail ─────────────────────
-    // Each consumer must independently have received all published msgs
-    // (fanout semantics). We're done when the MIN of per-consumer counts
-    // reaches pub_total_final.
-    let target_seq = pub_total_final;
-    let drain_start = Instant::now();
-    let drain_deadline = drain_start + Duration::from_secs(15);
-    let total_so_far = |counts: &[Arc<AtomicU64>]| -> u64 {
-        counts.iter().map(|c| c.load(Relaxed)).sum()
-    };
-    let min_so_far = |counts: &[Arc<AtomicU64>]| -> u64 {
-        counts.iter().map(|c| c.load(Relaxed)).min().unwrap_or(0)
-    };
-    let mut last_recv = total_so_far(&per_consumer_count);
-    let mut stall_start = Instant::now();
+    // ── Drain consumer ─────────────────────────────────────────────────────
+    println!("  draining consumer (target={pub_total} unique seqs) ...");
+    let drain_start    = Instant::now();
+    let drain_deadline = drain_start + Duration::from_secs(30);
+    let mut last_uniq  = recv_seqs.lock().unwrap().len();
+    let mut stall_at   = Instant::now();
+
     loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let per_min = min_so_far(&per_consumer_count);
-        if per_min >= target_seq {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let uniq = recv_seqs.lock().unwrap().len();
+
+        if uniq >= pub_total as usize {
+            println!("  drain complete in {:.2?}", drain_start.elapsed());
             break;
         }
         if Instant::now() >= drain_deadline {
-            println!(
-                "  WARN drain_deadline hit — min per-consumer {per_min}/{target_seq}"
-            );
+            println!("  WARN drain deadline — unique={uniq}/{pub_total}");
             break;
         }
-        let recv = total_so_far(&per_consumer_count);
-        if recv != last_recv {
-            last_recv = recv;
-            stall_start = Instant::now();
-        } else if Instant::now().duration_since(stall_start) > Duration::from_secs(3) {
-            println!(
-                "  WARN drain stalled — min per-consumer {per_min}/{target_seq} (no progress 3s)"
-            );
+        if uniq != last_uniq {
+            last_uniq = uniq;
+            stall_at  = Instant::now();
+        } else if Instant::now().duration_since(stall_at) > Duration::from_secs(8) {
+            println!("  WARN drain stalled 8s — unique={uniq}/{pub_total}");
             break;
         }
     }
 
-    consumer_stop.store(true, Relaxed);
-    for h in recv_tasks {
-        let _ = h.await;
-    }
-    sampler_stop.store(true, Relaxed);
-    let _ = sampler_task.await;
+    cons_stop.store(true, Relaxed);
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
-    // ── Resource usage ──────────────────────────────────────────────────
-    let rss_end_kb = rss_kb();
-    let peak_rss_kb = peak_rss.load(Relaxed);
-    let cpu_end_ns = cpu_time_ns();
+    // ── Results ────────────────────────────────────────────────────────────
+    let acked    = acked_seqs.lock().unwrap().clone();
+    let recvd    = recv_seqs.lock().unwrap().clone();
+    let recv_tot = recv_total.load(Relaxed);
+    let uniq_tot = recvd.len() as u64;
+    let dups     = recv_tot.saturating_sub(uniq_tot);
+    let rc_tot   = reconnect_cnt.load(Relaxed);
 
-    let drain_elapsed = drain_start.elapsed();
-    let total_elapsed = run_start.elapsed();
+    let missing_seqs: Vec<u64> = acked.difference(&recvd).copied().take(20).collect();
+    let missing_cnt  = acked.difference(&recvd).count();
 
-    println!("  drain tail: {drain_elapsed:.2?}");
+    println!();
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║                      Results                             ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!("  published (acked)     : {pub_total}");
+    println!("  errors (transient)    : {err_total}  (during server-down windows)");
+    println!("  received (total)      : {recv_tot}");
+    println!("  received (unique)     : {uniq_tot}");
+    println!("  duplicates            : {dups}  (redelivery — expected)");
+    println!("  consumer reconnects   : {rc_tot}  (expected ≥3: 2 kills + 1 force)");
+    println!("  total elapsed         : {:.2?}", run_start.elapsed());
     println!();
 
-    // ── Loss verification (per-consumer) ──────────────────────────────
-    println!("--------------------------------------------------------");
-    println!("  Loss check  (per-consumer fanout integrity)");
-    println!("--------------------------------------------------------");
-    println!("  published : {pub_total_final}");
-    println!();
-
-    let mut any_loss = false;
-    let mut total_recv_all = 0u64;
-    let mut all_gaps: Vec<Vec<u64>> = Vec::new();
-    for i in 0..n_consumers {
-        let seqs = per_consumer_seqs[i as usize].lock().unwrap();
-        let count = per_consumer_count[i as usize].load(Relaxed);
-        let unique = seqs.len() as u64;
-        let duplicates = count.saturating_sub(unique);
-        let max_seq = seqs.iter().copied().max().unwrap_or(0);
-        let gaps: Vec<u64> = if max_seq > 0 {
-            (1..=pub_total_final)
-                .filter(|s| !seqs.contains(s))
-                .take(5)
-                .collect()
-        } else {
-            (1..=pub_total_final.min(5)).collect()
-        };
-        drop(seqs);
-
-        let ok = count == pub_total_final && unique == pub_total_final && gaps.is_empty();
-        if !ok {
-            any_loss = true;
-        }
-        total_recv_all += count;
-        all_gaps.push(gaps.clone());
-
-        let status = if ok { "OK" } else { "LOSS" };
-        println!(
-            "  consumer {i:<2}: recv={count:>6} unique={unique:>6} dup={duplicates} max_seq={max_seq} [{status}]"
-        );
-        if !gaps.is_empty() {
-            println!("             missing (first 5): {gaps:?}");
-        }
+    if missing_cnt == 0 {
+        println!("  LOSS CHECK : ✓  PASS — all {pub_total} acked seqs received");
+    } else {
+        println!("  LOSS CHECK : ✗  FAIL — {missing_cnt} seqs missing");
+        println!("               first 20: {missing_seqs:?}");
     }
     println!();
-    println!("  aggregate received : {total_recv_all}  (expected {})", pub_total_final * n_consumers);
 
-    println!("--------------------------------------------------------");
-    println!("  Summary");
-    println!("--------------------------------------------------------");
-    println!("  runtime            : {total_elapsed:.2?}");
-    println!(
-        "  publish rate       : {:.0} msg/s",
-        pub_total_final as f64 / pub_elapsed.as_secs_f64()
-    );
-    println!(
-        "  end-to-end rate    : {:.0} msg/s  (aggregate across {n_consumers} consumers)",
-        total_recv_all as f64 / total_elapsed.as_secs_f64()
-    );
-
-    // Resource usage summary.
-    let rss_start_mb = rss_start_kb as f64 / 1024.0;
-    let rss_end_mb = rss_end_kb as f64 / 1024.0;
-    let rss_peak_mb = peak_rss_kb as f64 / 1024.0;
-    let rss_delta_mb = rss_end_mb - rss_start_mb;
-    let cpu_used_ns = cpu_end_ns.saturating_sub(cpu_start_ns);
-    let cpu_used_secs = cpu_used_ns as f64 / 1_000_000_000.0;
-    let wall_secs = total_elapsed.as_secs_f64();
-    let cpu_pct = (cpu_used_secs / wall_secs) * 100.0;
-
-    println!(
-        "  RSS start          : {rss_start_mb:>6.1} MB   end: {rss_end_mb:>6.1} MB   peak: {rss_peak_mb:>6.1} MB   Δ: {rss_delta_mb:+.1} MB"
-    );
-    println!(
-        "  CPU used           : {cpu_used_secs:>6.2} s   ({cpu_pct:>5.1}% of wall)   per msg: {:>5.0} ns",
-        cpu_used_ns as f64 / total_recv_all.max(1) as f64
-    );
-
-    // ── Assertions ─────────────────────────────────────────────────────
-    assert!(pub_total_final > 0, "no messages were published");
-    assert!(!any_loss, "per-consumer loss detected: {all_gaps:?}");
+    assert!(pub_total > 0, "no messages published — check server restart logic");
+    assert!(rc_tot >= 3, "expected ≥3 consumer reconnects (2 kills + 1 force), got {rc_tot}");
     assert_eq!(
-        total_recv_all,
-        pub_total_final * n_consumers,
-        "aggregate received ({total_recv_all}) != published * consumers ({})",
-        pub_total_final * n_consumers,
+        missing_cnt, 0,
+        "LOSS: {missing_cnt} acked seqs never received.\nFirst missing: {missing_seqs:?}"
     );
 
+    println!("  RESULT: OK — {pub_total} msgs, zero loss, {rc_tot} consumer reconnects survived");
     println!();
-    println!("  RESULT: OK — no loss per consumer, no duplicates, no gaps");
-    println!();
-
-    // DataDirCleanup drops here and removes the dir.
 }

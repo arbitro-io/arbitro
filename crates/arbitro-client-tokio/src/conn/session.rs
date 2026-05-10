@@ -1,116 +1,91 @@
-//! Per-session lifecycle: dial, handshake, spawn writer + reader, run
-//! until any task drops, drain pending with `Disconnected`, return.
-//!
-//! `connection_loop` (top-level) loops on `dial_and_run`, applying the
-//! decorrelated-jitter backoff on failure. Cancellation via the
-//! shared `CancellationToken` (set on `Client::drop` / `close`).
+//! Per-session lifecycle: dial, handshake, replay subscriptions, spawn
+//! writer + reader + heartbeat, run until any task drops, drain pending.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use arbitro_kit::route::MpscAsyncConsumer;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use arbitro_proto::v2::ingress::hello::{cap, Role};
 
-use crate::config::ClientConfig;
+use crate::conn::heartbeat::heartbeat_task;
 use crate::conn::reconnect::Backoff;
 use crate::error::ClientError;
-use crate::state::pending::Pending;
+use crate::state::Inner;
 use crate::transport::encode::encode_hello_v2;
-use crate::transport::frame::WriteFrame;
+use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
 
-/// Channel handle handed to `Client` so it can enqueue outbound frames.
-#[derive(Debug, Clone)]
-pub(crate) struct WriteTx(pub(crate) mpsc::Sender<WriteFrame>);
-
-impl WriteTx {
-    /// Enqueue a frame; awaits if the writer queue is full (back-pressure).
-    pub async fn send(&self, f: WriteFrame) -> Result<(), ClientError> {
-        self.0.send(f).await.map_err(|_| ClientError::ChannelClosed)
-    }
-}
-
-/// Spawn a connection that auto-reconnects until cancelled.
+/// Spawn the background connection loop.
 ///
-/// Returns the `WriteTx` once the *first* dial succeeds (so the caller
-/// can start publishing immediately); subsequent reconnects are silent.
+/// Establishes the first TCP connection + handshake before returning so
+/// callers get a fast failure on bad addresses.  All subsequent reconnects
+/// happen silently in the background task.
 pub(crate) async fn spawn_connection(
-    cfg: ClientConfig,
-    pending: Arc<Pending>,
-    cancel: CancellationToken,
-) -> Result<WriteTx, ClientError> {
-    // The writer queue lives across reconnects: we replace the
-    // OwnedWriteHalf inside the writer task, but the channel handle the
-    // public API holds stays valid for the lifetime of the Client.
-    let (tx, mut rx) = mpsc::channel::<WriteFrame>(cfg.write_queue_capacity);
-
-    // Initial connect must succeed (synchronously) so we can return a
-    // ready writer to the caller. HELLO is sent inside `run_session`
-    // (so every reconnect emits it on the fresh socket).
-    let first = TcpStream::connect(&cfg.addr).await?;
+    consumer: MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
+    inner:    Arc<Inner>,
+) -> Result<(), ClientError> {
+    // Initial connection — fast failure path.
+    let first = TcpStream::connect(&inner.cfg.addr).await?;
     let (read_h, mut write_h) = first.into_split();
     write_handshake(&mut write_h).await?;
+    // Replay any subscriptions (none on first connect — future-proofs reconnect).
+    replay_subscriptions(&inner);
 
-    // First session driver — owns the initial socket halves.
-    let pending_w = Arc::clone(&pending);
-    let cancel_w = cancel.clone();
-    let cfg_w = cfg.clone();
-
+    let cancel = inner.cancel.clone();
     tokio::spawn(async move {
-        // Run the first session until it returns, then loop on reconnect.
+        let mut consumer = consumer;
         let mut wh = Some(write_h);
         let mut rh = Some(read_h);
-        let mut back = Backoff::new(&cfg_w.reconnect);
+        let mut back = Backoff::new(&inner.cfg.reconnect);
 
         loop {
-            // ── run the current session ─────────────────────────────
-            let session_cancel = cancel_w.child_token();
-            let pending_r = Arc::clone(&pending_w);
+            let session_cancel = cancel.child_token();
 
-            // Take ownership of write/read halves for this iteration.
-            let wh_now = wh.take();
-            let rh_now = rh.take();
-
-            let res = if let (Some(w), Some(r)) = (wh_now, rh_now) {
-                run_session(&mut rx, w, r, pending_r, session_cancel.clone()).await
+            let res = if let (Some(w), Some(r)) = (wh.take(), rh.take()) {
+                run_session(
+                    &mut consumer,
+                    w, r,
+                    Arc::clone(&inner),
+                    session_cancel.clone(),
+                ).await
             } else {
                 Err(ClientError::Disconnected)
             };
 
-            // Wake every pending request — the socket is gone.
-            pending_w.drain_disconnected();
+            inner.pending.drain_disconnected();
 
-            // Top-level cancel? exit loop, the writer queue closes when
-            // the public-side senders drop.
-            if cancel_w.is_cancelled() {
+            if cancel.is_cancelled() {
                 debug!("connection cancelled");
                 return;
             }
 
             warn!(error = ?res, "session ended, will reconnect");
 
-            // ── reconnect with backoff ──────────────────────────────
+            // Back-off loop — keep retrying until we get a new connection.
             loop {
                 let Some(delay) = back.next() else {
                     debug!("reconnect attempts exhausted");
                     return;
                 };
                 tokio::select! {
-                    _ = cancel_w.cancelled() => return,
+                    _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
                 }
-                match TcpStream::connect(&cfg_w.addr).await {
+                match TcpStream::connect(&inner.cfg.addr).await {
                     Ok(s) => {
                         let (r, mut w) = s.into_split();
                         if let Err(e) = write_handshake(&mut w).await {
                             warn!(?e, "handshake write failed");
                             continue;
                         }
+                        // Replay subscriptions before the new session starts.
+                        replay_subscriptions(&inner);
                         rh = Some(r);
                         wh = Some(w);
                         back.reset();
@@ -124,67 +99,69 @@ pub(crate) async fn spawn_connection(
         }
     });
 
-    Ok(WriteTx(tx))
+    Ok(())
 }
 
-/// Write the v2 HELLO handshake. Must be called before any other frame
-/// on a fresh socket.
-async fn write_handshake(w: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<(), ClientError> {
+/// Write the v2 Hello handshake frame.
+async fn write_handshake(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<(), ClientError> {
     let hello = encode_hello_v2(Role::Client, cap::REPLY | cap::BATCH_HEADERS);
     w.write_all(&hello).await?;
     Ok(())
 }
 
-/// Drive one session: spawn writer (consumes the queue) and reader
-/// (decodes replies). Returns when *either* task finishes.
+/// Enqueue all stored `sub_body` frames via the admin producer.
+///
+/// Called after a successful handshake so the broker re-registers all
+/// active consumers.  Fire-and-forget — writer picks them up.
+fn replay_subscriptions(inner: &Inner) {
+    let sub_bodies = inner.subscriptions.all_sub_bodies();
+    if sub_bodies.is_empty() {
+        return;
+    }
+    // Reset the heartbeat timestamp so we don't time-out during replay.
+    inner.last_pong_ns.store(Inner::now_ns(), Ordering::Relaxed);
+
+    let admin = inner.admin_producer.lock().unwrap();
+    for sub_body in sub_bodies {
+        let _ = admin.try_send(WriteFrame::Mono(sub_body));
+    }
+}
+
+/// Run writer + reader + heartbeat concurrently under a child token.
+/// Returns when the first of the three finishes (error or clean exit).
 async fn run_session(
-    rx: &mut mpsc::Receiver<WriteFrame>,
-    w: tokio::net::tcp::OwnedWriteHalf,
-    r: tokio::net::tcp::OwnedReadHalf,
-    pending: Arc<Pending>,
-    cancel: CancellationToken,
+    consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
+    w:        tokio::net::tcp::OwnedWriteHalf,
+    r:        tokio::net::tcp::OwnedReadHalf,
+    inner:    Arc<Inner>,
+    cancel:   CancellationToken,
 ) -> Result<(), ClientError> {
-    // We need a fresh per-session channel to give writer ownership of
-    // the queue receiver. We drain `rx` (the long-lived receiver) into
-    // a per-session forwarder, so the writer can `recv_many` from a
-    // local channel and we can detect socket close by observing the
-    // forwarder task exit.
-    let (fwd_tx, fwd_rx) = mpsc::channel::<WriteFrame>(1024);
+    let cfg_ka = inner.cfg.keep_alive.clone();
 
-    let cancel_w = cancel.clone();
-    let writer_h = tokio::spawn(writer_task(fwd_rx, w, cancel_w));
+    let inner_r  = Arc::clone(&inner);
+    let inner_hb = Arc::clone(&inner);
+    let cancel_r  = cancel.clone();
+    let cancel_hb = cancel.clone();
 
-    let cancel_r = cancel.clone();
-    let reader_h = tokio::spawn(reader_task(r, pending, cancel_r));
+    let reader_h = tokio::spawn(reader_task(r, inner_r, cancel_r));
 
-    // Forwarder: copies from the long-lived `rx` to the per-session
-    // `fwd_tx`. Exits when the public senders all drop or the session
-    // cancels.
-    let cancel_f = cancel.clone();
-    let fwd = async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = cancel_f.cancelled() => return Ok::<(), ClientError>(()),
-                msg = rx.recv() => {
-                    let Some(f) = msg else { return Ok(()) };
-                    if fwd_tx.send(f).await.is_err() {
-                        // Writer task gone — bail so caller reconnects.
-                        return Err(ClientError::ChannelClosed);
-                    }
-                }
+    tokio::select! {
+        r = writer_task(consumer, w, cancel.clone()) => {
+            cancel.cancel();
+            r
+        }
+        r = reader_h => {
+            cancel.cancel();
+            match r {
+                Ok(v) => v,
+                Err(_) => Err(ClientError::Disconnected),
             }
         }
-    };
-
-    // Whichever task finishes first triggers the cancel for the others.
-    let result: Result<(), ClientError> = tokio::select! {
-        r = writer_h => match r { Ok(v) => v, Err(_) => Err(ClientError::ChannelClosed) },
-        r = reader_h => match r { Ok(v) => v, Err(_) => Err(ClientError::Disconnected) },
-        r = fwd      => r,
-    };
-
-    cancel.cancel();
-    let _ = result;
-    Ok(())
+        r = heartbeat_task(inner_hb, cfg_ka, cancel_hb) => {
+            cancel.cancel();
+            r
+        }
+    }
 }

@@ -32,6 +32,7 @@ One rule isolates an unbounded number of subjects. A saturated `orders.freemium.
 - **Crash-Safe Persistence** — Magic Byte (0xAF) validation survives `SIGKILL`.
 - **Reactive Model** — callback + pull subscription modes.
 - **Shard-Parallel Architecture** — lock-free drain + command threads per shard.
+- **Ack Timeout & Nack Delay** — per-consumer timing wheel auto-nacks stale deliveries and supports delayed requeue.
 
 ## Performance (E2E Throughput)
 
@@ -128,6 +129,17 @@ while let Some(msg) = sub.next().await {
 }
 ```
 
+### Negative acknowledgement with delay
+
+```rust
+while let Some(msg) = sub.next().await {
+    match process(&msg) {
+        Ok(_) => msg.ack(),
+        Err(_) => msg.nack_delay(5000), // retry after 5 seconds
+    }
+}
+```
+
 ### Publish
 
 ```rust
@@ -149,6 +161,8 @@ client.publish_batch(b"ORDERS", &[
 - [x] Atomic state management
 - [x] Linear-ingestion store
 - [x] Shard-parallel drain/command split
+- [x] Ack timeout (per-consumer timing wheel, auto-nack on expiry)
+- [x] Nack with delay (delayed redelivery via timing wheel)
 
 ### Phase 2 — Persistence & Connectivity (done)
 - [x] Disk persistence (TolerantStore)

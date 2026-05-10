@@ -17,6 +17,9 @@ pub enum Action {
     // its on-wire representation is a 8B HelloFrame starting with the v2
     // magic, sent as the first bytes of every connection.
     Hello                    = 0x0001,
+    /// Auth frame — Header + raw token bytes. Must be the first frame
+    /// after Hello when the server requires authentication.
+    Auth                     = 0x0002,
 
     // 0x02xx — Delivery
     Deliver       = 0x0200,
@@ -29,6 +32,7 @@ pub enum Action {
     FanoutBatch   = 0x0207,
     AckSync       = 0x0208,
     BatchAckSync  = 0x0209,
+    BatchNack     = 0x020A,
 
     // 0x03xx — Subscription
     Subscribe     = 0x0301,
@@ -66,6 +70,7 @@ impl Action {
     pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
             0x0001 => Some(Self::Hello),
+            0x0002 => Some(Self::Auth),
 
             0x0101 => Some(Self::Publish),
             0x0102 => Some(Self::PublishAccumulate),
@@ -84,6 +89,7 @@ impl Action {
             0x0207 => Some(Self::FanoutBatch),
             0x0208 => Some(Self::AckSync),
             0x0209 => Some(Self::BatchAckSync),
+            0x020A => Some(Self::BatchNack),
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
@@ -134,6 +140,7 @@ impl Action {
                 | Self::BatchAck
                 | Self::AckSync
                 | Self::BatchAckSync
+                | Self::BatchNack
         )
     }
 

@@ -28,11 +28,6 @@
 //!   BENCH_QUEUE_CONSUMERS  default 2
 //!   BENCH_QUEUE_FAIRNESS   default 0.25  (per-consumer min/avg ratio)
 //!
-//! ## Hygiene
-//!
-//! Before run: prunes `/tmp/arbitro-queue-*` from prior invocations.
-//! After run: drops the data dir via a `Drop` guard (panic-safe).
-//!
 //! ## Run
 //!
 //! ```bash
@@ -48,9 +43,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use arbitro_client::{BatchEntry, Client};
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
 use bytes::Bytes;
-use arbitro_proto::config::{AckPolicy, ConsumerConfig, DeliverPolicy, StreamConfig};
 use arbitro_server::{ArbitroServer, Config};
 
 const DEFAULT_MSGS: u64 = 10_000;
@@ -120,7 +114,7 @@ async fn spawn_server() -> String {
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect_with_timeout(addr, Duration::from_secs(5))
+    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
         .await
         .expect("client connects")
 }
@@ -131,8 +125,6 @@ async fn main() {
     let n_consumers = env_u64("BENCH_QUEUE_CONSUMERS", DEFAULT_CONSUMERS);
     let fairness_min_ratio = env_f64("BENCH_QUEUE_FAIRNESS", 0.25);
 
-    // Hygiene — even though we use a memory journal, if tolerant variants
-    // get added later, keep the cleanup pattern.
     prune_stale_tmp();
     let data_dir = make_data_dir();
     let _cleanup_guard = DataDirCleanup(data_dir.clone());
@@ -151,34 +143,41 @@ async fn main() {
 
     // ── Manager: create stream and N consumers sharing the same group ──
     let manager = connect(&addr).await;
-    manager
-        .create_stream(&StreamConfig::new(STREAM, b">").build())
+    let resp = manager
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
         .await
         .expect("create stream");
+    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     println!("  Manager: created stream \"{}\"", String::from_utf8_lossy(STREAM));
 
-    // Create each consumer with a UNIQUE name + SHARED group — this is
-    // exactly the queue-semantics setup (different identities, same queue).
+    // Create each consumer with a UNIQUE name + SHARED group.
+    // AckPolicy::Explicit=1, DeliverPolicy::All=0, DeliverMode::Push=0
+    // Queue semantics: shared group with same group bytes.
+    let mut consumer_ids: Vec<u32> = Vec::with_capacity(n_consumers as usize);
     for i in 0..n_consumers {
         let name = format!("worker-{i}");
-        let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
-            .group(GROUP)
-            .ack_policy(AckPolicy::Explicit)
-            .max_inflight(u16::MAX)
-            .deliver_policy(DeliverPolicy::All)
-            .build()
-            .unwrap();
-        manager.create_consumer(&cfg).await.expect("create consumer");
+        let resp = manager
+            .create_consumer(
+                stream_id,
+                name.as_bytes(),
+                GROUP,
+                b"",
+                u16::MAX,
+                1, // ack_policy = Explicit
+                0, // deliver_policy = All
+                0, // deliver_mode = Push/Fanout (queue semantics via shared group)
+                30_000,
+                0,
+            )
+            .await
+            .expect("create consumer");
+        let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+        consumer_ids.push(consumer_id);
     }
     println!("  Manager: created {n_consumers} consumers in group \"{}\"", String::from_utf8_lossy(GROUP));
 
     // ── Spawn one subscriber task per consumer ─────────────────────────
-    //
-    // Each task has its own TCP connection and receives only the messages
-    // the broker routed to its consumer_id. Tasks push each received seq
-    // into a shared `HashSet` (for no-duplicate verification) and bump a
-    // per-consumer counter (for fairness reporting).
     let seen_seqs: Arc<std::sync::Mutex<HashSet<u64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::with_capacity(msgs as usize)));
     let per_consumer: Vec<Arc<AtomicU64>> =
@@ -186,26 +185,17 @@ async fn main() {
 
     let mut worker_handles = Vec::new();
     for i in 0..n_consumers {
-        let name = format!("worker-{i}");
+        let consumer_id = consumer_ids[i as usize];
         let addr = addr.clone();
         let counter = Arc::clone(&per_consumer[i as usize]);
         let seen_seqs = Arc::clone(&seen_seqs);
 
         worker_handles.push(tokio::spawn(async move {
             let client = connect(&addr).await;
-            // The consumer already exists — subscribe using its name+stream.
-            let cfg = ConsumerConfig::new(name.as_bytes(), STREAM)
-                .group(GROUP)
-                .ack_policy(AckPolicy::Explicit)
-                .max_inflight(u16::MAX)
-                .deliver_policy(DeliverPolicy::All)
-                .build()
-                .unwrap();
-            let consumer = client.create_consumer(&cfg).await.unwrap();
-            let mut sub = consumer.subscribe(None).await.unwrap();
+            let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
             loop {
-                match tokio::time::timeout(Duration::from_millis(500), sub.next()).await {
+                match tokio::time::timeout(Duration::from_millis(500), sub.recv()).await {
                     Ok(Some(msg)) => {
                         let seq = msg.seq;
                         msg.ack();
@@ -230,7 +220,7 @@ async fn main() {
     let entries: Vec<BatchEntry<'_>> = (0..msgs)
         .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
-    manager.publish_batch(STREAM, &entries).await.expect("publish_batch");
+    manager.publish_batch_sync(stream_id, &entries).await.expect("publish_batch_sync");
     let pub_elapsed = pub_start.elapsed();
     println!(
         "  published {msgs} msgs in {:.2?} ({:.0} msg/s)",
@@ -239,9 +229,6 @@ async fn main() {
     );
 
     // ── Drain phase ────────────────────────────────────────────────────
-    //
-    // Wait for the subscribers to receive everything, with a stall cutoff
-    // (3 s of no forward progress across all workers).
     let drain_start = Instant::now();
     let stall_budget = Duration::from_secs(3);
     let overall_deadline = drain_start + Duration::from_secs(30);
@@ -267,7 +254,6 @@ async fn main() {
     }
     let drain_elapsed = drain_start.elapsed();
 
-    // Give the subscribers a moment to note they're done, then drop.
     drop(worker_handles);
 
     // ── Report ─────────────────────────────────────────────────────────
@@ -322,7 +308,6 @@ async fn main() {
             "  FAIRNESS FAIL: min/avg = {min_over_avg:.3} < {fairness_min_ratio} — distribution too skewed"
         );
         println!("  (queue grouping is correct, but one consumer is starving)");
-        // Fail the bench so CI catches it.
         std::process::exit(1);
     }
 

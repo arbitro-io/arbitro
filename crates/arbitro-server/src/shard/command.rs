@@ -46,6 +46,10 @@ pub enum ShardCommand {
     PauseConsumer(PauseConsumerCmd),
     ResumeConsumer(ResumeConsumerCmd),
 
+    // Stream content management
+    PurgeStream(PurgeStreamCmd),
+    DrainSubject(DrainSubjectCmd),
+
     // Query
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),
@@ -100,6 +104,8 @@ pub struct AckReply {
 pub struct NackCmd {
     pub consumer_id: ConsumerId,
     pub entries: Vec<AckEntry>,
+    /// Delay in ms before redelivery. 0 = immediate cursor rewind.
+    pub delay_ms: u32,
     pub reply: oneshot::Sender<NackReply>,
 }
 
@@ -117,6 +123,10 @@ pub struct SubscribeCmd {
     pub consumer_config: ConsumerConfig,
     pub subscription_config: SubscriptionConfig,
     pub connection_id: ConnectionId,
+    /// Deliver policy — determines cursor positioning for this consumer.
+    pub deliver_policy: u8,
+    /// Start sequence for `DeliverPolicy::ByStartSeq`.
+    pub start_seq: u64,
     pub reply: oneshot::Sender<bool>,
 }
 
@@ -129,7 +139,13 @@ pub struct UnsubscribeCmd {
 // ── Stream management ───────────────────────────────────────────────────────
 
 pub struct CreateStreamCmd {
-    pub config: StreamConfig,
+    pub config:     StreamConfig,
+    /// Maximum number of messages to retain per stream (0 = unlimited).
+    pub max_msgs:   u64,
+    /// Maximum total bytes to retain per stream (0 = unlimited).
+    pub max_bytes:  u64,
+    /// Age-based eviction threshold in milliseconds (0 = disabled).
+    pub max_age_ms: u64,
     pub reply: oneshot::Sender<bool>,
 }
 
@@ -203,6 +219,22 @@ pub struct BindCmd {
     pub connection_id: ConnectionId,
     pub subscription_id: SubscriptionId,
     pub reply: oneshot::Sender<()>,
+}
+
+// ── Stream content management ────────────────────────────────────────────────
+
+/// Purge all messages from a stream's store. Stream entity survives.
+/// Returns the number of messages deleted.
+pub struct PurgeStreamCmd {
+    pub stream_id: StreamId,
+    pub reply: oneshot::Sender<u64>,
+}
+
+/// Delete all messages whose subject matches a pattern. Returns the count.
+pub struct DrainSubjectCmd {
+    pub stream_id: StreamId,
+    pub subject: Vec<u8>,
+    pub reply: oneshot::Sender<u64>,
 }
 
 // ── Admin ───────────────────────────────────────────────────────────────────

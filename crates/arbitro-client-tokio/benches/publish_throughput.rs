@@ -156,9 +156,7 @@ fn bench_publish_single(c: &mut Criterion) {
                         fanout(&fix.clients, conns, move |client, _| {
                             let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
                             async move {
-                                let _ = client
-                                    .publish(stream_id, b"bench", payload)
-                                    .await;
+                                let _ = client.publish(stream_id, b"bench", payload);
                             }
                         })
                         .await;
@@ -193,7 +191,7 @@ fn bench_publish_batch(c: &mut Criterion) {
                             let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
                                 .map(|_| BatchEntry::new(b"bench", payload.clone()))
                                 .collect();
-                            let _ = client.publish_batch(stream_id, &entries).await;
+                            let _ = client.publish_batch(stream_id, &entries);
                         })
                         .await;
                     });

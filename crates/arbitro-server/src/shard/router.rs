@@ -17,8 +17,9 @@ use tokio::sync::mpsc;
 
 use crate::common::{Gate, NameRegistry};
 use crate::config::Config;
+use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::handle::ShardHandle;
-use crate::shard::shared::{DrainSnapshot, SharedCounters, SnapshotSwap};
+use crate::shard::shared::{DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
 use crate::transport::ConnectionRegistry;
 
@@ -32,6 +33,10 @@ pub struct ShardRouter {
     stores: Arc<[SharedStore]>,
     gates: Arc<[Arc<Gate>]>,
     names: Arc<NameRegistry>,
+    /// Optional persistent command log — set when `data_dir` is configured.
+    /// Used by dispatch to record metadata mutations (create/delete stream/consumer)
+    /// so they survive server restarts.
+    command_log: Option<SharedCommandLog>,
 }
 
 impl ShardRouter {
@@ -69,8 +74,9 @@ impl ShardRouter {
 
             let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-            // Notification channel: drain → command (deliveries + dead connections).
-            let (notify_tx, notify_rx) = mpsc::channel(8192);
+            // Notification ring: drain → command (deliveries + dead connections).
+            // SPSC Ring — drain is the sole producer, command task is the sole consumer.
+            let notify_ring = Arc::new(NotifyRing::new());
 
             // ── Drain thread — pure: gate.acquire → drain_cycle ──────
             let drain_worker = DrainWorker {
@@ -86,15 +92,13 @@ impl ShardRouter {
                 },
                 drain_scratch: super::drain::DrainScratch::new(),
                 running: Arc::clone(&running),
-                notify_tx,
+                notify_ring: Arc::clone(&notify_ring),
             };
 
-            let drain_handle = std::thread::Builder::new()
+            std::thread::Builder::new()
                 .name(format!("drain-{id}"))
                 .spawn(move || drain_worker.run())
                 .expect("failed to spawn drain thread");
-
-            let drain_thread = drain_handle.thread().clone();
 
             // ── Command task — tokio::spawn, owns engine ────────────
             let cmd_worker = CommandWorker {
@@ -106,7 +110,7 @@ impl ShardRouter {
                 registry: registry.clone(),
                 names: Arc::clone(&names),
                 rx,
-                notify_rx,
+                notify_ring,
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
                 accum_streams: std::collections::HashMap::with_hasher(
@@ -116,7 +120,14 @@ impl ShardRouter {
                 accum_total: 0,
                 accum_bytes: 0,
                 drain_config_batch_size: config.drain_batch_size,
+                stream_retention: std::collections::HashMap::with_hasher(
+                    foldhash::fast::FixedState::default(),
+                ),
                 bindings: Vec::new(),
+                next_eviction: None,
+                wheel: None,
+                wheel_buf: Vec::new(),
+                next_wheel_tick: None,
             };
 
             tokio::spawn(cmd_worker.run());
@@ -127,7 +138,6 @@ impl ShardRouter {
             handles.push(ShardHandle::new(
                 id as u32,
                 tx,
-                drain_thread,
                 Arc::clone(&shared_store),
                 Arc::clone(&gate),
                 registry.clone(),
@@ -139,7 +149,20 @@ impl ShardRouter {
             stores: stores.into(),
             gates: gates.into(),
             names,
+            command_log: None,
         }
+    }
+
+    /// Wire the persistent command log. Called by `ArbitroServer::set_command_log`
+    /// before `run()`. After this, metadata mutations are recorded to the log.
+    pub fn set_command_log(&mut self, log: SharedCommandLog) {
+        self.command_log = Some(log);
+    }
+
+    /// Return a reference to the command log, if configured.
+    #[inline]
+    pub fn command_log(&self) -> Option<&SharedCommandLog> {
+        self.command_log.as_ref()
     }
 
     #[inline]

@@ -22,7 +22,6 @@ use crate::transport::ConnectionRegistry;
 pub struct ShardHandle {
     shard_id: u32,
     tx: mpsc::Sender<ShardCommand>,
-    shard_thread: std::thread::Thread,
     /// Shared store — publish writes directly, bypassing the shard worker.
     store: SharedStore,
     /// Shared gate — publish notifies drain after store append.
@@ -35,7 +34,6 @@ impl ShardHandle {
     pub fn new(
         shard_id: u32,
         tx: mpsc::Sender<ShardCommand>,
-        shard_thread: std::thread::Thread,
         store: SharedStore,
         gate: Arc<Gate>,
         registry: ConnectionRegistry,
@@ -43,7 +41,6 @@ impl ShardHandle {
         Self {
             shard_id,
             tx,
-            shard_thread,
             store,
             gate,
             registry,
@@ -90,7 +87,6 @@ impl ShardHandle {
 
         send_rep_ok_v2(&self.registry, conn_id, env_seq as u64, first_seq);
         self.gate.release();
-        self.shard_thread.unpark();
         Ok(())
     }
 
@@ -130,11 +126,13 @@ impl ShardHandle {
         &self,
         consumer_id: ConsumerId,
         entries: Vec<AckEntry>,
+        delay_ms: u32,
     ) -> Result<NackReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Nack(NackCmd {
             consumer_id,
             entries,
+            delay_ms,
             reply: tx,
         }))
         .await?;
@@ -149,6 +147,8 @@ impl ShardHandle {
         consumer_config: ConsumerConfig,
         subscription_config: SubscriptionConfig,
         connection_id: ConnectionId,
+        deliver_policy: u8,
+        start_seq: u64,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Subscribe(SubscribeCmd {
@@ -156,6 +156,8 @@ impl ShardHandle {
             consumer_config,
             subscription_config,
             connection_id,
+            deliver_policy,
+            start_seq,
             reply: tx,
         }))
         .await?;
@@ -179,11 +181,48 @@ impl ShardHandle {
 
     pub async fn create_stream(
         &self,
-        config: StreamConfig,
+        config:     StreamConfig,
+        max_msgs:   u64,
+        max_bytes:  u64,
+        max_age_ms: u64,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::CreateStream(CreateStreamCmd {
             config,
+            max_msgs,
+            max_bytes,
+            max_age_ms,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Purge all messages from a stream's store. Returns the deleted count.
+    pub async fn purge_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<u64, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::PurgeStream(PurgeStreamCmd {
+            stream_id,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Drain all messages matching `subject` from a stream's store.
+    /// Returns the deleted count.
+    pub async fn drain_subject(
+        &self,
+        stream_id: StreamId,
+        subject: Vec<u8>,
+    ) -> Result<u64, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::DrainSubject(DrainSubjectCmd {
+            stream_id,
+            subject,
             reply: tx,
         }))
         .await?;
@@ -374,7 +413,7 @@ impl ShardHandle {
 
     pub fn send_shutdown(&self) {
         let _ = self.tx.try_send(ShardCommand::Shutdown);
-        self.shard_thread.unpark();
+        self.gate.release();
     }
 }
 

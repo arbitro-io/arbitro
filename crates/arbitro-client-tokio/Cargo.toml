@@ -23,7 +23,12 @@ tokio          = { workspace = true }
 criterion      = { workspace = true }
 tempfile       = { workspace = true }
 arbitro-server = { path = "../arbitro-server" }
+arbitro-proto  = { path = "../arbitro-proto" }
 
 [[bench]]
 name    = "publish_throughput"
+harness = false
+
+[[bench]]
+name    = "client_publish"
 harness = false

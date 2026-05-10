@@ -115,6 +115,35 @@ impl CommandWorker {
                         seq_offset += caller.entry_count as u64;
                     }
                     self.gate.release();
+
+                    // Enforce max_msgs / max_bytes capacity limits (FIFO eviction).
+                    // Checked after append so callers always get a sequence number.
+                    if let Some(ret) = self.stream_retention.get(&stream_id) {
+                        let need_check = (ret.max_msgs > 0) || (ret.max_bytes > 0);
+                        if need_check {
+                            let mut store = self.store.lock().unwrap();
+                            let info = store.info();
+                            let excess_msgs = if ret.max_msgs > 0 {
+                                info.messages.saturating_sub(ret.max_msgs)
+                            } else {
+                                0
+                            };
+                            let excess_bytes = if ret.max_bytes > 0 && info.bytes > ret.max_bytes {
+                                // Estimate how many leading messages to drop to bring bytes under limit.
+                                // Simple heuristic: drop proportionally using average message size.
+                                let avg = if info.messages > 0 { info.bytes / info.messages } else { 1 };
+                                let over = info.bytes - ret.max_bytes;
+                                (over + avg - 1) / avg  // ceiling division
+                            } else {
+                                0
+                            };
+                            let excess = excess_msgs.max(excess_bytes);
+                            if excess > 0 {
+                                let new_first_seq = info.first_seq + excess;
+                                store.truncate_front(new_first_seq);
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     for caller in &callers {
@@ -204,40 +233,81 @@ impl CommandWorker {
         // Process pending drain notifications first.
         self.drain_notifications();
 
-        let delta = self.engine.execute(&Command::Nack {
-            consumer_id: cmd.consumer_id,
-            entries: &cmd.entries,
-        });
+        if cmd.delay_ms > 0 {
+            // ── Delayed nack: insert into timing wheel, don't rewind yet ──
+            // Engine Nack releases inflight + removes from pending NOW.
+            // The wheel tick will rewind cursor later for redelivery.
+            let delta = self.engine.execute(&Command::Nack {
+                consumer_id: cmd.consumer_id,
+                entries: &cmd.entries,
+            });
 
-        let requeued = cmd.entries.len() as u32;
+            let requeued = cmd.entries.len() as u32;
 
-        // Decrement atomic inflight counters (nack releases inflight too).
-        if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
-            let queue_id = consumer.queue_id;
-            for _ in 0..requeued {
-                self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+            // Decrement atomic inflight counters.
+            if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
+                let queue_id = consumer.queue_id;
+                for _ in 0..requeued {
+                    self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+                }
             }
-        }
-        // Subject inflight decremented by apply_delta_and_sync below.
 
-        self.apply_delta_and_sync(&delta);
+            self.apply_delta_and_sync(&delta);
 
-        if requeued > 0 {
-            // Rewind cursor to re-scan nacked entries.
-            // Set cursor directly (nack wants immediate re-scan, not signal).
-            let min_seq = cmd.entries.iter().map(|e| e.seq).min().unwrap_or(0);
-            if min_seq > 0 {
-                let cur = self.counters.cursor();
-                self.counters.set_cursor(cur.min(min_seq - 1));
+            // Insert into wheel — delay_ms converted to ticks (1 tick = 1s).
+            let delay_ticks = ((cmd.delay_ms as u64 + 999) / 1000) as u32; // ceil(ms / 1000)
+            self.ensure_wheel();
+            let wheel = self.wheel.as_mut().unwrap();
+            for entry in &cmd.entries {
+                wheel.insert(
+                    arbitro_common::WheelEntry {
+                        seq: entry.seq,
+                        consumer_id: cmd.consumer_id.0,
+                        subject_hash: 0, // not needed for nack-delay rewind
+                    },
+                    delay_ticks,
+                );
             }
-            self.counters.clear_rewind();
-            self.gate.release();
-        }
 
-        let _ = cmd.reply.send(NackReply {
-            requeued,
-            not_found: 0,
-        });
+            let _ = cmd.reply.send(NackReply {
+                requeued,
+                not_found: 0,
+            });
+        } else {
+            // ── Immediate nack: existing behavior ─────────────────────────
+            let delta = self.engine.execute(&Command::Nack {
+                consumer_id: cmd.consumer_id,
+                entries: &cmd.entries,
+            });
+
+            let requeued = cmd.entries.len() as u32;
+
+            // Decrement atomic inflight counters (nack releases inflight too).
+            if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
+                let queue_id = consumer.queue_id;
+                for _ in 0..requeued {
+                    self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+                }
+            }
+
+            self.apply_delta_and_sync(&delta);
+
+            if requeued > 0 {
+                // Rewind cursor to re-scan nacked entries.
+                let min_seq = cmd.entries.iter().map(|e| e.seq).min().unwrap_or(0);
+                if min_seq > 0 {
+                    let cur = self.counters.cursor();
+                    self.counters.set_cursor(cur.min(min_seq - 1));
+                }
+                self.counters.clear_rewind();
+                self.gate.release();
+            }
+
+            let _ = cmd.reply.send(NackReply {
+                requeued,
+                not_found: 0,
+            });
+        }
     }
 
     // ── Admin — subscribe / unsubscribe ─────────────────────────────────
@@ -280,12 +350,13 @@ impl CommandWorker {
                 let fire_and_forget = consumer
                     .map(|c| c.ack_policy == AckPolicy::None)
                     .unwrap_or(false);
+                let ack_wait_ms = consumer
+                    .map(|c| c.ack_wait_ms)
+                    .unwrap_or(0);
 
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
-                if let Some((writer, write_lock)) =
-                    self.registry.get_writer_locked(connection_id.0)
-                {
+                if let Some(write_tx) = self.registry.get_write_tx(connection_id.0) {
                     self.bindings.push(ActiveBinding {
                         binding_id,
                         connection_id,
@@ -294,9 +365,8 @@ impl CommandWorker {
                         queue_id,
                         max_inflight,
                         fire_and_forget,
-                        writer,
-                        write_lock,
-                        runtime: self.registry.runtime_handle(),
+                        ack_wait_ms,
+                        write_tx,
                     });
                 }
 
@@ -312,9 +382,34 @@ impl CommandWorker {
                 self.bindings.retain(|b| b.binding_id != bid);
             }
 
-            // Rewind cursor BEFORE snapshot swap — drain must see cursor=0.
-            self.counters.set_cursor(0);
-            self.counters.clear_rewind();
+            // Rewind cursor based on deliver_policy:
+            // 0 = All: rewind to 0 (replay entire store)
+            // 1 = New: no rewind (only future messages)
+            // 2 = ByStartSeq: rewind to start_seq - 1
+            match cmd.deliver_policy {
+                0 => {
+                    // DeliverPolicy::All — replay from beginning.
+                    self.counters.set_cursor(0);
+                    self.counters.clear_rewind();
+                }
+                1 => {
+                    // DeliverPolicy::New — cursor stays at current position.
+                    // New consumer only sees messages published after subscribe.
+                }
+                2 => {
+                    // DeliverPolicy::ByStartSeq — rewind to start_seq.
+                    let target = cmd.start_seq.saturating_sub(1);
+                    let current = self.counters.cursor();
+                    if target < current {
+                        self.counters.signal_rewind(target);
+                    }
+                }
+                _ => {
+                    // Unknown — default to All for safety.
+                    self.counters.set_cursor(0);
+                    self.counters.clear_rewind();
+                }
+            }
 
             // Rebuild snapshot BEFORE gate release — drain must see new binding.
             self.rebuild_and_swap_snapshot();
@@ -356,8 +451,17 @@ impl CommandWorker {
         &mut self,
         cmd: CreateStreamCmd,
     ) {
+        let stream_id = cmd.config.id;
         let ok = self.engine.create_stream(cmd.config).is_ok();
         if ok {
+            // Persist per-stream retention config (even if all zeros).
+            // Zero-valued limits are no-ops; storing them is harmless and
+            // avoids a branch at set time.
+            self.stream_retention.insert(stream_id, crate::shard::worker::StreamRetention {
+                max_msgs:   cmd.max_msgs,
+                max_bytes:  cmd.max_bytes,
+                max_age_ms: cmd.max_age_ms,
+            });
             self.rebuild_and_swap_snapshot();
         }
         let _ = cmd.reply.send(ok);
@@ -379,6 +483,7 @@ impl CommandWorker {
 
         let events = self.engine.delete_stream(cmd.stream_id);
         self.apply_delta_and_sync(&events);
+        self.stream_retention.remove(&cmd.stream_id);
         self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(true);
     }
@@ -478,10 +583,11 @@ impl CommandWorker {
             let fire_and_forget = consumer
                 .map(|c| c.ack_policy == AckPolicy::None)
                 .unwrap_or(false);
+            let ack_wait_ms = consumer
+                .map(|c| c.ack_wait_ms)
+                .unwrap_or(0);
 
-            if let Some((writer, write_lock)) =
-                self.registry.get_writer_locked(cmd.connection_id.0)
-            {
+            if let Some(write_tx) = self.registry.get_write_tx(cmd.connection_id.0) {
                 self.bindings.push(ActiveBinding {
                     binding_id,
                     connection_id: cmd.connection_id,
@@ -490,9 +596,8 @@ impl CommandWorker {
                     queue_id,
                     max_inflight,
                     fire_and_forget,
-                    writer,
-                    write_lock,
-                    runtime: self.registry.runtime_handle(),
+                    ack_wait_ms,
+                    write_tx,
                 });
             }
 
@@ -556,6 +661,125 @@ impl CommandWorker {
             messages: info.messages,
             bytes: info.bytes,
         });
+    }
+
+    // ── Stream content management ───────────────────────────────────────
+
+    pub(in crate::shard) fn handle_purge_stream(
+        &mut self,
+        cmd: PurgeStreamCmd,
+    ) {
+        let deleted = self.store.lock().unwrap().purge();
+        // After a full purge the store's first_seq equals next_seq — no
+        // entries exist. The drain cursor may be behind next_seq; leave it
+        // where it is. New publishes will fire the gate and the drain will
+        // see them at their fresh sequences.
+        let _ = cmd.reply.send(deleted);
+    }
+
+    pub(in crate::shard) fn handle_drain_subject(
+        &mut self,
+        cmd: DrainSubjectCmd,
+    ) {
+        let deleted = self.store.lock().unwrap().drain(&cmd.subject);
+        let _ = cmd.reply.send(deleted);
+    }
+
+    // ── Background eviction — max_age ───────────────────────────────────
+
+    /// Evict entries older than `max_age_ms` from streams that have
+    /// age-based retention configured. Called periodically from the
+    /// command worker loop (cold path — every 5 seconds).
+    ///
+    /// Strategy: single pass over the store from first_seq forward.
+    /// For each stream with max_age, track whether we've seen the first
+    /// valid (non-expired) entry. The global truncation point is the
+    /// minimum first-valid seq across all streams — we cannot evict
+    /// past any stream's oldest valid entry. Streams without max_age
+    /// implicitly constrain the truncation point to their oldest entry.
+    pub(in crate::shard) fn evict_expired(&mut self) {
+        // Quick check: any stream with max_age configured?
+        let has_age_streams = self.stream_retention.values().any(|r| r.max_age_ms > 0);
+        if !has_age_streams {
+            return;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut store = self.store.lock().unwrap();
+        let info = store.info();
+
+        if info.messages == 0 {
+            return;
+        }
+
+        // Build per-stream cutoff timestamps. Indexed by stream_id.raw().
+        // 0 means "no age limit" (keep everything for that stream).
+        let max_stream_idx = self
+            .stream_retention
+            .keys()
+            .map(|s| s.raw() as usize)
+            .max()
+            .unwrap_or(0);
+        let mut cutoff_ts = vec![0u64; max_stream_idx + 1];
+        for (sid, r) in &self.stream_retention {
+            if r.max_age_ms > 0 {
+                cutoff_ts[sid.raw() as usize] = now_ms.saturating_sub(r.max_age_ms);
+            }
+        }
+
+        // Single pass: find the minimum first-valid seq across all streams.
+        // For streams with max_age: first entry with timestamp >= cutoff.
+        // For streams without max_age (cutoff_ts == 0): their first entry
+        // is always valid and constrains truncation.
+        let mut min_valid_seq: u64 = 0;
+        // Track which streams we've already resolved (found first valid entry).
+        let mut resolved = vec![false; max_stream_idx + 1];
+
+        let _ = store.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+            let sid = entry.stream_id as usize;
+            if sid >= resolved.len() {
+                // Unknown stream — conservative: constrain to this seq.
+                if min_valid_seq == 0 || entry.seq < min_valid_seq {
+                    min_valid_seq = entry.seq;
+                }
+                return;
+            }
+            if resolved[sid] {
+                return; // Already found first valid for this stream.
+            }
+
+            let stream_cutoff = cutoff_ts[sid];
+            if stream_cutoff == 0 {
+                // No age limit — this stream's first entry constrains truncation.
+                resolved[sid] = true;
+                if min_valid_seq == 0 || entry.seq < min_valid_seq {
+                    min_valid_seq = entry.seq;
+                }
+            } else if entry.timestamp >= stream_cutoff {
+                // First non-expired entry for this stream.
+                resolved[sid] = true;
+                if min_valid_seq == 0 || entry.seq < min_valid_seq {
+                    min_valid_seq = entry.seq;
+                }
+            }
+            // else: entry is expired for this stream, keep scanning.
+        });
+
+        // Truncate if we found a valid boundary past current first_seq.
+        if min_valid_seq > info.first_seq {
+            let deleted = store.truncate_front(min_valid_seq);
+            if deleted > 0 {
+                tracing::debug!(
+                    deleted,
+                    new_first_seq = min_valid_seq,
+                    "evict_expired: truncated aged entries"
+                );
+            }
+        }
     }
 
     // ── Admin — pause / resume ──────────────────────────────────────────

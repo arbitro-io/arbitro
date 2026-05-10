@@ -33,6 +33,8 @@ pub struct ConsumerConfig {
     pub durable: bool,
     pub ack_policy: AckPolicy,
     pub max_inflight: u32,
+    /// Ack deadline in milliseconds. 0 = no timeout (no wheel entry).
+    pub ack_wait_ms: u32,
 }
 
 /// Configuration for creating a subscription.
@@ -62,6 +64,8 @@ pub struct ConsumerInfo {
     pub paused: bool,
     pub ack_policy: AckPolicy,
     pub durable: bool,
+    /// Ack deadline in milliseconds. 0 = no timeout.
+    pub ack_wait_ms: u32,
 }
 
 /// Subscription metadata.
@@ -249,6 +253,7 @@ impl Catalog {
                 paused: false,
                 ack_policy: config.ack_policy,
                 durable: config.durable,
+                ack_wait_ms: config.ack_wait_ms,
             },
         );
         Ok(())
@@ -690,6 +695,7 @@ mod tests {
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 1000,
+            ack_wait_ms: 0,
         });
         assert!(result.is_err());
     }
@@ -711,6 +717,7 @@ mod tests {
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 10_000,
+            ack_wait_ms: 0,
         })
         .unwrap();
 
@@ -742,6 +749,7 @@ mod tests {
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 100,
+            ack_wait_ms: 0,
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
@@ -775,6 +783,7 @@ mod tests {
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 100,
+            ack_wait_ms: 0,
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
@@ -813,6 +822,7 @@ mod tests {
             durable: true,
             ack_policy: AckPolicy::Explicit,
             max_inflight: 100,
+            ack_wait_ms: 0,
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {

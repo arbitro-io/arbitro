@@ -9,6 +9,10 @@ use arbitro_engine_v2::common::subject_matches;
 pub mod flags {
     /// Entry has been tombstoned (logically deleted, kept for drain-time skip).
     pub const TOMBSTONE: u8 = 0b0000_0001;
+    /// Payload is prefixed with `[reply_len:u16 LE][reply_to bytes]`.
+    /// Used by request/reply (PubWithReply). Drain extracts the prefix
+    /// and passes `reply_to` through the delivery wire frame.
+    pub const HAS_REPLY_TO: u8 = 0b0000_1000;
 }
 
 /// A single stored message view.

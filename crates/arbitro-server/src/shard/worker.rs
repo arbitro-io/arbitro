@@ -23,14 +23,28 @@ use std::time::{Duration, Instant};
 
 use arbitro_engine_v2::types::*;
 use arbitro_engine_v2::ArbitroEngine;
-use bytes::Bytes;
+
 use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::router::SharedStore;
-use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap};
+use crate::shard::shared::{DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
+
+// ── Per-stream retention config ──────────────────────────────────────────────
+
+/// Retention limits stored in the command worker and propagated into
+/// `DrainSnapshot` for zero-copy access by the drain thread.
+#[derive(Clone, Copy, Default)]
+pub(super) struct StreamRetention {
+    /// Max messages per stream (0 = unlimited).
+    pub max_msgs: u64,
+    /// Max bytes per stream (0 = unlimited).
+    pub max_bytes: u64,
+    /// Age-based eviction threshold in milliseconds (0 = disabled).
+    pub max_age_ms: u64,
+}
 
 // ── Cross-handler private types ──────────────────────────────────────────────
 
@@ -48,18 +62,11 @@ pub struct ActiveBinding {
     pub(super) max_inflight: u32,
     /// `AckPolicy::None` — skip inflight tracking and capacity checks.
     pub(super) fire_and_forget: bool,
-    /// Cached shared writer half — cloned once from the registry at
-    /// subscribe time (~3 ns). The drain writes directly to the socket
-    /// via `try_write` + `writable()` for backpressure — no intermediate
-    /// channel, no writer task.
-    pub(super) writer: Arc<tokio::net::tcp::OwnedWriteHalf>,
-    /// Per-connection write lock. Serializes full frames across threads
-    /// so `try_write` loops from different shards don't interleave bytes
-    /// on the wire. See `transport::registry::write_all_blocking`.
-    pub(super) write_lock: Arc<std::sync::Mutex<()>>,
-    /// Tokio runtime handle — needed so the drain OS thread can
-    /// `block_on(writer.writable())` when the kernel buffer fills.
-    pub(super) runtime: tokio::runtime::Handle,
+    /// Ack deadline in milliseconds. 0 = no timeout (no wheel entry).
+    pub(super) ack_wait_ms: u32,
+    /// Sender to the per-connection async writer task. `try_send` is
+    /// non-blocking — no `block_in_place`, no write lock, no runtime handle.
+    pub(super) write_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }
 
 // ── Accumulator private types ────────────────────────────────────────────────
@@ -113,7 +120,8 @@ pub struct DrainWorker {
     pub(super) drain_scratch: super::drain::DrainScratch,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     /// Notifications to command thread (deliveries + dead connections).
-    pub(super) notify_tx: mpsc::Sender<DrainNotification>,
+    /// SPSC Ring — drain is the sole producer, command task is the sole consumer.
+    pub(super) notify_ring: Arc<NotifyRing>,
 }
 
 impl DrainWorker {
@@ -176,7 +184,7 @@ impl DrainWorker {
                         &self.names,
                         &self.drain_config,
                         &mut self.drain_scratch,
-                        &self.notify_tx,
+                        &self.notify_ring,
                         now_ms,
                     );
                 }
@@ -213,7 +221,8 @@ pub struct CommandWorker {
     pub(super) names: Arc<crate::common::NameRegistry>,
     pub(super) rx: mpsc::Receiver<ShardCommand>,
     /// Notifications from drain thread (deliveries + dead connections).
-    pub(super) notify_rx: mpsc::Receiver<DrainNotification>,
+    /// SPSC Ring shared with DrainWorker — command task is the sole consumer.
+    pub(super) notify_ring: Arc<NotifyRing>,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     // Accumulator
     pub(super) flusher_config: FlusherConfig,
@@ -225,17 +234,52 @@ pub struct CommandWorker {
     pub(super) accum_total: usize,
     pub(super) accum_bytes: usize,
     pub(super) drain_config_batch_size: u16,
+    /// Per-stream retention limits. Set at CreateStream, cleared at DeleteStream.
+    /// Propagated into `DrainSnapshot` during snapshot rebuild.
+    pub(super) stream_retention: HashMap<StreamId, StreamRetention, foldhash::fast::FixedState>,
     /// Local bindings list — command thread's copy. Cloned into
     /// `DrainSnapshot` on structural changes.
     pub(super) bindings: Vec<ActiveBinding>,
+    /// Next time to run max_age eviction (cold path, every 5 seconds).
+    pub(super) next_eviction: Option<Instant>,
+    /// Timing wheel for ack deadlines and nack-with-delay.
+    /// Created lazily on first consumer with ack_wait_ms > 0.
+    /// Resolution: 1 second per tick, 120 buckets = covers up to 120s.
+    pub(super) wheel: Option<arbitro_common::TimingWheel>,
+    /// Scratch buffer reused across wheel ticks to avoid allocation.
+    pub(super) wheel_buf: Vec<arbitro_common::WheelEntry>,
+    /// Next time to advance the wheel (1 tick per second).
+    pub(super) next_wheel_tick: Option<Instant>,
 }
 
 impl CommandWorker {
+    /// Eviction interval — cold path, runs every 5 seconds.
+    const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+    /// Wheel tick interval — 1 second resolution.
+    const WHEEL_TICK_INTERVAL: Duration = Duration::from_secs(1);
+    /// Number of wheel buckets (max delay in seconds).
+    const WHEEL_BUCKETS: usize = 120;
+
     /// Async command loop — runs as a `tokio::spawn` task.
     pub async fn run(mut self) {
+        // Initialize eviction timer.
+        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+
         loop {
             // Process any pending drain notifications first (non-blocking).
             self.drain_notifications();
+
+            // Check if eviction is due.
+            let eviction_sleep = self
+                .next_eviction
+                .map(|t| t.saturating_duration_since(Instant::now()))
+                .unwrap_or(Self::EVICTION_INTERVAL);
+
+            // Wheel tick sleep — only active when wheel exists.
+            let wheel_sleep = self
+                .next_wheel_tick
+                .map(|t| t.saturating_duration_since(Instant::now()))
+                .unwrap_or(Self::EVICTION_INTERVAL); // dormant if no wheel
 
             if self.accum_total > 0 {
                 let timeout = self
@@ -254,13 +298,19 @@ impl CommandWorker {
                             None => return,
                         }
                     }
-                    notif = self.notify_rx.recv() => {
-                        if let Some(n) = notif {
-                            self.handle_notification(n);
-                        }
+                    n = self.notify_ring.recv_async_send() => {
+                        self.handle_notification(n);
                     }
                     _ = tokio::time::sleep(timeout) => {
                         self.flush_accumulator();
+                    }
+                    _ = tokio::time::sleep(eviction_sleep) => {
+                        self.evict_expired();
+                        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+                    }
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
+                        self.wheel_tick();
+                        self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }
             } else {
@@ -275,10 +325,16 @@ impl CommandWorker {
                             None => return,
                         }
                     }
-                    notif = self.notify_rx.recv() => {
-                        if let Some(n) = notif {
-                            self.handle_notification(n);
-                        }
+                    n = self.notify_ring.recv_async_send() => {
+                        self.handle_notification(n);
+                    }
+                    _ = tokio::time::sleep(eviction_sleep) => {
+                        self.evict_expired();
+                        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+                    }
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
+                        self.wheel_tick();
+                        self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }
             }
@@ -287,7 +343,7 @@ impl CommandWorker {
 
     /// Process drain notifications (non-blocking batch drain).
     pub(super) fn drain_notifications(&mut self) {
-        while let Ok(n) = self.notify_rx.try_recv() {
+        while let Some(n) = self.notify_ring.try_recv() {
             self.handle_notification(n);
         }
     }
@@ -297,6 +353,7 @@ impl CommandWorker {
         match notif {
             DrainNotification::Delivered {
                 binding_id,
+                consumer_id,
                 entries,
                 ..
             } => {
@@ -314,11 +371,153 @@ impl CommandWorker {
                     binding_id,
                     entries: &entries,
                 });
+
+                // Insert delivered entries into the ack-timeout wheel.
+                self.wheel_insert_delivered(consumer_id, &entries);
             }
             DrainNotification::ConnectionDead(conn_id) => {
                 let delta = self.engine.mark_connection_dead(conn_id);
                 self.apply_delta_and_sync(&delta);
             }
+        }
+    }
+
+    // ── Timing wheel ─────────────────────────────────────────────────────────
+
+    /// Ensure the wheel is initialized. Called lazily on first need.
+    pub(super) fn ensure_wheel(&mut self) {
+        if self.wheel.is_none() {
+            self.wheel = Some(arbitro_common::TimingWheel::new(Self::WHEEL_BUCKETS));
+            self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
+        }
+    }
+
+    /// Insert delivered entries into the wheel for ack-timeout tracking.
+    /// Only inserts if the consumer has `ack_wait_ms > 0`.
+    fn wheel_insert_delivered(
+        &mut self,
+        consumer_id: ConsumerId,
+        entries: &[arbitro_engine_v2::command::DeliveredEntry],
+    ) {
+        // Look up ack_wait_ms from the consumer info.
+        let ack_wait_ms = self
+            .engine
+            .consumer(consumer_id)
+            .map(|c| c.ack_wait_ms)
+            .unwrap_or(0);
+        if ack_wait_ms == 0 {
+            return; // no timeout configured
+        }
+
+        self.ensure_wheel();
+        let delay_ticks = (ack_wait_ms / 1000).max(1); // at least 1 tick
+
+        let wheel = self.wheel.as_mut().unwrap();
+        for entry in entries {
+            // subject_hash != 0 signals ack-timeout entry to wheel_tick.
+            // Ensure it's never 0 (extremely rare: only if FNV-1a produces 0).
+            let hash = if entry.subject_hash == 0 { 1 } else { entry.subject_hash };
+            wheel.insert(
+                arbitro_common::WheelEntry {
+                    seq: entry.seq,
+                    consumer_id: consumer_id.0,
+                    subject_hash: hash,
+                },
+                delay_ticks,
+            );
+        }
+    }
+
+    /// Advance the wheel by one tick. Process expired entries: verify
+    /// still pending → auto-nack (cursor rewind + gate release).
+    fn wheel_tick(&mut self) {
+        let wheel = match self.wheel.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        wheel.advance_into(&mut self.wheel_buf);
+        if self.wheel_buf.is_empty() {
+            return;
+        }
+
+        // Process expired entries.
+        // Two kinds of entries hit the wheel:
+        //   1. Ack-timeout: message still pending → nack + dec inflight + rewind.
+        //   2. Nack-delay: message already nacked (not pending) → just rewind cursor.
+        // For (1) "lazy cancel" means: if acked since insertion → skip entirely.
+        // For (2) entry is never pending (already nacked) → always rewind.
+        //
+        // Distinguish: subject_hash == 0 ⇒ nack-delay entry (guaranteed not
+        // pending, just needs cursor rewind). subject_hash != 0 ⇒ ack-timeout.
+        let mut min_rewind: Option<u64> = None;
+        let mut expired_count: u32 = 0;
+
+        for entry in &self.wheel_buf {
+            let consumer_id = ConsumerId(entry.consumer_id);
+            let is_nack_delay = entry.subject_hash == 0;
+
+            if is_nack_delay {
+                // Nack-delay: message was already nacked, just rewind cursor.
+                min_rewind = Some(min_rewind.map_or(entry.seq, |m: u64| m.min(entry.seq)));
+                expired_count += 1;
+                continue;
+            }
+
+            // Ack-timeout path: check if entry is still pending.
+            let still_pending = self
+                .engine
+                .ctx()
+                .catalog
+                .bindings_for_consumer(consumer_id)
+                .iter()
+                .any(|&bid| {
+                    self.engine
+                        .ctx()
+                        .catalog
+                        .binding(bid)
+                        .map(|b| b.pending.iter().any(|p| p.seq == entry.seq))
+                        .unwrap_or(false)
+                });
+
+            if !still_pending {
+                continue; // already acked — stale entry, lazy cancel
+            }
+
+            // Auto-nack: remove from pending, dec inflight, track rewind.
+            use arbitro_engine_v2::command::{AckEntry, Command};
+            let stream_id = self
+                .engine
+                .consumer(consumer_id)
+                .map(|c| c.stream_id)
+                .unwrap_or(StreamId(0));
+            let ack_entry = AckEntry {
+                stream_id,
+                seq: entry.seq,
+            };
+            let _ = self.engine.execute(&Command::Nack {
+                consumer_id,
+                entries: &[ack_entry],
+            });
+
+            // Decrement atomic inflight.
+            if let Some(consumer) = self.engine.consumer(consumer_id) {
+                self.counters
+                    .dec_inflight(consumer_id.0, consumer.queue_id.0);
+            }
+
+            // Track minimum seq for cursor rewind.
+            min_rewind = Some(min_rewind.map_or(entry.seq, |m: u64| m.min(entry.seq)));
+            expired_count += 1;
+        }
+
+        if expired_count > 0 {
+            // Rewind cursor and wake drain for redelivery.
+            if let Some(min_seq) = min_rewind {
+                let cur = self.counters.cursor();
+                self.counters.set_cursor(cur.min(min_seq.saturating_sub(1)));
+                self.counters.clear_rewind();
+            }
+            self.gate.release();
         }
     }
 
@@ -360,6 +559,8 @@ impl CommandWorker {
             ShardCommand::Unsubscribe(cmd) => self.handle_unsubscribe(cmd),
             ShardCommand::CreateStream(cmd) => self.handle_create_stream(cmd),
             ShardCommand::DeleteStream(cmd) => self.handle_delete_stream(cmd),
+            ShardCommand::PurgeStream(cmd)  => self.handle_purge_stream(cmd),
+            ShardCommand::DrainSubject(cmd) => self.handle_drain_subject(cmd),
             ShardCommand::CreateConsumer(cmd) => self.handle_create_consumer(cmd),
             ShardCommand::DeleteConsumer(cmd) => self.handle_delete_consumer(cmd),
             ShardCommand::OpenConnection(cmd) => self.handle_open_connection(cmd),
@@ -420,9 +621,8 @@ impl CommandWorker {
                 queue_id: b.queue_id,
                 max_inflight: b.max_inflight,
                 fire_and_forget: b.fire_and_forget,
-                writer: Arc::clone(&b.writer),
-                write_lock: Arc::clone(&b.write_lock),
-                runtime: b.runtime.clone(),
+                ack_wait_ms: b.ack_wait_ms,
+                write_tx: b.write_tx.clone(),
             })
             .collect();
 
@@ -441,9 +641,7 @@ impl CommandWorker {
         for b in &self.bindings {
             writers_by_conn.entry(b.connection_id.0).or_insert_with(|| {
                 crate::shard::shared::WriterIndexEntry {
-                    writer: Arc::clone(&b.writer),
-                    write_lock: Arc::clone(&b.write_lock),
-                    runtime: b.runtime.clone(),
+                    write_tx: b.write_tx.clone(),
                 }
             });
         }
@@ -466,10 +664,24 @@ impl CommandWorker {
             }
         }
 
+        // Build per-stream max_age_ms vec, indexed by StreamId.raw().
+        // Drain looks up by stream_id.raw() — O(1) array access.
+        let max_stream_idx = self.stream_retention.keys()
+            .map(|s| s.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut stream_max_age_ms = vec![0u64; max_stream_idx + 1];
+        for (sid, r) in &self.stream_retention {
+            if let Some(slot) = stream_max_age_ms.get_mut(sid.0 as usize) {
+                *slot = r.max_age_ms;
+            }
+        }
+
         self.snapshot.store(DrainSnapshot {
             bindings: snap_bindings,
             writers_by_conn,
             match_tables,
+            stream_max_age_ms,
         });
     }
 }

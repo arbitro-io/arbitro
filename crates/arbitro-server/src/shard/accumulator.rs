@@ -17,7 +17,7 @@
 //!     // drain-side validation + match resolution already decided
 //!     // these (conn, consumer) targets are valid.
 //!     for target in targets {
-//!         acc.add(target.conn, stream, target.consumer, seq, subject, subject_hash, payload);
+//!         acc.add(target.conn, stream, target.consumer, seq, subject, subject_hash, reply_to, payload);
 //!     }
 //! }
 //! acc.for_each(names, |frame| write_all_blocking(&writer, &frame.bytes));
@@ -106,16 +106,19 @@ impl Bucket {
         seq: u64,
         subject_hash: u32,
         subject: &[u8],
+        reply_to: &[u8],
         payload: &[u8],
     ) {
         let subj_len = subject.len();
-        let data_len = subj_len + payload.len();
+        let reply_len = reply_to.len();
+        let data_len = subj_len + reply_len + payload.len();
         let total = DELIVERY_ENTRY_HEADER_SIZE + data_len;
 
         let header = DeliveryEntryHeader {
             consumer_id: U32::new(consumer_id),
             seq: U64::new(seq),
             subj_len: U16::new(subj_len as u16),
+            reply_len: U16::new(reply_len as u16),
             data_len: U32::new(data_len as u32),
             subject_hash: U32::new(subject_hash),
         };
@@ -131,6 +134,7 @@ impl Bucket {
         self.body.reserve(total);
         self.body.extend_from_slice(header.as_bytes());
         self.body.extend_from_slice(subject);
+        self.body.extend_from_slice(reply_to);
         self.body.extend_from_slice(payload);
 
         self.count = self.count.saturating_add(1);
@@ -211,10 +215,11 @@ impl Accumulator {
         seq: u64,
         subject: &[u8],
         subject_hash: u32,
+        reply_to: &[u8],
         payload: &[u8],
     ) {
         let idx = self.acquire_bucket(conn, stream, seq, /* is_fanout */ false);
-        self.buckets[idx].push_entry_bytes(consumer.0, seq, subject_hash, subject, payload);
+        self.buckets[idx].push_entry_bytes(consumer.0, seq, subject_hash, subject, reply_to, payload);
     }
 
     /// Append a broadcast entry. Routes to the `FanoutBatch` bucket for
@@ -234,10 +239,11 @@ impl Accumulator {
         seq: u64,
         subject: &[u8],
         subject_hash: u32,
+        reply_to: &[u8],
         payload: &[u8],
     ) {
         let idx = self.acquire_bucket(conn, stream, seq, /* is_fanout */ true);
-        self.buckets[idx].push_entry_bytes(0, seq, subject_hash, subject, payload);
+        self.buckets[idx].push_entry_bytes(0, seq, subject_hash, subject, reply_to, payload);
     }
 
     /// Iterate each active bucket, patch envelope + count, hand the
@@ -353,7 +359,7 @@ mod tests {
         acc.clear();
         for seq in 1..=10u64 {
             acc.add(ConnectionId(100), StreamId(1), ConsumerId(0),
-                    seq, SUBJECT, 0xDEAD, PAYLOAD);
+                    seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
         }
         assert_eq!(acc.active_count(), 1);
         assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(10));
@@ -366,7 +372,7 @@ mod tests {
         for conn in 1u64..=4 {
             for seq in 1..=5u64 {
                 acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        seq, SUBJECT, 0xDEAD, PAYLOAD);
+                        seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
             }
         }
         assert_eq!(acc.active_count(), 4);
@@ -379,8 +385,8 @@ mod tests {
     fn same_conn_different_streams_distinct_buckets() {
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(0), 1, SUBJECT, 0xDEAD, PAYLOAD);
-        acc.add(ConnectionId(100), StreamId(2), ConsumerId(0), 1, SUBJECT, 0xDEAD, PAYLOAD);
+        acc.add(ConnectionId(100), StreamId(1), ConsumerId(0), 1, SUBJECT, 0xDEAD, &[], PAYLOAD);
+        acc.add(ConnectionId(100), StreamId(2), ConsumerId(0), 1, SUBJECT, 0xDEAD, &[], PAYLOAD);
         assert_eq!(acc.active_count(), 2);
     }
 
@@ -391,7 +397,7 @@ mod tests {
             acc.clear();
             for conn in 1u64..=4 {
                 acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        1, SUBJECT, 0xDEAD, PAYLOAD);
+                        1, SUBJECT, 0xDEAD, &[], PAYLOAD);
             }
             assert_eq!(acc.active_count(), 4);
         }
@@ -406,7 +412,7 @@ mod tests {
         for conn in 1u64..=3 {
             for seq in 1..=4u64 {
                 acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        seq, SUBJECT, 0xDEAD, PAYLOAD);
+                        seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
             }
         }
 
@@ -426,7 +432,7 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         acc.add(ConnectionId(100), StreamId(1), ConsumerId(0),
-                42, SUBJECT, 0xBEEF, PAYLOAD);
+                42, SUBJECT, 0xBEEF, &[], PAYLOAD);
 
         let mut seen = false;
         acc.for_each(&names(), |frame| {
@@ -450,7 +456,7 @@ mod tests {
         acc.clear();
         acc.add(ConnectionId(100), StreamId(1),
                 ConsumerId(0),            // broadcast (consumer_id=0 in RepBatch)
-                1, SUBJECT, 0xDEAD, PAYLOAD);
+                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
         assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(1));
     }
 
@@ -466,13 +472,13 @@ mod tests {
 
         // 2 ack-mode consumers on this conn
         acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
-                1, SUBJECT, 0xDEAD, PAYLOAD);
+                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
         acc.add(ConnectionId(100), StreamId(1), ConsumerId(8),
-                1, SUBJECT, 0xDEAD, PAYLOAD);
+                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
 
         // 1 broadcast entry on the same conn (collapsed fire-and-forget)
         acc.add_fanout(ConnectionId(100), StreamId(1),
-                       1, SUBJECT, 0xDEAD, PAYLOAD);
+                       1, SUBJECT, 0xDEAD, &[], PAYLOAD);
 
         assert_eq!(acc.active_count(), 2, "RepBatch + FanoutBatch buckets");
         assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(2));
@@ -486,7 +492,7 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         for seq in 1..=10u64 {
-            acc.add_fanout(ConnectionId(100), StreamId(1), seq, SUBJECT, 0xDEAD, PAYLOAD);
+            acc.add_fanout(ConnectionId(100), StreamId(1), seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
         }
         assert_eq!(acc.active_count(), 1);
         assert_eq!(acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)), Some(10));
@@ -504,9 +510,9 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
-                1, SUBJECT, 0xDEAD, PAYLOAD);
+                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
         acc.add_fanout(ConnectionId(100), StreamId(1),
-                       2, SUBJECT, 0xBEEF, PAYLOAD);
+                       2, SUBJECT, 0xBEEF, &[], PAYLOAD);
 
         let mut actions: Vec<u16> = Vec::new();
         acc.for_each(&names(), |frame| {
@@ -533,7 +539,7 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         acc.add_fanout(ConnectionId(100), StreamId(1),
-                       42, SUBJECT, 0xBEEF, PAYLOAD);
+                       42, SUBJECT, 0xBEEF, &[], PAYLOAD);
 
         let mut saw = false;
         acc.for_each(&names(), |frame| {

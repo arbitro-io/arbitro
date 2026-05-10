@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["crates/arbitro-client-tokio", "crates/arbitro-common", "crates/arbitro-engine", "crates/arbitro-proto", "crates/arbitro-server", "crates/arbitro-store"]
-exclude  = ["crates/arbitro-client", "crates/arbitro-e2e"]
+members  = ["crates/arbitro-client-tokio", "crates/arbitro-common", "crates/arbitro-engine", "crates/arbitro-proto", "crates/arbitro-server", "crates/arbitro-store", "crates/arbitro-e2e"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,11 +10,12 @@ license = "MIT"
 [workspace.dependencies]
 arbitro-engine-v2 = { path = "crates/arbitro-engine", package = "arbitro-engine" }
 arbitro-common    = { path = "crates/arbitro-common" }
-zerocopy  = { version = "0.8", features = ["derive"] }
+arbitro-kit       = { path = "../arbitro-kit", features = ["tokio"] }
+zerocopy  = { version = "0.8", features = ["derive", "alloc"] }
 bytes     = "1"
 serde     = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tokio     = { version = "1", features = ["full"] }
 tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

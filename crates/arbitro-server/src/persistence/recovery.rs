@@ -69,7 +69,7 @@ impl ReplayApplier {
                 } => {
                     let shard = self.server.shard_for(stream_id);
                     let _ = journal_kind; // no longer needed — single store per shard
-                    match shard.create_stream(config).await {
+                    match shard.create_stream(config, 0, 0, 0).await {
                         Ok(true) => {
                             streams_recovered += 1;
                             tracing::debug!(?stream_id, "replayed CreateStream");
@@ -218,6 +218,11 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_consumer_queue(consumer_id, queue_id);
+                // Record consumer→stream binding so DeleteConsumer replay can
+                // route to the correct shard without a wire stream_id field.
+                self.server
+                    .names()
+                    .set_consumer_stream(consumer_id, stream_id);
 
                 let ack_policy = match cv.ack_policy() {
                     0 => AckPolicy::None,
@@ -242,6 +247,7 @@ impl MetadataApplier for ReplayApplier {
                         } else {
                             cv.max_inflight() as u32
                         },
+                        ack_wait_ms: cv.ack_wait_ms(),
                     },
                     max_subject_inflights,
                 });
@@ -249,15 +255,18 @@ impl MetadataApplier for ReplayApplier {
             CMD_DELETE_CONSUMER => {
                 let dv = arbitro_proto::wire::manager::DeleteConsumerView::new(view.body());
                 // DeleteConsumer doesn't carry stream_id in the wire body.
-                // The wire consumer_id is the small sequential id the server
-                // handed out at CreateConsumer time, so we forward it as-is
-                // (no NameRegistry translation needed — the id is already
-                // engine-native). stream_id is unknown at replay time;
-                // delete on the wrong shard is a no-op.
-                // TODO: encode stream_id in delete consumer wire format.
+                // Recover the correct stream by looking up the consumer→stream
+                // binding that was populated during CreateConsumer replay above.
+                // Journal is replayed in order, so the mapping is guaranteed to
+                // be present if the consumer was created in this journal.
                 let consumer_id = ConsumerId(dv.consumer_id());
+                let stream_id = self
+                    .server
+                    .names()
+                    .consumer_stream(consumer_id)
+                    .unwrap_or(StreamId(0)); // fallback: consumer already absent, no-op
                 self.commands.push(ReplayCommand::DeleteConsumer {
-                    stream_id: StreamId(dv.consumer_id()),
+                    stream_id,
                     consumer_id,
                 });
             }

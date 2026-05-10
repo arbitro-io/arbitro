@@ -52,6 +52,8 @@ Arbitro is a working broker that passes **~180 tests with `-race`** and sustains
 - Per-entry `consumer_id` in wire DeliveryBatch (enables broadcast collapse — one frame delivers to many consumers on the same TCP connection)
 - Lifecycle trace (feature-gated, zero-cost when off)
 - Connection registry with dead-connection cleanup
+- Ack timeout via per-shard timing wheel (auto-nack after `ack_wait_ms`)
+- Nack with delay (`msg.nack_delay(ms)` — delayed redelivery via same timing wheel)
 
 **Where code lives** (crate-level):
 
@@ -190,6 +192,7 @@ src/
 ├── gate.rs           # Cache-line aligned wake/lock doorbell (spin 512 → park)
 ├── name_registry.rs  # wire-id ↔ sequential-id translation, queue key mapping
 ├── id_pool.rs        # monotonic allocator
+├── wheel.rs          # Hashed timing wheel (ack-timeout + nack-delay)
 ```
 
 ### `arbitro-store`
@@ -611,13 +614,49 @@ pub enum DrainNotification {
 
 This is the only mutex-free cross-thread channel.
 
+### Timing Wheel (`arbitro-common::wheel`)
+
+A per-shard hashed timing wheel that handles both **ack-timeout** (auto-nack
+on expiry) and **nack-with-delay** (deferred redelivery). O(1) insert,
+O(expired) per tick. One wheel per shard, owned by the CommandWorker.
+
+```rust
+pub struct WheelEntry {
+    pub seq: u64,           // message sequence
+    pub consumer_id: u32,   // which consumer
+    pub subject_hash: u32,  // 0 = nack-delay, != 0 = ack-timeout
+}
+// 16 bytes, Copy
+```
+
+**Configuration**: 120 buckets, 1-second resolution per tick (max delay = 120s).
+The wheel is created lazily (`Option<TimingWheel>`) — zero overhead when no
+consumer has `ack_wait_ms > 0` and no `nack_delay` is used.
+
+**Ack-timeout flow**:
+1. Drain delivers message → command thread receives `Delivered` notification.
+2. If consumer has `ack_wait_ms > 0`, insert entry into wheel with `delay_ticks = ack_wait_ms / 1000`.
+3. On tick: if entry still in `binding.pending` → auto-nack + dec inflight + rewind cursor.
+4. If already acked (not in pending) → skip (lazy cancel, zero cost).
+
+**Nack-with-delay flow**:
+1. Client calls `msg.nack_delay(5000)`.
+2. Server receives `NackCmd { delay_ms: 5000 }`.
+3. Engine nacks immediately (releases inflight), entry inserted into wheel with `subject_hash = 0`.
+4. On tick: `subject_hash == 0` → just rewind cursor (no pending check needed). Drain re-delivers.
+
+**Lazy cancel** — the ack path never touches the wheel. When a message is acked
+normally, the wheel entry becomes stale. On the next tick the `still_pending`
+check returns false and the entry is silently discarded.
+
 ### Lifecycle
 
 1. Shard starts → spawn drain thread + command tokio task.
 2. Publish arrives → command thread appends to store, releases gate.
 3. Drain wakes → scans store → dispatches frames directly to connection writers → atomically bumps `consumer_inflight` / `subject_inflight` / cursor.
-4. Drain pushes `Delivered` notification → command thread processes → updates engine's `Binding::pending` for future ack/retire.
+4. Drain pushes `Delivered` notification → command thread processes → updates engine's `Binding::pending` for future ack/retire. If `ack_wait_ms > 0`, inserts into timing wheel.
 5. Ack arrives → command thread mutates engine → emits `DeltaEvents::subject_hashes_acked` → worker decrements atomic counters and rewinds cursor if needed.
+6. Wheel tick (every 1s) → advances wheel → processes expired entries (auto-nack or delayed rewind).
 
 ---
 
@@ -830,6 +869,8 @@ to the distinct `(consumer, subject)` pairs observed over the process's lifetime
 - **Magic byte `0xAF`** — validates the start of a persisted record in `TolerantStore`. Corruption after the last valid byte is truncated on startup.
 - **Snapshot swap** — atomic replacement of the `DrainSnapshot` pointer when structural state changes. Drain readers see either the old or the new state, never torn.
 - **`#[must_use] DeltaEvents`** — the compiler forces callers to inspect engine output (wake drain? retire bindings? release subjects?).
+- **Timing Wheel** — hashed timing wheel (120 buckets, 1s/tick). Handles ack-timeout (auto-nack) and nack-delay (deferred redelivery). One per shard, lazy-initialized.
+- **Lazy cancel** — ack path never touches the wheel. On tick, if the entry is no longer pending, it's silently discarded. Zero overhead for the happy path.
 
 ---
 
