@@ -146,32 +146,39 @@ fn local_delta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
 
 // ── Drain cycle (entry point) ───────────────────────────────────────────────
 
-/// Run one drain cycle. Reads atomics + snapshot. Zero engine, zero Mutex.
-pub(in crate::shard) fn drain_cycle(
+/// Result of Phase 1 (store read). Passed from `drain_read` to `drain_deliver`
+/// so the store lock can be released in between.
+pub(in crate::shard) struct DrainReadResult {
+    pub start: u64,
+    pub end: u64,
+    pub more_pending: bool,
+    pub lowest_skipped: Option<u64>,
+    pub last_seq: u64,
+}
+
+/// Phase 1 — read entries from the store into scratch buffers.
+///
+/// Holds the store reference only for the `for_each` walk. After this
+/// returns, the store is no longer needed and its lock can be released.
+/// Returns `None` if there is no work (caller should `gate.lock()`).
+pub(in crate::shard) fn drain_read(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
     store: &dyn Store,
-    gate: &Gate,
-    names: &Arc<crate::common::NameRegistry>,
     cfg: &DrainConfig,
     scratch: &mut DrainScratch,
-    notify_tx: &NotifyRing,
     now_ms: u64,
-) {
+) -> Option<DrainReadResult> {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
 
     if !counters.has_any_demand() {
-        gate.lock();
-        crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
-        return;
+        return None;
     }
 
     let info = store.info();
     let cursor = counters.cursor();
     if info.last_seq <= cursor {
-        gate.lock();
-        crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
-        return;
+        return None;
     }
 
     let start = cursor + 1;
@@ -194,7 +201,7 @@ pub(in crate::shard) fn drain_cycle(
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
-    // Phase 1 — walk the store, accumulate into per-connection buckets.
+    // Walk the store, accumulate into per-connection buckets.
     store
         .for_each(start, end, &mut |entry| {
             // Per-stream max_age_ms takes precedence over the global default;
@@ -217,6 +224,29 @@ pub(in crate::shard) fn drain_cycle(
         })
         .ok();
 
+    Some(DrainReadResult {
+        start,
+        end,
+        more_pending,
+        lowest_skipped,
+        last_seq: info.last_seq,
+    })
+}
+
+/// Phase 2+3 — flush accumulated frames to TCP + bookkeeping.
+///
+/// Does NOT need the store. The store lock should be released before
+/// calling this. All entry data lives in `scratch.acc` (copied during
+/// Phase 1's `for_each`).
+pub(in crate::shard) fn drain_deliver(
+    counters: &SharedCounters,
+    snap: &DrainSnapshot,
+    gate: &Gate,
+    names: &Arc<crate::common::NameRegistry>,
+    scratch: &mut DrainScratch,
+    notify_tx: &NotifyRing,
+    mut result: DrainReadResult,
+) {
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
     // Results are captured into a small Vec so Phase 3 can do ack
     // bookkeeping without borrowing scratch inside the for_each closure.
@@ -291,8 +321,8 @@ pub(in crate::shard) fn drain_cycle(
             FlushOutcome::Backpressured(first_seq) => {
                 flush_ok.insert(conn, false);
                 // Treat as skipped — cursor won't advance past these entries.
-                track_skipped(&mut lowest_skipped, first_seq);
-                more_pending = true;
+                track_skipped(&mut result.lowest_skipped, first_seq);
+                result.more_pending = true;
             }
             FlushOutcome::WriterGone => {
                 flush_ok.insert(conn, false);
@@ -316,11 +346,11 @@ pub(in crate::shard) fn drain_cycle(
     }
 
     // Cursor advances to last fully-processed entry.
-    let new_cursor = lowest_skipped.map_or(end - 1, |ls| ls.saturating_sub(1));
+    let new_cursor = result.lowest_skipped.map_or(result.end - 1, |ls| ls.saturating_sub(1));
     counters.set_cursor(new_cursor);
 
-    if end <= info.last_seq || lowest_skipped.is_some() {
-        more_pending = true;
+    if result.end <= result.last_seq || result.lowest_skipped.is_some() {
+        result.more_pending = true;
     }
 
     // Notify command thread of truly dead connections (writer gone from
@@ -330,12 +360,34 @@ pub(in crate::shard) fn drain_cycle(
         let _ = notify_tx.try_send(DrainNotification::ConnectionDead(conn_id));
     }
 
-    if more_pending {
+    if result.more_pending {
         gate.release();
         crate::lifecycle_trace!("33_drainer_exit_released", 0, 0, "shard");
     } else {
         gate.lock();
         crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
+    }
+}
+
+/// Legacy single-call API — kept for callers that don't need the split.
+/// Holds `store` for Phase 1 only; Phases 2+3 run after the borrow ends.
+pub(in crate::shard) fn drain_cycle(
+    counters: &SharedCounters,
+    snap: &DrainSnapshot,
+    store: &dyn Store,
+    gate: &Gate,
+    names: &Arc<crate::common::NameRegistry>,
+    cfg: &DrainConfig,
+    scratch: &mut DrainScratch,
+    notify_tx: &NotifyRing,
+    now_ms: u64,
+) {
+    match drain_read(counters, snap, store, cfg, scratch, now_ms) {
+        Some(result) => drain_deliver(counters, snap, gate, names, scratch, notify_tx, result),
+        None => {
+            gate.lock();
+            crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
+        }
     }
 }
 

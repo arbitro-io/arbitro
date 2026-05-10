@@ -174,19 +174,35 @@ impl DrainWorker {
                     }
                 }
 
-                {
+                // Split drain into two phases so the store lock is held
+                // ONLY during the for_each walk (Phase 1). TCP delivery
+                // and bookkeeping (Phase 2+3) run lock-free.
+                let read_result = {
                     let store_guard = self.store.lock().unwrap();
-                    super::drain::drain_cycle(
+                    super::drain::drain_read(
                         &self.counters,
                         &snap,
                         &**store_guard,
-                        &self.gate,
-                        &self.names,
                         &self.drain_config,
                         &mut self.drain_scratch,
-                        &self.notify_ring,
                         now_ms,
-                    );
+                    )
+                };
+                // Store lock released — publish can proceed concurrently.
+                match read_result {
+                    Some(result) => super::drain::drain_deliver(
+                        &self.counters,
+                        &snap,
+                        &self.gate,
+                        &self.names,
+                        &mut self.drain_scratch,
+                        &self.notify_ring,
+                        result,
+                    ),
+                    None => {
+                        self.gate.lock();
+                        crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
+                    }
                 }
 
                 let stalled = self.counters.cursor() == prev_cursor;
