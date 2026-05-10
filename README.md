@@ -31,7 +31,7 @@ One rule isolates an unbounded number of subjects. A saturated `orders.freemium.
 - **Predictable Latency** — sub-microsecond internal dispatch, zero GC pauses.
 - **Crash-Safe Persistence** — Magic Byte (0xAF) validation survives `SIGKILL`.
 - **Reactive Model** — callback + pull subscription modes.
-- **Shard-Parallel Architecture** — lock-free drain + command threads per shard.
+- **Shard-Parallel Architecture** — split-phase drain (store read + lock-free delivery) + command threads per shard. Publish never blocks on drain.
 - **Ack Timeout & Nack Delay** — per-consumer timing wheel auto-nacks stale deliveries and supports delayed requeue.
 
 ## Performance (E2E Throughput)
@@ -72,10 +72,10 @@ arbitro-e2e      # integration tests + benchmarks
 
 Each **shard** owns one engine + one store and runs two dedicated OS threads:
 
-- **Drain thread** — linear walk of the store, atomic reads of counters, dispatch to TCP. Zero locks on engine.
+- **Drain thread** — split-phase: reads from store (brief Mutex), then delivers to TCP lock-free. Zero locks on engine.
 - **Command thread** — mutates engine via `&mut self`, updates atomics, swaps snapshots.
 
-Communication across threads is **lock-free**: atomics for counters, `arc_swap`-style snapshot pointers for structural state, and mpsc channels for drain → command notifications.
+Communication across threads is **lock-free**: atomics for counters, `arc_swap`-style snapshot pointers for structural state, and a SPSC ring for drain → command notifications. The store Mutex is held only during the linear walk (~10 µs), not during TCP delivery (~400 µs) — publish proceeds concurrently with delivery.
 
 Full architectural details, sharding strategy, and data-structure trade-offs live in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 

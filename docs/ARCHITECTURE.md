@@ -48,7 +48,7 @@ Arbitro is a working broker that passes **~180 tests with `-race`** and sustains
 - `MaxSubjectInflight` per pattern with wildcard resolution, min-wins when multiple patterns match
 - Persistence: memory store + tolerant disk store (0xAF magic byte, crash-safe)
 - Metadata command log for admin replay on restart
-- Shard-parallel architecture: drain thread + command thread per shard, zero mutex between them
+- Shard-parallel architecture: drain thread + command thread per shard, split-phase drain (store lock held only during for_each walk, TCP delivery runs lock-free)
 - Per-entry `consumer_id` in wire DeliveryBatch (enables broadcast collapse — one frame delivers to many consumers on the same TCP connection)
 - Lifecycle trace (feature-gated, zero-cost when off)
 - Connection registry with dead-connection cleanup
@@ -549,20 +549,30 @@ The worker receives `DeltaEvents` and calls `counters.dec_subject(consumer_id, h
 
 ### Gate (`arbitro-common::gate`)
 
-A cache-line aligned doorbell that wakes the drain when work arrives, and parks when idle.
+A `kit::SignalSet`-backed doorbell that wakes the drain when work arrives, and parks when idle (0% CPU).
 
 ```rust
-#[repr(align(64))]
+#[repr(transparent)]
 pub struct Gate {
-    locked: AtomicBool,
-    parked: AtomicBool,
-    worker: UnsafeCell<Option<Thread>>,
+    inner: arbitro_kit::gate::SignalSet,  // single bit (bit 0)
 }
 ```
 
-- `acquire()` — drain calls. Spin 512 × with `std::hint::spin_loop()`, then `thread::park()`. Fast path ≤ 80 ns.
-- `release()` — command calls. Stores `false` into `locked`, unparks worker if `parked == true`.
-- `lock()` — drain calls when cursor has caught up.
+- `release()` — publisher/command calls. Atomic bit-OR into the signal set + `thread::unpark`. ~5 ns.
+- `acquire()` — drain calls. Parks via `thread::park` (Linux futex). 0% CPU when idle.
+- `lock()` — drain calls when cursor has caught up. Clears the signal bit.
+- `is_open()` — non-blocking check if there is pending work (used in drain tight-loop).
+
+### Split-phase drain (store lock minimization)
+
+The drain cycle is split into two phases so the store `Mutex` is held only during the linear walk:
+
+```
+Phase 1 — drain_read():   store.lock() → for_each → unlock   (~10 µs)
+Phase 2 — drain_deliver(): TCP flush + bookkeeping             (lock-free)
+```
+
+Before this split, the store lock was held for the entire drain cycle (~400 µs including TCP delivery). Now publish can proceed concurrently with drain delivery — a ~40× reduction in contention window.
 
 ### SnapshotSwap (`arbitro-server::shard::shared`)
 
