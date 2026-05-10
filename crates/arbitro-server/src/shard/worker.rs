@@ -24,12 +24,11 @@ use std::time::{Duration, Instant};
 use arbitro_engine_v2::types::*;
 use arbitro_engine_v2::ArbitroEngine;
 
-use arbitro_kit::route::MpscConsumer;
-use arbitro_kit::waiter::NotifyWaiter;
+use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::command::*;
-use crate::shard::router::{SharedStore, SHARD_RING_CAP};
+use crate::shard::router::SharedStore;
 use crate::shard::shared::{DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
 
@@ -236,17 +235,7 @@ pub struct CommandWorker {
     pub(super) gate: Arc<Gate>,
     pub(super) registry: ConnectionRegistry,
     pub(super) names: Arc<crate::common::NameRegistry>,
-    /// Command channel receiver — `kit::Mpsc` with `NotifyWaiter`. Drains M
-    /// per-lane SPSC rings in one `recv_batch_async_send` pass.
-    pub(super) rx: MpscConsumer<ShardCommand, SHARD_RING_CAP, NotifyWaiter>,
-    /// Signalled after every drain pass so `ShardHandle.send()` callers
-    /// waiting on a full lane can retry. See `shard/handle.rs` for the
-    /// lost-wake-safe acquire pattern.
-    pub(super) backpressure: Arc<tokio::sync::Notify>,
-    /// Set to `false` on shutdown so `ShardHandle.send()` callers waiting
-    /// on backpressure can short-circuit to `Err(SendError::SHARD_DOWN)`
-    /// instead of hanging on lanes that will never drain.
-    pub(super) consumer_alive: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) rx: mpsc::Receiver<ShardCommand>,
     /// Notifications from drain thread (deliveries + dead connections).
     /// SPSC Ring shared with DrainWorker — command task is the sole consumer.
     pub(super) notify_ring: Arc<NotifyRing>,
@@ -288,19 +277,9 @@ impl CommandWorker {
     const WHEEL_BUCKETS: usize = 120;
 
     /// Async command loop — runs as a `tokio::spawn` task.
-    ///
-    /// Hot path: `self.rx.recv_batch_async_send(...)` drains all M lanes in
-    /// one pass per await, amortising the tokio runtime overhead across the
-    /// whole batch. After each drain, signals `backpressure` to wake any
-    /// `ShardHandle.send()` callers parked on a full lane.
     pub async fn run(mut self) {
         // Initialize eviction timer.
         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
-
-        // Scratch buffer reused across batches to avoid allocation. Sized
-        // for one full pass through all M lanes × RING_CAP.
-        let mut cmd_batch: Vec<ShardCommand> =
-            Vec::with_capacity(super::router::SHARD_M * SHARD_RING_CAP);
 
         loop {
             // Process any pending drain notifications first (non-blocking).
@@ -318,14 +297,6 @@ impl CommandWorker {
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Self::EVICTION_INTERVAL); // dormant if no wheel
 
-            // Build a fresh closure each iteration that pushes into the
-            // local Vec. The closure borrows `&mut cmd_batch`; after the
-            // select! arm resolves the borrow is released and we can mutate
-            // self in the match handler.
-            let collect = |c: ShardCommand| cmd_batch.push(c);
-
-            let shutdown_seen;
-
             if self.accum_total > 0 {
                 let timeout = self
                     .accum_deadline
@@ -333,81 +304,55 @@ impl CommandWorker {
                     .unwrap_or(Duration::from_millis(self.flusher_config.interval_ms));
 
                 tokio::select! {
-                    res = self.rx.recv_batch_async_send(collect) => {
-                        if res.is_err() { return; }
-                        shutdown_seen = false; // computed after drain below
+                    cmd = self.rx.recv() => {
+                        match cmd {
+                            Some(cmd) => {
+                                if self.handle_or_shutdown(cmd) {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
                     }
                     n = self.notify_ring.recv_async_send() => {
                         self.handle_notification(n);
-                        continue;
                     }
                     _ = tokio::time::sleep(timeout) => {
                         self.flush_accumulator();
-                        continue;
                     }
                     _ = tokio::time::sleep(eviction_sleep) => {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
-                        continue;
                     }
                     _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
                         self.wheel_tick();
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
-                        continue;
                     }
                 }
             } else {
                 tokio::select! {
-                    res = self.rx.recv_batch_async_send(collect) => {
-                        if res.is_err() { return; }
-                        shutdown_seen = false;
+                    cmd = self.rx.recv() => {
+                        match cmd {
+                            Some(cmd) => {
+                                if self.handle_or_shutdown(cmd) {
+                                    return;
+                                }
+                            }
+                            None => return,
+                        }
                     }
                     n = self.notify_ring.recv_async_send() => {
                         self.handle_notification(n);
-                        continue;
                     }
                     _ = tokio::time::sleep(eviction_sleep) => {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
-                        continue;
                     }
                     _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
                         self.wheel_tick();
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
-                        continue;
                     }
                 }
-            }
-            let _ = shutdown_seen;
-
-            // Drain pass complete — wake any senders parked on backpressure.
-            self.backpressure.notify_waiters();
-
-            // Process the batch we just collected. handle_or_shutdown
-            // returns `true` on ShardCommand::Shutdown; in that case we
-            // drain remaining items already in the batch then exit.
-            //
-            // IMPORTANT: drain notifications between each command. The
-            // old per-command loop interleaved cmd / notification 1:1
-            // via tokio::select!; many handlers (e.g. subscribe → bind →
-            // first delivery) rely on the drain thread's notifications
-            // being applied before the next command runs. Batching the
-            // whole queue without re-checking notifications introduces
-            // ordering bugs (lost delivery in fanout tests).
-            let mut shutdown = false;
-            for cmd in cmd_batch.drain(..) {
-                if shutdown {
-                    // Drop further commands after shutdown — they would
-                    // mutate the engine after `running` was cleared.
-                    continue;
-                }
-                self.drain_notifications();
-                if self.handle_or_shutdown(cmd) {
-                    shutdown = true;
-                }
-            }
-            if shutdown {
-                return;
             }
         }
     }
@@ -601,11 +546,6 @@ impl CommandWorker {
             }
             self.running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // Tell senders parked on backpressure that we're gone so they
-            // can fail fast instead of waiting on lanes that won't drain.
-            self.consumer_alive
-                .store(false, std::sync::atomic::Ordering::Release);
-            self.backpressure.notify_waiters();
             self.gate.release();
             return true;
         }

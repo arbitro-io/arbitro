@@ -123,7 +123,6 @@ dependencies = [
  "bytes",
  "foldhash",
  "papaya",
- "parking_lot",
  "rustls-pemfile",
  "tokio",
  "tokio-rustls",
