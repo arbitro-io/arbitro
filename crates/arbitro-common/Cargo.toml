@@ -7,16 +7,5 @@ description = "Shared primitives (gate, name registry) used across Arbitro crate
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
+arbitro-kit       = { workspace = true }
 foldhash          = "0.1"
-crossbeam-channel = { version = "0.5", optional = true }
-tokio             = { workspace = true, optional = true, features = ["sync"] }
-futures           = { version = "0.3", optional = true, default-features = false, features = ["executor"] }
-
-[features]
-# Swap the Gate impl to a crossbeam_channel::bounded(1) variant.
-# API identical; 0% CPU when idle via crossbeam's internal parking.
-gate_crossbeam = ["dep:crossbeam-channel"]
-# Swap the Gate impl to a tokio::sync::Notify variant.
-# Uses futures::executor::block_on to drive the notified() future from
-# the sync shard OS thread. Notify is runtime-agnostic (waker-only).
-gate_tokio_notify = ["dep:tokio", "dep:futures"]

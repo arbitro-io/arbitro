@@ -8,7 +8,7 @@
 //! `.agent/rules/code-anti-patterns.md`.
 //!
 //! Currently extracted:
-//! - `gate::Gate` — drain-delivery doorbell (AtomicBool + spin + park).
+//! - `gate::Gate` — drain-delivery doorbell (kit SignalSet, 0% CPU idle).
 //! - `name_registry::NameRegistry` — wire ID ↔ sequential engine ID map.
 //!
 //! Intentionally **not** extracted (still in `arbitro-server/src/common/`):
