@@ -37,6 +37,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -57,6 +58,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -78,6 +80,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --lib
@@ -97,6 +100,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Integration tests
@@ -125,6 +129,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Persistence tests
@@ -146,6 +151,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --workspace --no-run
@@ -171,6 +177,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+          token: ${{ secrets.KIT_TOKEN }}
       - uses: docker/setup-buildx-action@v3
 
       # Only login + push on direct pushes to master/main (not on PRs).
