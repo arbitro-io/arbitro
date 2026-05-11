@@ -237,6 +237,10 @@ impl ArbitroEngine {
     }
 
     /// Set max inflight per subject by pattern on a stream.
+    ///
+    /// The limit lives on the stream's match table; the actual
+    /// enforcement happens on the server's drain thread (per-consumer
+    /// `ConsumerSubjects.can`). The engine just stores the policy.
     pub fn set_max_subject_inflight(
         &mut self,
         stream_id: StreamId,
@@ -245,9 +249,7 @@ impl ArbitroEngine {
     ) -> error::EngineResult<()> {
         self.ctx
             .catalog
-            .set_max_subject_inflight(stream_id, pattern, max_inflight)?;
-        self.ctx.inflight.enable_subject_tracking();
-        Ok(())
+            .set_max_subject_inflight(stream_id, pattern, max_inflight)
     }
 
     // ── Listing (cold path) ─────────────────────────────────────────────
