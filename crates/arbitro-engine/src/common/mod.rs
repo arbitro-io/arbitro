@@ -2,11 +2,9 @@
 //!
 //! Level 0 — no internal deps.
 
-mod btrie;
 mod subject;
 mod trie;
 
-pub use btrie::{BTrie, DEFAULT_CACHE_SLOTS};
 pub use subject::{subject_matches, next_token};
 pub use trie::{SubjectTrie, TrieNode};
 

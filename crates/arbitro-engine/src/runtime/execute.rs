@@ -46,9 +46,8 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // cache pollution and realloc spikes. retire_binding is
                 // a correct no-op when pending is empty and inflight = 0.
                 if !fire_and_forget {
-                    for entry in entries.iter() {
-                        ctx.inflight
-                            .inc_pending(entry.subject_hash, consumer_raw, queue_raw);
+                    for _ in entries.iter() {
+                        ctx.inflight.inc_pending(consumer_raw, queue_raw);
                     }
                     if let Some(binding) = ctx.catalog.binding_mut(binding_id) {
                         for entry in entries.iter() {
@@ -83,11 +82,8 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
-                            ctx.inflight.dec_pending(
-                                pending.subject_hash,
-                                consumer_id.raw(),
-                                queue_raw,
-                            );
+                            ctx.inflight
+                                .dec_pending(consumer_id.raw(), queue_raw);
                         }
                     }
                 }
@@ -114,11 +110,8 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
-                            ctx.inflight.dec_pending(
-                                pending.subject_hash,
-                                consumer_id.raw(),
-                                queue_raw,
-                            );
+                            ctx.inflight
+                                .dec_pending(consumer_id.raw(), queue_raw);
                         }
                     }
                 }

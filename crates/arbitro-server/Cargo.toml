@@ -34,8 +34,8 @@ tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytes             = { workspace = true }
 zerocopy          = { workspace = true }
-papaya            = "0.2"
 foldhash          = "0.1"
+nohash-hasher     = "0.2"
 # TLS (optional)
 tokio-rustls      = { version = "0.26", optional = true }
 rustls-pemfile    = { version = "2", optional = true }

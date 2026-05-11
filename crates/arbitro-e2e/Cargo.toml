@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name    = "chaos"
 harness = false
+
+[[bench]]
+name    = "memory_growth"
+harness = false

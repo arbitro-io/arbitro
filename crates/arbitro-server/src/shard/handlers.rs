@@ -523,6 +523,18 @@ impl CommandWorker {
 
         let events = self.engine.delete_consumer(cmd.consumer_id);
         self.apply_delta_and_sync(&events);
+
+        // Tell the drain to release this consumer's per-subject state.
+        // Best-effort: if the ring is full the slot just leaks until the
+        // drain next runs an Ack for this consumer (it won't — consumer
+        // is gone) so we accept a one-slot leak in the truly-stuck case.
+        let _ = self.drain_evt_tx.try_send(
+            crate::shard::drain_events::DrainEvent::ConsumerRemoved {
+                consumer_id: cmd.consumer_id,
+            },
+        );
+        self.gate.release();
+
         self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(true);
     }

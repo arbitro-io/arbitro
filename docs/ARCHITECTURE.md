@@ -90,14 +90,15 @@ Note: a previous `arbitro-client` crate was retired in favor of
 
 Priority-ordered backlog.
 
-### ~~P0 — Subject scavenging~~ (completed)
+### ~~P0 — Subject scavenging~~ (resolved by consumer-ownership refactor)
 
-`SharedCounters::subject` is now `papaya::HashMap<(u32, u32), AtomicU32, foldhash::fast::FixedState>`
-keyed by `(consumer_id, subject_hash)`. Entries are left at zero on ack (ABA-safe)
-rather than removed; memory is bounded to the working set of distinct
-`(consumer, subject)` pairs seen. See §6 and §8 for the runtime shape, and the
-shard-side call sites in `drain.rs` (`inc_subject`, `subject_has_room`) and
-`worker.rs` (`dec_subject`).
+The whole shared-papaya design was retired in favor of drain-owned
+`ConsumerSubjects`. Single-threaded mutation means entries can be
+removed on reaching zero without ABA hazard, so working-set memory is
+bounded by what's actually in flight, not lifetime distinct pairs.
+See "Subject inflight: consumer-owned" later in this document for the
+current shape + call sites. Bench: 3-4× faster than the papaya design
+on the steady-state op mix.
 
 ### P1 — Multi-language clients
 
@@ -129,19 +130,21 @@ Options:
 
 Not a blocker for MVP because most real deployments have streams that are naturally shard-local.
 
-### P3.5 — Known unbounded-growth points (memory audit)
+### ~~P3.5 — Known unbounded-growth points (memory audit)~~ (largely resolved)
 
-These are **intentional design trade-offs** today, not bugs, but they
-become problems under high subject-cardinality workloads (e.g. when
-subjects encode per-request UUIDs). Documented here so the next session
-knows to weigh the trade-off explicitly.
+Resolved in the `refactor/consumer-owned-counters` PR:
+
+| Site | Resolution |
+|---|---|
+| `SharedCounters.subject` (papaya) | **Deleted.** Per-(consumer, subject) inflight moved to drain-owned `Vec<Option<ConsumerSubjects>>`. Entries removed at zero (no ABA — single-thread mutation). `papaya` dep removed. |
+| `MatchTable.exact` | **Confirmed bounded.** The mutating `resolve_patterns` was deleted; production uses `resolve_patterns_readonly` into caller-owned scratch (`DrainScratch.resolve_cache`) which the drain clears every cycle. `exact` is now sized by literal subscriptions only. |
+| `MatchTable.resolved_subjects` | **Deleted** alongside the mutating `resolve_patterns`. |
+| `MatchTable.max_subject_inflights` | **Confirmed bounded.** Same fix path — only literal limit patterns insert here; pattern-resolved limits live in `DrainScratch.subject_limit_cache` (cleared per cycle). |
+
+Still open (deferred to a follow-up PR):
 
 | Site | Container | Why it grows | Mitigation |
 |---|---|---|---|
-| `SharedCounters.subject` | `papaya::HashMap<(consumer_id, subject_hash), AtomicU32>` | `dec_subject` decrements to 0 but **never removes** — ABA-safe under lock-free contention | Periodic vacuum thread that walks the map under a quiesce barrier and removes 0-count entries with a double-check |
-| `MatchTable.exact` | `HashMap<subject_hash, Vec<MatchEntry>>` | `resolve_patterns` inserts on first publish of each new subject; only cleared on add/remove of a pattern | LRU/TTL aging of subjects with zero recent activity |
-| `MatchTable.resolved_subjects` | `HashMap<subject_hash, bool>` | Populated alongside `exact`; same lifecycle | Cleared together with `exact` when subject is evicted |
-| `MatchTable.max_subject_inflights` | `HashMap<subject_hash, u32>` | Populated lazily per subject_hash when a wildcard limit matches | Cleared together with `exact` when subject is evicted |
 | `engine::inflight::consumer/queue` | `Vec<u32>` indexed by raw id | `ensure_len` grows to fit highest id; never shrinks. IDs are monotonic (no recycling) → Vec grows with churn | Wire `IdPool` into `NameRegistry` so deleted IDs are recycled |
 | `NameRegistry.streams_seq_to_wire` | `Vec<u32>` | Same monotonic-id story | Same fix |
 
@@ -150,38 +153,28 @@ are `Box<[T]>` allocated once at startup with `SLOT_COUNT = 4096`. Past
 that count, indexing panics. For deployments needing more, raise
 `SLOT_COUNT` or migrate to a growable container.
 
-**`IdPool` exists but is not wired**: `crates/arbitro-common/src/id_pool.rs`
-implements a slot allocator with free-list + generation tags, designed
-exactly to make dense Vec storage safe under churn. No caller currently
-imports it. Wiring it into `NameRegistry` (and replacing the
-`next_stream`/`next_consumer`/`next_queue` monotonic counters) is the
-single change that unblocks the `Vec` migrations above.
+**`IdPool` deferred**: wiring it into `NameRegistry` (and replacing
+`next_stream`/`next_consumer`/`next_queue`) needs a wire-protocol
+design pass — the v2 wire echoes raw `consumer_id` back from the
+client, so slot reuse introduces an ABA risk the current protocol
+can't catch. Out of scope for the consumer-owned-counters refactor;
+tracked as its own work item.
 
-### P3.6 — Engine public API surface — 14 unused methods
+### ~~P3.6 — Engine public API surface — 14 unused methods~~ (resolved)
 
-The `ArbitroEngine` facade exposes 35 public methods. An audit
-(`target/engine_audit_full.py`) found that 14 have zero callers from
-`arbitro-server`, `arbitro-client-tokio`, or `arbitro-e2e`:
+The audit (`target/engine_audit_full.py`) found 14 of 35
+`ArbitroEngine` methods had zero callers outside the engine itself.
+The `refactor/consumer-owned-counters` PR deleted 11:
 
-- Inspection helpers superseded by the atomic `SharedCounters` version
-  (drain uses the lock-free counterparts, not the engine's
-  single-threaded ones): `has_any_demand`, `has_demand`,
-  `subject_has_room`, `consumer_has_capacity`,
-  `consumer_capacity_remaining`, `is_paused`, `subject_tracking_enabled`,
-  `queue_inflight`, `subject_inflight`.
-- Catalog accessor never used externally: `match_table`.
-- Redundant convenience: `execute_batch` (server loops `execute()`
-  manually), `metrics` (server uses `metrics_snapshot()`).
-- Footgun: `ctx_mut` (lets callers bypass `execute()` and break engine
-  invariants).
-- Added then unused: `total_ack_pending` (the metrics task aggregates
-  `consumer_states_snapshot()` directly).
+- `subject_has_room`, `subject_inflight`, `subject_tracking_enabled`
+- `consumer_capacity_remaining`, `queue_inflight`
+- `is_paused`, `match_table`, `total_ack_pending`
+- `execute_batch`, `metrics`, `ctx_mut`
 
-Of those, 3 (`has_any_demand`, `has_demand`, `consumer_has_capacity`)
-are exercised by the engine's own `#[cfg(test)]` block; the other 11
-have literally no callers. Candidates for deletion on the next API
-sweep (engine is pre-1.0, no external consumers besides the bundled
-server).
+The 3 that remain (`has_any_demand`, `has_demand`,
+`consumer_has_capacity`) are exercised by the engine's own
+`#[cfg(test)]` block and stay until the catalog tests can call them
+directly. Engine API: **35 → 24 public methods.**
 
 ### P5 — Stream export / migration / filtered backup
 
@@ -244,10 +237,14 @@ src/
 ├── types.rs          # StreamId, ConsumerId, QueueId, BindingId, ConnectionId
 ├── events.rs         # DeltaEvents (#[must_use])
 ├── command.rs        # Command enum (Delivered, Ack, Nack, …)
+├── common/
+│   ├── subject.rs    # subject_matches, next_token
+│   ├── trie.rs       # SubjectTrie — arena pattern trie (used by MatchTable)
 ├── catalog/
 │   ├── mod.rs        # streams, consumers, bindings + 3 secondary indices
 │   ├── match_table.rs # subject_hash → Vec<MatchEntry>, limit trie, limit values
-├── inflight/mod.rs   # InFlightCounters: dense Vec + sparse HashMap, subject tracking gate
+├── inflight/mod.rs   # InFlightCounters: dense Vec — consumer + queue only.
+│                     # Subject inflight lives in the server (drain-owned).
 ├── runtime/
 │   ├── execute.rs    # apply(Command) → DeltaEvents
 │   ├── retire.rs     # retire_binding (dec credits, remove from indices)
@@ -282,19 +279,22 @@ src/
 ```
 src/
 ├── shard/
-│   ├── worker.rs       # DrainWorker + CommandWorker
-│   ├── shared.rs       # SharedCounters (atomics), SnapshotSwap, DrainSnapshot,
-│   │                   # DrainNotification channel
-│   ├── drain.rs        # drain_cycle + DrainScratch
-│   ├── handlers.rs     # publish, subscribe, ack, …
-│   ├── accumulator.rs  # per-connection wire-frame buckets
-│   ├── router.rs       # stream → shard mapping (hash % N)
+│   ├── worker.rs            # DrainWorker + CommandWorker
+│   ├── shared.rs            # SharedCounters (atomics), SnapshotSwap, DrainSnapshot,
+│   │                        # DrainNotification ring (drain → command)
+│   ├── consumer_subjects.rs # ConsumerSubjects: per-consumer subject inflight,
+│   │                        # owned by drain (no atomics, no locks)
+│   ├── drain_events.rs      # DrainEventRing (command → drain SPSC), DrainEvent enum
+│   ├── drain.rs             # drain_cycle + DrainScratch
+│   ├── handlers.rs          # publish, subscribe, ack, …
+│   ├── accumulator.rs       # per-connection wire-frame buckets
+│   ├── router.rs            # stream → shard mapping (hash % N)
 ├── transport/
 │   ├── mod.rs, dispatch.rs, registry.rs, connection.rs
 ├── persistence/
-│   ├── command_log.rs  # WAL for metadata (Create/Delete Stream/Consumer)
-│   ├── recovery.rs     # replay at startup
-├── lifecycle_trace.rs  # opt-in profiling (feature = "lifecycle_trace")
+│   ├── command_log.rs       # WAL for metadata (Create/Delete Stream/Consumer)
+│   ├── recovery.rs          # replay at startup
+├── lifecycle_trace.rs       # opt-in profiling (feature = "lifecycle_trace")
 ```
 
 ### `arbitro-client-tokio`
@@ -390,14 +390,17 @@ pub struct Gate {
 
 
 drain thread (parallel):
-  gate.acquire() → store.for_each → match → counters.has_room / has_capacity
+  gate.acquire() → drain_evt_rx.try_recv (apply Ack/ConsumerRemoved
+                                          to ConsumerSubjects)
+                 → store.for_each → match → counters.consumer_has_capacity
+                                          + ConsumerSubjects.can(sh, max)
                                                         ↓
                                    writer.try_send(frame)  (directly to TCP)
                                                         ↓
-                                   counters.inc_inflight / inc_subject
+                                   counters.inc_inflight + ConsumerSubjects.inc(sh)
                                    notify_tx.try_send(Delivered{binding_id, entries})
                                                         ↓
-                              command thread handles notification → engine.record_delivery
+                              command thread handles notification → engine.execute(Delivered)
 ```
 
 ---
@@ -528,18 +531,24 @@ An earlier design used `Box<[AtomicU32]>` of fixed size with `hash % N` slotting
 Every hot-path allocation in the drain uses `DrainScratch` (`crates/arbitro-server/src/shard/drain.rs`):
 
 ```rust
-pub struct DrainScratch {
-    pub body: BytesMut,                  // frame buffer
-    pub matches: Vec<MatchEntry>,        // resolved recipients
-    pub served_queues: Vec<QueueId>,     // dedup set
-    pub dead_connections: Vec<Connection>,
-    pub pending: PendingBatch,
-    pub resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>>,
-    pub subject_limit_cache: HashMap<(u32, u32), Option<u32>>,
+pub(in crate::shard) struct DrainScratch {
+    matches: Vec<MatchEntry>,                                       // resolved recipients per entry
+    served_queues: Vec<QueueId>,                                    // queue dedup within an entry
+    dead_connections: Vec<ConnectionId>,                            // writers gone this cycle
+    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, foldhash>,  // pattern-resolved per (stream, subject)
+    subject_limit_cache: HashMap<(u32, u32), Option<u32>, foldhash>,// limit per (stream, subject)
+    acc: Accumulator,                                               // wire-frame buckets
+    deliveries: Vec<PendingNotify>,                                 // ack-mode notify data
+    local_inflight: Vec<(u32, u32)>,                                // per-cycle consumer reservations
+    local_subject: HashMap<(u32, u32), u32, foldhash>,              // per-cycle (consumer, subject) reservations
 }
 ```
 
-Cleared via `.clear()` each cycle, never re-allocated. Zero heap pressure at steady state.
+All fields are cleared (`clear()` / pool reset) at the start of every
+drain cycle — zero heap pressure at steady state. **Per-consumer
+subject inflight does NOT live here**: it lives on `DrainWorker`
+directly as `Vec<Option<ConsumerSubjects>>` (drain-owned, persists
+across cycles, mutated only by the drain thread).
 
 ---
 
@@ -585,38 +594,46 @@ acks).
 On `create_consumer`:
 
 1. Engine validates that `AckPolicy::Explicit` is set (limits require ack mode). Rejects otherwise.
-2. Engine enables subject tracking: `InFlightCounters::enable_subject_tracking()` flips a sticky flag that enables the `HashMap<u32, u32>` write path.
-3. For each limit:
+2. For each limit:
    - If the pattern is literal → `MatchTable::max_subject_inflights.insert(hash, limit)`.
    - If it contains `*` or `>` → `MatchTable::limit_patterns.push((pattern, limit))` and rebuild `limit_trie`.
 
-Code: `crates/arbitro-engine/src/catalog/match_table.rs`.
+Code: `crates/arbitro-engine/src/catalog/match_table.rs`. The engine
+itself no longer counts subject inflight — the drain owns those
+counters (see below). The catalog only stores the policy.
 
-### Hot-path enforcement (drain)
+### Hot-path enforcement (drain — per-consumer ownership)
+
+Per-(consumer, subject) inflight lives in the drain thread as
+`Vec<Option<ConsumerSubjects>>` indexed by `ConsumerId.raw()`. The
+drain is the sole writer; the command thread funnels ack-driven
+decrements through the SPSC `DrainEventRing` and processes them at the
+top of every cycle.
 
 ```rust
-// crates/arbitro-server/src/shard/drain.rs::process_drain_entry
-if match_table.has_subject_limits() {
-    let limit = resolve_cache.entry(cache_key).or_insert_with(|| {
-        match_table.resolve_subject_limit_readonly(subject_hash, entry.subject)
-    });
-    if let Some(max) = *limit {
-        if !counters.subject_has_room(subject_hash, max) {
-            more_pending = true;
-            track_skipped(lowest_skipped, entry.seq);
-            return;
-        }
+// crates/arbitro-server/src/shard/drain.rs::dispatch_recipients
+if let Some(max) = subject_limit {
+    let pending_subj = scratch.local_subject
+        .get(&(consumer_id.0, subject_hash))
+        .copied()
+        .unwrap_or(0);
+    let committed = consumer_subjects_slot(consumer_subjects, consumer_id.0)
+        .map_or(0, |cs| cs.get(subject_hash));
+    if pending_subj + committed >= max {
+        more_pending = true;
+        track_skipped(lowest_skipped, entry.seq);
+        continue;
     }
 }
 ```
 
 **Key properties**:
 
-1. `has_subject_limits()` is a fast gate — skip everything if the stream has no limits.
-2. `resolve_subject_limit_readonly()` walks the limit trie and returns the minimum limit matching `subject` (min-wins semantics for overlapping patterns).
-3. The per-cycle `subject_limit_cache` avoids re-walking the trie for the same hash within a cycle.
-4. `subject_has_room(consumer, hash, max)` is an atomic load against the papaya map keyed by `(consumer_id, subject_hash)`.
-5. If no room, the cursor does **not** advance beyond `lowest_skipped` — on the next cycle, the skipped entries get retried.
+1. `has_subject_limits()` on the snapshot match table is a fast gate — skip the whole block if the stream has no limits.
+2. `resolve_subject_limit_readonly()` walks the limit trie and returns the minimum limit matching `subject` (min-wins for overlapping patterns).
+3. The per-cycle `subject_limit_cache` (cleared every cycle) avoids re-walking the trie for the same hash within a cycle.
+4. The capacity check is a **plain HashMap read** on the drain's local `ConsumerSubjects` — no atomics, no cross-thread coherence traffic.
+5. If no room, the cursor does **not** advance beyond `lowest_skipped`; the skipped entries get retried next cycle.
 
 ### Release on ack / retire
 
@@ -624,12 +641,21 @@ if match_table.has_subject_limits() {
 // engine::runtime::execute.rs — Command::Ack
 for ack in entries {
     let pending = binding.pending.swap_remove(pos);
-    events.subject_hashes_acked.push(pending.subject_hash);
-    ctx.inflight.dec_pending(pending.subject_hash, consumer_raw, queue_raw);
+    events.subject_hashes_acked.push((consumer_id.raw(), pending.subject_hash));
+    ctx.inflight.dec_pending(consumer_raw, queue_raw);
 }
+
+// arbitro-server::shard::worker.rs::apply_delta_and_sync
+for &(cid, sh) in &delta.subject_hashes_acked {
+    let _ = self.drain_evt_tx.try_send(DrainEvent::Ack {
+        consumer_id: ConsumerId(cid),
+        subject_hash: sh,
+    });
+}
+self.gate.release();
 ```
 
-The worker receives `DeltaEvents` and calls `counters.dec_subject(consumer_id, hash)` for each. The engine-side HashMap entry is removed at zero (bounded working-set memory). On the drain-side papaya map, the counter is decremented to zero but the entry is intentionally **not** removed — papaya's remove is ABA-unsafe (dec 1→0, concurrent inc back to 1, remove deletes the live entry). Leaving zeroed entries is safe (`has_room` returns true) and keeps memory bounded to the distinct `(consumer, subject)` pairs ever observed.
+The command thread pushes each freed `(consumer, subject_hash)` into the SPSC ring and rings the gate. At the top of the next drain cycle, `drain_event_ring` applies each `DrainEvent::Ack` to its `ConsumerSubjects` slot via `dec()`, which removes the entry on reaching zero (bounded working-set memory, no ABA hazard because mutation is single-threaded). On consumer delete, `DrainEvent::ConsumerRemoved` clears the whole slot.
 
 ### Correctness proof sketch
 
@@ -940,16 +966,26 @@ Files under `crates/arbitro-engine/.agent/rules/`. They are **inviolable** for n
 5. **Add bench** if the feature is on the hot path. Run per `testing.md` rules.
 6. **Update this document** in §5 (sharding) and §6 (data structures) if a new shared data structure lands.
 
-### `SharedCounters::subject` papaya migration (completed)
+### Subject inflight: consumer-owned (current, replaces the papaya design)
 
-Landed. The map now lives at [`shard/shared.rs`](../crates/arbitro-server/src/shard/shared.rs) as
-`papaya::HashMap<(u32, u32), AtomicU32, foldhash::fast::FixedState>`. Call sites:
-- drain increment: `shard/drain.rs::process_drain_entry` → `counters.inc_subject(consumer_id, subject_hash)`
-- drain gate: `shard/drain.rs` → `counters.subject_has_room(consumer_id, subject_hash, max)`
-- command decrement on ack: `shard/worker.rs::handle_delta_and_sync` → `counters.dec_subject(cid, sh)`
+Landed in `refactor/consumer-owned-counters`. Per-(consumer, subject)
+inflight is **owned exclusively by the drain thread** —
+`Vec<Option<ConsumerSubjects>>` in `DrainWorker`, indexed by
+`ConsumerId.raw()`. Mutation happens single-threaded; no atomics, no
+locks. Entries are removed when their count reaches zero (working-set
+bounded, no ABA hazard).
 
-Zero entries are intentionally retained (ABA-safe). Working-set memory is bounded
-to the distinct `(consumer, subject)` pairs observed over the process's lifetime.
+- drain increment (after frame flush): `consumer_subjects_slot_mut(&mut state, cid).inc(sh)`
+- drain capacity check: `consumer_subjects_slot(&state, cid).map_or(0, |cs| cs.get(sh))` + per-cycle scratch delta vs `max`
+- command → drain ack channel: `DrainEvent::Ack { consumer_id, subject_hash }` via SPSC `DrainEventRing` (cap 2048). Processed at the top of every drain cycle.
+- gate wake on every batch of acks so the drain re-evaluates capacity even with no new publishes.
+
+The bench that motivated this design (`arbitro-server` head-to-head
+between papaya and the Vec+HashMap-per-consumer model) found a 3–4×
+throughput improvement on the steady-state subject-inflight mix
+(50/25/25 has_room/inc/dec) across small/medium/large scenarios. The
+bench file was scaffolding; it landed and was deleted together with
+the papaya implementation.
 
 ### Migrating single → multi-shard replication (P2 groundwork)
 

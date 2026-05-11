@@ -12,8 +12,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use papaya::HashMap as PapayaMap;
-
 use arbitro_engine_v2::catalog::match_table::MatchTable;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
@@ -25,12 +23,12 @@ use crate::shard::worker::ActiveBinding;
 /// Indices beyond this panic — resize if needed for huge deployments.
 const SLOT_COUNT: usize = 4096;
 
-// Subject inflight uses papaya::HashMap<(u32,u32), AtomicU32, foldhash> for
-// true lock-free concurrent access. No RwLock — drain readers never block
-// on writer inserts/removes. Measured benefits under write-churn:
-//   RwLock<HashMap>: 137 ns/read, 7.2M reads/s    (91% degradation)
-//   papaya::HashMap:  29 ns/read, 34M reads/s     (75% degradation)
-// See crates/arbitro-server/benches/subject_inflight.rs workload E.
+// Per-(consumer, subject) inflight no longer lives here. It moved to
+// `crate::shard::consumer_subjects::ConsumerSubjects`, owned exclusively
+// by the drain thread. Acks travel command → drain via the SPSC
+// `DrainEventRing` (`crate::shard::drain_events`). Single-thread
+// ownership beats the old papaya design 3-4× on the head-to-head bench
+// while also removing the per-slot AtomicU32 footprint.
 
 /// Sentinel value for "no rewind requested".
 const NO_REWIND: u64 = u64::MAX;
@@ -52,16 +50,6 @@ pub struct SharedCounters {
     total_demand: AtomicU32,
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
-    /// Subject inflight — exact per-(consumer, subject) tracking via
-    /// lock-free papaya::HashMap.
-    /// Key = (consumer_id, subject_hash). Value = AtomicU32 counter.
-    /// Keying by consumer_id is required for per-consumer isolation:
-    /// two consumers on the same stream publishing the same subject must
-    /// not share a counter (otherwise their max_subject_inflight budgets
-    /// would collide and starve one of them).
-    /// Entry removed when counter reaches 0 (bounded memory to working set).
-    /// Lock-free: drain readers never block on writer inserts/removes.
-    subject: PapayaMap<(u32, u32), AtomicU32, foldhash::fast::FixedState>,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -89,9 +77,6 @@ impl SharedCounters {
             demand: mk_u32(),
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
-            subject: PapayaMap::builder()
-                .hasher(foldhash::fast::FixedState::default())
-                .build(),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
         }
@@ -132,55 +117,6 @@ impl SharedCounters {
     #[inline]
     pub fn consumer_has_capacity(&self, consumer_id: u32, max_inflight: u32) -> bool {
         self.consumer_inflight(consumer_id) < max_inflight
-    }
-
-    // ── Subject inflight (drain: add, ack: sub) ─────────────────────
-
-    /// Increment subject inflight for a (consumer, subject) pair.
-    /// Called by drain after delivery.
-    #[inline]
-    pub fn inc_subject(&self, consumer_id: u32, subject_hash: u32) {
-        let key = (consumer_id, subject_hash);
-        let g = self.subject.pin();
-        match g.get(&key) {
-            Some(c) => {
-                c.fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                // get_or_insert_with returns the final entry (inserted or
-                // raced by another thread). Always safe to fetch_add on it.
-                let c = g.get_or_insert_with(key, || AtomicU32::new(0));
-                c.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Decrement subject inflight for a (consumer, subject) pair.
-    /// Called by command thread after ack.
-    ///
-    /// NOTE: we DO NOT remove the entry at zero. papaya's remove is
-    /// vulnerable to the ABA race: dec goes 1→0, another thread incs to 1,
-    /// our remove deletes the entry losing the increment. Leaving zero
-    /// entries in the map is safe (has_room returns true), at cost of
-    /// bounded memory growth per distinct (consumer, subject) pair seen.
-    #[inline]
-    pub fn dec_subject(&self, consumer_id: u32, subject_hash: u32) {
-        let key = (consumer_id, subject_hash);
-        let g = self.subject.pin();
-        if let Some(c) = g.get(&key) {
-            c.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Check if the (consumer, subject) pair has room for more inflight.
-    /// Missing key = 0 inflight = always has room.
-    #[inline]
-    pub fn subject_has_room(&self, consumer_id: u32, subject_hash: u32, max: u32) -> bool {
-        let g = self.subject.pin();
-        match g.get(&(consumer_id, subject_hash)) {
-            Some(c) => c.load(Ordering::Relaxed) < max,
-            None => true,
-        }
     }
 
     // ── Demand (subscribe: add, unsubscribe: sub) ────────────────────

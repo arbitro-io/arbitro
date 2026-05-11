@@ -60,7 +60,8 @@ mod tests {
     #[test]
     fn context_creation() {
         let ctx = EngineContext::new();
-        assert_eq!(ctx.inflight.get(InFlightScope::Subject, 0), 0);
+        assert_eq!(ctx.inflight.get(InFlightScope::Consumer, 0), 0);
+        assert_eq!(ctx.inflight.get(InFlightScope::Queue, 0), 0);
     }
 
     #[test]

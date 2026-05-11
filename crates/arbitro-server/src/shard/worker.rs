@@ -28,6 +28,8 @@ use tokio::sync::mpsc;
 
 use crate::common::Gate;
 use crate::shard::command::*;
+use crate::shard::consumer_subjects::ConsumerSubjects;
+use crate::shard::drain_events::{DrainEvent, DrainEventRing};
 use crate::shard::router::SharedStore;
 use crate::shard::shared::{DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
@@ -122,6 +124,15 @@ pub struct DrainWorker {
     /// Notifications to command thread (deliveries + dead connections).
     /// SPSC Ring — drain is the sole producer, command task is the sole consumer.
     pub(super) notify_ring: Arc<NotifyRing>,
+    /// Drain-event ring: command → drain (ack-driven subject inflight decs).
+    /// SPSC — drain is the sole consumer, command task is the sole producer.
+    /// Drained at the top of every drain cycle via non-blocking `try_recv`.
+    pub(super) drain_evt_rx: Arc<DrainEventRing>,
+    /// Per-consumer subject inflight, indexed by `ConsumerId.raw()`. Slot
+    /// is lazily allocated on first inc; reset to `None` on
+    /// `DrainEvent::ConsumerRemoved`. Single-thread owned by drain — no
+    /// locks, no atomics. Replaces `SharedCounters.subject` (papaya).
+    pub(super) consumer_subjects: Vec<Option<ConsumerSubjects>>,
 }
 
 impl DrainWorker {
@@ -152,6 +163,12 @@ impl DrainWorker {
 
             while self.gate.is_open() {
                 crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
+
+                // Drain the command→drain event ring before deciding any
+                // delivery. This applies acks (subject inflight decs) and
+                // consumer removals so the upcoming dispatch sees current
+                // per-consumer state.
+                drain_event_ring(&self.drain_evt_rx, &mut self.consumer_subjects);
 
                 let now_ms = if self.drain_config.max_age_ms > 0 {
                     std::time::SystemTime::now()
@@ -185,6 +202,7 @@ impl DrainWorker {
                         &**store_guard,
                         &self.drain_config,
                         &mut self.drain_scratch,
+                        &mut self.consumer_subjects,
                         now_ms,
                     )
                 };
@@ -196,6 +214,7 @@ impl DrainWorker {
                         &self.gate,
                         &self.names,
                         &mut self.drain_scratch,
+                        &mut self.consumer_subjects,
                         &self.notify_ring,
                         result,
                     ),
@@ -215,6 +234,56 @@ impl DrainWorker {
             }
         }
     }
+}
+
+/// Apply every pending [`DrainEvent`] in the ring to the per-consumer
+/// subject inflight slots. Non-blocking; returns as soon as the ring is
+/// empty. Called at the top of every drain cycle.
+#[inline]
+fn drain_event_ring(
+    rx: &DrainEventRing,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+) {
+    while let Some(evt) = rx.try_recv() {
+        match evt {
+            DrainEvent::Ack { consumer_id, subject_hash } => {
+                let idx = consumer_id.raw() as usize;
+                if let Some(Some(cs)) = consumer_subjects.get_mut(idx) {
+                    cs.dec(subject_hash);
+                }
+            }
+            DrainEvent::ConsumerRemoved { consumer_id } => {
+                let idx = consumer_id.raw() as usize;
+                if let Some(slot) = consumer_subjects.get_mut(idx) {
+                    *slot = None;
+                }
+            }
+        }
+    }
+}
+
+/// Mutable accessor for a consumer's subject inflight, creating the slot
+/// on demand. Slot index = `ConsumerId.raw() as usize`.
+#[inline]
+pub(in crate::shard) fn consumer_subjects_slot_mut<'a>(
+    consumer_subjects: &'a mut Vec<Option<ConsumerSubjects>>,
+    consumer_id: u32,
+) -> &'a mut ConsumerSubjects {
+    let idx = consumer_id as usize;
+    if idx >= consumer_subjects.len() {
+        consumer_subjects.resize_with(idx + 1, || None);
+    }
+    consumer_subjects[idx].get_or_insert_with(ConsumerSubjects::new)
+}
+
+/// Read-only accessor. Returns `None` if the consumer has no tracked
+/// subjects yet — caller treats that as "0 inflight" (always has room).
+#[inline]
+pub(in crate::shard) fn consumer_subjects_slot<'a>(
+    consumer_subjects: &'a [Option<ConsumerSubjects>],
+    consumer_id: u32,
+) -> Option<&'a ConsumerSubjects> {
+    consumer_subjects.get(consumer_id as usize).and_then(|s| s.as_ref())
 }
 
 // ── Command worker ──────────────────────────────────────────────────────────
@@ -240,6 +309,10 @@ pub struct CommandWorker {
     /// Notifications from drain thread (deliveries + dead connections).
     /// SPSC Ring shared with DrainWorker — command task is the sole consumer.
     pub(super) notify_ring: Arc<NotifyRing>,
+    /// Drain-event ring shared with DrainWorker — command task is the
+    /// sole producer, drain thread is the sole consumer. Used to push
+    /// ack-driven subject inflight decrements + consumer cleanup events.
+    pub(super) drain_evt_tx: Arc<DrainEventRing>,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     // Accumulator
     pub(super) flusher_config: FlusherConfig,
@@ -610,10 +683,20 @@ impl CommandWorker {
         if !delta.demand_became_available.is_empty() {
             self.gate.release();
         }
-        // Decrement subject inflight for acked/retired pendings.
-        // Key is (consumer_id, subject_hash) — per-consumer isolation.
-        for &(cid, sh) in &delta.subject_hashes_acked {
-            self.counters.dec_subject(cid, sh);
+        // Push subject-inflight decs to the drain via SPSC ring. Drain
+        // owns the per-(consumer, subject) counters (`ConsumerSubjects`)
+        // and applies these at the top of its next cycle. Ring overflow
+        // is silently dropped — see `drain_events.rs` overflow policy.
+        if !delta.subject_hashes_acked.is_empty() {
+            for &(cid, sh) in &delta.subject_hashes_acked {
+                let _ = self.drain_evt_tx.try_send(DrainEvent::Ack {
+                    consumer_id: ConsumerId(cid),
+                    subject_hash: sh,
+                });
+            }
+            // Wake drain so it processes the ring even if no new publishes
+            // arrive. Multiple releases coalesce via `fetch_or`.
+            self.gate.release();
         }
         // Demand atomics are already updated by subscribe/unsubscribe handlers.
         // DeltaEvents demand_became_available/idle are informational only here.

@@ -78,9 +78,20 @@ impl std::hash::Hash for MatchEntry {
 ///
 /// Built incrementally when subscriptions are added/removed.
 /// Lookup at publish time is O(1) hash + iterate matched consumers (typically 1-3).
+///
+/// **Memory bounds.** `exact` and `max_subject_inflights` are populated
+/// only by management-path calls (`add_exact`, literal-pattern
+/// `add_max_subject_inflight`), so their size is bounded by the number
+/// of literal subscriptions / limit patterns on this stream — never by
+/// publish traffic. Pattern resolution for unknown subjects happens via
+/// `resolve_patterns_readonly` into caller-owned scratch (see
+/// `crates/arbitro-server/src/shard/drain.rs:DrainScratch`), which the
+/// drain clears every cycle.
 #[derive(Clone)]
 pub struct MatchTable {
     /// Exact subject_hash → matched consumers.
+    /// Populated at subscription time (literal filters). Never grows
+    /// with publish traffic — see struct docs.
     exact: HashMap<u32, Vec<MatchEntry>, foldhash::fast::FixedState>,
 
     /// Wildcard subscriptions that match all subjects on a stream.
@@ -98,9 +109,6 @@ pub struct MatchTable {
     /// Trie index → MatchEntry mapping.
     pattern_entries: Vec<MatchEntry>,
 
-    /// Cache of subjects we've already resolved patterns for.
-    resolved_subjects: HashMap<u32, bool, foldhash::fast::FixedState>,
-
     /// Subject limit patterns: (pattern_bytes, max_inflight).
     /// Resolved to concrete hashes at publish time (same as match patterns).
     limit_patterns: Vec<(Vec<u8>, u32)>,
@@ -111,8 +119,9 @@ pub struct MatchTable {
     /// Trie index → max_inflight mapping.
     limit_values: Vec<u32>,
 
-    /// Precomputed subject_hash → max inflight.
-    /// Populated at publish time when patterns are resolved.
+    /// Literal-subject inflight limits, set via `add_max_subject_inflight`
+    /// when the pattern has no wildcards. Bounded by # literal limit
+    /// patterns; pattern-based limits resolve into caller-owned scratch.
     max_subject_inflights: HashMap<u32, u32, foldhash::fast::FixedState>,
 }
 
@@ -124,7 +133,6 @@ impl MatchTable {
             patterns: Vec::new(),
             pattern_trie: SubjectTrie::new(),
             pattern_entries: Vec::new(),
-            resolved_subjects: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             limit_patterns: Vec::new(),
             limit_trie: SubjectTrie::new(),
             limit_values: Vec::new(),
@@ -148,12 +156,11 @@ impl MatchTable {
     }
 
     /// Add a subscription with a wildcard pattern.
-    /// The pattern will be evaluated against new subjects as they appear.
+    /// The pattern will be evaluated against new subjects as they appear
+    /// via the caller-owned scratch cache in `resolve_patterns_readonly`.
     pub fn add_pattern(&mut self, pattern: Vec<u8>, entry: MatchEntry) {
         self.patterns.push((pattern, entry));
         self.rebuild_pattern_trie();
-        // Invalidate resolved cache — new pattern may match cached subjects
-        self.resolved_subjects.clear();
     }
 
     /// Remove all entries for a subscription.
@@ -170,7 +177,6 @@ impl MatchTable {
         if had_patterns {
             self.rebuild_pattern_trie();
         }
-        self.resolved_subjects.clear();
     }
 
     /// Lookup matched consumers for a subject. O(1) for cached subjects.
@@ -189,51 +195,19 @@ impl MatchTable {
         }
     }
 
-    /// Resolve patterns for a subject that hasn't been seen before.
-    /// Called on first publish to a new subject_hash.
-    ///
-    /// Uses trie for O(depth) matching instead of O(patterns) linear scan.
-    /// The result is cached in `exact` for future O(1) lookups.
-    pub fn resolve_patterns(&mut self, subject_hash: u32, subject: &[u8]) {
-        if self.resolved_subjects.contains_key(&subject_hash) {
-            return;
-        }
-
-        // O(depth) trie walk instead of O(patterns) linear scan
-        let pattern_entries = &self.pattern_entries;
-        let exact = &mut self.exact;
-        self.pattern_trie.find_matches(subject, |idx| {
-            let entry = &pattern_entries[idx as usize];
-            let entries = exact.entry(subject_hash).or_default();
-            if !entries.contains(entry) {
-                entries.push(*entry);
-            }
-        });
-
-        // Resolve subject limit patterns — pick the tightest (minimum) limit
-        let limit_values = &self.limit_values;
-        let max_subject_inflights = &mut self.max_subject_inflights;
-        self.limit_trie.find_matches(subject, |idx| {
-            let max_inflight = limit_values[idx as usize];
-            let entry = max_subject_inflights.entry(subject_hash).or_insert(u32::MAX);
-            *entry = (*entry).min(max_inflight);
-        });
-
-        self.resolved_subjects.insert(subject_hash, true);
-    }
-
     /// Resolve patterns for a subject without mutating self.
-    /// Used by the drain thread which reads a snapshot.
-    /// Results are collected into `out` — caller should cache.
+    /// Used by the drain thread which reads a snapshot; results are
+    /// collected into `out` — caller owns the cache.
+    ///
+    /// The match table itself never caches resolved subjects — that
+    /// would unbound-grow with publish traffic. Caller-owned scratch
+    /// (cleared per drain cycle) is the only cache.
     pub fn resolve_patterns_readonly(
         &self,
-        subject_hash: u32,
+        _subject_hash: u32,
         subject: &[u8],
         out: &mut Vec<MatchEntry>,
     ) {
-        if self.resolved_subjects.contains_key(&subject_hash) {
-            return;
-        }
         let pattern_entries = &self.pattern_entries;
         self.pattern_trie.find_matches(subject, |idx| {
             let entry = &pattern_entries[idx as usize];
@@ -254,8 +228,6 @@ impl MatchTable {
         if pattern.contains(&b'*') || pattern.contains(&b'>') {
             self.limit_patterns.push((pattern.to_vec(), max_inflight));
             self.rebuild_limit_trie();
-            // Invalidate resolved cache so limits get recomputed
-            self.resolved_subjects.clear();
         } else {
             // Literal — resolve immediately
             let hash = crate::catalog::wire_hash_32(pattern);
@@ -268,7 +240,6 @@ impl MatchTable {
         if pattern.contains(&b'*') || pattern.contains(&b'>') {
             self.limit_patterns.retain(|(p, _)| p != pattern);
             self.rebuild_limit_trie();
-            self.resolved_subjects.clear();
         } else {
             let hash = crate::catalog::wire_hash_32(pattern);
             self.max_subject_inflights.remove(&hash);
@@ -437,7 +408,6 @@ impl MatchTable {
         self.patterns.clear();
         self.pattern_trie.clear();
         self.pattern_entries.clear();
-        self.resolved_subjects.clear();
         self.limit_patterns.clear();
         self.limit_trie.clear();
         self.limit_values.clear();
@@ -623,23 +593,24 @@ mod tests {
     }
 
     #[test]
-    fn pattern_resolution() {
+    fn pattern_resolution_readonly() {
         let mut mt = MatchTable::new();
         mt.add_pattern(b"orders.*".to_vec(), entry(1, 10, 100));
 
-        // Before resolution, exact lookup finds nothing
+        // Exact lookup finds nothing — patterns never auto-populate `exact`.
         let r = mt.lookup(0xBEEF);
         assert!(r.exact.is_empty());
 
-        // Resolve
-        mt.resolve_patterns(0xBEEF, b"orders.created");
-        let r = mt.lookup(0xBEEF);
-        assert_eq!(r.exact.len(), 1);
+        // Resolve into caller-owned buffer (drain's scratch path).
+        let mut out = Vec::new();
+        mt.resolve_patterns_readonly(0xBEEF, b"orders.created", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].consumer_id, ConsumerId(1));
 
-        // Non-matching subject
-        mt.resolve_patterns(0xDEAD, b"users.created");
-        let r = mt.lookup(0xDEAD);
-        assert!(r.exact.is_empty());
+        // Non-matching subject.
+        out.clear();
+        mt.resolve_patterns_readonly(0xDEAD, b"users.created", &mut out);
+        assert!(out.is_empty());
     }
 
     #[test]

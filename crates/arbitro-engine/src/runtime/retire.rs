@@ -3,9 +3,11 @@
 //!
 //! Level 7 — depends on context, catalog, inflight.
 //!
-//! Walks the binding's `Vec<Pending>`, decrements all inflight counters
-//! (subject, consumer, connection/queue), removes the binding from
-//! catalog indices, emits `bindings_retired` in `DeltaEvents`.
+//! Walks the binding's `Vec<Pending>`, decrements consumer/queue
+//! inflight counters, emits each pending `(consumer, subject_hash)` so
+//! the server can release its drain-side `ConsumerSubjects` slot,
+//! removes the binding from catalog indices, emits `bindings_retired`
+//! in `DeltaEvents`.
 
 use crate::context::EngineContext;
 use crate::events::DeltaEvents;
@@ -30,8 +32,7 @@ pub fn retire_binding(
         events
             .subject_hashes_acked
             .push((consumer_raw, pending.subject_hash));
-        ctx.inflight
-            .dec_pending(pending.subject_hash, consumer_raw, queue_raw);
+        ctx.inflight.dec_pending(consumer_raw, queue_raw);
     }
 }
 

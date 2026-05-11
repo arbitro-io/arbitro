@@ -2,6 +2,14 @@
 #
 # Build stage — statically linked against musl libc so the runtime stage
 # can be `scratch`. Workspace context = arbitro-io/ (parent of arbitro/).
+#
+# Build context excludes are tracked at `arbitro/.dockerignore`. Docker
+# only reads `.dockerignore` at the context ROOT, so before `docker build`:
+#
+#   cp arbitro/.dockerignore .dockerignore
+#
+# CI runs that step automatically (.github/workflows/ci.yml). Without it,
+# the local context can grow to >4 GB by sweeping in `target/` artifacts.
 FROM rust:1.85-slim AS builder
 
 # musl toolchain for static linking. ~30 MB extra in the builder layer

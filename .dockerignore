@@ -1,4 +1,38 @@
-target/
-.git/
-*.md
-.agent/
+# Docker build-context excludes.
+#
+# Docker only reads `.dockerignore` from the BUILD CONTEXT root, and our
+# Dockerfile uses the parent directory (`arbitro-io/`) as context so it
+# can also COPY the sibling `arbitro-kit/`. This file therefore lives in
+# the repo for source-of-truth + reviewability, and gets staged at the
+# real context root before `docker build`:
+#
+#   cp arbitro/.dockerignore .dockerignore
+#   docker build -f arbitro/Dockerfile -t arbitro .
+#
+# CI runs that cp automatically (.github/workflows/ci.yml).
+
+# Cargo build artifacts — gigabytes on a dev workstation, kill context
+# transfer if not excluded. Fresh CI checkouts don't have these, but the
+# rule still applies on cached runners.
+**/target/
+
+# Git history — `arbitro-kit/.git` clone alone is several MB. The image
+# is statically linked from source; no git state is needed at build time.
+**/.git/
+
+# Docs and agent notes — not consumed by the build.
+**/*.md
+**/.agent/
+
+# Editor / OS / Node noise.
+**/node_modules/
+**/.idea/
+**/.vscode/
+**/.DS_Store
+
+# Sibling repos that may share the parent dir on a dev machine but are
+# not part of the broker build.
+arbitro-ts/
+arbitro-go-server/
+arbitro-raft/
+arbitro-baseline/
