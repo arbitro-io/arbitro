@@ -182,6 +182,7 @@ mod tests {
             ack_tx,
             nack_tx,
             last_pong_ns:   AtomicU64::new(0),
+            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
         })
     }
 

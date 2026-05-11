@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::consume::message::{AckCmd, NackCmd, Message};
 use crate::error::ClientError;
 use crate::state::Inner;
-use crate::transport::encode::{encode_batch_ack_v2, encode_batch_nack_v2, encode_nack_v2, encode_sub_v2, encode_unsub_v2};
+use crate::transport::encode::{encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2};
 use crate::transport::frame::{WriteFrame, INLINE_CAP};
 
 pub mod demux;

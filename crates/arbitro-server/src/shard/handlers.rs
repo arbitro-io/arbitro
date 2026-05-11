@@ -377,7 +377,7 @@ impl CommandWorker {
             // Apply delta (bindings_retired cleanup).
             // NOTE: gate.release() inside apply_delta_and_sync is safe because
             // we rebuild snapshot below before returning.
-            let had_demand_event = !events.demand_became_available.is_empty();
+            let _had_demand_event = !events.demand_became_available.is_empty();
             for &bid in &events.bindings_retired {
                 self.bindings.retain(|b| b.binding_id != bid);
             }

@@ -41,6 +41,7 @@ use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::{
     CreateConsumerFrame, DeleteConsumerFrame, GetConsumerFrame, ListConsumersFrame,
+    ConsumerStatsFrame,
 };
 use arbitro_proto::v2::manager::stream_mgmt::{
     CreateStreamFrame, DeleteStreamFrame, DrainSubjectFrame, GetStreamFrame,
@@ -107,6 +108,7 @@ pub async fn dispatch_frame_v2(
         Action::DeleteConsumer => v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::GetConsumer    => v2_get_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::ListConsumers  => v2_list_consumers(conn_id, req_seq, &frame, server, registry).await,
+        Action::ConsumerStats  => v2_consumer_stats(conn_id, req_seq, &frame, server, registry).await,
 
         // ── System ──────────────────────────────────────────────────
         Action::Disconnect     => v2_disconnect(conn_id, server, registry).await,
@@ -660,6 +662,20 @@ async fn v2_create_consumer(
         _ => AckPolicy::Explicit,
     };
 
+    // Parse subject_limits from frame tail. Silently ignored if
+    // ack_policy == None (engine rejects pairing — match that here too).
+    let subject_limits = if ack_policy == AckPolicy::Explicit {
+        match f.subject_limits() {
+            Some(v) => v,
+            None => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     match shard
         .create_consumer(
             ConsumerConfig {
@@ -675,7 +691,7 @@ async fn v2_create_consumer(
                 },
                 ack_wait_ms: f.body.ack_wait_ms.get(),
             },
-            Vec::new(),
+            subject_limits,
         )
         .await
     {
@@ -719,6 +735,33 @@ async fn v2_delete_consumer(
         }
     }
     send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+}
+
+/// Get the live pending-ack count for one consumer. The reply is a
+/// standard `RepOk` whose `ref_seq` body carries the count as a u64.
+/// Routes by walking every shard until one reports a non-zero or until
+/// all replied — the consumer lives on exactly one shard, but querying
+/// stays simple by summing across (most return 0).
+async fn v2_consumer_stats(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match ConsumerStatsFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+
+    let mut total = 0u64;
+    for i in 0..server.shard_count() {
+        if let Ok(count) = server.shard(i).consumer_pending(consumer_id).await {
+            total += count;
+        }
+    }
+    send_rep_ok_v2(registry, conn_id, req_seq, total);
 }
 
 async fn v2_get_consumer(

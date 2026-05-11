@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ClientConfig;
 use crate::consume::message::{AckCmd, NackCmd};
+use crate::metrics::ClientMetrics;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::state::subscriptions::Subscriptions;
@@ -49,6 +50,9 @@ pub(crate) struct Inner {
     /// the time the session was established).  Updated by reader task;
     /// read by heartbeat watchdog.
     pub(crate) last_pong_ns:   AtomicU64,
+    /// Atomic client counters — shared with hot-path tasks for cheap
+    /// `fetch_add(Relaxed)` observability. See [`crate::metrics`].
+    pub(crate) metrics:        Arc<ClientMetrics>,
 }
 
 impl Inner {

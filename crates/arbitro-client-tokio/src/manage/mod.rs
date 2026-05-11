@@ -13,15 +13,17 @@
 
 use bytes::Bytes;
 
+pub use arbitro_proto::v2::manager::SubjectLimit;
+
 use crate::transport::frame::WriteProducer;
 use crate::error::ClientError;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::transport::encode::{
-    encode_create_consumer_v2, encode_create_stream_v2, encode_delete_consumer_v2,
-    encode_delete_stream_v2, encode_drain_subject_v2, encode_get_consumer_v2,
-    encode_get_stream_v2, encode_list_consumers_v2, encode_list_streams_v2,
-    encode_purge_stream_v2,
+    encode_consumer_stats_v2, encode_create_consumer_v2, encode_create_stream_v2,
+    encode_delete_consumer_v2, encode_delete_stream_v2, encode_drain_subject_v2,
+    encode_get_consumer_v2, encode_get_stream_v2, encode_list_consumers_v2,
+    encode_list_streams_v2, encode_purge_stream_v2,
 };
 use crate::transport::frame::WriteFrame;
 
@@ -97,11 +99,13 @@ pub(crate) async fn create_consumer(
     stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
     max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
     ack_wait_ms: u32, start_seq: u64,
+    subject_limits: &[SubjectLimit<'_>],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     let buf = encode_create_consumer_v2(
         seq, stream_id, name, group, subject, max_inflight,
         ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+        subject_limits,
     );
     request(tx, pending, seq, buf).await
 }
@@ -111,6 +115,13 @@ pub(crate) async fn delete_consumer(
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_delete_consumer_v2(seq, consumer_id)).await
+}
+
+pub(crate) async fn consumer_stats(
+    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, consumer_id: u32,
+) -> Result<Bytes, ClientError> {
+    let seq = seq_alloc.next();
+    request(tx, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
 }
 
 pub(crate) async fn get_consumer(

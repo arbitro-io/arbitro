@@ -33,6 +33,7 @@ use crate::shard::worker::ActiveBinding;
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
+#[allow(dead_code)] // batch_size kept for future use
 pub(in crate::shard) struct DrainConfig {
     pub max_feed: usize,
     pub max_age_ms: u64,
@@ -48,6 +49,7 @@ pub(in crate::shard) struct DrainConfig {
 /// `DrainNotification::Delivered` to the command thread, which owns
 /// `Binding.pending` and `InFlightCounters`. Fire-and-forget never
 /// pushes here — no ack will ever arrive.
+#[allow(dead_code)] // `stream` kept for diagnostics
 #[derive(Clone, Copy)]
 struct PendingNotify {
     conn: ConnectionId,
@@ -148,6 +150,7 @@ fn local_delta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
 
 /// Result of Phase 1 (store read). Passed from `drain_read` to `drain_deliver`
 /// so the store lock can be released in between.
+#[allow(dead_code)] // `start` kept for diagnostics
 pub(in crate::shard) struct DrainReadResult {
     pub start: u64,
     pub end: u64,
@@ -371,6 +374,7 @@ pub(in crate::shard) fn drain_deliver(
 
 /// Legacy single-call API — kept for callers that don't need the split.
 /// Holds `store` for Phase 1 only; Phases 2+3 run after the borrow ends.
+#[allow(dead_code)]
 pub(in crate::shard) fn drain_cycle(
     counters: &SharedCounters,
     snap: &DrainSnapshot,

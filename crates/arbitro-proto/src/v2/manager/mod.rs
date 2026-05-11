@@ -23,4 +23,6 @@ pub use consumer_mgmt::{
     DeleteConsumerBody, DeleteConsumerFrame, DELETE_CONSUMER_BODY_SIZE,
     GetConsumerBody, GetConsumerFrame, GET_CONSUMER_BODY_FIXED,
     ListConsumersBody, ListConsumersFrame, LIST_CONSUMERS_BODY_SIZE,
+    ConsumerStatsBody, ConsumerStatsFrame, CONSUMER_STATS_BODY_SIZE,
+    SubjectLimit, SUBJECT_LIMIT_HEADER_SIZE, subject_limits_tail_len,
 };

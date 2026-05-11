@@ -20,7 +20,7 @@ use arbitro_proto::v2::ingress::{
 use arbitro_proto::v2::manager::{
     CreateConsumerFrame, CreateStreamFrame, DeleteConsumerFrame, DeleteStreamFrame,
     DrainSubjectFrame, GetConsumerFrame, GetStreamFrame, ListConsumersFrame, ListStreamsFrame,
-    PurgeStreamFrame,
+    PurgeStreamFrame, ConsumerStatsFrame, SubjectLimit, subject_limits_tail_len,
 };
 
 // ─── BatchEntry ───────────────────────────────────────────────────────
@@ -143,6 +143,11 @@ pub(crate) fn encode_list_streams_v2(seq: u64, offset: u32, limit: u32) -> Bytes
 }
 
 /// CreateConsumer request frame.
+///
+/// `subject_limits` is an optional list of `(pattern, max_inflight)` pairs.
+/// Per-subject limits are enforced by the server only with `ack_policy ==
+/// Explicit`; the server silently drops them otherwise.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_create_consumer_v2(
     seq: u64,
     stream_id: u32,
@@ -155,12 +160,14 @@ pub(crate) fn encode_create_consumer_v2(
     deliver_mode: u8,
     ack_wait_ms: u32,
     start_seq: u64,
+    subject_limits: &[SubjectLimit<'_>],
 ) -> Bytes {
-    let size = CreateConsumerFrame::wire_size(name.len(), group.len(), subject.len());
+    let tail_len = subject_limits_tail_len(subject_limits);
+    let size = CreateConsumerFrame::wire_size(name.len(), group.len(), subject.len(), tail_len);
     let mut buf = vec![0u8; size];
     CreateConsumerFrame::encode_into(
         &mut buf, seq, stream_id, name, group, subject, max_inflight, ack_policy, deliver_policy,
-        deliver_mode, ack_wait_ms, start_seq,
+        deliver_mode, ack_wait_ms, start_seq, subject_limits,
     );
     Bytes::from(buf)
 }
@@ -168,6 +175,12 @@ pub(crate) fn encode_create_consumer_v2(
 /// DeleteConsumer request frame (sized, 8B body).
 pub(crate) fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
     let f = DeleteConsumerFrame::new(seq, consumer_id);
+    Bytes::copy_from_slice(f.as_bytes())
+}
+
+/// ConsumerStats request frame (sized, 8B body).
+pub(crate) fn encode_consumer_stats_v2(seq: u64, consumer_id: u32) -> Bytes {
+    let f = ConsumerStatsFrame::new(seq, consumer_id);
     Bytes::copy_from_slice(f.as_bytes())
 }
 

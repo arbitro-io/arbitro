@@ -119,6 +119,12 @@ impl ArbitroServer {
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         tracing::info!(addr = %self.config.listen_addr, "listening");
 
+        // ── Startup state snapshot ─────────────────────────────────────
+        // Always log post-replay state so operators see clean restarts
+        // ("0 streams loaded") and not-so-clean ones ("12 streams loaded,
+        // 4128 messages restored") with the same shape.
+        log_startup_state(&self.server).await;
+
         // ── TLS acceptor (optional) ────────────────────────────────────
         #[cfg(feature = "tls")]
         let tls_acceptor = self.config.tls_cert.as_ref().map(|cert| {
@@ -139,6 +145,21 @@ impl ArbitroServer {
         let keepalive_handle = tokio::spawn(async move {
             keepalive_loop(keepalive_registry, idle_timeout, keepalive_interval).await;
         });
+
+        // Periodic metrics task — env-configurable (ARBITRO_METRICS_INTERVAL).
+        // Set the interval to 0 to disable entirely.
+        let metrics_interval = self.config.metrics_interval;
+        let metrics_handle = if metrics_interval.is_zero() {
+            None
+        } else {
+            let metrics_server = self.server.clone();
+            let metrics_registry = self.registry.clone();
+            let metrics_shutdown = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                metrics_loop(metrics_server, metrics_registry, metrics_interval, metrics_shutdown)
+                    .await;
+            }))
+        };
 
         // Per-connection ingress: each read_loop dispatches frames directly.
         // No central mpsc — TCP guarantees order per connection, and each
@@ -277,6 +298,7 @@ impl ArbitroServer {
         let _ = shutdown_tx.send(true);
         accept_handle.abort();
         keepalive_handle.abort();
+        if let Some(h) = metrics_handle { h.abort(); }
 
         // Send ServerShuttingDown to all connections
         let all_conns = self.registry.all_conn_ids();
@@ -478,4 +500,148 @@ async fn keepalive_loop(
 fn send_ping(registry: &ConnectionRegistry, conn_id: u64) {
     let header = Header::new(Action::Ping.as_u16(), 0, 0);
     registry.send_parts(conn_id, &[header.as_bytes()]);
+}
+
+/// Walk every shard, enumerate streams and consumers, and log a single
+/// summary line so operators see broker state at startup — whether the
+/// server came up empty or recovered an existing dataset.
+async fn log_startup_state(server: &ShardRouter) {
+    let mut total_streams = 0usize;
+    let mut total_consumers = 0usize;
+    let mut total_messages = 0u64;
+    let mut total_bytes = 0u64;
+
+    for i in 0..server.shard_count() {
+        let shard = server.shard(i);
+        if let Ok(reply) = shard.list_streams().await {
+            for (stream_id, name) in &reply.streams {
+                total_streams += 1;
+                if let Ok(info) = shard.store_info(arbitro_engine_v2::types::StreamId(*stream_id)).await {
+                    total_messages += info.messages;
+                    total_bytes += info.bytes;
+                    tracing::info!(
+                        stream = %String::from_utf8_lossy(name),
+                        stream_id = stream_id,
+                        messages = info.messages,
+                        bytes = info.bytes,
+                        "stream ready",
+                    );
+                }
+            }
+        }
+        if let Ok(reply) = shard.list_consumers().await {
+            total_consumers += reply.consumers.len();
+        }
+    }
+
+    tracing::info!(
+        streams = total_streams,
+        consumers = total_consumers,
+        messages = total_messages,
+        bytes = total_bytes,
+        "broker state ready",
+    );
+}
+
+/// Periodic metrics task. Sums `MetricsSnapshot` across all shards every
+/// `interval` and emits one `tracing::info!` event with deltas vs. the
+/// previous tick (so logs show consumption *rate*, not running totals).
+async fn metrics_loop(
+    server: ShardRouter,
+    registry: ConnectionRegistry,
+    interval: std::time::Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use arbitro_engine_v2::MetricsSnapshot;
+    let mut ticker = tokio::time::interval(interval);
+    // Skip the first immediate tick — first emission is one interval in.
+    ticker.tick().await;
+    let mut prev = MetricsSnapshot::default();
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.changed() => break,
+        }
+
+        // Aggregate across all shards.
+        let mut acc = MetricsSnapshot::default();
+        for i in 0..server.shard_count() {
+            if let Ok(snap) = server.shard(i).metrics().await {
+                acc.publish_entries_accepted   += snap.publish_entries_accepted;
+                acc.publish_duplicates_skipped += snap.publish_duplicates_skipped;
+                acc.publish_no_match           += snap.publish_no_match;
+                acc.publish_queues_pushed      += snap.publish_queues_pushed;
+                acc.publish_fanout_notified    += snap.publish_fanout_notified;
+                acc.claim_entries_delivered    += snap.claim_entries_delivered;
+                acc.claim_skipped_max_inflight += snap.claim_skipped_max_inflight;
+                acc.claim_skipped_subject_limit += snap.claim_skipped_subject_limit;
+                acc.ack_accepted               += snap.ack_accepted;
+                acc.ack_not_found              += snap.ack_not_found;
+                acc.nack_accepted              += snap.nack_accepted;
+                acc.drain_pending_removed      += snap.drain_pending_removed;
+            }
+        }
+
+        // Counts of active entities and current saturation gauges.
+        // `ack_pending` is the broker's headline saturation indicator —
+        // sum of in-flight (delivered, unacked) messages across every
+        // consumer. Operators watch this for backpressure formation.
+        let mut streams        = 0usize;
+        let mut consumers      = 0usize;
+        let mut consumers_paused = 0usize;
+        let mut ack_pending    = 0u64;
+        let mut max_consumer_ack_pending = 0u32;
+        let mut stream_messages = 0u64;
+        let mut stream_bytes    = 0u64;
+        for i in 0..server.shard_count() {
+            let shard = server.shard(i);
+            if let Ok(r) = shard.list_streams().await {
+                streams += r.streams.len();
+                for (sid, _) in &r.streams {
+                    if let Ok(info) = shard.store_info(
+                        arbitro_engine_v2::types::StreamId(*sid),
+                    ).await {
+                        stream_messages += info.messages;
+                        stream_bytes    += info.bytes;
+                    }
+                }
+            }
+            if let Ok(states) = shard.consumer_states().await {
+                consumers += states.len();
+                for s in &states {
+                    if s.paused { consumers_paused += 1; }
+                    ack_pending += s.ack_pending as u64;
+                    if s.ack_pending > max_consumer_ack_pending {
+                        max_consumer_ack_pending = s.ack_pending;
+                    }
+                }
+            }
+        }
+        let connections = registry.active_count();
+
+        tracing::info!(
+            interval_s    = interval.as_secs(),
+            // ── Gauges (current state) ─────────────────────────────────
+            connections      = connections,
+            streams          = streams,
+            consumers        = consumers,
+            consumers_paused = consumers_paused,
+            ack_pending      = ack_pending,            // total in-flight unacked
+            max_ack_pending  = max_consumer_ack_pending, // worst-loaded consumer
+            stream_messages  = stream_messages,
+            stream_bytes     = stream_bytes,
+            // ── Deltas this tick (per-interval rate) ───────────────────
+            published     = acc.publish_entries_accepted   - prev.publish_entries_accepted,
+            delivered     = acc.claim_entries_delivered    - prev.claim_entries_delivered,
+            acked         = acc.ack_accepted               - prev.ack_accepted,
+            nacked        = acc.nack_accepted              - prev.nack_accepted,
+            pub_no_match  = acc.publish_no_match           - prev.publish_no_match,
+            held_inflight = acc.claim_skipped_max_inflight - prev.claim_skipped_max_inflight,
+            held_subject  = acc.claim_skipped_subject_limit - prev.claim_skipped_subject_limit,
+            "metrics",
+        );
+
+        prev = acc;
+    }
 }

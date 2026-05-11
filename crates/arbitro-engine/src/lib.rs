@@ -42,6 +42,20 @@ pub use events::DeltaEvents;
 pub use inflight::InFlightScope;
 pub use metrics::{EngineMetrics, MetricsSnapshot};
 
+/// Per-consumer state gauge — point-in-time picture of one consumer's
+/// load. Sent over the shard mpsc by `consumer_states_snapshot()`.
+///
+/// `ack_pending` is the count of messages delivered to the consumer
+/// but not yet acked. Use it as a NATS-style `num_ack_pending` gauge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerStateSnapshot {
+    pub consumer_id: u32,
+    pub stream_id:   u32,
+    pub queue_id:    u32,
+    pub paused:      bool,
+    pub ack_pending: u32,
+}
+
 // ── ArbitroEngine — oracle facade ───────────────────────────────────────────
 
 use context::EngineContext;
@@ -331,6 +345,38 @@ impl ArbitroEngine {
     }
 
     // ── Observability ───────────────────────────────────────────────────
+
+    /// Per-consumer live state — pending ACKs (`ack_pending`) and paused
+    /// flag. The result is materialized once (no iterator into engine
+    /// internals), so callers can safely send it across thread boundaries.
+    ///
+    /// `ack_pending` is the count of messages delivered to the consumer
+    /// that haven't been acked yet (the equivalent of NATS JetStream's
+    /// `num_ack_pending`). Sums across all consumers give the broker's
+    /// total in-flight load — useful as a saturation gauge.
+    pub fn consumer_states_snapshot(&self) -> Vec<ConsumerStateSnapshot> {
+        self.list_consumers()
+            .into_iter()
+            .map(|(consumer_id, stream_id, queue_id, paused)| ConsumerStateSnapshot {
+                consumer_id: consumer_id.raw(),
+                stream_id:   stream_id.raw(),
+                queue_id:    queue_id.raw(),
+                paused,
+                ack_pending: self.consumer_inflight(consumer_id),
+            })
+            .collect()
+    }
+
+    /// Total messages delivered-but-not-acked across every consumer on
+    /// this engine. The headline broker-saturation gauge — emit this
+    /// every metrics tick so operators see backpressure forming before
+    /// ack rates fall behind publish rates.
+    pub fn total_ack_pending(&self) -> u64 {
+        self.consumer_states_snapshot()
+            .iter()
+            .map(|s| s.ack_pending as u64)
+            .sum()
+    }
 
     /// Borrow the atomic counter set for cross-thread observability.
     #[inline]

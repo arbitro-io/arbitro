@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
+use arbitro_engine_v2::{ConsumerStateSnapshot, MetricsSnapshot};
 use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
@@ -352,6 +353,36 @@ impl ShardHandle {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::StoreInfo(StoreInfoCmd {
             stream_id,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Snapshot this shard's engine metrics. Cheap (atomic loads).
+    pub async fn metrics(&self) -> Result<MetricsSnapshot, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::Metrics(MetricsCmd { reply: tx })).await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Snapshot per-consumer live state (pending ACKs, paused flag, etc.).
+    /// One round-trip per shard — operators aggregate across shards.
+    pub async fn consumer_states(&self) -> Result<Vec<ConsumerStateSnapshot>, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::ConsumerStates(ConsumerStatesCmd { reply: tx })).await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Get the live pending-ack count for a single consumer. Returns 0 if
+    /// the consumer doesn't exist on this shard.
+    pub async fn consumer_pending(
+        &self,
+        consumer_id: ConsumerId,
+    ) -> Result<u64, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::ConsumerPending(ConsumerPendingCmd {
+            consumer_id,
             reply: tx,
         }))
         .await?;

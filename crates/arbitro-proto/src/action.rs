@@ -51,6 +51,9 @@ pub enum Action {
     DeleteConsumer = 0x0502,
     GetConsumer    = 0x0503,
     ListConsumers  = 0x0504,
+    /// Query a single consumer's live pending-ack count. Reply is a
+    /// standard `RepOk` whose `ref_seq` field carries the count as a u64.
+    ConsumerStats  = 0x0505,
 
     // 0x06xx — System
     Ping          = 0x0601,
@@ -105,6 +108,7 @@ impl Action {
             0x0502 => Some(Self::DeleteConsumer),
             0x0503 => Some(Self::GetConsumer),
             0x0504 => Some(Self::ListConsumers),
+            0x0505 => Some(Self::ConsumerStats),
 
             0x0601 => Some(Self::Ping),
             0x0602 => Some(Self::Pong),

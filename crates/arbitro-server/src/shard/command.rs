@@ -4,6 +4,7 @@
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
+use arbitro_engine_v2::{ConsumerStateSnapshot, MetricsSnapshot};
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -54,6 +55,9 @@ pub enum ShardCommand {
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),
     StoreInfo(StoreInfoCmd),
+    Metrics(MetricsCmd),
+    ConsumerStates(ConsumerStatesCmd),
+    ConsumerPending(ConsumerPendingCmd),
 
     // System
     Shutdown,
@@ -198,6 +202,27 @@ pub struct StoreInfoCmd {
 pub struct StoreInfoReply {
     pub messages: u64,
     pub bytes: u64,
+}
+
+/// Snapshot the shard's engine-level atomic counters. Cheap — just
+/// `Relaxed` loads on the same struct; no roundtrip cost beyond the
+/// channel hop.
+pub struct MetricsCmd {
+    pub reply: oneshot::Sender<MetricsSnapshot>,
+}
+
+/// Snapshot every consumer's live state on this shard (id, stream, queue,
+/// paused, `ack_pending`). One Vec per shard — caller aggregates across
+/// shards. Use this for NATS-style `num_ack_pending` reporting.
+pub struct ConsumerStatesCmd {
+    pub reply: oneshot::Sender<Vec<ConsumerStateSnapshot>>,
+}
+
+/// Get the live pending-ack count for a single consumer. Replies with
+/// 0 if the consumer doesn't exist on this shard.
+pub struct ConsumerPendingCmd {
+    pub consumer_id: ConsumerId,
+    pub reply:       oneshot::Sender<u64>,
 }
 
 // ── Connection lifecycle ────────────────────────────────────────────────────

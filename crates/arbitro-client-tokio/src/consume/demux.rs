@@ -82,6 +82,8 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
         inner.ack_tx.clone(),
         inner.nack_tx.clone(),
     );
+    inner.metrics.deliveries_received
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     inner.subscriptions.send(consumer_id, msg).await;
 }
 
@@ -148,6 +150,8 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
             inner.ack_tx.clone(),
             inner.nack_tx.clone(),
         );
+        inner.metrics.deliveries_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         inner.subscriptions.send(consumer_id, msg).await;
     }
 }

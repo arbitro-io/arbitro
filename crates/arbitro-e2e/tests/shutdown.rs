@@ -88,6 +88,7 @@ async fn connect_no_retry(addr: &str) -> Client {
         .expect("client must connect")
 }
 
+#[allow(dead_code)]
 async fn connect_with_retry(addr: &str) -> Client {
     Client::connect(ClientConfig {
         addr: addr.to_string(),

@@ -107,6 +107,35 @@ docker compose up -d   # default port: 4222
 | `ARBITRO_WRITE_BUFFER_CAP` | `8192` | Write channel capacity per connection |
 | `ARBITRO_IDLE_TIMEOUT` | `300` | Idle timeout (s) |
 | `ARBITRO_KEEPALIVE_INTERVAL` | `30` | Keepalive ping interval (s) |
+| `ARBITRO_METRICS_INTERVAL` | `5` | Periodic metrics log interval (s). `0` disables. |
+
+## Observability
+
+On startup, the broker logs a single summary line of the recovered state:
+
+```
+INFO arbitro_server::server: listening addr=0.0.0.0:9898
+INFO arbitro_server::server: broker state ready streams=4 consumers=12 messages=18302 bytes=4823104
+```
+
+Every `ARBITRO_METRICS_INTERVAL` seconds it then emits a metrics line with:
+
+- **Gauges** (current state): `connections`, `streams`, `consumers`, `consumers_paused`,
+  `ack_pending` (total in-flight unacked), `max_ack_pending` (worst-loaded consumer),
+  `stream_messages`, `stream_bytes`.
+- **Deltas this tick**: `published`, `delivered`, `acked`, `nacked`, `pub_no_match`,
+  `held_inflight`, `held_subject`.
+
+```
+INFO arbitro_server::server: metrics interval_s=5 connections=2 streams=4 consumers=12
+     consumers_paused=0 ack_pending=87 max_ack_pending=43 stream_messages=18302
+     stream_bytes=4823104 published=4128 delivered=4115 acked=4072 nacked=0
+     pub_no_match=0 held_inflight=12 held_subject=4
+```
+
+Clients can also query a single consumer's pending-ack count over the wire
+via the `ConsumerStats` action — see the Rust/TypeScript clients for
+`get_pending(consumer_id)` / `getPending(consumerId)` APIs.
 
 ## Usage
 

@@ -112,6 +112,7 @@ mod tests {
             ack_tx,
             nack_tx,
             last_pong_ns:   std::sync::atomic::AtomicU64::new(0),
+            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
         });
 
         // Should return immediately because cancel is already fired.

@@ -336,7 +336,7 @@ mod tests {
         let mut pool = IdPool::new(10);
         let (s0, _) = pool.alloc().unwrap();
         let (s1, _) = pool.alloc().unwrap();
-        let (s2, _) = pool.alloc().unwrap();
+        let (_s2, _) = pool.alloc().unwrap();
 
         pool.free(s1).unwrap();
         pool.free(s0).unwrap();

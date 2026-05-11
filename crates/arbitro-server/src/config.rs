@@ -20,6 +20,13 @@ pub struct Config {
     pub keepalive_interval: Duration,
     /// Shutdown timeout — max wait for graceful drain (default: 10s).
     pub shutdown_timeout: Duration,
+    /// Periodic metrics log interval (default: 5s). Set to 0 to disable.
+    ///
+    /// The server emits one `tracing::info!` event per interval with
+    /// aggregated counters across all shards: publishes accepted, deliveries,
+    /// acks, drops, and active streams/consumers/connections. Useful for
+    /// observability without scraping a metrics endpoint.
+    pub metrics_interval: Duration,
     /// Max messages fed into the engine ready queue per drain cycle (default: 256).
     pub max_feed_per_cycle: usize,
     /// Entries per RepBatch frame in the drain (default: 256).
@@ -52,6 +59,7 @@ impl Config {
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
             keepalive_interval: Duration::from_secs(env_parse("ARBITRO_KEEPALIVE_INTERVAL", 30)),
             shutdown_timeout: Duration::from_secs(env_parse("ARBITRO_SHUTDOWN_TIMEOUT", 10)),
+            metrics_interval: Duration::from_secs(env_parse("ARBITRO_METRICS_INTERVAL", 5)),
             data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
             tls_cert: std::env::var("ARBITRO_TLS_CERT").ok(),
             tls_key: std::env::var("ARBITRO_TLS_KEY").ok(),
@@ -104,6 +112,11 @@ impl Config {
         self
     }
 
+    pub fn metrics_interval(mut self, interval: Duration) -> Self {
+        self.metrics_interval = interval;
+        self
+    }
+
     pub fn data_dir(mut self, dir: impl Into<String>) -> Self {
         self.data_dir = Some(dir.into());
         self
@@ -123,6 +136,7 @@ impl Default for Config {
             idle_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(10),
+            metrics_interval: Duration::from_secs(5),
             data_dir: None,
             tls_cert: None,
             tls_key: None,

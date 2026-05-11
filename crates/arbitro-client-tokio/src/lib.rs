@@ -30,6 +30,7 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod metrics;
 
 pub(crate) mod conn;
 pub(crate) mod consume;
@@ -57,5 +58,9 @@ pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
 pub use consume::SubscriptionHandle;
 pub use consume::message::Message;
 pub use error::{ClientError, RequestResult};
+pub use metrics::{ClientMetrics, ClientMetricsSnapshot};
 pub use publish::PUBLISH_BATCH_MAX;
+/// Per-subject inflight cap (pattern + limit). Pass a slice of these to
+/// [`Client::create_consumer_with_limits`].
+pub use arbitro_proto::v2::manager::SubjectLimit;
 

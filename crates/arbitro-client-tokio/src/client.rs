@@ -94,6 +94,7 @@ impl Client {
             ack_tx,
             nack_tx,
             last_pong_ns:   AtomicU64::new(Inner::now_ns()),
+            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
         });
 
         // Spawn the ack-batcher and nack-batcher — both live for the Client lifetime.
@@ -136,9 +137,14 @@ impl Client {
         subject:   &[u8],
         payload:   Bytes,
     ) -> Result<(), ClientError> {
-        crate::publish::publish_async(
+        let r = crate::publish::publish_async(
             self.producer(), &self.inner.seq_alloc, stream_id, subject, payload,
-        )
+        );
+        if r.is_ok() {
+            self.inner.metrics.publishes_sent
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
     }
 
     #[inline]
@@ -171,9 +177,14 @@ impl Client {
         stream_id: u32,
         entries:   &[BatchEntry<'_>],
     ) -> Result<(), ClientError> {
-        crate::publish::publish_batch_async(
+        let r = crate::publish::publish_batch_async(
             self.producer(), &self.inner.seq_alloc, stream_id, entries,
-        )
+        );
+        if r.is_ok() {
+            self.inner.metrics.publish_batch_entries
+                .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
     }
 
     pub fn publish_batch_sync(
@@ -283,6 +294,13 @@ impl Client {
         ).await
     }
 
+    /// Create a consumer with no per-subject inflight limits.
+    ///
+    /// This is the common case. Use [`Client::create_consumer_with_limits`]
+    /// to attach per-subject `max_inflight` caps. Per-subject limits are
+    /// only enforced by the server with `ack_policy == AckPolicy::Explicit
+    /// (1)`; setting them on a fire-and-forget consumer is silently
+    /// dropped server-side.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer(
         &self,
@@ -290,10 +308,32 @@ impl Client {
         max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
         ack_wait_ms: u32, start_seq: u64,
     ) -> Result<Bytes, ClientError> {
+        self.create_consumer_with_limits(
+            stream_id, name, group, subject, max_inflight,
+            ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+            &[],
+        ).await
+    }
+
+    /// Create a consumer with per-subject inflight limits.
+    ///
+    /// Each `(pattern, max_inflight)` entry caps the number of in-flight
+    /// (delivered, unacked) messages per subject matching `pattern`. Wildcards
+    /// (`*`, `>`) are supported. Only effective with `ack_policy ==
+    /// AckPolicy::Explicit (1)`; otherwise silently ignored by the server.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_consumer_with_limits(
+        &self,
+        stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
+        max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
+        ack_wait_ms: u32, start_seq: u64,
+        subject_limits: &[arbitro_proto::v2::manager::SubjectLimit<'_>],
+    ) -> Result<Bytes, ClientError> {
         crate::manage::create_consumer(
             self.producer(), &self.inner.pending, &self.inner.seq_alloc,
             stream_id, name, group, subject, max_inflight,
             ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+            subject_limits,
         ).await
     }
 
@@ -318,5 +358,44 @@ impl Client {
             self.producer(), &self.inner.pending, &self.inner.seq_alloc,
             stream_id, offset, limit,
         ).await
+    }
+
+    /// Live pending-ack count for one consumer (broker round-trip).
+    ///
+    /// Returns the number of messages this consumer has been delivered
+    /// but not yet acked. Equivalent to NATS JetStream's
+    /// `num_ack_pending`. Reads engine state via one O(1) Vec lookup
+    /// per shard; cheap enough to poll from a dashboard.
+    pub async fn get_pending(&self, consumer_id: u32) -> Result<u64, ClientError> {
+        let resp = crate::manage::consumer_stats(
+            self.producer(), &self.inner.pending, &self.inner.seq_alloc, consumer_id,
+        ).await?;
+        // RepOk body is 8 bytes — server packs the u64 count in place of ref_seq.
+        if resp.len() < 8 {
+            return Err(ClientError::Proto(arbitro_proto::error::ProtoError::BufferTooShort {
+                need: 8,
+                have: resp.len() as u32,
+            }));
+        }
+        let count = u64::from_le_bytes(resp[..8].try_into().unwrap());
+        Ok(count)
+    }
+
+    // ── observability ─────────────────────────────────────────────────────────
+
+    /// Borrow the live atomic counters shared with every task on this
+    /// client. Mostly useful for testing — operators should prefer
+    /// [`Client::metrics_snapshot`] for periodic sampling.
+    #[inline]
+    pub fn metrics(&self) -> &crate::metrics::ClientMetrics {
+        &self.inner.metrics
+    }
+
+    /// Point-in-time snapshot of all client counters. Cheap — just
+    /// `Relaxed` loads on a few atomics. Call on a timer to chart
+    /// throughput, ack rates, reconnects, active subscriptions, etc.
+    #[inline]
+    pub fn metrics_snapshot(&self) -> crate::metrics::ClientMetricsSnapshot {
+        self.inner.metrics.snapshot()
     }
 }

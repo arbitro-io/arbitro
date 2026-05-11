@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, SubjectLimit};
 use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
 use tokio::sync::watch;
@@ -34,6 +34,7 @@ fn stream_names(resp: &Bytes) -> Vec<Vec<u8>> {
     names
 }
 
+#[allow(dead_code)]
 fn consumer_count(resp: &Bytes) -> usize {
     u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
 }
@@ -1248,10 +1249,12 @@ async fn max_inflight_caps_delivery() {
 
 /// 19. Multiple max_subject_inflight patterns with different limits.
 ///
-/// This test uses max_subject_inflight which is not yet exposed in
-/// arbitro-client-tokio. Kept as ignored until the API is available.
+/// Exercises the wire path end-to-end: client packs subject limits in
+/// the `CreateConsumer` trailer, server parses them and calls
+/// `engine.set_max_subject_inflight` per pattern. Two patterns are
+/// configured with different caps; a third subject has no cap and
+/// flows freely.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "max_subject_inflight not yet exposed in arbitro-client-tokio"]
 async fn max_subject_inflight_multiple_patterns() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
@@ -1259,9 +1262,17 @@ async fn max_subject_inflight_multiple_patterns() {
     let resp = client.create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
-    // consumer with max_inflight=100; max_subject_inflight not available
+    // Per-subject inflight caps: premium 3, freemium 1. `other.*` has no cap.
+    let limits = [
+        SubjectLimit { pattern: b"message.premium.>",  limit: 3 },
+        SubjectLimit { pattern: b"message.freemium.>", limit: 1 },
+    ];
     let resp = client
-        .create_consumer(stream_id, b"msi_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer_with_limits(
+            stream_id, b"msi_c", b"", b"",
+            100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            &limits,
+        )
         .await
         .unwrap();
     let consumer_id = parse_id(&resp);

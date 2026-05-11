@@ -224,6 +224,7 @@ impl DrainWorker {
 /// Processes all ShardCommands as a tokio::spawn task. After engine
 /// mutations, updates `SharedCounters` atomically and swaps
 /// `DrainSnapshot` for structural changes.
+#[allow(dead_code)] // `names`, `drain_config_batch_size` kept for upcoming features
 pub struct CommandWorker {
     /// Engine — owned exclusively. `&mut self`, no sharing, no lock.
     pub(super) engine: ArbitroEngine,
@@ -585,6 +586,16 @@ impl CommandWorker {
             ShardCommand::ListStreams(cmd) => self.handle_list_streams(cmd),
             ShardCommand::ListConsumers(cmd) => self.handle_list_consumers(cmd),
             ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
+            ShardCommand::Metrics(cmd) => {
+                let _ = cmd.reply.send(self.engine.metrics_snapshot());
+            }
+            ShardCommand::ConsumerStates(cmd) => {
+                let _ = cmd.reply.send(self.engine.consumer_states_snapshot());
+            }
+            ShardCommand::ConsumerPending(cmd) => {
+                let count = self.engine.consumer_inflight(cmd.consumer_id) as u64;
+                let _ = cmd.reply.send(count);
+            }
             ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
             ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
             ShardCommand::Shutdown => {}
