@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::common::{Gate, NameRegistry};
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
+use crate::shard::drain_events::DrainEventRing;
 use crate::shard::handle::ShardHandle;
 use crate::shard::shared::{DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
@@ -78,6 +79,10 @@ impl ShardRouter {
             // SPSC Ring — drain is the sole producer, command task is the sole consumer.
             let notify_ring = Arc::new(NotifyRing::new());
 
+            // Drain-event ring: command → drain (ack-driven subject-inflight
+            // decrements + consumer-removed cleanup). SPSC.
+            let drain_evt_ring = Arc::new(DrainEventRing::new());
+
             // ── Drain thread — pure: gate.acquire → drain_cycle ──────
             let drain_worker = DrainWorker {
                 counters: Arc::clone(&counters),
@@ -93,6 +98,8 @@ impl ShardRouter {
                 drain_scratch: super::drain::DrainScratch::new(),
                 running: Arc::clone(&running),
                 notify_ring: Arc::clone(&notify_ring),
+                drain_evt_rx: Arc::clone(&drain_evt_ring),
+                consumer_subjects: Vec::new(),
             };
 
             std::thread::Builder::new()
@@ -111,6 +118,7 @@ impl ShardRouter {
                 names: Arc::clone(&names),
                 rx,
                 notify_ring,
+                drain_evt_tx: drain_evt_ring,
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
                 accum_streams: std::collections::HashMap::with_hasher(

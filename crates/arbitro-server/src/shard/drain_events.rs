@@ -39,7 +39,14 @@ use arbitro_engine_v2::types::*;
 use arbitro_kit::stream::Ring;
 
 /// Capacity of the SPSC ring. Power-of-two by contract.
-pub const DRAIN_EVENT_CAP: usize = 8192;
+///
+/// Sized for the typical ack burst between drain cycles (drain cycles
+/// run every µs-scale when busy). 2048 events ≈ 20× the largest
+/// observed ack-batch in stress tests; the existing NotifyRing already
+/// covers the 8192 path drain → command. Keeping this struct smaller
+/// avoids piling extra stack onto `ShardRouter::spawn` (each Ring is
+/// briefly stack-allocated before being moved into Arc).
+pub const DRAIN_EVENT_CAP: usize = 2048;
 
 /// SPSC ring carrying [`DrainEvent`] from command → drain.
 ///

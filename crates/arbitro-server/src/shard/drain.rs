@@ -28,8 +28,9 @@ use arbitro_store::Store;
 
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
+use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, NotifyRing, SharedCounters};
-use crate::shard::worker::ActiveBinding;
+use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -170,6 +171,7 @@ pub(in crate::shard) fn drain_read(
     store: &dyn Store,
     cfg: &DrainConfig,
     scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     now_ms: u64,
 ) -> Option<DrainReadResult> {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
@@ -219,6 +221,7 @@ pub(in crate::shard) fn drain_read(
                 snap,
                 entry,
                 scratch,
+                consumer_subjects,
                 now_ms,
                 stream_max_age,
                 &mut more_pending,
@@ -247,6 +250,7 @@ pub(in crate::shard) fn drain_deliver(
     gate: &Gate,
     names: &Arc<crate::common::NameRegistry>,
     scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     notify_tx: &NotifyRing,
     mut result: DrainReadResult,
 ) {
@@ -336,7 +340,10 @@ pub(in crate::shard) fn drain_deliver(
     for d in &scratch.deliveries {
         if flush_ok.get(&d.conn).copied().unwrap_or(false) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
-            counters.inc_subject(d.consumer_id, d.subject_hash);
+            // Drain owns the per-(consumer, subject) inflight map; this
+            // is a local HashMap mutation, no atomics, no contention.
+            consumer_subjects_slot_mut(consumer_subjects, d.consumer_id)
+                .inc(d.subject_hash);
         }
     }
 
@@ -374,7 +381,7 @@ pub(in crate::shard) fn drain_deliver(
 
 /// Legacy single-call API — kept for callers that don't need the split.
 /// Holds `store` for Phase 1 only; Phases 2+3 run after the borrow ends.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(in crate::shard) fn drain_cycle(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
@@ -383,11 +390,21 @@ pub(in crate::shard) fn drain_cycle(
     names: &Arc<crate::common::NameRegistry>,
     cfg: &DrainConfig,
     scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     notify_tx: &NotifyRing,
     now_ms: u64,
 ) {
-    match drain_read(counters, snap, store, cfg, scratch, now_ms) {
-        Some(result) => drain_deliver(counters, snap, gate, names, scratch, notify_tx, result),
+    match drain_read(counters, snap, store, cfg, scratch, consumer_subjects, now_ms) {
+        Some(result) => drain_deliver(
+            counters,
+            snap,
+            gate,
+            names,
+            scratch,
+            consumer_subjects,
+            notify_tx,
+            result,
+        ),
         None => {
             gate.lock();
             crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
@@ -397,11 +414,13 @@ pub(in crate::shard) fn drain_cycle(
 
 // ── Per-entry processing ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn process_drain_entry(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
     entry: &arbitro_store::Entry<'_>,
     scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     now_ms: u64,
     max_age_ms: u64,
     more_pending: &mut bool,
@@ -485,6 +504,7 @@ fn process_drain_entry(
         subject_hash,
         subject_limit,
         scratch,
+        consumer_subjects,
         &snap.bindings,
         more_pending,
         lowest_skipped,
@@ -501,6 +521,7 @@ fn dispatch_recipients(
     subject_hash: u32,
     subject_limit: Option<u32>,
     scratch: &mut DrainScratch,
+    consumer_subjects: &[Option<ConsumerSubjects>],
     bindings: &[ActiveBinding],
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
@@ -572,18 +593,19 @@ fn dispatch_recipients(
                 continue;
             }
 
-            // Per-consumer subject inflight check — counter is keyed by
-            // (consumer_id, subject_hash). Two consumers on the same
-            // subject have independent budgets.
+            // Per-consumer subject inflight check — state lives in the
+            // drain-owned `ConsumerSubjects` slot (no atomics, no
+            // cross-thread traffic). Two consumers on the same subject
+            // have independent budgets.
             if let Some(max) = subject_limit {
                 let pending_subj = scratch
                     .local_subject
                     .get(&(consumer_id.0, subject_hash))
                     .copied()
                     .unwrap_or(0);
-                if pending_subj >= max
-                    || !counters.subject_has_room(consumer_id.0, subject_hash, max - pending_subj)
-                {
+                let committed = consumer_subjects_slot(consumer_subjects, consumer_id.0)
+                    .map_or(0, |cs| cs.get(subject_hash));
+                if pending_subj + committed >= max {
                     *more_pending = true;
                     track_skipped(lowest_skipped, entry.seq);
                     continue;
