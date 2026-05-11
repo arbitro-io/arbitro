@@ -54,18 +54,35 @@ Arbitro is a working broker that passes **~180 tests with `-race`** and sustains
 - Connection registry with dead-connection cleanup
 - Ack timeout via per-shard timing wheel (auto-nack after `ack_wait_ms`)
 - Nack with delay (`msg.nack_delay(ms)` — delayed redelivery via same timing wheel)
+- Wire-exposed `maxSubjectInflights` end-to-end (CreateConsumer trailer +
+  `Action::ConsumerStats (0x0505)` for live `get_pending(consumer_id)` queries)
+- Server observability: `broker state ready` startup log + periodic metrics
+  task (`ARBITRO_METRICS_INTERVAL`, default 5 s) emitting gauges
+  (`ack_pending`, `max_ack_pending`, `stream_messages`,
+  `consumers_paused`...) and per-interval deltas
+- Client-side metrics (`ClientMetrics` in both `arbitro-client-tokio` and
+  `arbitro-ts`) — atomic counters of publishes, deliveries, acks/nacks,
+  active subscriptions, reconnects
+- TypeScript client `arbitro-ts` (separate repo `arbitro-io/arbitro-ts`)
+  — TCP transport, reconnect + subscription reattach, `getPending`,
+  `maxSubjectInflights`, metrics. Note the WebSocket-bridge note from
+  earlier roadmap entries is obsolete: the client uses raw TCP.
 
 **Where code lives** (crate-level):
 
 ```
-crates/arbitro-proto       — wire protocol (zerocopy), opcodes, validators
-crates/arbitro-engine      — oracle: catalog, matcher, inflight, events, runtime
-crates/arbitro-common      — Gate, NameRegistry, IdPool (shared primitives)
-crates/arbitro-store       — Store trait + Memory + Tolerant backends
-crates/arbitro-server      — shard, transport, persistence, main binary
-crates/arbitro-client      — client SDK (Client, Consumer, Subscription, Message)
-crates/arbitro-e2e         — integration tests + standalone bench binaries
+crates/arbitro-proto         — wire protocol (zerocopy), opcodes, validators
+crates/arbitro-engine        — oracle: catalog, matcher, inflight, events, runtime
+crates/arbitro-common        — Gate, NameRegistry, IdPool (shared primitives)
+crates/arbitro-store         — Store trait + Memory + Tolerant backends
+crates/arbitro-server        — shard, transport, persistence, main binary
+crates/arbitro-client-tokio  — pure-tokio client SDK (Client, Subscription, Message)
+crates/arbitro-e2e           — integration tests + standalone bench binaries
 ```
+
+Note: a previous `arbitro-client` crate was retired in favor of
+`arbitro-client-tokio`, which is built on `arbitro-kit` primitives
+(Mpsc, OneShotAsync, Pipe, Hub) and runs entirely on tokio.
 
 ---
 
@@ -111,6 +128,60 @@ Options:
 - Hash-affinity: ensure any given `(pattern, subject_hash)` always lands on the same shard via an ownership table
 
 Not a blocker for MVP because most real deployments have streams that are naturally shard-local.
+
+### P3.5 — Known unbounded-growth points (memory audit)
+
+These are **intentional design trade-offs** today, not bugs, but they
+become problems under high subject-cardinality workloads (e.g. when
+subjects encode per-request UUIDs). Documented here so the next session
+knows to weigh the trade-off explicitly.
+
+| Site | Container | Why it grows | Mitigation |
+|---|---|---|---|
+| `SharedCounters.subject` | `papaya::HashMap<(consumer_id, subject_hash), AtomicU32>` | `dec_subject` decrements to 0 but **never removes** — ABA-safe under lock-free contention | Periodic vacuum thread that walks the map under a quiesce barrier and removes 0-count entries with a double-check |
+| `MatchTable.exact` | `HashMap<subject_hash, Vec<MatchEntry>>` | `resolve_patterns` inserts on first publish of each new subject; only cleared on add/remove of a pattern | LRU/TTL aging of subjects with zero recent activity |
+| `MatchTable.resolved_subjects` | `HashMap<subject_hash, bool>` | Populated alongside `exact`; same lifecycle | Cleared together with `exact` when subject is evicted |
+| `MatchTable.max_subject_inflights` | `HashMap<subject_hash, u32>` | Populated lazily per subject_hash when a wildcard limit matches | Cleared together with `exact` when subject is evicted |
+| `engine::inflight::consumer/queue` | `Vec<u32>` indexed by raw id | `ensure_len` grows to fit highest id; never shrinks. IDs are monotonic (no recycling) → Vec grows with churn | Wire `IdPool` into `NameRegistry` so deleted IDs are recycled |
+| `NameRegistry.streams_seq_to_wire` | `Vec<u32>` | Same monotonic-id story | Same fix |
+
+**Hard ceiling (not a leak)**: `SharedCounters.consumer/queue/demand/paused`
+are `Box<[T]>` allocated once at startup with `SLOT_COUNT = 4096`. Past
+that count, indexing panics. For deployments needing more, raise
+`SLOT_COUNT` or migrate to a growable container.
+
+**`IdPool` exists but is not wired**: `crates/arbitro-common/src/id_pool.rs`
+implements a slot allocator with free-list + generation tags, designed
+exactly to make dense Vec storage safe under churn. No caller currently
+imports it. Wiring it into `NameRegistry` (and replacing the
+`next_stream`/`next_consumer`/`next_queue` monotonic counters) is the
+single change that unblocks the `Vec` migrations above.
+
+### P3.6 — Engine public API surface — 14 unused methods
+
+The `ArbitroEngine` facade exposes 35 public methods. An audit
+(`target/engine_audit_full.py`) found that 14 have zero callers from
+`arbitro-server`, `arbitro-client-tokio`, or `arbitro-e2e`:
+
+- Inspection helpers superseded by the atomic `SharedCounters` version
+  (drain uses the lock-free counterparts, not the engine's
+  single-threaded ones): `has_any_demand`, `has_demand`,
+  `subject_has_room`, `consumer_has_capacity`,
+  `consumer_capacity_remaining`, `is_paused`, `subject_tracking_enabled`,
+  `queue_inflight`, `subject_inflight`.
+- Catalog accessor never used externally: `match_table`.
+- Redundant convenience: `execute_batch` (server loops `execute()`
+  manually), `metrics` (server uses `metrics_snapshot()`).
+- Footgun: `ctx_mut` (lets callers bypass `execute()` and break engine
+  invariants).
+- Added then unused: `total_ack_pending` (the metrics task aggregates
+  `consumer_states_snapshot()` directly).
+
+Of those, 3 (`has_any_demand`, `has_demand`, `consumer_has_capacity`)
+are exercised by the engine's own `#[cfg(test)]` block; the other 11
+have literally no callers. Candidates for deletion on the next API
+sweep (engine is pre-1.0, no external consumers besides the bundled
+server).
 
 ### P5 — Stream export / migration / filtered backup
 
@@ -226,15 +297,25 @@ src/
 ├── lifecycle_trace.rs  # opt-in profiling (feature = "lifecycle_trace")
 ```
 
-### `arbitro-client`
+### `arbitro-client-tokio`
 
 ```
 src/
-├── client.rs           # public Client API
-├── inner.rs            # connection state, pending map, subscription routing
-├── consumer.rs, subscription.rs, message.rs
-├── conn.rs             # reconnect loop
+├── client.rs              # public Client API (Client + BatchEntry + SubjectLimit)
+├── config.rs              # ClientConfig, KeepAlive, ReconnectPolicy
+├── error.rs               # ClientError + RequestResult
+├── metrics.rs             # ClientMetrics + ClientMetricsSnapshot
+├── consume/               # SubscriptionHandle, ack-batcher, demux
+├── manage/                # create/delete/get/list (streams + consumers)
+├── publish/               # fire-and-forget + sync publish helpers
+├── state/                 # Inner, Pending, SeqAllocator, Subscriptions
+├── transport/             # framer, encode, reader, writer producer
+├── conn/                  # session + reconnect state machine + heartbeat
 ```
+
+Built on `arbitro-kit` primitives. Coexists with no other client during
+this iteration. `SubjectLimit` is re-exported at the crate root for
+`Client::create_consumer_with_limits()`.
 
 ---
 
@@ -477,14 +558,27 @@ ConsumerConfig::new(b"worker", b"orders")
 
 ### Wire encoding
 
-`CreateConsumer` body carries a trailer with the limits:
+`CreateConsumer` body carries an **optional** trailer with the limits.
+When absent, the consumer has no per-subject caps; the legacy 28-byte
+body remains valid.
 
 ```
-[fixed CreateConsumerFixed 28B]
+[fixed CreateConsumerBody 28B]
 [name][group][subject]
-[4: limits_count]
-[for each: 4 limit] [2 pattern_len] [pattern]
+[optional trailer:
+  [2: count u16]
+  [for each: 4 limit u32] [2 pattern_len u16] [pattern bytes]
+]
 ```
+
+The trailer layout intentionally mirrors `wire::manager::CreateConsumerView::subject_limits`
+so the metadata command log can replay raw wire body bytes without
+translation. Decoded server-side via
+`CreateConsumerFrame::subject_limits() -> Option<Vec<(Vec<u8>, u32)>>`
+and applied via `engine.set_max_subject_inflight(stream, pattern, max)`
+per entry (only when `ack_policy == Explicit`; silently dropped for
+fire-and-forget consumers since the engine doesn't track inflight without
+acks).
 
 ### Server-side storage
 
