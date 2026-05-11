@@ -1,8 +1,22 @@
 ---
-description: Delta guide — what arbitro-server must adopt from arbitro-engine 2026-04 to keep the publish→claim→ack cycle inside the 90-100 ns/msg budget. Read together with engine-contract.md.
+description: HISTORICAL — superseded by the consumer-owned-counters refactor (2026-05). Reference values for old engine introspection methods that have since been deleted. Do not act on this file's advice; consult engine-contract.md and ARCHITECTURE.md instead.
 ---
 
-# ENGINE UPGRADE — 2026-04
+# ENGINE UPGRADE — 2026-04 (SUPERSEDED)
+
+> **This document is historical.** Many of the engine introspection
+> methods listed below (`subject_has_room`, `subject_inflight`,
+> `queue_inflight`, `consumer_capacity_remaining`, `is_paused`,
+> `subject_tracking_enabled`, `metrics`, `ctx_mut`, `execute_batch`,
+> `match_table`, `total_ack_pending`) were deleted in the
+> `refactor/consumer-owned-counters` PR after a usage audit found zero
+> external callers. The current engine API is documented in
+> `engine-contract.md`. The "use SharedCounters from the drain"
+> direction this doc points at remains correct in spirit; the specific
+> method names do not. Subject inflight is no longer in
+> `SharedCounters` — it is drain-owned in
+> `arbitro-server::shard::consumer_subjects::ConsumerSubjects`. See
+> `ARCHITECTURE.md` §7 for the current shape.
 
 This is a **delta**, not a replacement. `engine-contract.md` is still the
 contract. Everything below is what the server must add or fix to consume the
