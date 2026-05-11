@@ -193,6 +193,13 @@ jobs:
             echo "tags=$IMAGE:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Docker only reads .dockerignore at the context root. The
+      # source-of-truth list lives at `arbitro/.dockerignore` (so it
+      # ships in the repo at the obvious place); copy it into place at
+      # the actual context root before the build.
+      - name: Stage .dockerignore for context
+        run: cp arbitro/.dockerignore .dockerignore
+
       # The Dockerfile expects context `arbitro-io/` containing arbitro/
       # and arbitro-kit/ side-by-side — same layout as local builds.
       - name: Build (and push on master/main)
