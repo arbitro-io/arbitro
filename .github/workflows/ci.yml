@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [ main, master ]
+    tags:     [ 'v*' ]
   pull_request:
     branches: [ main, master ]
 
@@ -182,15 +183,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tag policy:
+      #   - PR push        → :pr-N (build only, not pushed)
+      #   - branch push    → :latest + :sha-XXX (rolling)
+      #   - git tag v*     → :X.Y.Z + :X.Y + :latest + :sha-XXX
+      #     (pre-1.0: no :X tag; major 0 spans breaking minors)
       - name: Compute image tags
         id: tags
         run: |
           IMAGE=ghcr.io/${{ github.repository_owner }}/arbitro-server
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "tags=$IMAGE:latest,$IMAGE:sha-$SHA_SHORT" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "tags=$IMAGE:pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+            MINOR=$(echo "$VERSION" | cut -d. -f1-2)
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            TAGS="$IMAGE:$VERSION,$IMAGE:$MINOR,$IMAGE:latest,$IMAGE:sha-$SHA_SHORT"
+            # Major-only tag stays out for pre-1.0; major bumps are
+            # breaking, so a sticky :0 is a footgun for consumers.
+            if [ "$MAJOR" -gt 0 ]; then
+              TAGS="$TAGS,$IMAGE:$MAJOR"
+            fi
+            echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          else
+            # Branch push (master/main).
+            echo "tags=$IMAGE:latest,$IMAGE:sha-$SHA_SHORT" >> "$GITHUB_OUTPUT"
           fi
 
       # Docker only reads .dockerignore at the context root. The
