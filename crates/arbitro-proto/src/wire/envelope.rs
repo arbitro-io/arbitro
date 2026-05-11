@@ -23,6 +23,22 @@ pub struct Envelope {
 pub const ENVELOPE_SIZE: usize = core::mem::size_of::<Envelope>();
 const _: () = assert!(ENVELOPE_SIZE == 16);
 
+impl Envelope {
+    /// Build a header on the stack. Use `as_bytes()` to send via `send_parts`
+    /// without any heap allocation.
+    #[inline(always)]
+    pub fn new(action: Action, stream_id: u32, msg_len: u32, env_seq: u32) -> Self {
+        Self {
+            action: U16::new(action.as_u16()),
+            flags: 0,
+            _rsv: 0,
+            stream_id: U32::new(stream_id),
+            msg_len: U32::new(msg_len),
+            env_seq: U32::new(env_seq),
+        }
+    }
+}
+
 /// Lazy view over a raw frame buffer.
 /// Decodes envelope on access, zero-copy.
 pub struct FrameView<'a> {

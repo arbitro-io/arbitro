@@ -1,15 +1,14 @@
 [package]
 name = "arbitro-engine"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+description = "Pure oracle engine for Arbitro — sync, zero-copy, single-threaded"
 
 [dependencies]
-arbitro-proto  = { path = "../arbitro-proto" }
-arbitro-common = { path = "../arbitro-common" }
-arbitro-store  = { path = "../arbitro-store" }
-arbitro-metadata = { path = "../arbitro-metadata" }
-zerocopy       = { workspace = true }
-bytes          = { workspace = true }
-parking_lot    = { workspace = true }
-tokio          = { workspace = true, features = ["sync"] }
+foldhash = "0.1"
+bytes = "1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+

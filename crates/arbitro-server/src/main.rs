@@ -1,9 +1,7 @@
 //! arbitro-server — TCP message broker.
 
-use std::sync::Arc;
-use std::path::Path;
-use arbitro_metadata::MetadataLog;
-use arbitro_server::{ArbitroServer, Config, TokioTransport};
+use arbitro_server::{ArbitroServer, Config};
+use arbitro_server::command_log::{CommandLog, SharedCommandLog};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -15,31 +13,13 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let config = Config::from_env();
-    let transport = Arc::new(TokioTransport::new(config.write_buffer_cap));
-    
-    // Optional persistence bootstrap
-    let metadata_log = if let Some(data_dir) = &config.data_dir {
-        let path = Path::new(data_dir);
-        if !path.exists() {
-            std::fs::create_dir_all(path)?;
-        }
-        let log_path = path.join("metadata.log");
-        tracing::info!(path = %log_path.display(), "loading metadata log");
-        Some(Arc::new(MetadataLog::open(log_path)?))
-    } else {
-        None
-    };
+    let mut server = ArbitroServer::new(config);
 
-    // Initialize server with NO metadata log initially to avoid recording replay
-    let server = ArbitroServer::new(config, transport, None);
-
-    // Replay log to restore state
-    if let Some(log) = metadata_log {
-        log.replay(server.engine())?;
-        
-        // Enable recording for future actions
-        tracing::info!("metadata recovery complete, enabling persistence");
-        *server.engine().ctx.metadata.write() = Some(log);
+    // Wire command log if data_dir is configured
+    if let Some(ref dir) = server.config().data_dir {
+        let path = std::path::Path::new(dir).join("metadata.log");
+        let log = CommandLog::open(path)?;
+        server.set_command_log(SharedCommandLog::new(log));
     }
 
     server.run().await

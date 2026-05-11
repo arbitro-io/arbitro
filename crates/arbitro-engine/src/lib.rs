@@ -1,243 +1,592 @@
-pub mod auth;
-pub mod drain;
-pub mod engine;
+//! ArbitroEngine — pure oracle engine.
+//!
+//! Root module. `&mut self`, sync, zero locks, zero async, zero I/O,
+//! zero threads. Only `AtomicU64::fetch_add(Relaxed)` for metrics.
+//!
+//! The engine answers queries (O(1): `has_demand`, `subject_has_room`,
+//! `consumer_has_capacity`, `is_paused`) and accepts mutations via
+//! `execute(Command) -> DeltaEvents`. Admin operations (create/delete
+//! stream/consumer, subscribe/unsubscribe, connection management) also
+//! return `DeltaEvents`.
+
+// Level 0 — no internal deps
+pub mod common;
+pub mod error;
+pub mod types;
+
+// Level 0 — metrics (atomic counters, leaf module)
 pub mod metrics;
-pub mod stream;
-pub mod transport;
 
-use std::sync::Arc;
-use arbitro_metadata::MetadataLog;
-pub use crate::engine::Engine;
-pub use crate::engine::context::Context;
-pub use crate::engine::context::SignalFactory;
-pub use crate::auth::Auth;
-pub use crate::transport::Transport;
-pub use crate::drain::signal::DrainSignal;
-use crate::auth::AllowAll;
-use crate::transport::NoopTransport;
+// Level 0 — events
+pub mod events;
 
-/// Builder for constructing an Engine with custom transport and auth.
-pub struct EngineBuilder {
-    transport: Option<Box<dyn Transport>>,
-    auth: Option<Box<dyn Auth>>,
-    signal_factory: Option<SignalFactory>,
-    metadata: Option<Arc<MetadataLog>>,
-    data_dir: Option<std::path::PathBuf>,
+// Level 1 — command vocabulary
+pub mod command;
+
+// Level 3 — inflight counters (credits)
+pub mod inflight;
+
+// Level 5 — catalog (entity storage + match tables + bindings)
+pub mod catalog;
+
+// Level 6 — context
+pub mod context;
+
+// Level 7 — runtime
+pub mod runtime;
+
+// ── Re-exports for ergonomic access ─────────────────────────────────────────
+
+pub use command::{AckEntry, Command, DeliveredEntry, DropReason};
+pub use events::DeltaEvents;
+pub use inflight::InFlightScope;
+pub use metrics::{EngineMetrics, MetricsSnapshot};
+
+/// Per-consumer state gauge — point-in-time picture of one consumer's
+/// load. Sent over the shard mpsc by `consumer_states_snapshot()`.
+///
+/// `ack_pending` is the count of messages delivered to the consumer
+/// but not yet acked. Use it as a NATS-style `num_ack_pending` gauge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerStateSnapshot {
+    pub consumer_id: u32,
+    pub stream_id:   u32,
+    pub queue_id:    u32,
+    pub paused:      bool,
+    pub ack_pending: u32,
 }
 
-impl Default for EngineBuilder {
+// ── ArbitroEngine — oracle facade ───────────────────────────────────────────
+
+use context::EngineContext;
+use types::*;
+
+/// The ArbitroEngine — pure oracle, single-threaded.
+///
+/// All operations go through this struct. `&mut self` is the
+/// synchronization — no locks needed.
+pub struct ArbitroEngine {
+    ctx: EngineContext,
+}
+
+impl ArbitroEngine {
+    /// Create a new engine with default settings.
+    pub fn new() -> Self {
+        Self {
+            ctx: EngineContext::new(),
+        }
+    }
+
+    // ── Oracle queries (hot path, O(1)) ─────────────────────────────────
+
+    /// Any stream has ≥1 active binding.
+    #[inline]
+    pub fn has_any_demand(&self) -> bool {
+        self.ctx.catalog.has_any_demand()
+    }
+
+    /// This stream has ≥1 active binding.
+    #[inline]
+    pub fn has_demand(&self, stream_id: StreamId) -> bool {
+        self.ctx.catalog.has_demand(stream_id)
+    }
+
+    /// Subject has room for more in-flight on this stream.
+    /// Returns `true` if no subject-inflight limit is set.
+    #[inline]
+    pub fn subject_has_room(
+        &self,
+        stream_id: StreamId,
+        _subject: &[u8],
+        subject_hash: u32,
+    ) -> bool {
+        if !self.ctx.inflight.is_tracking_subject() {
+            return true;
+        }
+        match self.ctx.catalog.max_subject_inflight(stream_id, subject_hash) {
+            Some(max) => self.ctx.inflight.has_capacity(
+                inflight::InFlightScope::Subject,
+                subject_hash,
+                max,
+            ),
+            None => true,
+        }
+    }
+
+    /// Consumer has capacity for more in-flight messages. ~3 ns.
+    #[inline]
+    pub fn consumer_has_capacity(
+        &self,
+        consumer_id: ConsumerId,
+        max_inflight: u32,
+    ) -> bool {
+        self.ctx.inflight.has_capacity(
+            inflight::InFlightScope::Consumer,
+            consumer_id.raw(),
+            max_inflight,
+        )
+    }
+
+    /// Spare consumer capacity (`max - inflight`, saturated). ~3 ns.
+    #[inline]
+    pub fn consumer_capacity_remaining(
+        &self,
+        consumer_id: ConsumerId,
+        max_inflight: u32,
+    ) -> u32 {
+        max_inflight.saturating_sub(self.consumer_inflight(consumer_id))
+    }
+
+    /// Live consumer inflight count. O(1) Vec read, ~2 ns.
+    #[inline]
+    pub fn consumer_inflight(&self, consumer_id: ConsumerId) -> u32 {
+        self.ctx
+            .inflight
+            .get(inflight::InFlightScope::Consumer, consumer_id.raw())
+    }
+
+    /// Is the consumer paused?
+    #[inline]
+    pub fn is_paused(&self, consumer_id: ConsumerId) -> bool {
+        self.ctx.catalog.is_paused(consumer_id)
+    }
+
+    /// Resolve recipients for a subject on a stream. Returns match
+    /// entries from the precomputed match table. Caller iterates and
+    /// dispatches.
+    #[inline]
+    pub fn match_table(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<&catalog::match_table::MatchTable> {
+        self.ctx.catalog.match_table(stream_id)
+    }
+
+    /// Whether subject-scope inflight is being tracked at all.
+    #[inline]
+    pub fn subject_tracking_enabled(&self) -> bool {
+        self.ctx.inflight.is_tracking_subject()
+    }
+
+    // ── Execute (hot-path mutation, returns events) ─────────────────────
+
+    /// Apply a single `Command` to engine state. Returns events for
+    /// the worker to react to.
+    #[must_use]
+    #[inline]
+    pub fn execute(&mut self, cmd: &command::Command<'_>) -> DeltaEvents {
+        runtime::execute::apply(&mut self.ctx, cmd)
+    }
+
+    /// Apply a slice of `Command`s in order.
+    #[must_use]
+    #[inline]
+    pub fn execute_batch(&mut self, cmds: &[command::Command<'_>]) -> DeltaEvents {
+        runtime::execute::apply_batch(&mut self.ctx, cmds)
+    }
+
+    // ── Catalog admin (cold path, returns events) ───────────────────────
+
+    /// Create or ensure a stream exists.
+    pub fn create_stream(
+        &mut self,
+        config: catalog::StreamConfig,
+    ) -> error::EngineResult<()> {
+        self.ctx.catalog.ensure_stream(config)
+    }
+
+    /// Delete a stream. Retires all bindings on this stream, releasing
+    /// inflight credits. Returns events with `bindings_retired` +
+    /// `demand_became_idle`.
+    #[must_use]
+    pub fn delete_stream(&mut self, id: StreamId) -> DeltaEvents {
+        let mut events = DeltaEvents::default();
+        runtime::retire::retire_bindings_for_stream(&mut self.ctx, id, &mut events);
+        let _ = self.ctx.catalog.remove_stream_entity(id);
+        events
+    }
+
+    /// Create or ensure a consumer exists.
+    pub fn create_consumer(
+        &mut self,
+        config: catalog::ConsumerConfig,
+    ) -> error::EngineResult<()> {
+        self.ctx.catalog.ensure_consumer(config)
+    }
+
+    /// Delete a consumer. Retires all bindings + subscriptions for this
+    /// consumer.
+    #[must_use]
+    pub fn delete_consumer(&mut self, id: ConsumerId) -> DeltaEvents {
+        let mut events = DeltaEvents::default();
+
+        // Retire bindings first (releases inflight).
+        runtime::retire::retire_bindings_for_consumer(&mut self.ctx, id, &mut events);
+
+        // Remove subscriptions for this consumer.
+        let sub_ids = self.ctx.catalog.subscriptions_for_consumer(id);
+        for sid in sub_ids {
+            let _ = self.ctx.catalog.remove_subscription_entity(sid);
+        }
+
+        // Remove consumer entity.
+        let _ = self.ctx.catalog.remove_consumer_entity(id);
+
+        events
+    }
+
+    /// Create or ensure a subscription exists (subject filter → consumer).
+    pub fn create_subscription(
+        &mut self,
+        config: catalog::SubscriptionConfig,
+    ) -> error::EngineResult<()> {
+        self.ctx.catalog.ensure_subscription(config)
+    }
+
+    /// Subscribe: bind a subscription to a connection. Creates a binding,
+    /// updates match table with connection_id, increments demand.
+    #[must_use]
+    pub fn subscribe(
+        &mut self,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> (error::EngineResult<BindingId>, DeltaEvents) {
+        let mut events = DeltaEvents::default();
+        let result =
+            self.ctx
+                .catalog
+                .subscribe(connection_id, subscription_id, &mut events);
+        (result, events)
+    }
+
+    /// Unsubscribe: retire a binding.
+    #[must_use]
+    pub fn unsubscribe(&mut self, binding_id: BindingId) -> DeltaEvents {
+        let mut events = DeltaEvents::default();
+        runtime::retire::retire_binding(&mut self.ctx, binding_id, &mut events);
+        events
+    }
+
+    /// Register a new connection.
+    pub fn open_connection(&mut self, connection_id: ConnectionId, node_id: NodeId) {
+        self.ctx.catalog.open_connection(connection_id, node_id);
+    }
+
+    /// Mark a connection as dead. Retires all bindings on this connection.
+    #[must_use]
+    pub fn mark_connection_dead(&mut self, connection_id: ConnectionId) -> DeltaEvents {
+        let mut events = DeltaEvents::default();
+        runtime::retire::retire_bindings_for_connection(
+            &mut self.ctx,
+            connection_id,
+            &mut events,
+        );
+        self.ctx.catalog.remove_connection_entity(connection_id);
+        events
+    }
+
+    /// Pause a consumer.
+    pub fn pause_consumer(&mut self, id: ConsumerId) -> bool {
+        self.ctx.catalog.pause_consumer(id)
+    }
+
+    /// Resume a consumer.
+    pub fn resume_consumer(&mut self, id: ConsumerId) -> bool {
+        self.ctx.catalog.resume_consumer(id)
+    }
+
+    /// Set max inflight per subject by pattern on a stream.
+    pub fn set_max_subject_inflight(
+        &mut self,
+        stream_id: StreamId,
+        pattern: &[u8],
+        max_inflight: u32,
+    ) -> error::EngineResult<()> {
+        self.ctx
+            .catalog
+            .set_max_subject_inflight(stream_id, pattern, max_inflight)?;
+        self.ctx.inflight.enable_subject_tracking();
+        Ok(())
+    }
+
+    // ── Listing (cold path) ─────────────────────────────────────────────
+
+    /// List all streams.
+    pub fn list_streams(&self) -> Vec<(StreamId, Vec<u8>)> {
+        self.ctx.catalog.list_streams()
+    }
+
+    /// List all consumers.
+    pub fn list_consumers(&self) -> Vec<(ConsumerId, StreamId, QueueId, bool)> {
+        self.ctx.catalog.list_consumers()
+    }
+
+    /// Get consumer info.
+    pub fn consumer(&self, id: ConsumerId) -> Option<&catalog::ConsumerInfo> {
+        self.ctx.catalog.consumer(id)
+    }
+
+    // ── Inflight introspection ──────────────────────────────────────────
+
+    /// Live queue inflight count. O(1) Vec read.
+    #[inline]
+    pub fn queue_inflight(&self, queue_id: QueueId) -> u32 {
+        self.ctx
+            .inflight
+            .get(inflight::InFlightScope::Queue, queue_id.raw())
+    }
+
+    /// Live subject inflight count. O(1) HashMap read.
+    #[inline]
+    pub fn subject_inflight(&self, subject_hash: u32) -> u32 {
+        self.ctx
+            .inflight
+            .get(inflight::InFlightScope::Subject, subject_hash)
+    }
+
+    // ── Observability ───────────────────────────────────────────────────
+
+    /// Per-consumer live state — pending ACKs (`ack_pending`) and paused
+    /// flag. The result is materialized once (no iterator into engine
+    /// internals), so callers can safely send it across thread boundaries.
+    ///
+    /// `ack_pending` is the count of messages delivered to the consumer
+    /// that haven't been acked yet (the equivalent of NATS JetStream's
+    /// `num_ack_pending`). Sums across all consumers give the broker's
+    /// total in-flight load — useful as a saturation gauge.
+    pub fn consumer_states_snapshot(&self) -> Vec<ConsumerStateSnapshot> {
+        self.list_consumers()
+            .into_iter()
+            .map(|(consumer_id, stream_id, queue_id, paused)| ConsumerStateSnapshot {
+                consumer_id: consumer_id.raw(),
+                stream_id:   stream_id.raw(),
+                queue_id:    queue_id.raw(),
+                paused,
+                ack_pending: self.consumer_inflight(consumer_id),
+            })
+            .collect()
+    }
+
+    /// Total messages delivered-but-not-acked across every consumer on
+    /// this engine. The headline broker-saturation gauge — emit this
+    /// every metrics tick so operators see backpressure forming before
+    /// ack rates fall behind publish rates.
+    pub fn total_ack_pending(&self) -> u64 {
+        self.consumer_states_snapshot()
+            .iter()
+            .map(|s| s.ack_pending as u64)
+            .sum()
+    }
+
+    /// Borrow the atomic counter set for cross-thread observability.
+    #[inline]
+    pub fn metrics(&self) -> &metrics::EngineMetrics {
+        &self.ctx.metrics
+    }
+
+    /// Point-in-time snapshot of all counters.
+    #[inline]
+    pub fn metrics_snapshot(&self) -> metrics::MetricsSnapshot {
+        self.ctx.metrics.snapshot()
+    }
+
+    // ── Internal access (for server integration) ────────────────────────
+
+    /// Direct access to the engine context (for advanced/server use).
+    #[inline]
+    pub fn ctx(&self) -> &EngineContext {
+        &self.ctx
+    }
+
+    /// Mutable access to the engine context.
+    #[inline]
+    pub fn ctx_mut(&mut self) -> &mut EngineContext {
+        &mut self.ctx
+    }
+}
+
+impl Default for ArbitroEngine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EngineBuilder {
-    pub fn new() -> Self {
-        Self {
-            transport: None,
-            auth: None,
-            signal_factory: None,
-            metadata: None,
-            data_dir: None,
-        }
-    }
-
-    pub fn transport(mut self, t: impl Transport + 'static) -> Self {
-        self.transport = Some(Box::new(t));
-        self
-    }
-
-    pub fn auth(mut self, a: impl Auth + 'static) -> Self {
-        self.auth = Some(Box::new(a));
-        self
-    }
-
-    pub fn signal_factory(mut self, f: SignalFactory) -> Self {
-        self.signal_factory = Some(f);
-        self
-    }
-
-    pub fn metadata(mut self, m: Arc<MetadataLog>) -> Self {
-        self.metadata = Some(m);
-        self
-    }
-
-    pub fn data_dir(mut self, d: impl Into<std::path::PathBuf>) -> Self {
-        self.data_dir = Some(d.into());
-        self
-    }
-
-    pub fn build(self) -> Engine {
-        let transport = self.transport.unwrap_or_else(|| Box::new(NoopTransport));
-        let auth = self.auth.unwrap_or_else(|| Box::new(AllowAll));
-        let mut ctx = Context::new(transport, auth);
-        ctx.data_dir = self.data_dir;
-        if let Some(f) = self.signal_factory {
-            ctx.signal_factory = f;
-        }
-        if let Some(m) = self.metadata {
-            *ctx.metadata.write() = Some(m);
-        }
-        Engine::new(ctx)
-    }
-}
-
 #[cfg(test)]
-mod tests {
+mod engine_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-    use std::sync::Mutex;
 
-    use arbitro_proto::action::Action;
-    use arbitro_proto::config::StreamConfig;
-    use arbitro_proto::ids::ConnId;
-    use arbitro_proto::wire::envelope::{Envelope, ENVELOPE_SIZE};
-    use arbitro_proto::wire::publish::PublishEntry;
-    use zerocopy::IntoBytes;
-    use zerocopy::byteorder::little_endian::{U16, U32};
+    #[test]
+    fn oracle_lifecycle() {
+        let mut engine = ArbitroEngine::new();
 
-    /// Transport that captures sent frames for assertions.
-    struct CaptureTransport {
-        frames: Mutex<Vec<(ConnId, Vec<u8>)>>,
-        count: AtomicU32,
-    }
+        // Setup catalog.
+        engine
+            .create_stream(catalog::StreamConfig {
+                id: StreamId(1),
+                name: b"orders".to_vec(),
+            })
+            .unwrap();
 
-    impl CaptureTransport {
-        fn new() -> Self {
-            Self {
-                frames: Mutex::new(Vec::new()),
-                count: AtomicU32::new(0),
-            }
-        }
+        engine
+            .create_consumer(catalog::ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 1000,
+                ack_wait_ms: 0,
+            })
+            .unwrap();
 
-        fn sent_count(&self) -> u32 {
-            self.count.load(Relaxed)
-        }
+        engine
+            .create_subscription(catalog::SubscriptionConfig {
+                id: SubscriptionId(1),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            })
+            .unwrap();
 
-        fn last_frame(&self) -> Option<Vec<u8>> {
-            self.frames.lock().unwrap().last().map(|(_, f)| f.clone())
-        }
-    }
+        // No demand yet — no binding.
+        assert!(!engine.has_any_demand());
 
-    impl Transport for CaptureTransport {
-        fn send(&self, conn_id: ConnId, data: &[u8]) -> bool {
-            self.frames.lock().unwrap().push((conn_id, data.to_vec()));
-            self.count.fetch_add(1, Relaxed);
-            true
-        }
-        fn close(&self, _conn_id: ConnId) {}
-    }
+        // Open connection + subscribe.
+        engine.open_connection(ConnectionId(100), NodeId(1));
+        let (result, events) =
+            engine.subscribe(ConnectionId(100), SubscriptionId(1));
+        let binding_id = result.unwrap();
+        assert!(!events.is_empty());
+        assert!(engine.has_any_demand());
+        assert!(engine.has_demand(StreamId(1)));
 
-    fn build_publish_frame(stream_id: u32, subject: &[u8], payload: &[u8]) -> Vec<u8> {
-        // Entry header: data_len = payload only (not subject)
-        let entry = PublishEntry {
-            data_len: U32::new(payload.len() as u32),
-            subj_len: U16::new(subject.len() as u16),
-            reply_len: U16::new(0),
-            flags: 0,
-            _pad: [0; 3],
-        };
-        let entry_bytes = entry.as_bytes();
+        // Simulate delivery via execute(Delivered).
+        let delivered = [command::DeliveredEntry {
+            seq: 1,
+            subject_hash: 0xBEEF,
+            _pad: 0,
+        }];
+        let _events = engine.execute(&command::Command::Delivered {
+            stream_id: StreamId(1),
+            binding_id,
+            entries: &delivered,
+        });
 
-        // Body = 2-byte count + entry header + subject + payload
-        let count: u16 = 1;
-        let body_len = 2 + entry_bytes.len() + subject.len() + payload.len();
+        // Consumer inflight bumped.
+        assert_eq!(engine.consumer_inflight(ConsumerId(1)), 1);
+        assert!(engine.consumer_has_capacity(ConsumerId(1), 1000));
 
-        let envelope = Envelope {
-            action: U16::new(Action::Publish.as_u16()),
-            flags: 0,
-            _rsv: 0,
-            stream_id: U32::new(stream_id),
-            msg_len: U32::new(body_len as u32),
-            env_seq: U32::new(1),
-        };
+        // Ack the message.
+        let acks = [command::AckEntry {
+            stream_id: StreamId(1),
+            seq: 1,
+        }];
+        let _events = engine.execute(&command::Command::Ack {
+            consumer_id: ConsumerId(1),
+            entries: &acks,
+        });
 
-        let mut frame = Vec::with_capacity(ENVELOPE_SIZE + body_len);
-        frame.extend_from_slice(envelope.as_bytes());
-        frame.extend_from_slice(&count.to_le_bytes()); // batch count
-        frame.extend_from_slice(entry_bytes);
-        frame.extend_from_slice(subject);
-        frame.extend_from_slice(payload);
-        frame
+        // Inflight back to 0.
+        assert_eq!(engine.consumer_inflight(ConsumerId(1)), 0);
+
+        // Unsubscribe.
+        let events = engine.unsubscribe(binding_id);
+        assert!(!engine.has_any_demand());
+        assert_eq!(events.bindings_retired.len(), 1);
+        assert_eq!(events.demand_became_idle.len(), 1);
     }
 
     #[test]
-    fn full_publish_roundtrip() {
-        let transport = CaptureTransport::new();
-        let mut engine = EngineBuilder::new()
-            .transport(transport)
-            .build();
+    fn mark_connection_dead_retires_bindings() {
+        let mut engine = ArbitroEngine::new();
 
-        // Create stream
-        let config = StreamConfig::new(b"ORDERS").build();
-        let stream_id = config.stream_id;
+        engine
+            .create_stream(catalog::StreamConfig {
+                id: StreamId(1),
+                name: b"s".to_vec(),
+            })
+            .unwrap();
+        engine
+            .create_consumer(catalog::ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+                ack_wait_ms: 0,
+            })
+            .unwrap();
+        engine
+            .create_subscription(catalog::SubscriptionConfig {
+                id: SubscriptionId(1),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            })
+            .unwrap();
 
-        engine::management::on_create_stream(&engine.ctx, 1, 0, config);
-        assert_eq!(engine.ctx.metrics.snapshot().streams, 1);
+        engine.open_connection(ConnectionId(42), NodeId(1));
+        let (result, _) =
+            engine.subscribe(ConnectionId(42), SubscriptionId(1));
+        let _bid = result.unwrap();
+        assert!(engine.has_demand(StreamId(1)));
 
-        // Publish
-        let frame = build_publish_frame(stream_id, b"orders.created", b"{}");
-        engine.process_frame(1, &frame);
-
-        assert_eq!(engine.ctx.metrics.snapshot().msgs_in, 1);
-
-        // Verify store has the entry
-        let info = engine.ctx.streams.with(stream_id, |s| s.store.info());
-        assert_eq!(info.unwrap().messages, 1);
+        // Kill connection.
+        let events = engine.mark_connection_dead(ConnectionId(42));
+        assert!(!engine.has_demand(StreamId(1)));
+        assert_eq!(events.bindings_retired.len(), 1);
     }
 
     #[test]
-    fn publish_to_nonexistent_stream() {
-        let transport = CaptureTransport::new();
-        let mut engine = EngineBuilder::new()
-            .transport(transport)
-            .build();
+    fn delete_stream_cascades() {
+        let mut engine = ArbitroEngine::new();
 
-        let frame = build_publish_frame(999, b"test", b"{}");
-        engine.process_frame(1, &frame);
+        engine
+            .create_stream(catalog::StreamConfig {
+                id: StreamId(1),
+                name: b"s".to_vec(),
+            })
+            .unwrap();
+        engine
+            .create_consumer(catalog::ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+                ack_wait_ms: 0,
+            })
+            .unwrap();
+        engine
+            .create_subscription(catalog::SubscriptionConfig {
+                id: SubscriptionId(1),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            })
+            .unwrap();
+        engine.open_connection(ConnectionId(1), NodeId(1));
+        let (r, _) =
+            engine.subscribe(ConnectionId(1), SubscriptionId(1));
+        r.unwrap();
 
-        // Should get RepError (StreamNotFound)
-        assert_eq!(engine.ctx.metrics.snapshot().msgs_in, 0);
-    }
+        // Deliver + leave pending.
+        let _events = engine.execute(&command::Command::Delivered {
+            stream_id: StreamId(1),
+            binding_id: BindingId(1),
+            entries: &[command::DeliveredEntry {
+                seq: 1,
+                subject_hash: 0xABC,
+                _pad: 0,
+            }],
+        });
+        assert_eq!(engine.consumer_inflight(ConsumerId(1)), 1);
 
-    #[test]
-    fn create_delete_stream() {
-        let engine = EngineBuilder::new().build();
-
-        let config = StreamConfig::new(b"ORDERS").build();
-        let stream_id = config.stream_id;
-
-        engine::management::on_create_stream(&engine.ctx, 1, 0, config);
-        assert_eq!(engine.ctx.streams.count(), 1);
-
-        engine::management::on_delete_stream(&engine.ctx, 1, stream_id, 0);
-        assert_eq!(engine.ctx.streams.count(), 0);
-    }
-
-    #[test]
-    fn purge_and_drain() {
-        let mut engine = EngineBuilder::new().build();
-
-        let config = StreamConfig::new(b"ORDERS").build();
-        let stream_id = config.stream_id;
-        engine::management::on_create_stream(&engine.ctx, 1, 0, config);
-
-        // Publish some messages
-        for _ in 0..5 {
-            let frame = build_publish_frame(stream_id, b"orders.created", b"{}");
-            engine.process_frame(1, &frame);
-        }
-
-        assert_eq!(
-            engine.ctx.streams.with(stream_id, |s| s.store.info()).unwrap().messages,
-            5
-        );
-
-        // Purge
-        engine::management::on_purge_stream(&engine.ctx, 1, stream_id, 0);
-        assert_eq!(
-            engine.ctx.streams.with(stream_id, |s| s.store.info()).unwrap().messages,
-            0
-        );
+        // Delete stream — retires binding, releases inflight.
+        let events = engine.delete_stream(StreamId(1));
+        assert_eq!(events.bindings_retired.len(), 1);
+        assert_eq!(engine.consumer_inflight(ConsumerId(1)), 0);
     }
 }

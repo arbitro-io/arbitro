@@ -11,16 +11,38 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
+[features]
+default = []
+# Enables the one-shot lifecycle profiler (lifecycle_trace.rs).
+# When OFF, `record()` compiles to a no-op `#[inline(always)] {}` and every
+# call site is eliminated by dead-code elimination — zero instructions in
+# the final binary, zero AtomicBool gate, zero cost on the hot path.
+# Enable with `cargo test --features lifecycle_trace` when you need to
+# profile end-to-end timings of a single message through the server.
+lifecycle_trace = []
+# TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+
 [dependencies]
-arbitro-proto  = { path = "../arbitro-proto" }
-arbitro-engine = { path = "../arbitro-engine" }
-arbitro-store  = { path = "../arbitro-store" }
-arbitro-metadata = { path = "../arbitro-metadata" }
-tokio          = { workspace = true }
-tracing        = { workspace = true }
+arbitro-engine-v2 = { workspace = true }
+arbitro-common    = { workspace = true }
+arbitro-proto     = { path = "../arbitro-proto" }
+arbitro-store     = { path = "../arbitro-store" }
+arbitro-kit       = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
-bytes          = { workspace = true }
-zerocopy       = { workspace = true }
+bytes             = { workspace = true }
+zerocopy          = { workspace = true }
+papaya            = "0.2"
+foldhash          = "0.1"
+# TLS (optional)
+tokio-rustls      = { version = "0.26", optional = true }
+rustls-pemfile    = { version = "2", optional = true }
 
 [dev-dependencies]
-arbitro-client = { path = "../arbitro-client" }
+# (intentionally empty — benches now use only workspace deps)
+
+# Benches removed: they were strategy comparisons used during
+# development, not regression benchmarks. Add a new bench under
+# `benches/` when targeting a specific production path.

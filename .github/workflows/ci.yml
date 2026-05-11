@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# arbitro-kit lives as a sibling crate (path = "../arbitro-kit"). The
+# checkout step pulls it into a parallel path so the workspace builds.
+defaults:
+  run:
+    working-directory: arbitro
+
+jobs:
+  # ── Quick checks (fast, fail-fast) ────────────────────────────────────
+  # ── Informational gates ───────────────────────────────────────────────
+  # fmt + clippy run informationally — they catch style/lint drift but
+  # don't fail the build. Required gates are: unit-tests, e2e-integration,
+  # e2e-persistence, bench-compile. This matches the arbitro-kit policy.
+  fmt:
+    name: rustfmt (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --lib --tests
+
+  # ── Unit tests (per-crate, fast) ──────────────────────────────────────
+  unit-tests:
+    name: unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --lib
+
+  # ── E2E integration tests (no persistence) ────────────────────────────
+  e2e-integration:
+    name: e2e integration
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Integration tests
+        run: cargo test -p arbitro-e2e --test integration
+      - name: Client ack invariants
+        run: cargo test -p arbitro-e2e --test client_ack_invariants
+      - name: Invariants
+        run: cargo test -p arbitro-e2e --test invariants
+      - name: Lifecycle flow
+        run: cargo test -p arbitro-e2e --test lifecycle_flow
+      - name: Shutdown
+        run: cargo test -p arbitro-e2e --test shutdown
+
+  # ── Persistence tests (separate: disk I/O, longer, isolated) ──────────
+  e2e-persistence:
+    name: e2e persistence
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Persistence tests
+        run: cargo test -p arbitro-e2e --test persistence -- --test-threads=1
+        timeout-minutes: 10
+
+  # ── Benches compile (no run; just ensure they don't bit-rot) ──────────
+  bench-compile:
+    name: benches compile
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run

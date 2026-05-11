@@ -3,23 +3,41 @@
 //! Sync only. No tokio, no async. If a backend needs async I/O,
 //! the server wraps it in spawn_blocking.
 
-use arbitro_common::subject::subject_matches;
+use arbitro_engine_v2::common::subject_matches;
+
+/// Entry flag bits — stored as `flags: u8` on every Entry.
+pub mod flags {
+    /// Entry has been tombstoned (logically deleted, kept for drain-time skip).
+    pub const TOMBSTONE: u8 = 0b0000_0001;
+    /// Payload is prefixed with `[reply_len:u16 LE][reply_to bytes]`.
+    /// Used by request/reply (PubWithReply). Drain extracts the prefix
+    /// and passes `reply_to` through the delivery wire frame.
+    pub const HAS_REPLY_TO: u8 = 0b0000_1000;
+}
 
 /// A single stored message view.
 /// Borrows data from the store arena — zero allocations.
+///
+/// `stream_id` is embedded so the store remains stream-agnostic: the
+/// shard has ONE store, one cursor, and the drain filters by
+/// `engine.has_demand(stream_id)` per entry during linear walk.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry<'a> {
     pub seq: u64,
+    pub stream_id: u32,
     pub timestamp: u64,
     pub subject: &'a [u8],
     pub payload: &'a [u8],
+    pub flags: u8,
 }
 
 /// Message reference for appending — borrows data, no allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct EntryRef<'a> {
+    pub stream_id: u32,
     pub subject: &'a [u8],
     pub payload: &'a [u8],
+    pub flags: u8,
 }
 
 /// Store stats.

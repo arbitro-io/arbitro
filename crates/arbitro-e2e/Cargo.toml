@@ -1,0 +1,60 @@
+[package]
+name = "arbitro-e2e"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+zerocopy       = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { workspace = true }
+arbitro-proto  = { path = "../arbitro-proto" }
+arbitro-engine-v2 = { workspace = true }
+arbitro-store  = { path = "../arbitro-store" }
+arbitro-server = { path = "../arbitro-server" }
+arbitro-client-tokio = { path = "../arbitro-client-tokio" }
+arbitro-common = { path = "../arbitro-common" }
+tempfile       = { workspace = true }
+futures        = "0.3"
+
+[features]
+lifecycle_trace = ["arbitro-server/lifecycle_trace"]
+
+
+[dev-dependencies]
+criterion = { workspace = true }
+crossbeam-channel = "0.5"
+flume = "0.11"
+atomic-wait = "1"
+libc = "0.2"
+nix  = { version = "0.27", features = ["signal", "process"] }
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio-uring = { workspace = true }
+
+[[bench]]
+name    = "throughput"
+harness = false
+
+[[bench]]
+name    = "limits"
+harness = false
+
+[[bench]]
+name    = "queue"
+harness = false
+
+[[bench]]
+name    = "fanout"
+harness = false
+
+[[bench]]
+name    = "ack"
+harness = false
+
+[[bench]]
+name    = "chaos"
+harness = false

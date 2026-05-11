@@ -4,8 +4,22 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum Action {
-    // 0x01xx — Publish
-    Publish       = 0x0101,
+    // 0x01xx — Publish family. Specific actions per body shape — no
+    // discriminator byte inside the payload, no inner branching.
+    Publish                  = 0x0101,
+    PublishAccumulate        = 0x0102,
+    PublishBatch             = 0x0103,
+    PublishWithReply         = 0x0104, // + reply_to (RPC)
+    PublishWithHeaders       = 0x0105, // + headers (tracing/metadata)
+    PublishBatchWithHeaders  = 0x0106, // batch where every entry has headers
+
+    // 0x00xx — Handshake / control (pre-Header). Hello is *not* a v2 frame:
+    // its on-wire representation is a 8B HelloFrame starting with the v2
+    // magic, sent as the first bytes of every connection.
+    Hello                    = 0x0001,
+    /// Auth frame — Header + raw token bytes. Must be the first frame
+    /// after Hello when the server requires authentication.
+    Auth                     = 0x0002,
 
     // 0x02xx — Delivery
     Deliver       = 0x0200,
@@ -18,11 +32,11 @@ pub enum Action {
     FanoutBatch   = 0x0207,
     AckSync       = 0x0208,
     BatchAckSync  = 0x0209,
+    BatchNack     = 0x020A,
 
     // 0x03xx — Subscription
     Subscribe     = 0x0301,
     Unsubscribe   = 0x0302,
-    Fetch         = 0x0303,
 
     // 0x04xx — Stream management
     CreateStream  = 0x0401,
@@ -37,6 +51,9 @@ pub enum Action {
     DeleteConsumer = 0x0502,
     GetConsumer    = 0x0503,
     ListConsumers  = 0x0504,
+    /// Query a single consumer's live pending-ack count. Reply is a
+    /// standard `RepOk` whose `ref_seq` field carries the count as a u64.
+    ConsumerStats  = 0x0505,
 
     // 0x06xx — System
     Ping          = 0x0601,
@@ -55,7 +72,15 @@ impl Action {
     #[inline(always)]
     pub const fn from_u16(v: u16) -> Option<Self> {
         match v {
+            0x0001 => Some(Self::Hello),
+            0x0002 => Some(Self::Auth),
+
             0x0101 => Some(Self::Publish),
+            0x0102 => Some(Self::PublishAccumulate),
+            0x0103 => Some(Self::PublishBatch),
+            0x0104 => Some(Self::PublishWithReply),
+            0x0105 => Some(Self::PublishWithHeaders),
+            0x0106 => Some(Self::PublishBatchWithHeaders),
 
             0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
@@ -67,10 +92,10 @@ impl Action {
             0x0207 => Some(Self::FanoutBatch),
             0x0208 => Some(Self::AckSync),
             0x0209 => Some(Self::BatchAckSync),
+            0x020A => Some(Self::BatchNack),
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
-            0x0303 => Some(Self::Fetch),
 
             0x0401 => Some(Self::CreateStream),
             0x0402 => Some(Self::DeleteStream),
@@ -83,6 +108,7 @@ impl Action {
             0x0502 => Some(Self::DeleteConsumer),
             0x0503 => Some(Self::GetConsumer),
             0x0504 => Some(Self::ListConsumers),
+            0x0505 => Some(Self::ConsumerStats),
 
             0x0601 => Some(Self::Ping),
             0x0602 => Some(Self::Pong),
@@ -102,15 +128,52 @@ impl Action {
         self as u16
     }
 
-    /// Hot-path actions: publish, ack, nack.
+    /// Hot-path actions: publish family, ack, nack.
     #[inline(always)]
     pub const fn is_hot(self) -> bool {
-        matches!(self, Self::Publish | Self::Ack | Self::Nack | Self::BatchAck | Self::AckSync | Self::BatchAckSync)
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+                | Self::Ack
+                | Self::Nack
+                | Self::BatchAck
+                | Self::AckSync
+                | Self::BatchAckSync
+                | Self::BatchNack
+        )
     }
 
     /// Actions that carry a subject for routing.
     #[inline(always)]
     pub const fn has_subject(self) -> bool {
-        matches!(self, Self::Publish | Self::Subscribe)
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+                | Self::Subscribe
+        )
+    }
+
+    /// Whether the action is a member of the publish family.
+    #[inline(always)]
+    pub const fn is_publish(self) -> bool {
+        matches!(
+            self,
+            Self::Publish
+                | Self::PublishAccumulate
+                | Self::PublishBatch
+                | Self::PublishWithReply
+                | Self::PublishWithHeaders
+                | Self::PublishBatchWithHeaders
+        )
     }
 }
