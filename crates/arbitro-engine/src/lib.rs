@@ -3,11 +3,14 @@
 //! Root module. `&mut self`, sync, zero locks, zero async, zero I/O,
 //! zero threads. Only `AtomicU64::fetch_add(Relaxed)` for metrics.
 //!
-//! The engine answers queries (O(1): `has_demand`, `subject_has_room`,
-//! `consumer_has_capacity`, `is_paused`) and accepts mutations via
-//! `execute(Command) -> DeltaEvents`. Admin operations (create/delete
+//! The engine answers queries (O(1): `has_demand`, `has_any_demand`,
+//! `consumer_has_capacity`, `consumer_inflight`) and accepts mutations
+//! via `execute(Command) -> DeltaEvents`. Admin operations (create/delete
 //! stream/consumer, subscribe/unsubscribe, connection management) also
 //! return `DeltaEvents`.
+//!
+//! Subject inflight + paused-state are tracked by the server (per-consumer
+//! ownership) and never via the engine, so the engine exposes neither.
 
 // Level 0 — no internal deps
 pub mod common;
@@ -91,28 +94,6 @@ impl ArbitroEngine {
         self.ctx.catalog.has_demand(stream_id)
     }
 
-    /// Subject has room for more in-flight on this stream.
-    /// Returns `true` if no subject-inflight limit is set.
-    #[inline]
-    pub fn subject_has_room(
-        &self,
-        stream_id: StreamId,
-        _subject: &[u8],
-        subject_hash: u32,
-    ) -> bool {
-        if !self.ctx.inflight.is_tracking_subject() {
-            return true;
-        }
-        match self.ctx.catalog.max_subject_inflight(stream_id, subject_hash) {
-            Some(max) => self.ctx.inflight.has_capacity(
-                inflight::InFlightScope::Subject,
-                subject_hash,
-                max,
-            ),
-            None => true,
-        }
-    }
-
     /// Consumer has capacity for more in-flight messages. ~3 ns.
     #[inline]
     pub fn consumer_has_capacity(
@@ -127,45 +108,12 @@ impl ArbitroEngine {
         )
     }
 
-    /// Spare consumer capacity (`max - inflight`, saturated). ~3 ns.
-    #[inline]
-    pub fn consumer_capacity_remaining(
-        &self,
-        consumer_id: ConsumerId,
-        max_inflight: u32,
-    ) -> u32 {
-        max_inflight.saturating_sub(self.consumer_inflight(consumer_id))
-    }
-
     /// Live consumer inflight count. O(1) Vec read, ~2 ns.
     #[inline]
     pub fn consumer_inflight(&self, consumer_id: ConsumerId) -> u32 {
         self.ctx
             .inflight
             .get(inflight::InFlightScope::Consumer, consumer_id.raw())
-    }
-
-    /// Is the consumer paused?
-    #[inline]
-    pub fn is_paused(&self, consumer_id: ConsumerId) -> bool {
-        self.ctx.catalog.is_paused(consumer_id)
-    }
-
-    /// Resolve recipients for a subject on a stream. Returns match
-    /// entries from the precomputed match table. Caller iterates and
-    /// dispatches.
-    #[inline]
-    pub fn match_table(
-        &self,
-        stream_id: StreamId,
-    ) -> Option<&catalog::match_table::MatchTable> {
-        self.ctx.catalog.match_table(stream_id)
-    }
-
-    /// Whether subject-scope inflight is being tracked at all.
-    #[inline]
-    pub fn subject_tracking_enabled(&self) -> bool {
-        self.ctx.inflight.is_tracking_subject()
     }
 
     // ── Execute (hot-path mutation, returns events) ─────────────────────
@@ -176,13 +124,6 @@ impl ArbitroEngine {
     #[inline]
     pub fn execute(&mut self, cmd: &command::Command<'_>) -> DeltaEvents {
         runtime::execute::apply(&mut self.ctx, cmd)
-    }
-
-    /// Apply a slice of `Command`s in order.
-    #[must_use]
-    #[inline]
-    pub fn execute_batch(&mut self, cmds: &[command::Command<'_>]) -> DeltaEvents {
-        runtime::execute::apply_batch(&mut self.ctx, cmds)
     }
 
     // ── Catalog admin (cold path, returns events) ───────────────────────
@@ -326,24 +267,6 @@ impl ArbitroEngine {
         self.ctx.catalog.consumer(id)
     }
 
-    // ── Inflight introspection ──────────────────────────────────────────
-
-    /// Live queue inflight count. O(1) Vec read.
-    #[inline]
-    pub fn queue_inflight(&self, queue_id: QueueId) -> u32 {
-        self.ctx
-            .inflight
-            .get(inflight::InFlightScope::Queue, queue_id.raw())
-    }
-
-    /// Live subject inflight count. O(1) HashMap read.
-    #[inline]
-    pub fn subject_inflight(&self, subject_hash: u32) -> u32 {
-        self.ctx
-            .inflight
-            .get(inflight::InFlightScope::Subject, subject_hash)
-    }
-
     // ── Observability ───────────────────────────────────────────────────
 
     /// Per-consumer live state — pending ACKs (`ack_pending`) and paused
@@ -367,23 +290,6 @@ impl ArbitroEngine {
             .collect()
     }
 
-    /// Total messages delivered-but-not-acked across every consumer on
-    /// this engine. The headline broker-saturation gauge — emit this
-    /// every metrics tick so operators see backpressure forming before
-    /// ack rates fall behind publish rates.
-    pub fn total_ack_pending(&self) -> u64 {
-        self.consumer_states_snapshot()
-            .iter()
-            .map(|s| s.ack_pending as u64)
-            .sum()
-    }
-
-    /// Borrow the atomic counter set for cross-thread observability.
-    #[inline]
-    pub fn metrics(&self) -> &metrics::EngineMetrics {
-        &self.ctx.metrics
-    }
-
     /// Point-in-time snapshot of all counters.
     #[inline]
     pub fn metrics_snapshot(&self) -> metrics::MetricsSnapshot {
@@ -396,12 +302,6 @@ impl ArbitroEngine {
     #[inline]
     pub fn ctx(&self) -> &EngineContext {
         &self.ctx
-    }
-
-    /// Mutable access to the engine context.
-    #[inline]
-    pub fn ctx_mut(&mut self) -> &mut EngineContext {
-        &mut self.ctx
     }
 }
 
