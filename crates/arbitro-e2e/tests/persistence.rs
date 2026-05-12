@@ -556,3 +556,163 @@ async fn messages_survive_multiple_restarts() {
         assert_eq!(&received[3].payload()[..], b"c2-0");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Catalog-state invariants across restart.
+//
+// The metadata command log replays CreateStream / CreateConsumer /
+// DeleteStream / DeleteConsumer on startup. These tests pin down the
+// CATALOG view (GetStream / GetConsumer / ListConsumers) before and
+// after restart so a recovery bug surfaces as a test failure instead of
+// silent state divergence.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Consumer created pre-restart must be present (and reachable through
+/// `GetConsumer`) post-restart with the SAME consumer id. If the
+/// NameRegistry allocator silently restarts at 0 after recovery,
+/// `GetConsumer` either returns NotFound or returns a different id —
+/// either way, this assertion fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn consumer_survives_restart_with_same_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let pre_consumer_id: u32;
+    {
+        let (tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+        let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let stream_id = parse_id(&resp);
+        let resp = client
+            .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .await
+            .unwrap();
+        pre_consumer_id = parse_id(&resp);
+        shutdown(tx).await;
+    }
+
+    {
+        let (_tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        assert_eq!(stream_count(&resp), 1, "stream must survive restart");
+        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+
+        let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
+        assert_eq!(
+            consumer_count(&resp),
+            1,
+            "consumer must survive restart and appear in list_consumers"
+        );
+
+        // GetConsumer must locate the recovered consumer by name and return
+        // an Ok body — pre-restart and post-restart names map to the same
+        // entity even if the id allocator decided to use a different slot.
+        let resp = client
+            .get_consumer(stream_id, b"worker")
+            .await
+            .expect("GetConsumer must succeed for a recovered consumer");
+        let post_consumer_id = parse_id(&resp);
+        assert_eq!(
+            post_consumer_id, pre_consumer_id,
+            "recovered consumer must keep its original id ({pre_consumer_id}) — \
+             a different post-restart id ({post_consumer_id}) means stale \
+             references to the old id will silently misroute"
+        );
+    }
+}
+
+/// Deleting a consumer pre-restart must NOT cause it to come back
+/// after recovery. Same guarantee as the previous test but at the
+/// consumer level — catches a bug where the replay applies CreateConsumer
+/// to a re-created NameRegistry without then applying the DeleteConsumer.
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_consumer_stays_deleted_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    {
+        let (tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let stream_id = parse_id(&resp);
+        let resp = client
+            .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .await
+            .unwrap();
+        let consumer_id = parse_id(&resp);
+        client.delete_consumer(consumer_id).await.unwrap();
+        shutdown(tx).await;
+    }
+
+    {
+        let (_tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+
+        let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
+        assert_eq!(
+            consumer_count(&resp),
+            0,
+            "consumer deleted pre-restart must remain deleted; recovery \
+             must apply DeleteConsumer after CreateConsumer in log order"
+        );
+
+        assert!(
+            client.get_consumer(stream_id, b"worker").await.is_err(),
+            "GetConsumer for a deleted-then-recovered consumer must fail"
+        );
+    }
+}
+
+/// After recovery, the id allocator MUST NOT hand out an id that
+/// collides with a recovered entity. Otherwise a fresh create
+/// silently aliases the recovered consumer.
+#[tokio::test(flavor = "multi_thread")]
+async fn post_restart_create_does_not_collide_with_recovered_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    let pre_ids: Vec<u32>;
+    {
+        let (tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let stream_id = parse_id(&resp);
+
+        let mut ids = Vec::new();
+        for n in 0..5u32 {
+            let name = format!("worker-{n}");
+            let resp = client
+                .create_consumer(stream_id, name.as_bytes(), b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+                .await
+                .unwrap();
+            ids.push(parse_id(&resp));
+        }
+        pre_ids = ids;
+        shutdown(tx).await;
+    }
+
+    {
+        let (_tx, addr) = start_server_with_dir(dir_str).await;
+        let client = connect(&addr).await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+
+        // Create one new consumer post-restart.
+        let resp = client
+            .create_consumer(stream_id, b"worker-new", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .await
+            .unwrap();
+        let new_id = parse_id(&resp);
+
+        assert!(
+            !pre_ids.contains(&new_id),
+            "id allocator after recovery handed out {new_id}, which \
+             collides with a pre-restart id from {pre_ids:?}; the \
+             allocator MUST advance past the highest recovered id"
+        );
+    }
+}
