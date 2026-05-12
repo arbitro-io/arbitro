@@ -512,8 +512,21 @@ async fn v2_delete_stream(
     };
     let shard = server.shard_for(seq_stream);
 
+    // Snapshot the consumers attached to this stream BEFORE the engine
+    // cascade removes them — we need their ids to mirror the cleanup
+    // into NameRegistry. The engine's `delete_stream` cascade removes
+    // the consumer ENTITIES but NameRegistry holds a separate wire-name
+    // → ConsumerId mapping that must also be cleared, else a same-named
+    // recreate on a fresh stream would silently alias to a defunct id.
+    let cascaded_consumers = server.names().consumers_for_stream(seq_stream);
+
     match shard.delete_stream(seq_stream, true).await {
         Ok(_) => {
+            // Cascade NameRegistry cleanup for every consumer the
+            // engine removed, then drop the stream mapping itself.
+            for cid in cascaded_consumers {
+                server.names().remove_consumer_by_id(cid);
+            }
             server.names().remove_stream(wire_stream);
             if let Some(log) = server.command_log() {
                 let cmd = build_delete_stream(&frame[HEADER_SIZE..]);
@@ -724,6 +737,15 @@ async fn v2_delete_consumer(
 
     for i in 0..server.shard_count() {
         if let Ok(_) = server.shard(i).delete_consumer(consumer_id).await {
+            // Mirror the cascade that `v2_delete_stream` does for streams:
+            // drop the wire-name → id mapping (plus the consumer's reverse
+            // queue / stream / deliver-policy indexes) from NameRegistry.
+            // Without this, `GetConsumer` keeps returning `Ok` for a
+            // consumer the engine has already removed, and the registry
+            // leaks one entry per deleted consumer (the maps grow forever
+            // under a create→delete→recreate workload).
+            server.names().remove_consumer_by_id(consumer_id);
+
             if let Some(log) = server.command_log() {
                 let cmd = build_delete_consumer(&frame[HEADER_SIZE..]);
                 if let Err(e) = log.record(&cmd) {

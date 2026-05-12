@@ -223,13 +223,54 @@ impl NameRegistry {
             .copied()
     }
 
-    /// Drop a consumer mapping. The integer is intentionally NOT recycled.
+    /// Drop a consumer mapping by NAME. Removes the wire-name→id mapping
+    /// and every reverse index keyed by that id, so a subsequent
+    /// `consumer_id(name)`, `consumer_queue(id)`, `consumer_stream(id)` or
+    /// `consumer_deliver_policy(id)` all return `None`.
+    ///
+    /// The integer id is intentionally NOT recycled — a re-create with the
+    /// same name allocates a fresh id (so stale references can never
+    /// silently re-route to a different consumer).
     pub fn remove_consumer(&self, name: &[u8]) -> Option<ConsumerId> {
         let mut g = self.inner.lock().expect("name registry poisoned");
         let removed = g.consumers_by_name.remove(name)?;
         g.consumer_queue.remove(&removed);
         g.consumer_stream.remove(&removed);
+        g.consumer_deliver.remove(&removed);
         Some(removed)
+    }
+
+    /// Return the `ConsumerId`s currently registered against
+    /// `stream_id`. Used by the `DeleteStream` wire handler to figure
+    /// out which consumers it must also drop from NameRegistry so the
+    /// engine's cascade removal stays in lock-step with the wire-name
+    /// → id mapping. O(N) scan of `consumer_stream`; DeleteStream is
+    /// a cold admin path.
+    pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumer_stream
+            .iter()
+            .filter_map(|(cid, sid)| if *sid == stream_id { Some(*cid) } else { None })
+            .collect()
+    }
+
+    /// Drop a consumer mapping by ID. Used by `DeleteConsumer` wire
+    /// handling, which carries only the `ConsumerId` (the original name is
+    /// not in the request body). Walks `consumers_by_name` once to find
+    /// the name — O(N) but `DeleteConsumer` is a cold admin path.
+    ///
+    /// Returns the name that was removed, or `None` if the id was unknown
+    /// or already removed.
+    pub fn remove_consumer_by_id(&self, id: ConsumerId) -> Option<Vec<u8>> {
+        let mut g = self.inner.lock().expect("name registry poisoned");
+        let name = g.consumers_by_name
+            .iter()
+            .find_map(|(n, &v)| if v == id { Some(n.clone()) } else { None })?;
+        g.consumers_by_name.remove(&name);
+        g.consumer_queue.remove(&id);
+        g.consumer_stream.remove(&id);
+        g.consumer_deliver.remove(&id);
+        Some(name)
     }
 
     // ── Queues ─────────────────────────────────────────────────────────────

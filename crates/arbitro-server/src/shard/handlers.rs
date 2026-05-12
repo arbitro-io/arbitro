@@ -397,12 +397,25 @@ impl CommandWorker {
                     // New consumer only sees messages published after subscribe.
                 }
                 2 => {
-                    // DeliverPolicy::ByStartSeq — rewind to start_seq.
+                    // DeliverPolicy::ByStartSeq — position the cursor at
+                    // `start_seq - 1` so the next delivery is the message
+                    // with sequence `start_seq`.
+                    //
+                    // This must work in BOTH directions:
+                    //   - rewind  (current > target): replay messages we
+                    //     have already delivered past
+                    //   - forward (current < target): a fresh consumer
+                    //     subscribing on a stream that already has a
+                    //     backlog and wants to skip the first N msgs
+                    //
+                    // The previous implementation only handled the rewind
+                    // case (`if target < current { signal_rewind }`),
+                    // silently dropping the forward case — so a brand-new
+                    // consumer with cursor=0 asking for start_seq=6 was
+                    // served from seq=1, not seq=6.
                     let target = cmd.start_seq.saturating_sub(1);
-                    let current = self.counters.cursor();
-                    if target < current {
-                        self.counters.signal_rewind(target);
-                    }
+                    self.counters.set_cursor(target);
+                    self.counters.clear_rewind();
                 }
                 _ => {
                     // Unknown — default to All for safety.

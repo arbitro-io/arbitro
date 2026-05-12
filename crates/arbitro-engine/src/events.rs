@@ -6,7 +6,7 @@
 //! inspects each return: `demand_became_available` → `gate.release()`,
 //! `bindings_retired` → cleanup cached tx handles.
 
-use crate::types::{BindingId, StreamId};
+use crate::types::{BindingId, ConsumerId, StreamId};
 
 /// Events produced by `execute(Command)` and admin mutations.
 ///
@@ -27,6 +27,16 @@ pub struct DeltaEvents {
     /// `DrainEvent::Ack` so the drain-owned
     /// `ConsumerSubjects` slot decrements in lock-step.
     pub subject_hashes_acked: Vec<(u32, u32)>,
+    /// Consumer ids whose entities were removed as part of this
+    /// mutation. Populated by `delete_consumer` (single id) and by
+    /// `delete_stream` (every consumer attached to the stream).
+    ///
+    /// The server uses this to mirror the engine cascade into the
+    /// `NameRegistry`: for each id, call `remove_consumer_by_id` so the
+    /// wire-name → id mapping (and reverse indexes) are cleared. Without
+    /// it, a same-named recreate on a fresh stream silently aliases to
+    /// the old (now-defunct) ConsumerId.
+    pub consumers_removed: Vec<ConsumerId>,
 }
 
 impl DeltaEvents {
@@ -38,6 +48,7 @@ impl DeltaEvents {
         self.demand_became_idle.extend(other.demand_became_idle);
         self.bindings_retired.extend(other.bindings_retired);
         self.subject_hashes_acked.extend(other.subject_hashes_acked);
+        self.consumers_removed.extend(other.consumers_removed);
     }
 
     /// True if no events were emitted.
@@ -47,6 +58,7 @@ impl DeltaEvents {
             && self.demand_became_idle.is_empty()
             && self.bindings_retired.is_empty()
             && self.subject_hashes_acked.is_empty()
+            && self.consumers_removed.is_empty()
     }
 }
 

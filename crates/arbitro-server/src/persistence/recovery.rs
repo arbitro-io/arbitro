@@ -196,6 +196,14 @@ impl MetadataApplier for ReplayApplier {
                         return;
                     }
                 };
+                // Same cascade as `v2_delete_stream`: every consumer
+                // attached to this stream must be dropped from
+                // NameRegistry too, otherwise replay would leave stale
+                // name → id mappings pointing at consumers the cascade
+                // is about to remove from the engine catalog.
+                for cid in self.server.names().consumers_for_stream(stream_id) {
+                    self.server.names().remove_consumer_by_id(cid);
+                }
                 self.server.names().remove_stream(wire_id);
                 self.commands
                     .push(ReplayCommand::DeleteStream { stream_id });
@@ -265,6 +273,13 @@ impl MetadataApplier for ReplayApplier {
                     .names()
                     .consumer_stream(consumer_id)
                     .unwrap_or(StreamId(0)); // fallback: consumer already absent, no-op
+                // Mirror the wire handler's cascade (`v2_delete_consumer` in
+                // dispatch_v2.rs): drop the wire-name → id mapping and the
+                // reverse indexes from NameRegistry. Without this, a
+                // pre-restart create→delete sequence replays the create into
+                // NameRegistry but never undoes it, leaving a phantom name
+                // mapping that aliases a future re-create on the same name.
+                self.server.names().remove_consumer_by_id(consumer_id);
                 self.commands.push(ReplayCommand::DeleteConsumer {
                     stream_id,
                     consumer_id,

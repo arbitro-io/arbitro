@@ -138,11 +138,45 @@ impl ArbitroEngine {
 
     /// Delete a stream. Retires all bindings on this stream, releasing
     /// inflight credits. Returns events with `bindings_retired` +
-    /// `demand_became_idle`.
+    /// `demand_became_idle` + `consumers_removed`.
+    ///
+    /// Cascade: every consumer attached to the deleted stream is also
+    /// fully removed (entity, subscriptions, bindings). Their ids are
+    /// reported in `events.consumers_removed` so the server can mirror
+    /// the cleanup into the `NameRegistry` (drop wire-name → id +
+    /// reverse indexes). Without that cascade, the next CreateConsumer
+    /// with the same name on a recreated stream silently aliases to a
+    /// defunct id pointing at a catalog slot this method just removed.
     #[must_use]
     pub fn delete_stream(&mut self, id: StreamId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
+
+        // Snapshot the consumer ids BEFORE we start removing entities —
+        // the iteration runs on the catalog state at call time.
+        let consumer_ids = self.ctx.catalog.consumers_for_stream(id);
+
+        // Remove each consumer's entity + subscriptions + retire its
+        // bindings. We do this via the same path that `delete_consumer`
+        // uses so the invariants (bindings retired → inflight released)
+        // stay consistent regardless of whether the trigger was an
+        // explicit DeleteConsumer wire frame or a cascade.
+        for cid in &consumer_ids {
+            runtime::retire::retire_bindings_for_consumer(&mut self.ctx, *cid, &mut events);
+            let sub_ids = self.ctx.catalog.subscriptions_for_consumer(*cid);
+            for sid in sub_ids {
+                let _ = self.ctx.catalog.remove_subscription_entity(sid);
+            }
+            let _ = self.ctx.catalog.remove_consumer_entity(*cid);
+        }
+        events.consumers_removed.extend(consumer_ids);
+
+        // Retire any remaining stream-level bindings (defensive — most
+        // bindings should already be retired through the per-consumer
+        // path above; this catches anything the engine ties to the
+        // stream itself rather than to a specific consumer).
         runtime::retire::retire_bindings_for_stream(&mut self.ctx, id, &mut events);
+
+        // Finally, drop the stream entity.
         let _ = self.ctx.catalog.remove_stream_entity(id);
         events
     }
@@ -156,7 +190,9 @@ impl ArbitroEngine {
     }
 
     /// Delete a consumer. Retires all bindings + subscriptions for this
-    /// consumer.
+    /// consumer. Reports the removed id in `events.consumers_removed`
+    /// so the server mirrors the cleanup into NameRegistry — same
+    /// signal the cascade from `delete_stream` produces.
     #[must_use]
     pub fn delete_consumer(&mut self, id: ConsumerId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
@@ -171,7 +207,9 @@ impl ArbitroEngine {
         }
 
         // Remove consumer entity.
-        let _ = self.ctx.catalog.remove_consumer_entity(id);
+        if self.ctx.catalog.remove_consumer_entity(id).is_ok() {
+            events.consumers_removed.push(id);
+        }
 
         events
     }

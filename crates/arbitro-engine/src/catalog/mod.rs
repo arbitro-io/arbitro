@@ -644,6 +644,21 @@ impl Catalog {
             .map(|(id, info)| (*id, info.stream_id, info.queue_id, info.paused))
             .collect()
     }
+
+    /// List the `ConsumerId`s of every consumer attached to `stream_id`.
+    /// Used by `engine.delete_stream` to cascade-remove consumers when
+    /// their owning stream is deleted — without this, consumer entities
+    /// (and their NameRegistry mappings) leak past the stream's
+    /// lifetime and a same-named recreate on a fresh stream silently
+    /// aliases to a defunct id.
+    pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
+        self.consumers
+            .iter()
+            .filter_map(|(cid, info)| {
+                if info.stream_id == stream_id { Some(*cid) } else { None }
+            })
+            .collect()
+    }
 }
 
 impl Default for Catalog {
