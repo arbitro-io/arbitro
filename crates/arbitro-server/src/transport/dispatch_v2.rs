@@ -66,19 +66,19 @@ pub async fn dispatch_frame_v2(
     frame: Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
-) {
+) -> Result<(), ()> {
     if frame.len() < HEADER_SIZE {
-        return;
+        return Err(());
     }
     let header = match Header::ref_from_bytes(&frame[..HEADER_SIZE]) {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return Err(()),
     };
     let action = match Action::from_u16(header.action.get()) {
         Some(a) => a,
         None => {
             send_error_v2(registry, conn_id, header.seq.get(), ErrorCode::UnknownAction);
-            return;
+            return Err(());
         }
     };
     let req_seq = header.seq.get();
@@ -88,10 +88,10 @@ pub async fn dispatch_frame_v2(
         Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry),
         Action::PublishBatch     => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
         Action::PublishWithReply => v2_publish_with_reply(conn_id, req_seq, &frame, server, registry),
-        Action::Ack            => v2_ack(&frame, server).await,
-        Action::BatchAck       => v2_batch_ack(&frame, server).await,
-        Action::Nack           => v2_nack(&frame, server).await,
-        Action::BatchNack      => v2_batch_nack(&frame, server).await,
+        Action::Ack            => v2_ack(conn_id, &frame, server).await,
+        Action::BatchAck       => v2_batch_ack(conn_id, &frame, server).await,
+        Action::Nack           => v2_nack(conn_id, &frame, server).await,
+        Action::BatchNack      => v2_batch_nack(conn_id, &frame, server).await,
         Action::Subscribe      => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
         Action::Unsubscribe    => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
 
@@ -120,8 +120,12 @@ pub async fn dispatch_frame_v2(
 
         // Anything else (AckSync, accumulators, with-headers, ...)
         // is unsupported in this iteration.
-        _ => send_error_v2(registry, conn_id, req_seq, ErrorCode::UnknownAction),
+        _ => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::UnknownAction);
+            return Err(());
+        }
     }
+    Ok(())
 }
 
 // ── Hot path ───────────────────────────────────────────────────────────────
@@ -370,7 +374,7 @@ fn v2_publish_batch(
     server.gate_for(seq_stream).release();
 }
 
-async fn v2_ack(frame: &Bytes, server: &ShardRouter) {
+async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match AckFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -384,12 +388,13 @@ async fn v2_ack(frame: &Bytes, server: &ShardRouter) {
     let _ = shard
         .ack(
             consumer_id,
+            conn_id,
             vec![AckEntry { stream_id: seq_stream, seq: f.body.ack_seq.get() }],
         )
         .await;
 }
 
-async fn v2_batch_ack(frame: &Bytes, server: &ShardRouter) {
+async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match BatchAckFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -405,11 +410,11 @@ async fn v2_batch_ack(frame: &Bytes, server: &ShardRouter) {
         .iter()
         .map(|e| AckEntry { stream_id: seq_stream, seq: e.seq.get() })
         .collect();
-    let _ = shard.ack(consumer_id, entries).await;
+    let _ = shard.ack(consumer_id, conn_id, entries).await;
 }
 
 /// Single-entry NACK — fire-and-forget, no reply. Always immediate (delay=0).
-async fn v2_nack(frame: &Bytes, server: &ShardRouter) {
+async fn v2_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match NackFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -423,6 +428,7 @@ async fn v2_nack(frame: &Bytes, server: &ShardRouter) {
     let _ = shard
         .nack(
             consumer_id,
+            conn_id,
             vec![AckEntry { stream_id: seq_stream, seq: f.body.nack_seq.get() }],
             0, // single nack frame has no delay field
         )
@@ -430,7 +436,7 @@ async fn v2_nack(frame: &Bytes, server: &ShardRouter) {
 }
 
 /// Batch NACK — fire-and-forget, no reply. Supports per-batch delay_ms.
-async fn v2_batch_nack(frame: &Bytes, server: &ShardRouter) {
+async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match BatchNackFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -453,7 +459,7 @@ async fn v2_batch_nack(frame: &Bytes, server: &ShardRouter) {
         .map(|e| e.delay_ms.get())
         .max()
         .unwrap_or(0);
-    let _ = shard.nack(consumer_id, entries, delay_ms).await;
+    let _ = shard.nack(consumer_id, conn_id, entries, delay_ms).await;
 }
 
 async fn v2_subscribe(

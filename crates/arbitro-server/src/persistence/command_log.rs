@@ -53,14 +53,23 @@ impl CommandLog {
 
     /// Append a raw metadata command to the log.
     ///
-    /// Framing: `[4 len_le][payload]`. The payload is the full metadata
+    /// Framing: `[4 len_le][4 crc32_le][payload]`. The payload is the full metadata
     /// command bytes (`[1 type][body...]`).
     ///
     /// Flushes after each write for durability. Cold path only.
     pub fn record(&mut self, command: &[u8]) -> std::io::Result<()> {
         let len = command.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(command)?;
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(command);
+        let crc = hasher.finalize();
+
+        // Combine header and payload to avoid multiple write() syscalls
+        let mut buf = Vec::with_capacity(8 + command.len());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(command);
+
+        self.file.write_all(&buf)?;
         self.file.flush()?;
         Ok(())
     }
@@ -78,6 +87,7 @@ impl CommandLog {
         let mut reader = BufReader::new(file);
         let mut count = 0u32;
         let mut len_buf = [0u8; 4];
+        let mut crc_buf = [0u8; 4];
 
         info!("Replaying metadata log from {:?}", self.path);
 
@@ -95,6 +105,17 @@ impl CommandLog {
                 continue;
             }
 
+            // Read CRC32
+            match reader.read_exact(&mut crc_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    warn!("Truncated entry (missing CRC) at end of log. Stopping replay.");
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+            let stored_crc = u32::from_le_bytes(crc_buf);
+
             // Read payload
             let mut payload = vec![0u8; len];
             match reader.read_exact(&mut payload) {
@@ -104,6 +125,16 @@ impl CommandLog {
                     break;
                 }
                 Err(e) => return Err(e),
+            }
+
+            // Verify CRC32
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&payload);
+            let calculated_crc = hasher.finalize();
+
+            if stored_crc != calculated_crc {
+                warn!("CRC mismatch at entry {}, skipping", count);
+                continue;
             }
 
             // Validate and apply
@@ -309,9 +340,10 @@ mod tests {
             let mut log = CommandLog::open(&path).unwrap();
             log.record(&cmd).unwrap();
 
-            // Write a length header for 100 bytes but only 5 bytes of payload (truncated)
+            // Write a length header for 100 bytes, a dummy CRC, but only 5 bytes of payload (truncated)
             use std::io::Write;
             log.file.write_all(&100u32.to_le_bytes()).unwrap();
+            log.file.write_all(&12345u32.to_le_bytes()).unwrap(); // Dummy CRC
             log.file.write_all(&[1, 2, 3, 4, 5]).unwrap();
             log.file.flush().unwrap();
         }

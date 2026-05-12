@@ -21,6 +21,8 @@ use arbitro_proto::v2::header::{Header, HEADER_SIZE as HEADER_SIZE_V2};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, HELLO_FRAME_SIZE};
 use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
 
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+
 use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::config::Config;
@@ -415,13 +417,22 @@ async fn read_loop(
                 let msg_len = u32::from_le_bytes([
                     acc[4], acc[5], acc[6], acc[7],
                 ]) as usize;
+                
+                if msg_len > MAX_FRAME_SIZE {
+                    tracing::warn!(conn_id, msg_len, "frame exceeds MAX_FRAME_SIZE, dropping connection");
+                    break 'outer;
+                }
+                
                 let total = HEADER_SIZE_V2 + msg_len;
                 if acc.len() < total {
                     break;
                 }
                 let frame = acc.split_to(total).freeze();
                 registry.touch(conn_id);
-                dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry).await;
+                if dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry).await.is_err() {
+                    tracing::warn!(conn_id, "malformed frame, dropping connection");
+                    break 'outer;
+                }
             }
         }
 

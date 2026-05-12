@@ -94,6 +94,7 @@ impl PublishEntryOwned {
 /// Acknowledge messages. Uses engine's AckEntry (stream_id + seq).
 pub struct AckCmd {
     pub consumer_id: ConsumerId,
+    pub conn_id: u64,
     pub entries: Vec<AckEntry>,
     pub reply: oneshot::Sender<AckReply>,
 }
@@ -107,6 +108,7 @@ pub struct AckReply {
 /// Negative acknowledge (requeue). Same entry type as ack.
 pub struct NackCmd {
     pub consumer_id: ConsumerId,
+    pub conn_id: u64,
     pub entries: Vec<AckEntry>,
     /// Delay in ms before redelivery. 0 = immediate cursor rewind.
     pub delay_ms: u32,

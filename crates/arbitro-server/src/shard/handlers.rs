@@ -173,6 +173,13 @@ impl CommandWorker {
             "shard"
         );
 
+        // Tenant Isolation Check: verify connection owns this consumer
+        let owns = self.bindings.iter().any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
+        if !owns {
+            let _ = cmd.reply.send(AckReply { accepted: 0, rejected: cmd.entries.len() as u32 });
+            return;
+        }
+
         // Process pending drain notifications first so pending list is current.
         self.drain_notifications();
 
@@ -230,6 +237,13 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_nack(&mut self, cmd: NackCmd) {
+        // Tenant Isolation Check: verify connection owns this consumer
+        let owns = self.bindings.iter().any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
+        if !owns {
+            let _ = cmd.reply.send(NackReply { requeued: 0, not_found: cmd.entries.len() as u32 });
+            return;
+        }
+
         // Process pending drain notifications first.
         self.drain_notifications();
 

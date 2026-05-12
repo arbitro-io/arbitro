@@ -1,12 +1,17 @@
 ---
 description: Workflow for auditing broker security, tenant isolation, and data integrity
+arguments: [LOW, MEDIUM, HIGH, Custom]
 ---
 
 # SECURITY AUDIT WORKFLOW
 
 This workflow defines the steps to validate the security posture of the Arbitro broker.
+Node: Agent ask for Level of Auditation  LOW, MEDIUM, HIGH or Custom Note
 
 ## 1. Tenant Isolation & Identity
+- [ ] **Audit Level**: Agent must ask for Level LOW, MEDIUM, HIGH or Custom Note for audit
+
+## 1.1 Tenant Isolation & Identity
 - [ ] **Consumer Name Scoping**: Verify that consumers with identical names in different streams do NOT collapse into the same `ConsumerId` unless intended.
 - [ ] **Limit Leaks**: Assert that `max_subject_inflight` and `max_inflight` caps are strictly enforced per `ConsumerId` and do not leak across connections.
 - [ ] **Cross-Stream Access**: Validate that a connection bound to Stream A cannot `claim` or `ack` messages from Stream B without explicit permissions.

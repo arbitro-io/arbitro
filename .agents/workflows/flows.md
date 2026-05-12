@@ -1,5 +1,6 @@
 ---
 description: Workflow for auditing Ingress/Egress role separation, ownership fences, and latency isolation
+arguments: []
 ---
 
 # INGRESS/EGRESS ROLE AUDIT WORKFLOW

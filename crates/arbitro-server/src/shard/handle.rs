@@ -111,11 +111,13 @@ impl ShardHandle {
     pub async fn ack(
         &self,
         consumer_id: ConsumerId,
+        conn_id: u64,
         entries: Vec<AckEntry>,
     ) -> Result<AckReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Ack(AckCmd {
             consumer_id,
+            conn_id,
             entries,
             reply: tx,
         }))
@@ -126,12 +128,14 @@ impl ShardHandle {
     pub async fn nack(
         &self,
         consumer_id: ConsumerId,
+        conn_id: u64,
         entries: Vec<AckEntry>,
         delay_ms: u32,
     ) -> Result<NackReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Nack(NackCmd {
             consumer_id,
+            conn_id,
             entries,
             delay_ms,
             reply: tx,

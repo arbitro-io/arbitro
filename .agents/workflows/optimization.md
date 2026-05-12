@@ -1,5 +1,6 @@
 ---
 description: Real-world optimization best practices for high-performance systems
+arguments: []
 ---
 
 # PERFORMANCE OPTIMIZATION WORKFLOW
