@@ -1,15 +1,24 @@
-use zerocopy::byteorder::little_endian::{U16, U64};
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// 32B fixed — Create a stream. Variable name + filter follow.
+/// 40B fixed — Create a stream. Variable name + filter follow.
+///
+/// Mirror of `v2::manager::stream_mgmt::CreateStreamBody`. The
+/// command log persists v2 wire bodies bytewise, and the recovery
+/// pass parses them through `CreateStreamView` — so this struct
+/// MUST stay in lock-step with the v2 body (same fields, same
+/// order, same size).
 ///
 /// ```text
-/// [2 name_len][2 filter_len][8 max_msgs][8 max_bytes][8 max_age_secs][1 replicas][1 journal_kind][1 retention][1 discard]
+/// [2 name_len][2 filter_len][8 max_msgs][8 max_bytes][8 max_age_secs]
+/// [1 replicas][1 journal_kind][1 retention][1 discard]
+/// [4 idempotency_window_ms][4 _pad]
 /// ```
 ///
-/// Variable data layout: `[name (name_len)][filter (filter_len)]`
-/// `filter` is the subject pattern this stream captures (e.g. `"orders.>"`).
-/// `discard`: 0 = Old (ring-buffer, default), 1 = New (reject publish when full).
+/// `filter`: subject pattern this stream captures (e.g. `"orders.>"`).
+/// `discard`: 0 = Old (ring-buffer, default), 1 = New (reject when full).
+/// `idempotency_window_ms`: 0 = idempotency disabled (legacy default),
+/// >0 = dedup window in milliseconds.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct CreateStreamFixed {
@@ -22,10 +31,12 @@ pub struct CreateStreamFixed {
     pub journal_kind: u8,
     pub retention: u8,
     pub discard: u8,
+    pub idempotency_window_ms: U32,
+    pub _pad: U32,
 }
 
 pub const CREATE_STREAM_FIXED_SIZE: usize = core::mem::size_of::<CreateStreamFixed>();
-const _: () = assert!(CREATE_STREAM_FIXED_SIZE == 32);
+const _: () = assert!(CREATE_STREAM_FIXED_SIZE == 40);
 
 /// 8B fixed — Delete a stream. Variable name follows.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
@@ -119,6 +130,15 @@ impl<'a> CreateStreamView<'a> {
 
     #[inline(always)]
     pub fn discard(&self) -> u8 { self.fixed().discard }
+
+    /// Per-stream idempotency window in milliseconds. `0` means the
+    /// stream is NOT idempotent (legacy default — no dedup). A
+    /// non-zero value activates the dedup window on the publish hot
+    /// path. Recovery reads this back and calls
+    /// `NameRegistry::set_stream_idempotency` to rebuild the per-stream
+    /// state lost by a restart.
+    #[inline(always)]
+    pub fn idempotency_window_ms(&self) -> u32 { self.fixed().idempotency_window_ms.get() }
 }
 
 pub struct DeleteStreamView<'a> {

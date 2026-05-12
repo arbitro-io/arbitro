@@ -24,3 +24,9 @@ pub use gate::Gate;
 pub use id_pool::{IdPool, PoolError, PoolSnapshot};
 pub use name_registry::NameRegistry;
 pub use wheel::{TimingWheel, WheelEntry};
+
+/// Re-export of the foldhash crate so downstream crates can build
+/// HashMaps with the same hasher choice we already pull transitively.
+/// Keeps the hash family consistent across NameRegistry, IdempotencyTracker,
+/// and any future per-shard structure.
+pub use foldhash;

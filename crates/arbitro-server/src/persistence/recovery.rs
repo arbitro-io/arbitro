@@ -175,6 +175,14 @@ impl MetadataApplier for ReplayApplier {
                 // common::name_registry for full rationale).
                 let wire_id = arbitro_engine_v2::catalog::wire_hash_32(name);
                 let (stream_id, _created) = self.server.names().get_or_create_stream(wire_id);
+                // Restore the per-stream idempotency window — same call
+                // `v2_create_stream` makes on the live path. Without this,
+                // a stream that was idempotent at write time would lose
+                // its dedup window across restart.
+                self.server.names().set_stream_idempotency(
+                    stream_id,
+                    sv.idempotency_window_ms(),
+                );
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
                     config: StreamConfig {

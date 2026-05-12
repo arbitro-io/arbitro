@@ -221,6 +221,8 @@ mod tests {
             journal_kind: 0,
             retention: 0,
             discard: 0,
+            idempotency_window_ms: U32::new(0),
+            _pad: U32::new(0),
         };
         let mut body = Vec::new();
         body.extend_from_slice(fixed.as_bytes());
@@ -295,6 +297,8 @@ mod tests {
                 journal_kind: 0,
                 retention: 0,
                 discard: 0,
+                idempotency_window_ms: U32::new(0),
+                _pad: U32::new(0),
             };
             let mut body = Vec::new();
             body.extend_from_slice(fixed.as_bytes());

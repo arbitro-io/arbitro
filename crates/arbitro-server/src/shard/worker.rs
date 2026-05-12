@@ -340,6 +340,16 @@ pub struct CommandWorker {
     pub(super) wheel_buf: Vec<arbitro_common::WheelEntry>,
     /// Next time to advance the wheel (1 tick per second).
     pub(super) next_wheel_tick: Option<Instant>,
+    /// Per-shard idempotency dedup. `None` until the first stream
+    /// owned by this shard is created with `idempotency_window_ms > 0`.
+    /// Once allocated it stays alive — cheap (a few KB empty) and
+    /// avoids racing realloc on burst creates.
+    ///
+    /// Lives on the command thread (this struct's owner) — no Mutex,
+    /// no Arc. The publish hot path checks the fast-bail bool in
+    /// `NameRegistry` first; only enabled streams reach into the
+    /// tracker.
+    pub(super) idempotency_tracker: Option<crate::shard::idempotency::IdempotencyTracker>,
 }
 
 impl CommandWorker {
@@ -398,8 +408,15 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.is_some() => {
+                        // Both timers run at the same 1-second cadence,
+                        // hence one tokio::sleep drives both. Each tick
+                        // is a no-op if its structure is `None`, so the
+                        // branch fires whenever EITHER is allocated.
                         self.wheel_tick();
+                        if let Some(t) = self.idempotency_tracker.as_mut() {
+                            t.tick();
+                        }
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }
@@ -422,8 +439,15 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() => {
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.is_some() => {
+                        // Both timers run at the same 1-second cadence,
+                        // hence one tokio::sleep drives both. Each tick
+                        // is a no-op if its structure is `None`, so the
+                        // branch fires whenever EITHER is allocated.
                         self.wheel_tick();
+                        if let Some(t) = self.idempotency_tracker.as_mut() {
+                            t.tick();
+                        }
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }

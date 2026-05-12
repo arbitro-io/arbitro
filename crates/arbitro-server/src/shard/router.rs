@@ -136,6 +136,7 @@ impl ShardRouter {
                 wheel: None,
                 wheel_buf: Vec::new(),
                 next_wheel_tick: None,
+                idempotency_tracker: None,
             };
 
             tokio::spawn(cmd_worker.run());

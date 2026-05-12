@@ -15,6 +15,7 @@ pub mod drain;
 pub mod drain_events;
 pub mod handle;
 pub mod handlers;
+pub mod idempotency;
 pub mod router;
 pub mod shared;
 pub mod worker;

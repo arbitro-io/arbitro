@@ -81,6 +81,18 @@ struct Inner {
     /// `ListStreams` to give the client the same wire IDs it computes
     /// locally with `wire_hash_32`.
     streams_seq_to_wire: Vec<u32>,
+    /// Per-stream idempotency window in milliseconds. Indexed directly
+    /// by `StreamId.0` — same shape as `streams_seq_to_wire`. A value
+    /// of `0` means idempotency is DISABLED for that stream (legacy
+    /// default, no per-publish dedup overhead). A non-zero value
+    /// activates dedup with that window.
+    ///
+    /// This Vec is the fast-bail check on the publish hot path: a
+    /// single indexed `u32` load + compare-with-zero. Branch predictor
+    /// learns the value (almost always 0) within a few publishes per
+    /// stream, so the steady-state cost for non-idempotent traffic is
+    /// effectively a free load.
+    streams_idempotency_window_ms: Vec<u32>,
     next_stream: u32,
 
     /// Consumers are keyed by name because the wire never carries a
@@ -125,6 +137,7 @@ impl Inner {
         Self {
             streams_by_wire: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             streams_seq_to_wire: Vec::new(),
+            streams_idempotency_window_ms: Vec::new(),
             next_stream: 0,
             consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
@@ -165,6 +178,13 @@ impl NameRegistry {
             g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
         }
         g.streams_seq_to_wire[id.0 as usize] = wire_id;
+        // Idempotency vec mirrors the seq → wire indexing. Default 0
+        // means "idempotency disabled for this stream"; callers that
+        // want it on must call `set_stream_idempotency` separately.
+        if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
+            g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
+        }
+        g.streams_idempotency_window_ms[id.0 as usize] = 0;
         (id, true)
     }
 
@@ -194,7 +214,39 @@ impl NameRegistry {
         if let Some(slot) = g.streams_seq_to_wire.get_mut(removed.0 as usize) {
             *slot = 0;
         }
+        if let Some(slot) = g.streams_idempotency_window_ms.get_mut(removed.0 as usize) {
+            *slot = 0;
+        }
         Some(removed)
+    }
+
+    /// Set the idempotency window for an already-allocated stream. A
+    /// non-zero value enables per-stream dedup on the publish hot
+    /// path (the value is checked by `stream_idempotency_window_ms`).
+    /// A zero value disables it. Setting on an unknown `seq` is a
+    /// silent no-op (defensive — recovery may replay out of order).
+    pub fn set_stream_idempotency(&self, seq: StreamId, window_ms: u32) {
+        let mut g = self.inner.lock().expect("name registry poisoned");
+        let idx = seq.0 as usize;
+        if idx >= g.streams_idempotency_window_ms.len() {
+            g.streams_idempotency_window_ms.resize(idx + 1, 0);
+        }
+        g.streams_idempotency_window_ms[idx] = window_ms;
+    }
+
+    /// Get the idempotency window for a stream. Returns `0` when the
+    /// stream doesn't exist or when idempotency is disabled. This is
+    /// the fast-bail check used by the publish hot path — a single
+    /// indexed `u32` load + compare-with-zero.
+    #[inline]
+    pub fn stream_idempotency_window_ms(&self, seq: StreamId) -> u32 {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .streams_idempotency_window_ms
+            .get(seq.0 as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     // ── Consumers ──────────────────────────────────────────────────────────

@@ -468,6 +468,7 @@ async fn v2_create_stream(
     let max_msgs   = f.body.max_msgs.get();
     let max_bytes  = f.body.max_bytes.get();
     let max_age_ms = f.body.max_age_secs.get().saturating_mul(1_000);
+    let idempotency_window_ms = f.body.idempotency_window_ms.get();
 
     match shard
         .create_stream(
@@ -479,6 +480,13 @@ async fn v2_create_stream(
         .await
     {
         Ok(true) => {
+            // Record the per-stream idempotency window in NameRegistry.
+            // The publish hot path checks this with a single indexed
+            // u32 load (see `stream_idempotency_window_ms`). 0 is the
+            // legacy default = no dedup; any non-zero value activates
+            // the dedup window on `v2_publish` / `v2_publish_batch`.
+            server.names().set_stream_idempotency(seq_stream, idempotency_window_ms);
+
             // Persist to command log on cold path — idempotent on replay.
             if let Some(log) = server.command_log() {
                 let cmd = build_create_stream(&frame[HEADER_SIZE..]);
