@@ -1,59 +1,12 @@
-//! End-to-end idempotency invariants.
-//!
-//! Pins the per-stream dedup behaviour from the user's API surface:
-//!  - Streams created with `idempotency_window_ms = 0` accept every
-//!    publish; identical `msg_id` causes no rejection.
-//!  - Streams created with `idempotency_window_ms > 0` reject the
-//!    second publish of the same `msg_id` with
-//!    `ErrorCode::IdempotencyDuplicate`.
-//!  - Two streams are independent: enabling dedup on one does not
-//!    affect the other.
-//!  - Batch publishes honour the same contract atomically — a batch
-//!    that contains a duplicate is rejected wholesale.
-//!  - Entries with empty `msg_id` are NEVER deduped, even on a stream
-//!    that has the feature enabled (per-message opt-in).
-//!
-//! These tests use the real TCP client + server, so they also catch
-//! wire-shape regressions in `PubFrame` / `BatchPubFrame`.
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::time::Duration;
-
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, ClientError};
+use arbitro_client_tokio::{BatchEntry, Client, ClientError};
 use arbitro_proto::error::ErrorCode;
-use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
-use tokio::sync::watch;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-async fn start_server() -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(1024);
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run_with_shutdown(rx).await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (tx, addr)
-}
-
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client should connect")
-}
 
 fn is_duplicate(err: &ClientError) -> bool {
     matches!(err, ClientError::Broker { code: ErrorCode::IdempotencyDuplicate })
@@ -68,14 +21,14 @@ fn is_duplicate(err: &ClientError) -> bool {
 /// is fully opt-in.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_without_window_allows_duplicates() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
         .create_stream(b"plain", b">", 0, 0, 0, 1, 0, 0, 0, /*idempotency_window_ms*/ 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     client
         .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
@@ -85,6 +38,7 @@ async fn stream_without_window_allows_duplicates() {
         .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
         .await
         .expect("second publish must also succeed when window=0");
+    server.shutdown().await;
 }
 
 /// Stream created with `idempotency_window_ms > 0`. Second publish
@@ -92,14 +46,14 @@ async fn stream_without_window_allows_duplicates() {
 /// `ErrorCode::IdempotencyDuplicate`.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_with_window_rejects_duplicate_msg_id() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
         .create_stream(b"dedup", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     client
         .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
@@ -113,6 +67,7 @@ async fn stream_with_window_rejects_duplicate_msg_id() {
         is_duplicate(&err),
         "expected IdempotencyDuplicate, got {err:?}",
     );
+    server.shutdown().await;
 }
 
 /// Even on an idempotent stream, a publish with EMPTY msg_id is never
@@ -120,14 +75,14 @@ async fn stream_with_window_rejects_duplicate_msg_id() {
 /// must succeed every time.
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_msg_id_is_never_deduped() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
         .create_stream(b"dedup2", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Three identical publishes with NO msg_id — all three must land.
     for _ in 0..3 {
@@ -136,19 +91,20 @@ async fn empty_msg_id_is_never_deduped() {
             .await
             .expect("empty-id publish must always succeed");
     }
+    server.shutdown().await;
 }
 
 /// Distinct msg_ids on the same stream don't collide.
 #[tokio::test(flavor = "multi_thread")]
 async fn different_msg_ids_are_independent() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
         .create_stream(b"dedup3", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     client
         .publish_sync_with_id(stream_id, b"k", b"id-a", Bytes::from_static(b"a"))
@@ -162,20 +118,21 @@ async fn different_msg_ids_are_independent() {
         .publish_sync_with_id(stream_id, b"k", b"id-c", Bytes::from_static(b"c"))
         .await
         .expect("id-c accepted (different id)");
+    server.shutdown().await;
 }
 
 /// Two streams, one with dedup, one without. The dedup state on the
 /// idempotent stream must not bleed into the plain stream.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_streams_isolated_one_with_one_without() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let dedup_id = parse_id(&client
+    let dedup_id = TestServer::parse_id(&client
         .create_stream(b"with_dedup", b"a.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap());
-    let plain_id = parse_id(&client
+    let plain_id = TestServer::parse_id(&client
         .create_stream(b"no_dedup", b"b.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap());
@@ -204,6 +161,7 @@ async fn two_streams_isolated_one_with_one_without() {
         .await
         .expect_err("dedup stream rejects duplicate");
     assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    server.shutdown().await;
 }
 
 /// After delete + recreate, the dedup state for a stream is reset.
@@ -211,14 +169,14 @@ async fn two_streams_isolated_one_with_one_without() {
 /// `(StreamId, hash)` so old entries cannot collide.)
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_and_recreate_clears_dedup_state() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
         .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
-    let first_id = parse_id(&resp);
+    let first_id = TestServer::parse_id(&resp);
 
     client
         .publish_sync_with_id(first_id, b"k", b"reused", Bytes::from_static(b"v1"))
@@ -231,13 +189,14 @@ async fn delete_and_recreate_clears_dedup_state() {
         .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
-    let second_id = parse_id(&resp);
+    let second_id = TestServer::parse_id(&resp);
 
     // The reused msg_id must be accepted on the fresh stream.
     client
         .publish_sync_with_id(second_id, b"k", b"reused", Bytes::from_static(b"v2"))
         .await
         .expect("recreated stream starts with empty dedup state");
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -247,10 +206,10 @@ async fn delete_and_recreate_clears_dedup_state() {
 /// A batch where every entry has a unique msg_id lands in full.
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_with_all_unique_ids_succeeds() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let stream_id = parse_id(&client
+    let stream_id = TestServer::parse_id(&client
         .create_stream(b"batch_uniq", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap());
@@ -264,16 +223,17 @@ async fn batch_with_all_unique_ids_succeeds() {
         .publish_batch_sync(stream_id, &entries)
         .await
         .expect("unique-id batch must succeed");
+    server.shutdown().await;
 }
 
 /// A batch whose entries collide with previously-recorded msg_ids on
 /// the same stream is rejected wholesale.
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_with_duplicate_from_prior_publish_is_rejected() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let stream_id = parse_id(&client
+    let stream_id = TestServer::parse_id(&client
         .create_stream(b"batch_dup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap());
@@ -305,16 +265,17 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
         .publish_sync_with_id(stream_id, b"k", b"new-2", Bytes::from_static(b"v2-retry"))
         .await
         .expect("non-colliding id must remain unrecorded after batch rejection");
+    server.shutdown().await;
 }
 
 /// A batch containing two entries with the SAME msg_id is rejected
 /// (the second entry collides with the first within the same batch).
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_with_internal_duplicate_is_rejected() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let stream_id = parse_id(&client
+    let stream_id = TestServer::parse_id(&client
         .create_stream(b"batch_internal", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap());
@@ -328,6 +289,7 @@ async fn batch_with_internal_duplicate_is_rejected() {
         .await
         .expect_err("batch with internal twin id must be rejected");
     assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    server.shutdown().await;
 }
 
 /// On a stream with dedup enabled, mixing entries WITH and WITHOUT
@@ -337,10 +299,10 @@ async fn batch_with_internal_duplicate_is_rejected() {
 /// id to track.
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_mixed_id_and_no_id_entries() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let stream_id = parse_id(&client
+    let stream_id = TestServer::parse_id(&client
         .create_stream(b"batch_mixed", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap());
@@ -379,4 +341,5 @@ async fn batch_mixed_id_and_no_id_entries() {
         .await
         .expect_err("batch with replayed id must be rejected");
     assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    server.shutdown().await;
 }

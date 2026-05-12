@@ -16,6 +16,8 @@ arbitro-client-tokio = { path = "../arbitro-client-tokio" }
 arbitro-common = { path = "../arbitro-common" }
 tempfile       = { workspace = true }
 futures        = "0.3"
+serde          = { workspace = true }
+serde_json     = { workspace = true }
 
 [features]
 lifecycle_trace = ["arbitro-server/lifecycle_trace"]
@@ -62,3 +64,4 @@ harness = false
 [[bench]]
 name    = "memory_growth"
 harness = false
+

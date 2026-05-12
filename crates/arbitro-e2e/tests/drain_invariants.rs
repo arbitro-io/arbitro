@@ -20,57 +20,23 @@
 //! This file covers the EDGE cases of the drain itself: pause/resume,
 //! ack-timeout, wildcards, mid-drain teardown, fairness, etc.
 
-use std::time::Duration;
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
-use arbitro_client_tokio::{Client, ClientConfig};
-use arbitro_server::{ArbitroServer, Config};
+use std::time::Duration;
 use bytes::Bytes;
-use tokio::sync::watch;
+use arbitro_client_tokio::Client;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-async fn start_server() -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(2048);
-
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run_with_shutdown(rx).await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (tx, addr)
-}
-
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig {
-        addr: addr.to_string(),
-        ..ClientConfig::default()
-    })
-    .await
-    .expect("client should connect")
-}
-
 async fn create_stream(client: &Client, name: &[u8], filter: &[u8]) -> u32 {
-    // (name, filter, max_msgs, max_bytes, max_age, replicas,
-    //  journal_kind=Memory, retention=Limits, discard=Old)
     let resp = client
         .create_stream(name, filter, 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream must succeed");
-    parse_id(&resp)
+    TestServer::parse_id(&resp)
 }
+
 
 /// Full create_consumer call exposed so tests can tune every knob.
 #[allow(clippy::too_many_arguments)]
@@ -88,12 +54,20 @@ async fn create_consumer(
 ) -> u32 {
     let resp = client
         .create_consumer(
-            stream_id, name, group, filter, max_inflight, ack_policy,
-            deliver_policy, 0u8 /* push */, ack_wait_ms, start_seq,
+            stream_id,
+            name,
+            group,
+            filter,
+            max_inflight,
+            ack_policy,
+            deliver_policy,
+            0u8, /* push */
+            ack_wait_ms,
+            start_seq,
         )
         .await
         .expect("create_consumer must succeed");
-    parse_id(&resp)
+    TestServer::parse_id(&resp)
 }
 
 /// Block on `recv` with a deadline. Returns `Some(msg)` or `None` on
@@ -102,7 +76,10 @@ async fn recv_within<'a>(
     handle: &'a mut arbitro_client_tokio::SubscriptionHandle,
     timeout: Duration,
 ) -> Option<arbitro_client_tokio::Message> {
-    tokio::time::timeout(timeout, handle.recv()).await.ok().flatten()
+    tokio::time::timeout(timeout, handle.recv())
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Drain a subscription until either `expected` messages are received
@@ -121,7 +98,9 @@ async fn drain_n(
     let mut out = Vec::with_capacity(expected);
     while out.len() < expected {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() { break; }
+        if remaining.is_zero() {
+            break;
+        }
         match tokio::time::timeout(remaining, handle.recv()).await {
             Ok(Some(m)) => out.push(m),
             _ => break,
@@ -140,21 +119,24 @@ async fn drain_n(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_wait_timeout_redelivers() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"acktimeout", b">").await;
 
     // 500 ms wait window — short enough to keep the test fast.
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"",
-        100, 1 /* Explicit */, 0 /* All */,
-        500 /* ack_wait_ms */, 0,
-    ).await;
+        &client, stream_id, b"worker", b"", b"", 100, 1,   /* Explicit */
+        0,   /* All */
+        500, /* ack_wait_ms */
+        0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"acktimeout.event", Bytes::from_static(b"hello"))
-        .expect("publish");
+        .publish_sync(stream_id, b"acktimeout.event", Bytes::from_static(b"hello"))
+        .await
+        .unwrap();
 
     // First delivery arrives quickly.
     let first = recv_within(&mut handle, Duration::from_secs(2))
@@ -166,13 +148,17 @@ async fn ack_wait_timeout_redelivers() {
 
     let second = recv_within(&mut handle, Duration::from_secs(3))
         .await
-        .expect("ack_wait_ms timeout must trigger redelivery; pre-fix \
-                 a stalled consumer never sees the message again");
+        .expect(
+            "ack_wait_ms timeout must trigger redelivery; pre-fix \
+                 a stalled consumer never sees the message again",
+        );
     assert_eq!(
-        &second.payload()[..], b"hello",
+        &second.payload()[..],
+        b"hello",
         "redelivered payload must match the original"
     );
     second.ack();
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,21 +171,30 @@ async fn ack_wait_timeout_redelivers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn max_inflight_pauses_then_resumes_on_ack() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"flow", b">").await;
 
     const K: u16 = 4;
     let consumer_id = create_consumer(
-        &client, stream_id, b"slow", b"", b"",
-        K, 1 /* Explicit */, 0 /* All */, 30_000, 0,
-    ).await;
+        &client, stream_id, b"slow", b"", b"", K, 1, /* Explicit */
+        0, /* All */
+        30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Publish 10 — drain must stop after 4.
     for i in 0u32..10 {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"flow.event", Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"flow.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     let first_batch = drain_n(&mut handle, K as usize, Duration::from_secs(3)).await;
@@ -227,15 +222,23 @@ async fn max_inflight_pauses_then_resumes_on_ack() {
     // Ack the rest — drain to completion. The remainder of the
     // backlog must drain through the same K-sized window: ack every
     // message inline so we keep credit available.
-    for m in iter { m.ack(); }
+    for m in iter {
+        m.ack();
+    }
     let mut remaining = 0;
     while remaining < 5 {
         match recv_within(&mut handle, Duration::from_secs(2)).await {
-            Some(m) => { m.ack(); remaining += 1; }
+            Some(m) => {
+                m.ack();
+                remaining += 1;
+            }
             None => break,
         }
     }
-    assert_eq!(remaining, 5, "after ack burst, the remaining 5-msg backlog must drain");
+    assert_eq!(
+        remaining, 5,
+        "after ack burst, the remaining 5-msg backlog must drain"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -247,15 +250,27 @@ async fn max_inflight_pauses_then_resumes_on_ack() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wildcard_single_token_filter_matches_correctly() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"wcsingle", b">").await;
 
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"wcsingle.*.event",
-        100, 1, 0, 30_000, 0,
-    ).await;
-    let mut handle = client.subscribe(stream_id, consumer_id, b"wcsingle.*.event").await.unwrap();
+        &client,
+        stream_id,
+        b"reader",
+        b"",
+        b"wcsingle.*.event",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
+    let mut handle = client
+        .subscribe(stream_id, consumer_id, b"wcsingle.*.event")
+        .await
+        .unwrap();
 
     // 3 should match (a/b/c at the wildcard slot); 1 should NOT.
     //
@@ -263,14 +278,31 @@ async fn wildcard_single_token_filter_matches_correctly() {
     // measure the drain — keeps the test deterministic regardless of how
     // long the broker takes to apply the publishes (which can spike under
     // load and turn fire-and-forget + tight drain timeout into a flake).
-    client.publish_sync(stream_id, b"wcsingle.a.event", Bytes::from_static(b"a")).await.unwrap();
-    client.publish_sync(stream_id, b"wcsingle.b.event", Bytes::from_static(b"b")).await.unwrap();
-    client.publish_sync(stream_id, b"wcsingle.c.event", Bytes::from_static(b"c")).await.unwrap();
-    client.publish_sync(stream_id, b"wcsingle.a.b.event", Bytes::from_static(b"too-many-tokens")).await.unwrap();
+    client
+        .publish_sync(stream_id, b"wcsingle.a.event", Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+    client
+        .publish_sync(stream_id, b"wcsingle.b.event", Bytes::from_static(b"b"))
+        .await
+        .unwrap();
+    client
+        .publish_sync(stream_id, b"wcsingle.c.event", Bytes::from_static(b"c"))
+        .await
+        .unwrap();
+    client
+        .publish_sync(
+            stream_id,
+            b"wcsingle.a.b.event",
+            Bytes::from_static(b"too-many-tokens"),
+        )
+        .await
+        .unwrap();
 
     let got = drain_n(&mut handle, 3, Duration::from_secs(5)).await;
     assert_eq!(
-        got.len(), 3,
+        got.len(),
+        3,
         "exactly the three single-token matches must arrive; got {}",
         got.len()
     );
@@ -284,6 +316,7 @@ async fn wildcard_single_token_filter_matches_correctly() {
         extra.is_none(),
         "`*` must NOT match more than one token; spurious delivery: {extra:?}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -292,15 +325,27 @@ async fn wildcard_single_token_filter_matches_correctly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wildcard_multi_token_filter_matches_everything_below() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"wcmulti", b">").await;
 
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"wcmulti.>",
-        100, 1, 0, 30_000, 0,
-    ).await;
-    let mut handle = client.subscribe(stream_id, consumer_id, b"wcmulti.>").await.unwrap();
+        &client,
+        stream_id,
+        b"reader",
+        b"",
+        b"wcmulti.>",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
+    let mut handle = client
+        .subscribe(stream_id, consumer_id, b"wcmulti.>")
+        .await
+        .unwrap();
 
     // All 4 of these match `wcmulti.>`. Use publish_sync so each message
     // is confirmed in the store before we measure the drain — the bare
@@ -314,12 +359,16 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
         b"wcmulti.long.chain.of.tokens",
     ];
     for s in subjects {
-        client.publish_sync(stream_id, s, Bytes::from_static(b"data")).await.unwrap();
+        client
+            .publish_sync(stream_id, s, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
     }
 
     let got = drain_n(&mut handle, subjects.len(), Duration::from_secs(5)).await;
     assert_eq!(
-        got.len(), subjects.len(),
+        got.len(),
+        subjects.len(),
         "`>` must match arbitrarily-deep subjects below the prefix"
     );
     for m in got {
@@ -337,25 +386,34 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_consumer_mid_drain_stops_delivery() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"mid", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client, stream_id, b"worker", b"", b"", 100, 1, 0, 30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Saturate with messages.
     for i in 0u32..20 {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"mid.event", Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"mid.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Consume a few, then delete the consumer.
     let pre = drain_n(&mut handle, 3, Duration::from_secs(2)).await;
     assert!(pre.len() >= 1, "must deliver something before delete");
-    for m in pre { m.ack(); }
+    for m in pre {
+        m.ack();
+    }
 
     client.delete_consumer(consumer_id).await.unwrap();
 
@@ -374,6 +432,7 @@ async fn delete_consumer_mid_drain_stops_delivery() {
         "after delete_consumer, the subscription must stop receiving; \
          got {after:?}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -382,26 +441,57 @@ async fn delete_consumer_mid_drain_stops_delivery() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_stream_mid_drain_stops_all_subscriptions() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"midstream", b">").await;
 
     let consumer_id_a = create_consumer(
-        &client, stream_id, b"worker-a", b"", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"worker-a",
+        b"",
+        b"",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
     let consumer_id_b = create_consumer(
-        &client, stream_id, b"worker-b", b"", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"worker-b",
+        b"",
+        b"",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
 
     // Two subscriptions on the same stream (fanout).
-    let mut handle_a = client.subscribe(stream_id, consumer_id_a, b"").await.unwrap();
-    let mut handle_b = client.subscribe(stream_id, consumer_id_b, b"").await.unwrap();
+    let mut handle_a = client
+        .subscribe(stream_id, consumer_id_a, b"")
+        .await
+        .unwrap();
+    let mut handle_b = client
+        .subscribe(stream_id, consumer_id_b, b"")
+        .await
+        .unwrap();
 
     for i in 0u32..10 {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"midstream.event", Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"midstream.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Consume something on each, then nuke the stream.
@@ -421,6 +511,7 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
         "after delete_stream, BOTH attached subscriptions must stop \
          receiving; got a={extra_a:?} b={extra_b:?}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -433,19 +524,35 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_none_drains_without_acks() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"fire", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"firehose", b"", b"",
-        100, 0 /* None */, 0 /* All */, 0, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"firehose",
+        b"",
+        b"",
+        100,
+        0, /* None */
+        0, /* All */
+        0,
+        0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     const N: usize = 50;
     for i in 0..N {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"fire.event", Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"fire.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Why 30s instead of a tight budget: AckPolicy::None has NO flow-
@@ -466,7 +573,8 @@ async fn ack_policy_none_drains_without_acks() {
     // alone) but it prevents flake when running with the full suite.
     let got = drain_n(&mut handle, N, Duration::from_secs(30)).await;
     assert_eq!(
-        got.len(), N,
+        got.len(),
+        N,
         "AckPolicy::None must deliver every message; the drain has no \
          ack-pending gate to wait on, but the cursor stays put on \
          writer backpressure → eventual delivery is guaranteed"
@@ -481,6 +589,7 @@ async fn ack_policy_none_drains_without_acks() {
         "AckPolicy::None must NOT redeliver; the un-acked drop is final. \
          Got {extra:?}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -500,21 +609,35 @@ async fn ack_policy_none_drains_without_acks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_none_ignores_max_inflight() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"fire-cap", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"firehose", b"", b"",
-        2 /* max_inflight = tiny */, 0 /* AckPolicy::None */,
-        0 /* DeliverPolicy::All */, 0, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"firehose",
+        b"",
+        b"",
+        2, /* max_inflight = tiny */
+        0, /* AckPolicy::None */
+        0, /* DeliverPolicy::All */
+        0,
+        0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     const N: usize = 50;
     for i in 0..N {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"fire-cap.event",
-            Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"fire-cap.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // All 50 must arrive — max_inflight=2 is supposed to be IGNORED for
@@ -523,12 +646,14 @@ async fn ack_policy_none_ignores_max_inflight() {
     // come).
     let got = drain_n(&mut handle, N, Duration::from_secs(30)).await;
     assert_eq!(
-        got.len(), N,
+        got.len(),
+        N,
         "AckPolicy::None must IGNORE max_inflight — got {} / {N}. \
          If you see ≤ 2, the drain is gating fire-and-forget on a \
          counter that ack will never decrement.",
         got.len()
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -541,21 +666,29 @@ async fn ack_policy_none_ignores_max_inflight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_explicit_does_enforce_max_inflight() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"explicit-cap", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"",
-        2 /* max_inflight = tiny */, 1 /* AckPolicy::Explicit */,
-        0 /* DeliverPolicy::All */, 30_000, 0,
-    ).await;
+        &client, stream_id, b"worker", b"", b"", 2, /* max_inflight = tiny */
+        1, /* AckPolicy::Explicit */
+        0, /* DeliverPolicy::All */
+        30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     const N: usize = 50;
     for i in 0..N {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"explicit-cap.event",
-            Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"explicit-cap.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Drain WITHOUT acking. With Explicit + max_inflight=2, drain must
@@ -563,7 +696,8 @@ async fn ack_policy_explicit_does_enforce_max_inflight() {
     // broken (or the consumer was misclassified as fire-and-forget).
     let got = drain_n(&mut handle, N, Duration::from_secs(2)).await;
     assert_eq!(
-        got.len(), 2,
+        got.len(),
+        2,
         "AckPolicy::Explicit with max_inflight=2 must deliver exactly \
          2 messages without acks; got {}. More than 2 means the gate \
          is broken; fewer means the drain isn't running.",
@@ -589,37 +723,52 @@ async fn ack_policy_explicit_does_enforce_max_inflight() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_none_ignores_max_subject_inflight() {
     use arbitro_client_tokio::SubjectLimit;
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"fire-subj", b">").await;
 
     // Cannot reuse the helper — need create_consumer_with_limits.
     let resp = client
         .create_consumer_with_limits(
-            stream_id, b"firehose", b"", b"",
-            u16::MAX,           // max_inflight unlimited
-            0 /* AckPolicy::None */,
-            0 /* DeliverPolicy::All */,
-            0 /* push */, 0, 0,
-            &[SubjectLimit { pattern: b"fire-subj.>", limit: 1 }],
+            stream_id,
+            b"firehose",
+            b"",
+            b"",
+            u16::MAX, // max_inflight unlimited
+            0,        /* AckPolicy::None */
+            0,        /* DeliverPolicy::All */
+            0,        /* push */
+            0,
+            0,
+            &[SubjectLimit {
+                pattern: b"fire-subj.>",
+                limit: 1,
+            }],
         )
         .await
         .expect("create_consumer with subject limit");
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     const N: usize = 20;
     for i in 0..N {
         let p = format!("msg-{i}");
-        client.publish(stream_id, b"fire-subj.event",
-            Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"fire-subj.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // All 20 must arrive — even with max_subject_inflight=1, fire-and-
     // forget must ignore it (no ack will ever decrement).
     let got = drain_n(&mut handle, N, Duration::from_secs(30)).await;
     assert_eq!(
-        got.len(), N,
+        got.len(),
+        N,
         "AckPolicy::None must IGNORE max_subject_inflight — got {} / {N}. \
          If you see only 1, the drain is enforcing the per-subject cap \
          on a fire-and-forget consumer.",
@@ -633,23 +782,29 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deliver_policy_by_start_seq_skips_earlier() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"seq", b">").await;
 
     // Publish 10 BEFORE subscribing.
     for i in 0u32..10 {
         let p = format!("msg-{i}");
-        client.publish_sync(stream_id, b"seq.event", Bytes::copy_from_slice(p.as_bytes()))
+        client
+            .publish_sync(
+                stream_id,
+                b"seq.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
             .await
             .unwrap();
     }
 
     // Consumer that starts at seq 6 (deliver_policy=2 = ByStartSeq).
     let consumer_id = create_consumer(
-        &client, stream_id, b"late", b"", b"",
-        100, 1, 2 /* ByStartSeq */, 30_000, 6,
-    ).await;
+        &client, stream_id, b"late", b"", b"", 100, 1, 2, /* ByStartSeq */
+        30_000, 6,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     let got = drain_n(&mut handle, 5, Duration::from_secs(5)).await;
@@ -668,7 +823,9 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
         idx >= 5,
         "ByStartSeq=6 must skip publishes 0..=4; got first={s} (idx={idx})"
     );
-    for m in got { m.ack(); }
+    for m in got {
+        m.ack();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -677,13 +834,13 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_stream_subscribe_produces_no_deliveries() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"empty", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client, stream_id, b"reader", b"", b"", 100, 1, 0, 30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     let nothing = recv_within(&mut handle, Duration::from_millis(300)).await;
@@ -692,6 +849,7 @@ async fn empty_stream_subscribe_produces_no_deliveries() {
         "subscribing to an empty stream must NOT produce any frames; \
          got {nothing:?}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -704,19 +862,27 @@ async fn empty_stream_subscribe_produces_no_deliveries() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_consumer_fast_publisher_is_lossless() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"pace", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"slow", b"", b"",
-        16 /* tight inflight */, 1, 0, 30_000, 0,
-    ).await;
+        &client, stream_id, b"slow", b"", b"", 16, /* tight inflight */
+        1, 0, 30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     const N: usize = 100;
     for i in 0..N {
         let p = format!("msg-{i:03}");
-        client.publish(stream_id, b"pace.event", Bytes::copy_from_slice(p.as_bytes())).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"pace.event",
+                Bytes::copy_from_slice(p.as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     let mut received = Vec::with_capacity(N);
@@ -731,11 +897,13 @@ async fn slow_consumer_fast_publisher_is_lossless() {
         }
     }
     assert_eq!(
-        received.len(), N,
+        received.len(),
+        N,
         "every message must be delivered despite slow consumer; \
          got {} / {N}",
         received.len()
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -748,42 +916,54 @@ async fn slow_consumer_fast_publisher_is_lossless() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn recycle_subject_after_ack_drains_fresh_batch() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"recycle", b">").await;
-    let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"",
-        10, 1, 0, 30_000, 0,
-    ).await;
+    let consumer_id =
+        create_consumer(&client, stream_id, b"worker", b"", b"", 10, 1, 0, 30_000, 0).await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Cycle 1 — publish_sync so the broker has confirmed acceptance
     // of every message before we measure drain.
     for i in 0u32..5 {
-        client.publish_sync(
-            stream_id, b"recycle.event",
-            Bytes::copy_from_slice(format!("c1-{i}").as_bytes()),
-        ).await.unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"recycle.event",
+                Bytes::copy_from_slice(format!("c1-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
     let batch_a = drain_n(&mut handle, 5, Duration::from_secs(5)).await;
     assert_eq!(batch_a.len(), 5, "cycle 1: all 5 must drain");
-    for m in batch_a { m.ack(); }
+    for m in batch_a {
+        m.ack();
+    }
 
     // Cycle 2 — same subject.
     for i in 0u32..5 {
-        client.publish_sync(
-            stream_id, b"recycle.event",
-            Bytes::copy_from_slice(format!("c2-{i}").as_bytes()),
-        ).await.unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"recycle.event",
+                Bytes::copy_from_slice(format!("c2-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
     let batch_b = drain_n(&mut handle, 5, Duration::from_secs(5)).await;
     assert_eq!(
-        batch_b.len(), 5,
+        batch_b.len(),
+        5,
         "cycle 2 on the same subject must also drain 5; pre-fix a \
          broken per-subject inflight that didn't dec-on-zero would \
          leave residual credit and starve the cycle 2 publishes"
     );
-    for m in batch_b { m.ack(); }
+    for m in batch_b {
+        m.ack();
+    }
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -796,43 +976,71 @@ async fn recycle_subject_after_ack_drains_fresh_batch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_consumer_does_not_starve_fast_consumer() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"fair", b">").await;
 
     let slow_id = create_consumer(
-        &client, stream_id, b"slow", b"slow-group", b"",
-        4, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"slow",
+        b"slow-group",
+        b"",
+        4,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
     let fast_id = create_consumer(
-        &client, stream_id, b"fast", b"fast-group", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"fast",
+        b"fast-group",
+        b"",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
     let mut slow = client.subscribe(stream_id, slow_id, b"").await.unwrap();
     let mut fast = client.subscribe(stream_id, fast_id, b"").await.unwrap();
 
     const N: usize = 30;
     for i in 0..N {
-        client.publish(
-            stream_id, b"fair.event",
-            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
-        ).unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"fair.event",
+                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Fast consumer drains everything quickly.
     let fast_msgs = drain_n(&mut fast, N, Duration::from_secs(8)).await;
     assert_eq!(
-        fast_msgs.len(), N,
+        fast_msgs.len(),
+        N,
         "fast consumer must receive ALL {N} messages even while the \
          slow consumer has un-acked frames blocking its own inflight"
     );
-    for m in fast_msgs { m.ack(); }
+    for m in fast_msgs {
+        m.ack();
+    }
 
     // Now drain the slow one (acking as we go).
     let mut slow_count = 0;
     while slow_count < N {
         match recv_within(&mut slow, Duration::from_secs(2)).await {
-            Some(m) => { m.ack(); slow_count += 1; }
+            Some(m) => {
+                m.ack();
+                slow_count += 1;
+            }
             None => break,
         }
     }
@@ -840,6 +1048,7 @@ async fn slow_consumer_does_not_starve_fast_consumer() {
         slow_count, N,
         "slow consumer must also receive all {N} once its inflight clears"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -852,16 +1061,29 @@ async fn slow_consumer_does_not_starve_fast_consumer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_publishers_one_consumer_exactly_n() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let addr = server.addr.clone();
 
     // Subscriber side.
-    let sub_client = connect(&addr).await;
+    let sub_client = server.connect().await;
     let stream_id = create_stream(&sub_client, b"concur", b">").await;
     let consumer_id = create_consumer(
-        &sub_client, stream_id, b"reader", b"", b"",
-        u16::MAX, 1, 0, 30_000, 0,
-    ).await;
-    let mut handle = sub_client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+        &sub_client,
+        stream_id,
+        b"reader",
+        b"",
+        b"",
+        u16::MAX,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
+    let mut handle = sub_client
+        .subscribe(stream_id, consumer_id, b"")
+        .await
+        .unwrap();
 
     // Publisher side — 4 separate connections each pushing 25 messages.
     const PUB_COUNT: usize = 4;
@@ -882,20 +1104,25 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let c = connect(&addr).await;
+                let c = TestServer::connect_to(&addr).await;
                 let resp = c.get_stream(b"concur").await.unwrap();
-                let sid = parse_id(&resp);
+                let sid = TestServer::parse_id(&resp);
                 for i in 0..PER_PUB {
                     let payload = format!("p{p}-i{i}");
                     c.publish_sync(
-                        sid, b"concur.event",
+                        sid,
+                        b"concur.event",
                         Bytes::copy_from_slice(payload.as_bytes()),
-                    ).await.unwrap();
+                    )
+                    .await
+                    .unwrap();
                 }
             });
         }));
     }
-    for h in publishers { h.join().unwrap(); }
+    for h in publishers {
+        h.join().unwrap();
+    }
 
     // Receive everyone.
     let mut got = std::collections::HashSet::new();
@@ -906,17 +1133,21 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
                 let inserted = got.insert(s.clone());
                 assert!(inserted, "duplicate delivery: {s}");
                 m.ack();
-                if got.len() == TOTAL { break; }
+                if got.len() == TOTAL {
+                    break;
+                }
             }
             None => break,
         }
     }
     assert_eq!(
-        got.len(), TOTAL,
+        got.len(),
+        TOTAL,
         "exactly {TOTAL} unique messages must be delivered from {PUB_COUNT} \
          concurrent publishers; got {}",
         got.len()
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -929,13 +1160,13 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resubscribe_continues_from_cursor() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     let stream_id = create_stream(&client, b"cursor", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client, stream_id, b"reader", b"", b"", 100, 1, 0, 30_000, 0,
+    )
+    .await;
 
     // Phase 1: subscribe, drain 3, ack, drop.
     {
@@ -945,23 +1176,33 @@ async fn resubscribe_continues_from_cursor() {
         // drain — rules out a publish-arrival race that would skew the
         // assertion.
         for i in 0u32..5 {
-            client.publish_sync(
-                stream_id, b"cursor.event",
-                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
-            ).await.unwrap();
+            client
+                .publish_sync(
+                    stream_id,
+                    b"cursor.event",
+                    Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+                )
+                .await
+                .unwrap();
         }
         let three = drain_n(&mut handle, 3, Duration::from_secs(5)).await;
         assert_eq!(three.len(), 3, "phase 1: 3 must drain");
-        for m in three { m.ack(); }
+        for m in three {
+            m.ack();
+        }
     } // handle dropped — subscription closed at the client end
 
     // While unsubscribed, publish more. publish_sync guarantees these
     // are confirmed in the store before re-subscribe.
     for i in 5u32..8 {
-        client.publish_sync(
-            stream_id, b"cursor.event",
-            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
-        ).await.unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"cursor.event",
+                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Phase 2: re-subscribe.
@@ -973,5 +1214,8 @@ async fn resubscribe_continues_from_cursor() {
          must continue arriving; got {}",
         resumed.len()
     );
-    for m in resumed { m.ack(); }
+    for m in resumed {
+        m.ack();
+    }
+    server.shutdown().await;
 }

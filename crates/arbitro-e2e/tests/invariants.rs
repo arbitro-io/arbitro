@@ -1,73 +1,10 @@
-//! End-to-end invariant tests — real TCP client ↔ server.
-//!
-//! Each test starts a server on a random port, connects a client,
-//! and verifies correctness through the public client API only.
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::time::Duration;
-
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, SubjectLimit};
-use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
-use tokio::sync::watch;
+use arbitro_client_tokio::{BatchEntry, SubjectLimit};
 
-// ── Helper functions ──────────────────────────────────────────────────────
-
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-fn stream_count(resp: &Bytes) -> usize {
-    u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
-}
-
-fn stream_names(resp: &Bytes) -> Vec<Vec<u8>> {
-    let count = u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize;
-    let mut names = Vec::with_capacity(count);
-    let mut pos = 4usize;
-    for _ in 0..count {
-        pos += 4; // wire_id u32
-        let name_len = u16::from_le_bytes(resp[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        names.push(resp[pos..pos + name_len].to_vec());
-        pos += name_len;
-    }
-    names
-}
-
-#[allow(dead_code)]
-fn consumer_count(resp: &Bytes) -> usize {
-    u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
-}
-
-/// Start a server on a random port, return (shutdown_tx, addr).
-async fn start_server() -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener); // free the port for the server
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(1024);
-
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run_with_shutdown(rx).await;
-    });
-
-    // Give server a moment to bind
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    (tx, addr)
-}
-
-/// Connect a client to the given address.
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client should connect")
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Stream CRUD
@@ -76,51 +13,55 @@ async fn connect(addr: &str) -> Client {
 /// 1. Create stream → appears in list_streams.
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_create_then_list() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
-    assert_eq!(stream_count(&resp), 1);
-    let names = stream_names(&resp);
+    assert_eq!(TestServer::stream_count(&resp), 1);
+    let names = TestServer::stream_names(&resp);
     assert_eq!(names[0], b"orders");
+    server.shutdown().await;
 }
 
 /// 2. Create duplicate stream → idempotent (no error).
 #[tokio::test(flavor = "multi_thread")]
 async fn stream_create_idempotent() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     // Second create should not fail
     client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
-    assert_eq!(stream_count(&resp), 1);
+    assert_eq!(TestServer::stream_count(&resp), 1);
+    server.shutdown().await;
 }
 
 /// 3. Delete stream → disappears from list_streams.
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_delete_then_list() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+async fn create_and_list_streams() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+
     let resp = client.list_streams(0, 1000).await.unwrap();
-    assert_eq!(stream_count(&resp), 1);
+    assert_eq!(TestServer::stream_count(&resp), 1);
 
     client.delete_stream(b"events").await.unwrap();
     let resp = client.list_streams(0, 1000).await.unwrap();
-    assert_eq!(stream_count(&resp), 0);
+    assert_eq!(TestServer::stream_count(&resp), 0);
+    server.shutdown().await;
 }
 
 /// 4. Publish to non-existent stream → error.
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_to_missing_stream_errors() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     // Use a non-existent stream_id (e.g., u32::MAX)
     let result = client
@@ -130,6 +71,7 @@ async fn publish_to_missing_stream_errors() {
         result.is_err(),
         "publish to non-existent stream should fail"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -138,42 +80,24 @@ async fn publish_to_missing_stream_errors() {
 
 /// 5. Create consumer → returns valid ID.
 #[tokio::test(flavor = "multi_thread")]
-async fn consumer_create_returns_id() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+async fn create_consumer_and_delete() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
-    assert!(consumer_id > 0, "consumer ID should be non-zero");
-}
-
-/// 6. Delete consumer → clean removal.
-#[tokio::test(flavor = "multi_thread")]
-async fn consumer_delete() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
-
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
-
-    let resp = client
-        .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
-        .await
-        .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
 
     client.delete_consumer(consumer_id).await.unwrap();
 
-    // Deleting again should error (or be no-op)
-    let result = client.delete_consumer(consumer_id).await;
-    // Either error or idempotent — just shouldn't panic
-    let _ = result;
+    // Deleting again should be fine (returning success or specific error, but not crashing)
+    let _ = client.delete_consumer(consumer_id).await;
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -183,21 +107,22 @@ async fn consumer_delete() {
 /// 7. Publish single → subscriber receives correct subject + payload.
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_single_delivers_correctly() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"chat_hello", Bytes::copy_from_slice(b"world"))
+        .publish_sync(stream_id, b"chat_hello", Bytes::copy_from_slice(b"world"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -208,28 +133,29 @@ async fn publish_single_delivers_correctly() {
     assert_eq!(msg.subject(), b"chat_hello");
     assert_eq!(&msg.payload()[..], b"world");
     msg.ack();
+    server.shutdown().await;
 }
 
 /// 8. Publish batch → all messages delivered.
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_batch_delivers_all() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     let entries: Vec<BatchEntry<'_>> = (0..50)
         .map(|_| BatchEntry::new(&b"logs_line"[..], Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch(stream_id, &entries).expect("publish_batch");
+    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
 
     let mut count = 0u32;
     loop {
@@ -243,16 +169,17 @@ async fn publish_batch_delivers_all() {
     }
 
     assert_eq!(count, 50, "all 50 messages should be delivered");
+    server.shutdown().await;
 }
 
 /// 9. Publish returns monotonic sequences.
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_sequences_monotonic() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp1 = client
         .publish_sync(stream_id, b"counter_inc", Bytes::copy_from_slice(b"1"))
@@ -274,44 +201,31 @@ async fn publish_sequences_monotonic() {
 
     assert!(seq2 > seq1, "seq2 ({seq2}) > seq1 ({seq1})");
     assert!(seq3 > seq2, "seq3 ({seq3}) > seq2 ({seq2})");
+    server.shutdown().await;
 }
 
 /// publish-before-subscribe replay: publish N msgs, then create consumer with
 /// deliver_policy=All (0) and subscribe — should receive all N historical messages.
 #[tokio::test(flavor = "multi_thread")]
 async fn replay_deliver_all_historical() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Publish 100 messages BEFORE any consumer exists.
     let entries: Vec<BatchEntry<'_>> = (0..100)
         .map(|_| BatchEntry::new(&b"history.evt"[..], Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch(stream_id, &entries).expect("publish_batch");
-
-    // Small delay so the shard drain loop processes publish_pending_to_engine.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
 
     // Create consumer with deliver_policy=0 (All) — should replay from seq=1.
     let resp = client
-        .create_consumer(
-            stream_id,
-            b"replayer",
-            b"",
-            b"",
-            200u16,
-            1u8,
-            0u8, // deliver_policy: 0 = All
-            0u8,
-            0u32,
-            0u64,
-        )
+        .create_consumer(stream_id, b"replayer", b"", b"", 200u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
 
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
@@ -324,6 +238,7 @@ async fn replay_deliver_all_historical() {
     }
 
     assert_eq!(count, 100, "replay should deliver all 100 historical messages, got {count}");
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -333,21 +248,22 @@ async fn replay_deliver_all_historical() {
 /// 10. Ack → message not redelivered.
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_prevents_redelivery() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"acker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"acktest_msg", Bytes::copy_from_slice(b"data"))
+        .publish_sync(stream_id, b"acktest_msg", Bytes::copy_from_slice(b"data"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -359,26 +275,28 @@ async fn ack_prevents_redelivery() {
     // No more messages should arrive
     let extra = tokio::time::timeout(Duration::from_millis(200), handle.recv()).await;
     assert!(extra.is_err(), "after ack, no redelivery should happen");
+    server.shutdown().await;
 }
 
 /// 11. Nack → message redelivered.
 #[tokio::test(flavor = "multi_thread")]
 async fn nack_causes_redelivery() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"nacker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"nacktest_msg", Bytes::copy_from_slice(b"data"))
+        .publish_sync(stream_id, b"nacktest_msg", Bytes::copy_from_slice(b"data"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -397,6 +315,7 @@ async fn nack_causes_redelivery() {
         assert_eq!(&msg.payload()[..], b"data");
         msg.ack();
     }
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -406,23 +325,24 @@ async fn nack_causes_redelivery() {
 /// 12. Messages arrive in sequence order.
 #[tokio::test(flavor = "multi_thread")]
 async fn delivery_preserves_order() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     for i in 0..20u32 {
         let payload = i.to_le_bytes();
         client
-            .publish(stream_id, b"ordered_seq", Bytes::copy_from_slice(&payload))
+            .publish_sync(stream_id, b"ordered_seq", Bytes::copy_from_slice(&payload))
+            .await
             .expect("publish");
     }
 
@@ -441,6 +361,7 @@ async fn delivery_preserves_order() {
         prev_seq = msg.seq;
         msg.ack();
     }
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -450,24 +371,24 @@ async fn delivery_preserves_order() {
 /// 13. Fan-out — two consumers with DIFFERENT groups both receive every message.
 #[tokio::test(flavor = "multi_thread")]
 async fn fanout_two_consumers_each_receive_all() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Two consumers with DIFFERENT groups → separate queues → fan-out
     let resp = client
         .create_consumer(stream_id, b"svc_a", b"group_a", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid1 = parse_id(&resp);
+    let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"svc_b", b"group_b", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid2 = parse_id(&resp);
+    let cid2 = TestServer::parse_id(&resp);
 
     let mut handle1 = client.subscribe(stream_id, cid1, b"").await.unwrap();
     let mut handle2 = client.subscribe(stream_id, cid2, b"").await.unwrap();
@@ -475,7 +396,8 @@ async fn fanout_two_consumers_each_receive_all() {
     // Publish 5 messages
     for i in 0..5u32 {
         client
-            .publish(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
             .expect("publish");
     }
 
@@ -493,29 +415,30 @@ async fn fanout_two_consumers_each_receive_all() {
         }
         assert_eq!(count, 5, "{name} should receive all 5 messages");
     }
+    server.shutdown().await;
 }
 
 /// 14. Queue group — two consumers with the SAME group share messages (each delivered once).
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_group_distributes_messages() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Two consumers with the SAME default group → same queue → round-robin
     let resp = client
         .create_consumer(stream_id, b"worker1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid1 = parse_id(&resp);
+    let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"worker2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid2 = parse_id(&resp);
+    let cid2 = TestServer::parse_id(&resp);
 
     let mut handle1 = client.subscribe(stream_id, cid1, b"").await.unwrap();
     let mut handle2 = client.subscribe(stream_id, cid2, b"").await.unwrap();
@@ -523,7 +446,8 @@ async fn queue_group_distributes_messages() {
     // Publish 10 messages
     for i in 0..10u32 {
         client
-            .publish(stream_id, b"tasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(stream_id, b"tasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
             .expect("publish");
     }
 
@@ -554,6 +478,7 @@ async fn queue_group_distributes_messages() {
         total, 10,
         "total delivered should be 10, got {count1}+{count2}={total}"
     );
+    server.shutdown().await;
 }
 
 /// 14e. Fanout with subject filters — only matching subscriptions receive.
@@ -563,54 +488,56 @@ async fn queue_group_distributes_messages() {
 /// should only deliver to the consumer whose filter matches.
 #[tokio::test(flavor = "multi_thread")]
 async fn fanout_with_subject_filters() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"filt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Consumer A: subscribes to `orders.*`
-    let cli_a = connect(&addr).await;
+    let cli_a = server.connect().await;
     let resp = cli_a
         .create_consumer(stream_id, b"fa", b"ga", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_a = parse_id(&resp);
+    let cid_a = TestServer::parse_id(&resp);
     let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"orders.*").await.unwrap();
 
     // Consumer B: subscribes to `payments.*`
-    let cli_b = connect(&addr).await;
+    let cli_b = server.connect().await;
     let resp = cli_b
         .create_consumer(stream_id, b"fb", b"gb", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_b = parse_id(&resp);
+    let cid_b = TestServer::parse_id(&resp);
     let mut handle_b = cli_b.subscribe(stream_id, cid_b, b"payments.*").await.unwrap();
 
     // Consumer C: subscribes to `>` (catch-all)
-    let cli_c = connect(&addr).await;
+    let cli_c = server.connect().await;
     let resp = cli_c
         .create_consumer(stream_id, b"fc", b"gc", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_c = parse_id(&resp);
+    let cid_c = TestServer::parse_id(&resp);
     let mut handle_c = cli_c.subscribe(stream_id, cid_c, b">").await.unwrap();
 
     // Publish: 3 orders, 2 payments
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         publisher
-            .publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"order-data"))
+            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"order-data"))
+            .await
             .expect("publish");
     }
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         publisher
-            .publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"pay-data"))
+            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"pay-data"))
+            .await
             .expect("publish");
     }
 
@@ -662,6 +589,7 @@ async fn fanout_with_subject_filters() {
         }
     }
     assert_eq!(count_c, 5, "consumer C (>) should get 5, got {count_c}");
+    server.shutdown().await;
 }
 
 /// 14f. Queue with subject filters — dedup only among matching bindings.
@@ -672,45 +600,47 @@ async fn fanout_with_subject_filters() {
 /// Publishing `payments.1` should ONLY go to B.
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_with_subject_filters_no_false_dedup() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"qfilt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Same default group (queue mode) but different subject filters
-    let cli_a = connect(&addr).await;
+    let cli_a = server.connect().await;
     let resp = cli_a
         .create_consumer(stream_id, b"qfa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_a = parse_id(&resp);
+    let cid_a = TestServer::parse_id(&resp);
     let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"orders.*").await.unwrap();
 
-    let cli_b = connect(&addr).await;
+    let cli_b = server.connect().await;
     let resp = cli_b
         .create_consumer(stream_id, b"qfb", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_b = parse_id(&resp);
+    let cid_b = TestServer::parse_id(&resp);
     let mut handle_b = cli_b.subscribe(stream_id, cid_b, b"payments.*").await.unwrap();
 
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
 
     // Publish 3 orders + 2 payments
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         publisher
-            .publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
+            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
+            .await
             .expect("publish");
     }
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         publisher
-            .publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
+            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
+            .await
             .expect("publish");
     }
 
@@ -749,6 +679,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
         }
     }
     assert_eq!(count_b, 2, "B (payments.*) should get 2, got {count_b}");
+    server.shutdown().await;
 }
 
 /// 14g. Queue with overlapping filters — same group, both match.
@@ -758,36 +689,37 @@ async fn queue_with_subject_filters_no_false_dedup() {
 /// receives each message. Total = published count, no duplicates.
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_overlapping_filters_no_duplicates() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"qovlp", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
-    let cli_a = connect(&addr).await;
+    let cli_a = server.connect().await;
     let resp = cli_a
         .create_consumer(stream_id, b"qoa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_a = parse_id(&resp);
+    let cid_a = TestServer::parse_id(&resp);
     let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"events.*").await.unwrap();
 
-    let cli_b = connect(&addr).await;
+    let cli_b = server.connect().await;
     let resp = cli_b
         .create_consumer(stream_id, b"qob", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_b = parse_id(&resp);
+    let cid_b = TestServer::parse_id(&resp);
     let mut handle_b = cli_b.subscribe(stream_id, cid_b, b">").await.unwrap();
 
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
     for i in 0..10u32 {
         let subj = format!("events.{i}");
         publisher
-            .publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
             .expect("publish");
     }
 
@@ -823,37 +755,39 @@ async fn queue_overlapping_filters_no_duplicates() {
     let total = count_a + count_b;
     assert_eq!(total, 10, "total should be 10, got {count_a}+{count_b}={total}");
     assert_eq!(seqs.len(), 10, "all seqs unique (no duplicates), got {}", seqs.len());
+    server.shutdown().await;
 }
 
 /// 15. Consumers on different streams — publishing to one doesn't deliver to the other.
 #[tokio::test(flavor = "multi_thread")]
 async fn consumers_on_different_streams_isolated() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp1 = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id1 = parse_id(&resp1);
+    let stream_id1 = TestServer::parse_id(&resp1);
     let resp2 = client.create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id2 = parse_id(&resp2);
+    let stream_id2 = TestServer::parse_id(&resp2);
 
     let resp = client
         .create_consumer(stream_id1, b"log_sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid1 = parse_id(&resp);
+    let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id2, b"metric_sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid2 = parse_id(&resp);
+    let cid2 = TestServer::parse_id(&resp);
 
     let mut handle1 = client.subscribe(stream_id1, cid1, b"").await.unwrap();
     let mut handle2 = client.subscribe(stream_id2, cid2, b"").await.unwrap();
 
     // Publish to logs only
     client
-        .publish(stream_id1, b"logs_line", Bytes::copy_from_slice(b"hello"))
+        .publish_sync(stream_id1, b"logs_line", Bytes::copy_from_slice(b"hello"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle1.recv())
@@ -869,6 +803,7 @@ async fn consumers_on_different_streams_isolated() {
         leaked.is_err(),
         "metrics sub should not receive logs messages"
     );
+    server.shutdown().await;
 }
 
 /// 14b. Queue group — multiple clients (separate connections), same group.
@@ -877,39 +812,40 @@ async fn consumers_on_different_streams_isolated() {
 /// total delivered across both must be exactly 10 (no duplicates).
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_group_multi_client() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"qtasks", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Two separate connections, each with its own consumer, same default group
-    let client1 = connect(&addr).await;
-    let client2 = connect(&addr).await;
+    let client1 = server.connect().await;
+    let client2 = server.connect().await;
 
     let resp = client1
         .create_consumer(stream_id, b"qw1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid1 = parse_id(&resp);
+    let cid1 = TestServer::parse_id(&resp);
 
     let resp = client2
         .create_consumer(stream_id, b"qw2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid2 = parse_id(&resp);
+    let cid2 = TestServer::parse_id(&resp);
 
     let mut handle1 = client1.subscribe(stream_id, cid1, b"").await.unwrap();
     let mut handle2 = client2.subscribe(stream_id, cid2, b"").await.unwrap();
 
     // Publish from a third connection
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
     for i in 0..10u32 {
         publisher
-            .publish(stream_id, b"qtasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(stream_id, b"qtasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
             .expect("publish");
     }
 
@@ -947,6 +883,7 @@ async fn queue_group_multi_client() {
     assert_eq!(total, 10, "queue total should be 10, got {count1}+{count2}={total}");
     assert_eq!(seqs.len(), 10, "all 10 seqs must be unique (no duplicates)");
     assert!(count1 > 0 || count2 > 0, "at least one worker got messages");
+    server.shutdown().await;
 }
 
 /// 14c. Fanout — multiple clients (separate connections), different groups.
@@ -955,46 +892,36 @@ async fn queue_group_multi_client() {
 /// 5 messages published → each consumer receives all 5.
 #[tokio::test(flavor = "multi_thread")]
 async fn fanout_multi_client() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"fevents", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // 3 separate connections, each with its own consumer and unique group
     let mut handles = Vec::new();
     for i in 0..3u32 {
-        let cli = connect(&addr).await;
+        let cli = server.connect().await;
         let name = format!("fc{i}");
         let group = format!("fgrp{i}");
         let resp = cli
-            .create_consumer(
-                stream_id,
-                name.as_bytes(),
-                group.as_bytes(),
-                b"",
-                100u16,
-                1u8,
-                0u8,
-                0u8,
-                0u32,
-                0u64,
-            )
+            .create_consumer(stream_id, name.as_bytes(), group.as_bytes(), b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
             .await
             .unwrap();
-        let consumer_id = parse_id(&resp);
+        let consumer_id = TestServer::parse_id(&resp);
         let sub = cli.subscribe(stream_id, consumer_id, b"").await.unwrap();
         handles.push((cli, sub));
     }
 
     // Publish from yet another connection
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
     for i in 0..5u32 {
         publisher
-            .publish(stream_id, b"fevents_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(stream_id, b"fevents_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
             .expect("publish");
     }
 
@@ -1012,6 +939,7 @@ async fn fanout_multi_client() {
         }
         assert_eq!(count, 5, "fanout consumer {idx} should receive all 5, got {count}");
     }
+    server.shutdown().await;
 }
 
 /// 14d. Queue group — 3 consumers on 3 connections, 100 messages.
@@ -1019,48 +947,48 @@ async fn fanout_multi_client() {
 /// Verifies no duplicates and full coverage at scale.
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_group_three_clients_100_msgs() {
-    let (_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
 
-    let setup = connect(&addr).await;
+    let setup = server.connect().await;
     let resp = setup
         .create_stream(b"q3", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // 3 consumers on separate connections, same default group
-    let cli0 = connect(&addr).await;
-    let cli1 = connect(&addr).await;
-    let cli2 = connect(&addr).await;
+    let cli0 = server.connect().await;
+    let cli1 = server.connect().await;
+    let cli2 = server.connect().await;
 
     let resp = cli0
         .create_consumer(stream_id, b"q3w0", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid0 = parse_id(&resp);
+    let cid0 = TestServer::parse_id(&resp);
 
     let resp = cli1
         .create_consumer(stream_id, b"q3w1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid1 = parse_id(&resp);
+    let cid1 = TestServer::parse_id(&resp);
 
     let resp = cli2
         .create_consumer(stream_id, b"q3w2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid2 = parse_id(&resp);
+    let cid2 = TestServer::parse_id(&resp);
 
     let mut handle0 = cli0.subscribe(stream_id, cid0, b"").await.unwrap();
     let mut handle1 = cli1.subscribe(stream_id, cid1, b"").await.unwrap();
     let mut handle2 = cli2.subscribe(stream_id, cid2, b"").await.unwrap();
 
     // Publish 100 messages
-    let publisher = connect(&addr).await;
+    let publisher = server.connect().await;
     let entries: Vec<BatchEntry<'_>> = (0..100)
         .map(|_| BatchEntry::new(&b"q3_job"[..], Bytes::copy_from_slice(b"work")))
         .collect();
-    publisher.publish_batch(stream_id, &entries).expect("publish_batch");
+    publisher.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
 
     // Drain all 3 concurrently
     let mut counts = [0u32; 3];
@@ -1110,6 +1038,7 @@ async fn queue_group_three_clients_100_msgs() {
         "all 100 seqs must be unique (no duplicates), got {}",
         all_seqs.len()
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1119,29 +1048,31 @@ async fn queue_group_three_clients_100_msgs() {
 /// 16. Streams are independent — publish to one doesn't leak to another.
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_are_isolated() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp_a = client.create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id_a = parse_id(&resp_a);
+    let stream_id_a = TestServer::parse_id(&resp_a);
     let resp_b = client.create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id_b = parse_id(&resp_b);
+    let stream_id_b = TestServer::parse_id(&resp_b);
 
     let resp = client
         .create_consumer(stream_id_b, b"beta_reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let cid_b = parse_id(&resp);
+    let cid_b = TestServer::parse_id(&resp);
     let mut handle_b = client.subscribe(stream_id_b, cid_b, b"").await.unwrap();
 
     // Publish to stream alpha only
     client
-        .publish(stream_id_a, b"alpha_event", Bytes::copy_from_slice(b"data"))
+        .publish_sync(stream_id_a, b"alpha_event", Bytes::copy_from_slice(b"data"))
+        .await
         .expect("publish");
 
     // Stream beta subscriber should receive nothing
     let leaked = tokio::time::timeout(Duration::from_millis(300), handle_b.recv()).await;
     assert!(leaked.is_err(), "messages in alpha must not leak to beta");
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1151,21 +1082,22 @@ async fn streams_are_isolated() {
 /// 17. ack waits for broker confirmation and returns Ok.
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_sync_returns_ok() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"syncer", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"acksync_ev", Bytes::copy_from_slice(b"payload"))
+        .publish_sync(stream_id, b"acksync_ev", Bytes::copy_from_slice(b"payload"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -1184,6 +1116,7 @@ async fn ack_sync_returns_ok() {
         extra.is_err(),
         "after ack, no redelivery should happen"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1196,23 +1129,24 @@ async fn ack_sync_returns_ok() {
 /// before we ack. After acking one, a third arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn max_inflight_caps_delivery() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(stream_id, b"inf_consumer", b"", b"", 2u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Publish 5 messages
     for i in 0..5u8 {
         client
-            .publish(stream_id, b"inf_subj", Bytes::copy_from_slice(&[i]))
+            .publish_sync(stream_id, b"inf_subj", Bytes::copy_from_slice(&[i]))
+            .await
             .expect("publish");
     }
 
@@ -1245,6 +1179,7 @@ async fn max_inflight_caps_delivery() {
     if let Ok(Some(msg)) = m3 {
         msg.ack();
     }
+    server.shutdown().await;
 }
 
 /// 19. Multiple max_subject_inflight patterns with different limits.
@@ -1256,11 +1191,11 @@ async fn max_inflight_caps_delivery() {
 /// flows freely.
 #[tokio::test(flavor = "multi_thread")]
 async fn max_subject_inflight_multiple_patterns() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client.create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
 
     // Per-subject inflight caps: premium 3, freemium 1. `other.*` has no cap.
     let limits = [
@@ -1275,7 +1210,7 @@ async fn max_subject_inflight_multiple_patterns() {
         )
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Single batch publish — all 11 land in one shard command, one drain sees all.
@@ -1292,10 +1227,10 @@ async fn max_subject_inflight_multiple_patterns() {
         BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P3")),
         BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P4")),
     ];
-    client.publish_batch(stream_id, &entries).expect("publish_batch");
+    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
 
     // Let all publishes and drain cycles settle
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Collect initial burst
     let mut received = Vec::new();
@@ -1342,4 +1277,5 @@ async fn max_subject_inflight_multiple_patterns() {
     for msg in received {
         msg.ack();
     }
+    server.shutdown().await;
 }

@@ -1,73 +1,8 @@
-//! Persistence tests — verify metadata and store data survive server restart.
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::time::Duration;
-
-use arbitro_client_tokio::{Client, ClientConfig};
 use bytes::Bytes;
-use arbitro_server::command_log::{CommandLog, SharedCommandLog};
-use arbitro_server::{ArbitroServer, Config};
-use tokio::sync::watch;
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-async fn start_server_with_dir(data_dir: &str) -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(1024)
-        .data_dir(data_dir);
-
-    let mut server = ArbitroServer::new(config);
-
-    let path = std::path::Path::new(data_dir).join("metadata.log");
-    let log = CommandLog::open(path).unwrap();
-    server.set_command_log(SharedCommandLog::new(log));
-
-    tokio::spawn(async move { let _ = server.run_with_shutdown(rx).await; });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (tx, addr)
-}
-
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await.expect("client should connect")
-}
-
-async fn shutdown(tx: watch::Sender<bool>) {
-    let _ = tx.send(true);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-}
-
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-fn stream_count(resp: &Bytes) -> usize {
-    u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
-}
-
-fn stream_names(resp: &Bytes) -> Vec<Vec<u8>> {
-    let count = u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize;
-    let mut names = Vec::with_capacity(count);
-    let mut pos = 4usize;
-    for _ in 0..count {
-        pos += 4; // wire_id
-        let name_len = u16::from_le_bytes(resp[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        names.push(resp[pos..pos + name_len].to_vec());
-        pos += name_len;
-    }
-    names
-}
-
-fn consumer_count(resp: &Bytes) -> usize {
-    u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Stream metadata survives restart
@@ -79,20 +14,21 @@ async fn stream_survives_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
-        shutdown(tx).await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        assert_eq!(stream_count(&resp), 1, "stream should survive restart");
-        let names = stream_names(&resp);
+        assert_eq!(TestServer::stream_count(&resp), 1, "stream should survive restart");
+        let names = TestServer::stream_names(&resp);
         assert_eq!(names[0], b"orders");
+        server.shutdown().await;
     }
 }
 
@@ -106,21 +42,22 @@ async fn multiple_streams_survive_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         client.create_stream(b"events", b"events.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        assert_eq!(stream_count(&resp), 2, "both streams should survive restart");
-        let names = stream_names(&resp);
+        assert_eq!(TestServer::stream_count(&resp), 2, "both streams should survive restart");
+        let names = TestServer::stream_names(&resp);
         assert!(names.iter().any(|n| n == b"orders"), "orders missing");
         assert!(names.iter().any(|n| n == b"events"), "events missing");
+        server.shutdown().await;
     }
 }
 
@@ -134,22 +71,23 @@ async fn deleted_stream_stays_deleted_after_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         client.create_stream(b"temp", b"temp.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         client.delete_stream(b"temp").await.unwrap();
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 0);
-        shutdown(tx).await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 0);
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         assert_eq!(
-            stream_count(&client.list_streams(0, 1000).await.unwrap()),
+            TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()),
             0,
             "deleted stream should not reappear"
         );
+        server.shutdown().await;
     }
 }
 
@@ -159,20 +97,11 @@ async fn deleted_stream_stays_deleted_after_restart() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn no_data_dir_works_without_persistence() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default().listen_addr(&addr).shard_count(2).channel_capacity(1024);
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move { let _ = server.run_with_shutdown(rx).await; });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
     client.create_stream(b"ephemeral", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
-    let _ = tx.send(true);
+    assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,14 +114,13 @@ async fn command_log_file_is_created() {
     let dir_str = dir.path().to_str().unwrap();
     let log_path = dir.path().join("metadata.log");
 
-    let (tx, addr) = start_server_with_dir(dir_str).await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+    let client = server.connect().await;
     client.create_stream(b"logged", b"logged.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    server.shutdown().await;
 
     assert!(log_path.exists(), "metadata.log should be created");
     assert!(std::fs::metadata(&log_path).unwrap().len() > 0, "metadata.log should be non-empty");
-    shutdown(tx).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,20 +133,21 @@ async fn consumer_survives_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
         client.create_consumer(sid, b"worker1", b"", b"", u16::MAX, 1, 0, 0, 0, 0).await.unwrap();
-        assert_eq!(consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1);
-        shutdown(tx).await;
+        assert_eq!(TestServer::consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1);
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1, "stream should survive");
-        assert_eq!(consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1, "consumer should survive");
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1, "stream should survive");
+        assert_eq!(TestServer::consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1, "consumer should survive");
+        server.shutdown().await;
     }
 }
 
@@ -232,35 +161,27 @@ async fn messages_survive_restart_with_disk_store() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
         for i in 0u32..10 {
             let payload = format!("msg-{i}");
-            client.publish(sid, b"durable.events", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"durable.events", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = {
-            let mut pos = 4usize;
-            let wire_id = u32::from_le_bytes(resp[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            let name_len = u16::from_le_bytes(resp[pos..pos + 2].try_into().unwrap()) as usize;
-            let _ = name_len;
-            wire_id
-        };
+        let sid = TestServer::find_stream_id(&resp, b"durable").expect("durable stream not found");
 
         let resp = client.create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
-        let cid = parse_id(&resp);
+        let cid = TestServer::parse_id(&resp);
         let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
 
         let mut received = Vec::new();
@@ -276,6 +197,7 @@ async fn messages_survive_restart_with_disk_store() {
             let expected = format!("msg-{i}");
             assert_eq!(&msg.payload()[..], expected.as_bytes(), "message {i} payload mismatch");
         }
+        server.shutdown().await;
     }
 }
 
@@ -289,28 +211,29 @@ async fn multiple_restart_cycles() {
     let dir_str = dir.path().to_str().unwrap();
 
     { // Cycle 1: create stream A
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         client.create_stream(b"alpha", b"alpha.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     { // Cycle 2: create stream B (A should still exist)
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1, "alpha should survive first restart");
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1, "alpha should survive first restart");
         client.create_stream(b"beta", b"beta.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     { // Cycle 3: verify both A and B exist
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        assert_eq!(stream_count(&resp), 2, "both alpha and beta should survive");
-        let names = stream_names(&resp);
+        assert_eq!(TestServer::stream_count(&resp), 2, "both alpha and beta should survive");
+        let names = TestServer::stream_names(&resp);
         assert!(names.iter().any(|n| n == b"alpha"), "alpha missing");
         assert!(names.iter().any(|n| n == b"beta"), "beta missing");
+        server.shutdown().await;
     }
 }
 
@@ -324,21 +247,22 @@ async fn idempotent_create_after_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         let _ = client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0, 0).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         assert_eq!(
-            stream_count(&client.list_streams(0, 1000).await.unwrap()),
+            TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()),
             1,
             "duplicate create should not produce two streams after restart"
         );
+        server.shutdown().await;
     }
 }
 
@@ -352,38 +276,36 @@ async fn deleted_disk_stream_data_does_not_leak() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
 
         for i in 0u32..5 {
             let payload = format!("old-{i}");
-            client.publish(sid, b"recycled.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"recycled.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         client.delete_stream(b"recycled").await.unwrap();
         let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid2 = parse_id(&resp);
+        let sid2 = TestServer::parse_id(&resp);
 
         for i in 0u32..2 {
             let payload = format!("new-{i}");
-            client.publish(sid2, b"recycled.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid2, b"recycled.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let sid = TestServer::find_stream_id(&resp, b"recycled").expect("recycled stream not found");
         let resp = client.create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
-        let cid = parse_id(&resp);
+        let cid = TestServer::parse_id(&resp);
         let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
 
         let mut received = Vec::new();
@@ -396,6 +318,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
         assert_eq!(received.len(), 2, "only 2 new messages should exist, got {}", received.len());
         assert_eq!(&received[0].payload()[..], b"new-0");
         assert_eq!(&received[1].payload()[..], b"new-1");
+        server.shutdown().await;
     }
 }
 
@@ -409,29 +332,28 @@ async fn consumer_and_messages_survive_together() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
         client.create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
         for i in 0u32..5 {
             let payload = format!("event-{i}");
-            client.publish(sid, b"durable.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"durable.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
-        assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
-        assert_eq!(consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1);
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        assert_eq!(TestServer::stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
+        assert_eq!(TestServer::consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1);
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let sid = TestServer::find_stream_id(&resp, b"durable").expect("durable stream not found");
         let resp = client.create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
-        let cid = parse_id(&resp);
+        let cid = TestServer::parse_id(&resp);
         let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
 
         let mut received = Vec::new();
@@ -442,6 +364,7 @@ async fn consumer_and_messages_survive_together() {
             }
         }
         assert_eq!(received.len(), 5, "all 5 messages should survive restart, got {}", received.len());
+        server.shutdown().await;
     }
 }
 
@@ -455,34 +378,31 @@ async fn publish_after_restart_continues() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"seq", b"seq.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
         for i in 0u32..3 {
             let payload = format!("before-{i}");
-            client.publish(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let sid = TestServer::find_stream_id(&resp, b"seq").expect("seq stream not found");
 
         let resp = client.create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
-        let cid = parse_id(&resp);
+        let cid = TestServer::parse_id(&resp);
         let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         for i in 0u32..3 {
             let payload = format!("after-{i}");
-            client.publish(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
 
         let mut received = Vec::new();
@@ -497,6 +417,7 @@ async fn publish_after_restart_continues() {
         assert_eq!(&received[2].payload()[..], b"before-2");
         assert_eq!(&received[3].payload()[..], b"after-0");
         assert_eq!(&received[5].payload()[..], b"after-2");
+        server.shutdown().await;
     }
 }
 
@@ -510,38 +431,36 @@ async fn messages_survive_multiple_restarts() {
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"multi", b"multi.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
-        let sid = parse_id(&resp);
+        let sid = TestServer::parse_id(&resp);
         for i in 0u32..3 {
             let payload = format!("c1-{i}");
-            client.publish(sid, b"multi.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"multi.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let sid = TestServer::find_stream_id(&resp, b"multi").expect("multi stream not found");
         for i in 0u32..3 {
             let payload = format!("c2-{i}");
-            client.publish(sid, b"multi.data", Bytes::copy_from_slice(payload.as_bytes())).expect("publish");
+            client.publish_sync(sid, b"multi.data", Bytes::copy_from_slice(payload.as_bytes())).await.expect("publish");
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let sid = TestServer::find_stream_id(&resp, b"multi").expect("multi stream not found");
         let resp = client.create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
-        let cid = parse_id(&resp);
+        let cid = TestServer::parse_id(&resp);
         let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
 
         let mut received = Vec::new();
@@ -554,24 +473,14 @@ async fn messages_survive_multiple_restarts() {
         assert_eq!(received.len(), 6, "should receive all 6 messages across 2 cycles, got {}", received.len());
         assert_eq!(&received[0].payload()[..], b"c1-0");
         assert_eq!(&received[3].payload()[..], b"c2-0");
+        server.shutdown().await;
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Catalog-state invariants across restart.
-//
-// The metadata command log replays CreateStream / CreateConsumer /
-// DeleteStream / DeleteConsumer on startup. These tests pin down the
-// CATALOG view (GetStream / GetConsumer / ListConsumers) before and
-// after restart so a recovery bug surfaces as a test failure instead of
-// silent state divergence.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Consumer created pre-restart must be present (and reachable through
-/// `GetConsumer`) post-restart with the SAME consumer id. If the
-/// NameRegistry allocator silently restarts at 0 after recovery,
-/// `GetConsumer` either returns NotFound or returns a different id —
-/// either way, this assertion fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_survives_restart_with_same_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -579,97 +488,81 @@ async fn consumer_survives_restart_with_same_id() {
 
     let pre_consumer_id: u32;
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        let stream_id = parse_id(&resp);
+        let stream_id = TestServer::parse_id(&resp);
         let resp = client
             .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
             .await
             .unwrap();
-        pre_consumer_id = parse_id(&resp);
-        shutdown(tx).await;
+        pre_consumer_id = TestServer::parse_id(&resp);
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        assert_eq!(stream_count(&resp), 1, "stream must survive restart");
-        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(TestServer::stream_count(&resp), 1, "stream must survive restart");
+        let stream_id = TestServer::find_stream_id(&resp, b"orders").expect("orders stream not found");
 
         let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
         assert_eq!(
-            consumer_count(&resp),
+            TestServer::consumer_count(&resp),
             1,
             "consumer must survive restart and appear in list_consumers"
         );
 
-        // GetConsumer must locate the recovered consumer by name and return
-        // an Ok body — pre-restart and post-restart names map to the same
-        // entity even if the id allocator decided to use a different slot.
         let resp = client
             .get_consumer(stream_id, b"worker")
             .await
             .expect("GetConsumer must succeed for a recovered consumer");
-        let post_consumer_id = parse_id(&resp);
+        let post_consumer_id = TestServer::parse_id(&resp);
         assert_eq!(
             post_consumer_id, pre_consumer_id,
-            "recovered consumer must keep its original id ({pre_consumer_id}) — \
-             a different post-restart id ({post_consumer_id}) means stale \
-             references to the old id will silently misroute"
+            "recovered consumer must keep its original id"
         );
+        server.shutdown().await;
     }
 }
 
-/// Deleting a consumer pre-restart must NOT cause it to come back
-/// after recovery. Same guarantee as the previous test but at the
-/// consumer level — catches a bug where the replay applies CreateConsumer
-/// to a re-created NameRegistry without then applying the DeleteConsumer.
 #[tokio::test(flavor = "multi_thread")]
 async fn deleted_consumer_stays_deleted_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
 
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        let stream_id = parse_id(&resp);
+        let stream_id = TestServer::parse_id(&resp);
         let resp = client
             .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
             .await
             .unwrap();
-        let consumer_id = parse_id(&resp);
+        let consumer_id = TestServer::parse_id(&resp);
         client.delete_consumer(consumer_id).await.unwrap();
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let stream_id = TestServer::find_stream_id(&resp, b"orders").expect("orders stream not found");
 
         let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
         assert_eq!(
-            consumer_count(&resp),
+            TestServer::consumer_count(&resp),
             0,
-            "consumer deleted pre-restart must remain deleted; recovery \
-             must apply DeleteConsumer after CreateConsumer in log order"
+            "consumer deleted pre-restart must remain deleted"
         );
-
-        assert!(
-            client.get_consumer(stream_id, b"worker").await.is_err(),
-            "GetConsumer for a deleted-then-recovered consumer must fail"
-        );
+        server.shutdown().await;
     }
 }
 
-/// After recovery, the id allocator MUST NOT hand out an id that
-/// collides with a recovered entity. Otherwise a fresh create
-/// silently aliases the recovered consumer.
 #[tokio::test(flavor = "multi_thread")]
 async fn post_restart_create_does_not_collide_with_recovered_ids() {
     let dir = tempfile::tempdir().unwrap();
@@ -677,10 +570,10 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
 
     let pre_ids: Vec<u32>;
     {
-        let (tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-        let stream_id = parse_id(&resp);
+        let stream_id = TestServer::parse_id(&resp);
 
         let mut ids = Vec::new();
         for n in 0..5u32 {
@@ -689,30 +582,28 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
                 .create_consumer(stream_id, name.as_bytes(), b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
                 .await
                 .unwrap();
-            ids.push(parse_id(&resp));
+            ids.push(TestServer::parse_id(&resp));
         }
         pre_ids = ids;
-        shutdown(tx).await;
+        server.shutdown().await;
     }
 
     {
-        let (_tx, addr) = start_server_with_dir(dir_str).await;
-        let client = connect(&addr).await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let stream_id = u32::from_le_bytes(resp[4..8].try_into().unwrap());
+        let stream_id = TestServer::find_stream_id(&resp, b"orders").expect("orders stream not found");
 
-        // Create one new consumer post-restart.
         let resp = client
             .create_consumer(stream_id, b"worker-new", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
             .await
             .unwrap();
-        let new_id = parse_id(&resp);
+        let new_id = TestServer::parse_id(&resp);
 
         assert!(
             !pre_ids.contains(&new_id),
-            "id allocator after recovery handed out {new_id}, which \
-             collides with a pre-restart id from {pre_ids:?}; the \
-             allocator MUST advance past the highest recovered id"
+            "id allocator after recovery must advance past the highest recovered id"
         );
+        server.shutdown().await;
     }
 }

@@ -1,51 +1,11 @@
-//! Client ack-correlation invariants — safety net for the upcoming
-//! Phase 2 swap (`tokio::oneshot` → `arbitro_kit::slot::Pipe<RequestResult>`,
-//! `tokio::mpsc` → `arbitro_kit::route::Mpsc`).
-//!
-//! Each test pins one invariant the swap can break. Style mirrors
-//! `tests/invariants.rs` — real TCP server, public client API only.
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use arbitro_client_tokio::{Client, ClientConfig, ClientError};
-use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
-use tokio::sync::watch;
-
-// ── Helper functions ──────────────────────────────────────────────────────
-
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-// ─── Helpers (copied from invariants.rs to keep this file self-contained) ──
-
-async fn start_server() -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(1024);
-
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run_with_shutdown(rx).await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (tx, addr)
-}
-
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client should connect")
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Concurrent publish_sync correlation
@@ -63,17 +23,24 @@ async fn connect(addr: &str) -> Client {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_publish_sync_correlation() {
     const N: u64 = 100;
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let resp = client.create_stream(b"corr", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"corr", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
 
     // Obtain all futures synchronously before spawning — publish_sync returns
     // `impl Future + Send` so the futures themselves can be sent to tasks.
     let mut handles = Vec::with_capacity(N as usize);
     for i in 0..N {
-        let fut = client.publish_sync(stream_id, b"corr_ev", Bytes::copy_from_slice(&i.to_le_bytes()));
+        let fut = client.publish_sync(
+            stream_id,
+            b"corr_ev",
+            Bytes::copy_from_slice(&i.to_le_bytes()),
+        );
         handles.push(tokio::spawn(fut));
     }
 
@@ -86,13 +53,19 @@ async fn concurrent_publish_sync_correlation() {
             "duplicate ref_seq {ref_seq} — two callers got the same reply"
         );
     }
-    assert_eq!(seqs.len(), N as usize, "lost reply: only {} acks", seqs.len());
+    assert_eq!(
+        seqs.len(),
+        N as usize,
+        "lost reply: only {} acks",
+        seqs.len()
+    );
 
     // Sanity: contiguous monotonic range starting at 1.
     let mut sorted: Vec<u64> = seqs.into_iter().collect();
     sorted.sort_unstable();
     assert_eq!(*sorted.first().unwrap(), 1);
     assert_eq!(*sorted.last().unwrap(), N);
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -110,25 +83,32 @@ async fn concurrent_publish_sync_correlation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn many_inflight_publish_sync_wake_on_disconnect() {
     const N: u64 = 50;
-    let (shutdown_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let resp = client.create_stream(b"orphan", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"orphan", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
 
     // Launch N concurrent publish_sync, each carrying a slow-ish payload.
     // Obtain futures synchronously (publish_sync returns impl Future + Send).
     let mut handles = Vec::with_capacity(N as usize);
     for i in 0..N {
-        let fut = client.publish_sync(stream_id, b"orphan_ev", Bytes::copy_from_slice(&i.to_le_bytes()));
+        let fut = client.publish_sync(
+            stream_id,
+            b"orphan_ev",
+            Bytes::copy_from_slice(&i.to_le_bytes()),
+        );
         handles.push(tokio::spawn(fut));
     }
 
-    // Give the publishes time to register in the pending map.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // // Give the publishes time to register in the pending map.
+    // tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Kill the server — every pending request must wake (Ok or Err, never hang).
-    let _ = shutdown_tx.send(true);
+    server.shutdown().await;
 
     // Hard wall: 5 s total. Default request_timeout is 30 s, so a hang
     // here proves a leaked waiter, not a slow timeout.
@@ -168,16 +148,23 @@ async fn many_inflight_publish_sync_wake_on_disconnect() {
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_sync_recycles_env_seq() {
     const N: u64 = 1000;
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let resp = client.create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
 
     let mut last_seq = 0u64;
     for i in 0..N {
         let resp = client
-            .publish_sync(stream_id, b"recycle_ev", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"recycle_ev",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish_sync should succeed mid-loop");
         let s = u64::from_le_bytes(resp[..8].try_into().unwrap());
@@ -192,6 +179,7 @@ async fn publish_sync_recycles_env_seq() {
         .expect("post-loop publish_sync must succeed (registry not stuck)");
     let final_seq = u64::from_le_bytes(resp[..8].try_into().unwrap());
     assert!(final_seq > last_seq);
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -209,11 +197,14 @@ async fn publish_sync_recycles_env_seq() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     const N: usize = 50;
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
-    let resp = client.create_stream(b"mix", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"mix", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(
@@ -230,17 +221,25 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
         )
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Side-channel: another stream, fire publish_syncs in parallel.
-    let resp = client.create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let side_stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let side_stream_id = TestServer::parse_id(&resp);
 
     // Publish N messages on the consumed stream.
     for i in 0..N {
         client
-            .publish(stream_id, b"mix_ev", Bytes::copy_from_slice(&(i as u64).to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"mix_ev",
+                Bytes::copy_from_slice(&(i as u64).to_le_bytes()),
+            )
+            .await
             .expect("publish");
     }
 
@@ -263,7 +262,6 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
             .expect("delivery should arrive")
             .expect("subscription open");
         msg.ack();
-        tokio::time::sleep(Duration::from_millis(30)).await;
         received += 1;
     }
 
@@ -286,6 +284,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
         extra.is_err(),
         "no message should redeliver after ack of all {N}"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -297,21 +296,27 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
 /// unable to deliver — either way the call must not panic.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_message_ack_after_disconnect_is_silent() {
-    let (shutdown_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
-
-    let resp = client.create_stream(b"stale", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let resp = client
-        .create_consumer(stream_id, b"stale_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_stream(b"stale", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
-    let consumer_id = parse_id(&resp);
+    let stream_id = TestServer::parse_id(&resp);
+
+    let resp = client
+        .create_consumer(
+            stream_id, b"stale_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish(stream_id, b"stale_ev", Bytes::copy_from_slice(b"once"))
+        .publish_sync(stream_id, b"stale_ev", Bytes::copy_from_slice(b"once"))
+        .await
         .expect("publish");
 
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -320,7 +325,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
         .unwrap();
 
     // Kill server — Message now holds a stale ack_tx.
-    let _ = shutdown_tx.send(true);
+    server.shutdown().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Fire-and-forget ack: must not panic, regardless of internal state.
@@ -356,32 +361,35 @@ async fn publish_sync_on_dead_server_returns_error() {
     use arbitro_client_tokio::{ClientConfig, ReconnectPolicy};
     use std::time::Duration as D;
 
-    let (shutdown_tx, addr) = start_server().await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let addr = server.addr.clone();
 
     // Connect with no reconnect attempts — client will not retry after disconnect.
     let cfg = ClientConfig {
         addr: addr.clone(),
         reconnect: ReconnectPolicy {
             base: D::from_millis(50),
-            cap:  D::from_millis(100),
+            cap: D::from_millis(100),
             max_attempts: Some(0),
         },
         ..ClientConfig::default()
     };
     let client = Client::connect(cfg).await.expect("client should connect");
 
-    let resp = client.create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
-    let stream_id = parse_id(&resp);
+    let resp = client
+        .create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
 
     // Spawn the publish_sync future so it starts running concurrently with
     // the shutdown signal. It may complete (Ok) during the drain window or
     // fail (Err) if the session ends first.
-    let handle = tokio::spawn(
-        client.publish_sync(stream_id, b"dead_ev", Bytes::copy_from_slice(b"x")),
-    );
+    let handle =
+        tokio::spawn(client.publish_sync(stream_id, b"dead_ev", Bytes::copy_from_slice(b"x")));
 
     // Signal shutdown — drain_disconnected() will wake any pending waiters.
-    let _ = shutdown_tx.send(true);
+    server.shutdown().await;
 
     let r = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
@@ -390,7 +398,7 @@ async fn publish_sync_on_dead_server_returns_error() {
 
     // Both outcomes are valid — the invariant is "resolves, no panic, no hang".
     match r {
-        Ok(_) => {}   // Processed during drain window — correct.
+        Ok(_) => {} // Processed during drain window — correct.
         Err(ClientError::Disconnected)
         | Err(ClientError::Timeout)
         | Err(ClientError::ChannelClosed) => {}

@@ -1,93 +1,26 @@
-//! Catalog invariants — regression + structural tests.
-//!
-//! These tests pin down the contract for the broker's STREAM + CONSUMER
-//! catalog separately from the message journal. Every test starts with
-//! a fresh in-memory broker so any failure is reproducible without
-//! restart.
-//!
-//! ## Why this file exists
-//!
-//! In 2026-05 we shipped a fix for `DeleteConsumer` (Action 0x0502).
-//! The handler used to call `engine.delete_consumer()` (which removed
-//! the entity from the engine's catalog HashMap) but FORGOT to also
-//! call `NameRegistry::remove_consumer_by_id()`. The wire-name → id
-//! mapping survived, so the next `GetConsumer` request returned `Ok`
-//! for a consumer the engine had already deleted, and the same
-//! consumer name allocated to a fresh client run silently aliased the
-//! ghost id — breaking the next run's subscription.
-//!
-//! The fix is at:
-//!   - `arbitro-common/src/name_registry.rs`: `remove_consumer_by_id`
-//!   - `arbitro-server/src/transport/dispatch_v2.rs`: cascade call
-//!
-//! Every test below either re-checks the original bug (regression) or
-//! generalises it into an invariant the system must honour going
-//! forward.
+mod test_helper;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::time::Duration;
-
-use arbitro_client_tokio::{Client, ClientConfig};
-use arbitro_server::{ArbitroServer, Config};
+use arbitro_client_tokio::Client;
 use bytes::Bytes;
-use tokio::sync::watch;
 
-// ── Helpers (kept inline so tests are self-contained) ───────────────────────
-
-fn parse_id(resp: &Bytes) -> u32 {
-    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
-}
-
-fn consumer_count(resp: &Bytes) -> usize {
-    u32::from_le_bytes(resp[..4].try_into().unwrap()) as usize
-}
-
-async fn start_server() -> (watch::Sender<bool>, String) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    let (tx, rx) = watch::channel(false);
-    let config = Config::default()
-        .listen_addr(&addr)
-        .shard_count(2)
-        .channel_capacity(1024);
-
-    let server = ArbitroServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run_with_shutdown(rx).await;
-    });
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    (tx, addr)
-}
-
-async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig {
-        addr: addr.to_string(),
-        ..ClientConfig::default()
-    })
-    .await
-    .expect("client should connect")
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 async fn create_stream(client: &Client, name: &[u8]) -> u32 {
-    // (name, filter, max_msgs, max_bytes, max_age, replicas,
-    //  journal_kind=Memory, retention=Limits, discard=Old)
     let resp = client
         .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream must succeed");
-    parse_id(&resp)
+    TestServer::parse_id(&resp)
 }
 
 async fn create_consumer(client: &Client, stream_id: u32, name: &[u8]) -> u32 {
-    // (stream_id, name, group, filter, max_inflight, ack_policy=Explicit,
-    //  deliver_policy=All, deliver_mode=Push, ack_wait_ms, start_seq)
     let resp = client
         .create_consumer(stream_id, name, b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
         .await
         .expect("create_consumer must succeed");
-    parse_id(&resp)
+    TestServer::parse_id(&resp)
 }
 
 /// Returns `true` if `GetConsumer` returns `Ok`, `false` if it returns
@@ -105,8 +38,8 @@ async fn consumer_exists(client: &Client, stream_id: u32, name: &[u8]) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_consumer_then_get_returns_not_found() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
@@ -129,6 +62,7 @@ async fn delete_consumer_then_get_returns_not_found() {
          pre-fix the wire-name -> id mapping survived in NameRegistry \
          and this returned Ok for a phantom consumer"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -137,15 +71,15 @@ async fn delete_consumer_then_get_returns_not_found() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_consumer_excluded_from_list() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
     assert_eq!(
-        consumer_count(&resp),
+        TestServer::consumer_count(&resp),
         1,
         "list_consumers must include the freshly-created consumer"
     );
@@ -154,11 +88,12 @@ async fn delete_consumer_excluded_from_list() {
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
     assert_eq!(
-        consumer_count(&resp),
+        TestServer::consumer_count(&resp),
         0,
         "list_consumers must drop the deleted consumer; otherwise the \
          engine catalog and the wire-facing view disagree"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -172,8 +107,8 @@ async fn delete_consumer_excluded_from_list() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_then_recreate_same_name_is_functional() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
 
@@ -197,10 +132,11 @@ async fn delete_then_recreate_same_name_is_functional() {
     // ... and through ListConsumers.
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
     assert_eq!(
-        consumer_count(&resp),
+        TestServer::consumer_count(&resp),
         1,
         "exactly one consumer with the recycled name must be listed"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -221,8 +157,8 @@ async fn delete_then_recreate_same_name_is_functional() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_stream_resets_consumer_namespace() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id_a = create_stream(&client, b"events").await;
     let consumer_id_a = create_consumer(&client, stream_id_a, b"worker").await;
@@ -261,6 +197,7 @@ async fn delete_stream_resets_consumer_namespace() {
         .expect("re-created consumer after delete_stream must deliver")
         .expect("subscription must yield a message");
     assert_eq!(&msg.payload()[..], b"hello");
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -272,8 +209,8 @@ async fn delete_stream_resets_consumer_namespace() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_stream_cascades_consumers() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"events").await;
     for name in [&b"worker-a"[..], b"worker-b", b"worker-c"] {
@@ -281,7 +218,7 @@ async fn delete_stream_cascades_consumers() {
     }
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
-    assert_eq!(consumer_count(&resp), 3);
+    assert_eq!(TestServer::consumer_count(&resp), 3);
 
     client.delete_stream(b"events").await.unwrap();
 
@@ -291,12 +228,13 @@ async fn delete_stream_cascades_consumers() {
     let stream_id_2 = create_stream(&client, b"events").await;
     let resp = client.list_consumers(stream_id_2, 0, 1000).await.unwrap();
     assert_eq!(
-        consumer_count(&resp),
+        TestServer::consumer_count(&resp),
         0,
         "DeleteStream must cascade-delete its consumers; otherwise \
          GetConsumer / ListConsumers leak stale catalog entries across \
          stream lifecycles"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -311,8 +249,8 @@ async fn delete_stream_cascades_consumers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_delete_cycles_no_leak() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
 
@@ -326,7 +264,7 @@ async fn create_delete_cycles_no_leak() {
         // After each create, exactly one consumer should be listed.
         let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
         assert_eq!(
-            consumer_count(&resp),
+            TestServer::consumer_count(&resp),
             1,
             "iter {i}: exactly one consumer must be listed mid-cycle"
         );
@@ -336,7 +274,7 @@ async fn create_delete_cycles_no_leak() {
         // After each delete, none.
         let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
         assert_eq!(
-            consumer_count(&resp),
+            TestServer::consumer_count(&resp),
             0,
             "iter {i}: list_consumers must be empty after delete; \
              pre-fix this stayed at 1 across all cycles"
@@ -353,6 +291,7 @@ async fn create_delete_cycles_no_leak() {
         "every create must yield a distinct ConsumerId; collision would \
          mean two different lifecycles share state"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -366,8 +305,8 @@ async fn create_delete_cycles_no_leak() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_consumer_is_idempotent() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
@@ -388,10 +327,11 @@ async fn delete_consumer_is_idempotent() {
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
     assert_eq!(
-        consumer_count(&resp),
+        TestServer::consumer_count(&resp),
         0,
         "list_consumers must remain at 0 even after a redundant delete"
     );
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -400,8 +340,8 @@ async fn delete_consumer_is_idempotent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn distinct_names_have_distinct_ids() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
     let mut ids = Vec::new();
@@ -420,7 +360,8 @@ async fn distinct_names_have_distinct_ids() {
     );
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
-    assert_eq!(consumer_count(&resp), 20);
+    assert_eq!(TestServer::consumer_count(&resp), 20);
+    server.shutdown().await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -433,8 +374,8 @@ async fn distinct_names_have_distinct_ids() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_recreate_subscription_delivers() {
-    let (_tx, addr) = start_server().await;
-    let client = connect(&addr).await;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
 
     let stream_id = create_stream(&client, b"orders").await;
 
@@ -466,4 +407,5 @@ async fn delete_recreate_subscription_delivers() {
              pre-fix the broker held a phantom binding and this timed out",
         );
     assert!(msg_b.is_some(), "second subscription must produce a message");
+    server.shutdown().await;
 }
