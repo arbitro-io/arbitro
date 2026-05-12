@@ -340,16 +340,20 @@ pub struct CommandWorker {
     pub(super) wheel_buf: Vec<arbitro_common::WheelEntry>,
     /// Next time to advance the wheel (1 tick per second).
     pub(super) next_wheel_tick: Option<Instant>,
-    /// Per-shard idempotency dedup. `None` until the first stream
-    /// owned by this shard is created with `idempotency_window_ms > 0`.
-    /// Once allocated it stays alive — cheap (a few KB empty) and
-    /// avoids racing realloc on burst creates.
+    /// Per-shard idempotency dedup, shared with `dispatch_v2` so the
+    /// publish hot path can check membership and record new entries
+    /// (publishes don't go through this worker — they hit the store
+    /// directly via `ShardRouter::store_for`). Wrapped in `Arc<Mutex>`
+    /// for the same reason `SharedStore` is: the publish path locks,
+    /// the worker's tick loop also locks (1Hz), uncontended in normal
+    /// operation.
     ///
-    /// Lives on the command thread (this struct's owner) — no Mutex,
-    /// no Arc. The publish hot path checks the fast-bail bool in
-    /// `NameRegistry` first; only enabled streams reach into the
-    /// tracker.
-    pub(super) idempotency_tracker: Option<crate::shard::idempotency::IdempotencyTracker>,
+    /// `Option<...>` inside the Mutex stays `None` until the first
+    /// publish that hits an idempotent stream owned by this shard
+    /// (lazy allocation). Cost when None: zero — the publish hot path
+    /// fast-bails via `NameRegistry::stream_idempotency_window_ms`
+    /// before touching this Arc.
+    pub(super) idempotency_tracker: crate::shard::idempotency::SharedIdempotency,
 }
 
 impl CommandWorker {
@@ -408,13 +412,21 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.is_some() => {
-                        // Both timers run at the same 1-second cadence,
-                        // hence one tokio::sleep drives both. Each tick
-                        // is a no-op if its structure is `None`, so the
-                        // branch fires whenever EITHER is allocated.
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.lock().expect("idempotency mutex poisoned").is_some() => {
+                        // Both timers run at the same 1-second cadence;
+                        // one tokio::sleep drives both. Wheel tick is a
+                        // no-op when wheel is None. Idempotency tick
+                        // locks the shared Arc<Mutex<>>; the publish
+                        // path also locks it on idempotent publishes,
+                        // but contention is negligible (publish lock
+                        // hold time = HashMap lookup, sub-microsecond).
                         self.wheel_tick();
-                        if let Some(t) = self.idempotency_tracker.as_mut() {
+                        if let Some(t) = self
+                            .idempotency_tracker
+                            .lock()
+                            .expect("idempotency mutex poisoned")
+                            .as_mut()
+                        {
                             t.tick();
                         }
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
@@ -439,13 +451,21 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.is_some() => {
-                        // Both timers run at the same 1-second cadence,
-                        // hence one tokio::sleep drives both. Each tick
-                        // is a no-op if its structure is `None`, so the
-                        // branch fires whenever EITHER is allocated.
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.lock().expect("idempotency mutex poisoned").is_some() => {
+                        // Both timers run at the same 1-second cadence;
+                        // one tokio::sleep drives both. Wheel tick is a
+                        // no-op when wheel is None. Idempotency tick
+                        // locks the shared Arc<Mutex<>>; the publish
+                        // path also locks it on idempotent publishes,
+                        // but contention is negligible (publish lock
+                        // hold time = HashMap lookup, sub-microsecond).
                         self.wheel_tick();
-                        if let Some(t) = self.idempotency_tracker.as_mut() {
+                        if let Some(t) = self
+                            .idempotency_tracker
+                            .lock()
+                            .expect("idempotency mutex poisoned")
+                            .as_mut()
+                        {
                             t.tick();
                         }
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);

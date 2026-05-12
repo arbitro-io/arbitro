@@ -158,7 +158,7 @@ fn bench_step1(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
     let seq     = std::sync::atomic::AtomicU64::new(1);
 
@@ -167,7 +167,7 @@ fn bench_step1(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
         });
     });
@@ -189,7 +189,7 @@ fn bench_step2(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<usize>(4096);
@@ -205,7 +205,7 @@ fn bench_step2(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let tx  = tx.clone();
@@ -230,7 +230,7 @@ fn bench_step3(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx)         = mpsc::channel::<usize>(4096);
@@ -251,7 +251,7 @@ fn bench_step3(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let tx  = tx.clone();
@@ -276,7 +276,7 @@ fn bench_step4_kit(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
@@ -292,7 +292,7 @@ fn bench_step4_kit(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let _ = producer.try_send(buf.as_ptr() as usize);
         });
@@ -317,7 +317,7 @@ fn bench_step5(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<usize>(4096);
@@ -344,7 +344,7 @@ fn bench_step5(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let tx  = tx.clone();
@@ -371,7 +371,7 @@ fn bench_step6(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
@@ -400,7 +400,7 @@ fn bench_step6(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let _ = producer.try_send(buf.as_ptr() as usize);
         });
@@ -425,7 +425,7 @@ fn bench_step7(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<(usize, oneshot::Sender<()>)>(4096);
@@ -448,7 +448,7 @@ fn bench_step7(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let tx  = tx.clone();
@@ -479,7 +479,7 @@ fn bench_step8(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) =
@@ -505,7 +505,7 @@ fn bench_step8(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let (ack_tx, ack_rx) = OneShotAsync::<()>::new();
@@ -546,7 +546,7 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
     let seq     = AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), PAYLOAD_LEN);
+    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
 
     let (mut producers, mut consumer, _shutdown) =
         MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(1);
@@ -574,7 +574,7 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let _ = producer.try_send(WriteFrame::Mono(Bytes::from(buf)));
         });
@@ -587,7 +587,7 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut data[..size],
                 seq.fetch_add(1, Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &payload,
+                STREAM_ID, 0, 0, subject, &[], &payload,
             );
             let _ = producer.try_send(WriteFrame::Inline(data, size as u16));
         });

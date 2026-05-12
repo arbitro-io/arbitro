@@ -21,6 +21,11 @@ pub enum ErrorCode {
     StreamFull          = 0x0203,
     StreamFilterOverlap = 0x0204,
     SubjectNotFound     = 0x0205,
+    /// Publish carried a `msg_id` that the broker has already seen for
+    /// this stream within `idempotency_window_ms`. The message was not
+    /// stored. Safe for the client to treat as a successful publish
+    /// (same logical effect — the original write is what's stored).
+    IdempotencyDuplicate = 0x0206,
 
     // 0x03xx — Consumer
     ConsumerNotFound       = 0x0301,
@@ -54,6 +59,7 @@ impl ErrorCode {
             0x0203 => Some(Self::StreamFull),
             0x0204 => Some(Self::StreamFilterOverlap),
             0x0205 => Some(Self::SubjectNotFound),
+            0x0206 => Some(Self::IdempotencyDuplicate),
 
             0x0301 => Some(Self::ConsumerNotFound),
             0x0302 => Some(Self::ConsumerAlreadyExists),

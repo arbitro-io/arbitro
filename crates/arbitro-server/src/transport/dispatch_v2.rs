@@ -143,6 +143,35 @@ fn v2_publish(
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
     };
 
+    // ── Idempotency check (fast-bail) ─────────────────────────────────
+    //
+    // Two early-outs make non-idempotent publishes free:
+    //   1. The stream's window is 0  → skip (most streams).
+    //   2. The frame carries no msg_id → skip (legacy publishers).
+    //
+    // Only when BOTH a window AND a msg_id exist do we hash the id
+    // and consult the shared tracker. The lock is held for the
+    // membership check + insert only — sub-microsecond on a hash
+    // miss, single-digit microseconds on a hash hit.
+    let msg_id = f.msg_id();
+    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    if window_ms > 0 && !msg_id.is_empty() {
+        let hash = idempotency_hash(msg_id);
+        let shared = server.idempotency_for(seq_stream);
+        let mut guard = shared.lock().expect("idempotency mutex poisoned");
+        let tracker = guard.get_or_insert_with(
+            crate::shard::idempotency::IdempotencyTracker::new,
+        );
+        if !tracker.record(seq_stream, hash, window_ms) {
+            // Duplicate within window — reject. The original write
+            // (whichever publish landed first) remains intact.
+            drop(guard);
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            return;
+        }
+        drop(guard);
+    }
+
     let entries = [arbitro_store::EntryRef {
         stream_id: seq_stream.raw(),
         subject: f.subject(),
@@ -168,6 +197,22 @@ fn v2_publish(
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
     server.gate_for(seq_stream).release();
+}
+
+/// Hash an opaque `msg_id` for the idempotency tracker.
+///
+/// We don't need cryptographic strength — false positives on
+/// `IdempotencyTracker::record` would only mis-reject a legitimate
+/// publish (rare; the broker reports `IdempotencyDuplicate` and the
+/// client can retry with a different id). foldhash is the same hasher
+/// we use for all the broker's HashMaps; using it here keeps the
+/// codebase consistent.
+#[inline]
+fn idempotency_hash(msg_id: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = arbitro_common::foldhash::fast::FixedState::default().build_hasher();
+    h.write(msg_id);
+    h.finish()
 }
 
 fn v2_publish_with_reply(
@@ -242,6 +287,59 @@ fn v2_publish_batch(
 
     // Collect entry views; subject/payload are zero-copy slices into `frame`.
     let entry_views: Vec<_> = f.iter().collect();
+
+    // ── Idempotency check (all-or-nothing) ────────────────────────────
+    //
+    // We honour the same atomic batch semantics the store uses: if any
+    // entry in the batch carries a `msg_id` that's already in the
+    // dedup window, we reject the WHOLE batch and roll back any
+    // entries we'd already inserted into the tracker on this call.
+    // This matches what the user expects from `publishBatch` — either
+    // every entry lands, or none do.
+    //
+    // Fast-bail when the stream has no idempotency window or none of
+    // the entries carry a msg_id (the common case for batch publish
+    // on non-idempotent streams).
+    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    let any_msg_id = window_ms > 0 && entry_views.iter().any(|v| !v.msg_id().is_empty());
+    if any_msg_id {
+        let shared = server.idempotency_for(seq_stream);
+        let mut guard = shared.lock().expect("idempotency mutex poisoned");
+        let tracker = guard.get_or_insert_with(
+            crate::shard::idempotency::IdempotencyTracker::new,
+        );
+
+        // Track which (hash) keys we inserted on this call so we can
+        // roll them back if a later entry collides. Entries with an
+        // empty msg_id are skipped (per-entry opt-in dedup).
+        let mut inserted_hashes: Vec<u64> = Vec::with_capacity(entry_views.len());
+        let mut duplicate = false;
+        for v in entry_views.iter() {
+            let id = v.msg_id();
+            if id.is_empty() {
+                continue;
+            }
+            let hash = idempotency_hash(id);
+            if !tracker.record(seq_stream, hash, window_ms) {
+                duplicate = true;
+                break;
+            }
+            inserted_hashes.push(hash);
+        }
+        if duplicate {
+            // Roll back every record we just inserted — the batch
+            // as a whole is being rejected, so we must not leave the
+            // tracker poisoned with phantom ids.
+            for hash in &inserted_hashes {
+                tracker.forget(seq_stream, *hash);
+            }
+            drop(guard);
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            return;
+        }
+        drop(guard);
+    }
+
     let entries: Vec<arbitro_store::EntryRef<'_>> = entry_views
         .iter()
         .map(|v| arbitro_store::EntryRef {

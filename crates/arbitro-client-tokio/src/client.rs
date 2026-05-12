@@ -130,6 +130,11 @@ impl Client {
 
     // ── publish ───────────────────────────────────────────────────────────────
 
+    /// Fire-and-forget publish (no msg_id, no broker-side dedup).
+    ///
+    /// For idempotent publishes on streams with a non-zero
+    /// `idempotency_window_ms`, use [`Client::publish_with_id`] /
+    /// [`Client::publish_sync_with_id`].
     #[inline]
     pub fn publish(
         &self,
@@ -137,8 +142,21 @@ impl Client {
         subject:   &[u8],
         payload:   Bytes,
     ) -> Result<(), ClientError> {
+        self.publish_with_id(stream_id, subject, &[], payload)
+    }
+
+    /// Fire-and-forget publish with an explicit `msg_id` for broker
+    /// dedup. Pass an empty `msg_id` to match [`Client::publish`].
+    #[inline]
+    pub fn publish_with_id(
+        &self,
+        stream_id: u32,
+        subject:   &[u8],
+        msg_id:    &[u8],
+        payload:   Bytes,
+    ) -> Result<(), ClientError> {
         let r = crate::publish::publish_async(
-            self.producer(), &self.inner.seq_alloc, stream_id, subject, payload,
+            self.producer(), &self.inner.seq_alloc, stream_id, subject, msg_id, payload,
         );
         if r.is_ok() {
             self.inner.metrics.publishes_sent
@@ -157,6 +175,7 @@ impl Client {
         self.publish(stream_id, subject, Bytes::copy_from_slice(payload))
     }
 
+    /// Sync publish — awaits broker confirmation (RepOk with first_seq).
     #[inline]
     pub fn publish_sync(
         &self,
@@ -164,11 +183,26 @@ impl Client {
         subject:   &[u8],
         payload:   Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        self.publish_sync_with_id(stream_id, subject, &[], payload)
+    }
+
+    /// Sync publish with an explicit `msg_id` for broker dedup.
+    /// Returns `Err(ErrorCode::IdempotencyDuplicate)` when the broker
+    /// has already seen this `(stream_id, msg_id)` within the stream's
+    /// `idempotency_window_ms`.
+    #[inline]
+    pub fn publish_sync_with_id(
+        &self,
+        stream_id: u32,
+        subject:   &[u8],
+        msg_id:    &[u8],
+        payload:   Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_sync_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, payload,
+            stream_id, subject, msg_id, payload,
         )
     }
 

@@ -122,7 +122,7 @@ async fn connect_retry(addr: &str) -> Client {
 /// Returns (stream_id, consumer_id).
 async fn ensure_stream_and_consumer(addr: &str) -> (u32, u32) {
     let c = connect_retry(addr).await;
-    let resp = c.create_stream(STREAM, b">", 0, 0, 0, 1, JOURNAL_DISK, 0, 0)
+    let resp = c.create_stream(STREAM, b">", 0, 0, 0, 1, JOURNAL_DISK, 0, 0, 0)
         .await.expect("create_stream");
     let sid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 

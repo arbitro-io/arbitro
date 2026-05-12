@@ -40,9 +40,22 @@
 //! medium-sized message store.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use arbitro_engine_v2::types::StreamId;
 use arbitro_common::{TimingWheel, foldhash::fast::FixedState};
+
+/// Shared handle to a shard's idempotency tracker. The publish hot
+/// path in `dispatch_v2` and the worker's 1Hz tick loop hold the
+/// same Arc. `Option<...>` stays `None` until the first publish on
+/// an idempotent stream forces lazy allocation — shards that never
+/// see an idempotent stream pay zero memory cost.
+pub type SharedIdempotency = Arc<Mutex<Option<IdempotencyTracker>>>;
+
+/// Build a fresh shared handle with no tracker allocated yet.
+pub fn new_shared_idempotency() -> SharedIdempotency {
+    Arc::new(Mutex::new(None))
+}
 
 /// Wheel resolution: each bucket represents one second. We round
 /// `idempotency_window_ms` UP to the nearest second when inserting.
@@ -136,6 +149,21 @@ impl IdempotencyTracker {
                 true
             }
         }
+    }
+
+    /// Forcibly remove a `(stream, msg_id_hash)` mapping from the
+    /// membership map, regardless of its expiration. Used to roll
+    /// back records inserted during a batch publish when a later
+    /// entry in the same batch turns out to be a duplicate — the
+    /// batch is atomic, so partial inserts must be undone.
+    ///
+    /// The wheel entry is left in place; when its bucket fires
+    /// `tick()` will look up the key, miss, and silently move on.
+    /// Leaving phantom wheel entries is fine — they cost one HashMap
+    /// lookup at expiration time and don't break the dedup contract.
+    #[inline]
+    pub fn forget(&mut self, stream: StreamId, msg_id_hash: u64) {
+        self.seen.remove(&(stream, msg_id_hash));
     }
 
     /// Advance the wheel by one tick (1 s). Removes from `seen` every

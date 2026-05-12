@@ -117,12 +117,12 @@ fn v2_pubframe_roundtrip_via_as_bytes() {
     let subject: &[u8] = b"orders.eu.42";
     let payload: &[u8] = &[0xAB; 256];
 
-    let size = PubFrame::wire_size(subject.len(), payload.len());
+    let size = PubFrame::wire_size(subject.len(), 0, payload.len());
     let mut buf = vec![0u8; size];
 
     PubFrame::encode_into(
         &mut buf, /*seq*/ 777, /*stream_id*/ 0xCAFEBABE, /*flags*/ 0,
-        /*entry_flags*/ 0, subject, payload,
+        /*entry_flags*/ 0, subject, &[], payload,
     );
 
     let wire_snapshot = buf.clone();
@@ -160,7 +160,7 @@ fn pubframe_decode_then_reemit_is_identity() {
     let body = PubBody {
         stream_id:   U32::new(0),
         subject_len: U16::new(subject.len() as u16),
-        _pad:        U16::new(0),
+        msg_id_len:  U16::new(0),
     };
 
     let mut wire: Vec<u8> = Vec::new();
@@ -213,7 +213,7 @@ fn whole_frame_one_struct_one_as_bytes_zero_copies() {
         body: PubBody {
             stream_id:   U32::new(0xCAFEBABE),
             subject_len: U16::new(SUBJ_LEN as u16),
-            _pad:        U16::new(0),
+            msg_id_len:  U16::new(0),
         },
         subject: *b"orders.eu.42",
         payload: *b"hello-world-1234",
@@ -258,7 +258,7 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
             body: PubBody {
                 stream_id:   U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                _pad:        U16::new(0),
+                msg_id_len:  U16::new(0),
             },
             subject: *b"orders.eu.01",
             payload: *b"AAAAAAAAAAAAAAAA",
@@ -268,7 +268,7 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
             body: PubBody {
                 stream_id:   U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                _pad:        U16::new(0),
+                msg_id_len:  U16::new(0),
             },
             subject: *b"orders.eu.02",
             payload: *b"BBBBBBBBBBBBBBBB",
@@ -278,7 +278,7 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
             body: PubBody {
                 stream_id:   U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                _pad:        U16::new(0),
+                msg_id_len:  U16::new(0),
             },
             subject: *b"orders.eu.03",
             payload: *b"CCCCCCCCCCCCCCCC",
@@ -288,7 +288,7 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
             body: PubBody {
                 stream_id:   U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                _pad:        U16::new(0),
+                msg_id_len:  U16::new(0),
             },
             subject: *b"orders.eu.04",
             payload: *b"DDDDDDDDDDDDDDDD",
@@ -366,7 +366,7 @@ fn batch_heterogeneous_per_entry_struct_zero_copies() {
         body: PubBody {
             stream_id:   U32::new(7),
             subject_len: U16::new(5),
-            _pad:        U16::new(0),
+            msg_id_len:  U16::new(0),
         },
         subject: *b"a.b.c",
         payload: *b"PING",
@@ -377,7 +377,7 @@ fn batch_heterogeneous_per_entry_struct_zero_copies() {
         body: PubBody {
             stream_id:   U32::new(7),
             subject_len: U16::new(16),
-            _pad:        U16::new(0),
+            msg_id_len:  U16::new(0),
         },
         subject: *b"orders.eu.42.xx.",
         payload: [0x42; 64],

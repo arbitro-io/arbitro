@@ -26,19 +26,32 @@ use arbitro_proto::v2::manager::{
 // ─── BatchEntry ───────────────────────────────────────────────────────
 
 /// One entry of a batch publish: a borrowed subject plus an owned
-/// payload. The payload is `Bytes` so it can travel as a separate
-/// iovec without an extra userspace copy.
+/// payload, with an optional per-entry `msg_id` for broker-side
+/// idempotency dedup. The payload is `Bytes` so it can travel as a
+/// separate iovec without an extra userspace copy.
+///
+/// `msg_id` is opaque — the broker treats it as a hash key for the
+/// stream's dedup window. Empty `msg_id` means "no dedup for this
+/// entry" (mixing dedup + non-dedup entries in the same batch is
+/// allowed).
 #[derive(Debug, Clone)]
 pub struct BatchEntry<'a> {
     pub subject: &'a [u8],
+    pub msg_id:  &'a [u8],
     pub payload: Bytes,
 }
 
 impl<'a> BatchEntry<'a> {
-    /// Convenience constructor.
+    /// Convenience constructor — no msg_id, legacy / non-dedup entry.
     #[inline]
     pub fn new(subject: &'a [u8], payload: Bytes) -> Self {
-        Self { subject, payload }
+        Self { subject, msg_id: &[], payload }
+    }
+
+    /// Constructor with an explicit `msg_id` for dedup-enabled streams.
+    #[inline]
+    pub fn with_msg_id(subject: &'a [u8], msg_id: &'a [u8], payload: Bytes) -> Self {
+        Self { subject, msg_id, payload }
     }
 }
 
@@ -53,7 +66,8 @@ pub(crate) fn encode_pub_batch_v2(
 ) -> Bytes {
     let mut tail_bytes = 0usize;
     for e in entries {
-        tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + e.subject.len() + e.payload.len();
+        tail_bytes +=
+            BATCH_PUB_ENTRY_HEADER_SIZE + e.subject.len() + e.msg_id.len() + e.payload.len();
     }
     let size = BatchPubFrame::wire_size(tail_bytes);
     let mut buf = vec![0u8; size];
@@ -61,7 +75,7 @@ pub(crate) fn encode_pub_batch_v2(
     BatchPubFrame::encode_into_iter(
         &mut buf, seq, stream_id, 0, entry_flags,
         entries.len() as u32, tail_bytes,
-        entries.iter().map(|e| (e.subject, e.payload.as_ref())),
+        entries.iter().map(|e| (e.subject, e.msg_id, e.payload.as_ref())),
     );
     Bytes::from(buf)
 }
@@ -249,10 +263,10 @@ mod tests {
     fn pub_single_v2_roundtrip() {
         let subject = b"orders.created";
         let payload = b"hello world";
-        let expected_size = PubFrame::wire_size(subject.len(), payload.len());
+        let expected_size = PubFrame::wire_size(subject.len(), 0, payload.len());
 
         let mut data = vec![0u8; expected_size];
-        PubFrame::encode_into(&mut data, 1, 42, 0, 0, subject, payload);
+        PubFrame::encode_into(&mut data, 1, 42, 0, 0, subject, &[], payload);
 
         // Action bytes [0..2] must be Publish = 0x0101 (little-endian)
         assert_eq!(u16::from_le_bytes([data[0], data[1]]), Action::Publish.as_u16());

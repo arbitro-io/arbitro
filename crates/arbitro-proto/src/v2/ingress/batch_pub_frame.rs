@@ -50,7 +50,11 @@ const _: () = assert!(BATCH_PUB_BODY_FIXED == 8);
 #[repr(C)]
 pub struct BatchPubEntryHeader {
     pub subject_len: U16,
-    pub _pad:        U16,
+    /// Length of an opaque per-entry id used for broker-side dedup
+    /// when the target stream has idempotency enabled. `0` = no id
+    /// for this entry (mixing dedup + non-dedup entries in the same
+    /// batch is allowed; the broker checks each independently).
+    pub msg_id_len:  U16,
     pub payload_len: U32,
 }
 pub const BATCH_PUB_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<BatchPubEntryHeader>();
@@ -90,19 +94,20 @@ impl BatchPubFrame {
 
     /// Encode a fresh BATCH_PUB frame into `out`.
     ///
-    /// Each entry = `(subject, payload)`. Pre-size `out` to
-    /// `wire_size(total_tail_bytes)`.
+    /// Each entry = `(subject, msg_id, payload)`. Pass an empty
+    /// `msg_id` slice for entries that should not be deduped (legacy
+    /// behaviour). Pre-size `out` to `wire_size(total_tail_bytes)`.
     pub fn encode_into<'a>(
         out: &'a mut [u8],
         seq: u64,
         stream_id: u32,
         flags: u8,
         entry_flags: u8,
-        entries: &[(&'a [u8], &'a [u8])],
+        entries: &[(&'a [u8], &'a [u8], &'a [u8])],
     ) -> &'a mut Self {
         let mut tail_bytes: usize = 0;
-        for (s, p) in entries {
-            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + p.len();
+        for (s, m, p) in entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
         }
         Self::encode_into_iter(
             out, seq, stream_id, flags, entry_flags,
@@ -116,6 +121,7 @@ impl BatchPubFrame {
     ///
     /// `count` and `tail_bytes` must be pre-computed by the caller.
     /// `out.len()` must equal `wire_size(tail_bytes)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_into_iter<'a, I>(
         out: &'a mut [u8],
         seq: u64,
@@ -127,7 +133,7 @@ impl BatchPubFrame {
         entries: I,
     ) -> &'a mut Self
     where
-        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        I: IntoIterator<Item = (&'a [u8], &'a [u8], &'a [u8])>,
     {
         debug_assert_eq!(out.len(), Self::wire_size(tail_bytes));
 
@@ -142,18 +148,20 @@ impl BatchPubFrame {
         };
 
         let mut off = 0usize;
-        for (subject, payload) in entries {
+        for (subject, msg_id, payload) in entries {
             let hdr_end = off + BATCH_PUB_ENTRY_HEADER_SIZE;
             let entry_hdr = BatchPubEntryHeader {
                 subject_len: U16::new(subject.len() as u16),
-                _pad:        U16::new(0),
+                msg_id_len:  U16::new(msg_id.len() as u16),
                 payload_len: U32::new(payload.len() as u32),
             };
             frame.tail[off..hdr_end].copy_from_slice(entry_hdr.as_bytes());
             let s_end = hdr_end + subject.len();
             frame.tail[hdr_end..s_end].copy_from_slice(subject);
-            let p_end = s_end + payload.len();
-            frame.tail[s_end..p_end].copy_from_slice(payload);
+            let m_end = s_end + msg_id.len();
+            frame.tail[s_end..m_end].copy_from_slice(msg_id);
+            let p_end = m_end + payload.len();
+            frame.tail[m_end..p_end].copy_from_slice(payload);
             off = p_end;
         }
         frame
@@ -180,12 +188,24 @@ impl<'a> BatchPubEntryView<'a> {
         &self.buf[BATCH_PUB_ENTRY_HEADER_SIZE..BATCH_PUB_ENTRY_HEADER_SIZE + s]
     }
 
+    /// Per-entry id used for broker-side dedup. Empty slice when
+    /// `msg_id_len == 0` (legacy / non-dedup entry).
+    #[inline(always)]
+    pub fn msg_id(&self) -> &'a [u8] {
+        let h = self.header();
+        let s = h.subject_len.get() as usize;
+        let m = h.msg_id_len.get() as usize;
+        let start = BATCH_PUB_ENTRY_HEADER_SIZE + s;
+        &self.buf[start..start + m]
+    }
+
     #[inline(always)]
     pub fn payload(&self) -> &'a [u8] {
         let h = self.header();
         let s = h.subject_len.get() as usize;
+        let m = h.msg_id_len.get() as usize;
         let p = h.payload_len.get() as usize;
-        let start = BATCH_PUB_ENTRY_HEADER_SIZE + s;
+        let start = BATCH_PUB_ENTRY_HEADER_SIZE + s + m;
         &self.buf[start..start + p]
     }
 
@@ -194,6 +214,7 @@ impl<'a> BatchPubEntryView<'a> {
         let h = self.header();
         BATCH_PUB_ENTRY_HEADER_SIZE
             + h.subject_len.get() as usize
+            + h.msg_id_len.get() as usize
             + h.payload_len.get() as usize
     }
 }
@@ -239,14 +260,14 @@ mod tests {
 
     #[test]
     fn encode_then_iter_roundtrip() {
-        let entries: &[(&[u8], &[u8])] = &[
-            (b"a.b", b"PING"),
-            (b"orders.eu.42", b"hello world"),
-            (b"x", &[0xCC; 32]),
+        let entries: &[(&[u8], &[u8], &[u8])] = &[
+            (b"a.b", b"", b"PING"),
+            (b"orders.eu.42", b"", b"hello world"),
+            (b"x", b"", &[0xCC; 32]),
         ];
         let mut tail_bytes = 0usize;
-        for (s, p) in entries {
-            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + p.len();
+        for (s, m, p) in entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
         }
 
         let size = BatchPubFrame::wire_size(tail_bytes);
@@ -259,24 +280,49 @@ mod tests {
         assert_eq!(frame.body.stream_id.get(), 0xCAFE);
         assert_eq!(frame.count(), 3);
 
-        let collected: Vec<(Vec<u8>, Vec<u8>)> = frame
+        let collected: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = frame
             .iter()
-            .map(|v| (v.subject().to_vec(), v.payload().to_vec()))
+            .map(|v| (v.subject().to_vec(), v.msg_id().to_vec(), v.payload().to_vec()))
             .collect();
 
         assert_eq!(collected.len(), 3);
         assert_eq!(collected[0].0, b"a.b");
-        assert_eq!(collected[0].1, b"PING");
+        assert_eq!(collected[0].2, b"PING");
         assert_eq!(collected[1].0, b"orders.eu.42");
-        assert_eq!(collected[2].1, vec![0xCC; 32]);
+        assert_eq!(collected[2].2, vec![0xCC; 32]);
+    }
+
+    #[test]
+    fn msg_id_roundtrips_per_entry() {
+        let entries: &[(&[u8], &[u8], &[u8])] = &[
+            (b"orders.new", b"id-1", b"a"),
+            (b"orders.new", b"",     b"b"), // legacy entry — no dedup
+            (b"orders.new", b"id-2", b"c"),
+        ];
+        let mut tail_bytes = 0usize;
+        for (s, m, p) in entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
+        }
+        let size = BatchPubFrame::wire_size(tail_bytes);
+        let mut buf = vec![0u8; size];
+        BatchPubFrame::encode_into(&mut buf, 1, 7, 0, 0, entries);
+
+        let frame = BatchPubFrame::ref_from_bytes(&buf).unwrap();
+        let v: Vec<_> = frame.iter().collect();
+        assert_eq!(v[0].msg_id(), b"id-1");
+        assert_eq!(v[0].payload(), b"a");
+        assert_eq!(v[1].msg_id(), b"" as &[u8]);
+        assert_eq!(v[1].payload(), b"b");
+        assert_eq!(v[2].msg_id(), b"id-2");
+        assert_eq!(v[2].payload(), b"c");
     }
 
     #[test]
     fn as_bytes_is_identity_after_decode() {
-        let entries: &[(&[u8], &[u8])] = &[(b"s", b"P"), (b"ss", b"PP")];
+        let entries: &[(&[u8], &[u8], &[u8])] = &[(b"s", b"", b"P"), (b"ss", b"", b"PP")];
         let mut tail_bytes = 0usize;
-        for (s, p) in entries {
-            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + p.len();
+        for (s, m, p) in entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
         }
         let size = BatchPubFrame::wire_size(tail_bytes);
         let mut buf = vec![0u8; size];

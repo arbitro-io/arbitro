@@ -172,7 +172,7 @@ async fn reset_streams(client: &Client, names: &[Vec<u8>]) -> Vec<u32> {
     for name in names {
         let _ = client.delete_stream(name).await.ok();
         let resp = client
-            .create_stream(name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0)
+            .create_stream(name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0, 0)
             .await
             .expect("create stream");
         let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -234,6 +234,7 @@ async fn run_batch(
             for _ in 0..batch_size {
                 entries.push(BatchEntry {
                     subject: b"bench.msg".as_slice(),
+                    msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
             }
@@ -277,6 +278,7 @@ async fn run_batch_sync(
             for _ in 0..batch_size {
                 entries.push(BatchEntry {
                     subject: b"bench.msg".as_slice(),
+                    msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
             }
@@ -315,6 +317,7 @@ async fn prefill_streams(
             for _ in 0..BATCH_SIZE {
                 entries.push(BatchEntry {
                     subject: b"bench.msg".as_slice(),
+                    msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
             }
@@ -862,7 +865,7 @@ fn main() {
                 let fanout_name = b"fanout_bench".as_slice();
                 let _ = setup_client.delete_stream(fanout_name).await.ok();
                 let resp = setup_client
-                    .create_stream(fanout_name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0)
+                    .create_stream(fanout_name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0, 0)
                     .await
                     .expect("create fanout stream");
                 let fanout_stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -919,7 +922,8 @@ fn main() {
                     for _ in 0..batch_size {
                         entries.push(BatchEntry {
                             subject: b"bench.msg".as_slice(),
-                            payload: payload_bytes.clone(),
+                            msg_id: &[],
+                    payload: payload_bytes.clone(),
                         });
                     }
                     let batches = total.div_ceil(batch_size);

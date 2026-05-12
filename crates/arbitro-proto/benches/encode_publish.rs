@@ -258,7 +258,7 @@ fn encode_v2_raw(subject: &[u8], payload: &[u8]) -> Vec<u8> {
 // vs the legacy body format used by V1-V3: [4B count][12B PublishEntry][subject][payload].
 #[inline]
 fn encode_v2_pubframe(subject: &[u8], payload: &[u8]) -> Vec<u8> {
-    let size = PubFrame::wire_size(subject.len(), payload.len());
+    let size = PubFrame::wire_size(subject.len(), 0, payload.len());
     // SAFETY: encode_into writes every byte before any read.
     let mut buf = Vec::<u8>::with_capacity(size);
     unsafe { buf.set_len(size); }
@@ -269,6 +269,7 @@ fn encode_v2_pubframe(subject: &[u8], payload: &[u8]) -> Vec<u8> {
         /*flags*/       0,
         /*entry_flags*/ 0,
         subject,
+        /*msg_id*/      &[],
         payload,
     );
     buf

@@ -27,21 +27,28 @@ pub(crate) fn enqueue(tx: &WriteProducer, frame: WriteFrame) -> Result<(), Clien
 ///
 /// Frames ≤ `INLINE_CAP` bytes are stored inline (zero heap allocation).
 /// Larger frames fall back to a `Bytes` allocation.
+///
+/// Pass `msg_id = &[]` for the legacy / non-dedup case. A non-empty
+/// `msg_id` opts the message into broker-side idempotency dedup on
+/// streams that have a non-zero `idempotency_window_ms`.
 #[inline]
 fn encode_pub_frame(
     seq: u64,
     stream_id: u32,
     subject: &[u8],
+    msg_id: &[u8],
     payload: &[u8],
 ) -> WriteFrame {
-    let size = PubFrame::wire_size(subject.len(), payload.len());
+    let size = PubFrame::wire_size(subject.len(), msg_id.len(), payload.len());
     if size <= INLINE_CAP {
         let mut data = [0u8; INLINE_CAP];
-        PubFrame::encode_into(&mut data[..size], seq, stream_id, 0, 0, subject, payload);
+        PubFrame::encode_into(
+            &mut data[..size], seq, stream_id, 0, 0, subject, msg_id, payload,
+        );
         WriteFrame::Inline(data, size as u16)
     } else {
         let mut buf = vec![0u8; size];
-        PubFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, payload);
+        PubFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, msg_id, payload);
         WriteFrame::Mono(Bytes::from(buf))
     }
 }
@@ -53,10 +60,11 @@ pub(crate) fn publish_async(
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
+    msg_id: &[u8],
     payload: Bytes,
 ) -> Result<(), ClientError> {
     let seq = seq_alloc.next();
-    enqueue(tx, encode_pub_frame(seq, stream_id, subject, &payload))
+    enqueue(tx, encode_pub_frame(seq, stream_id, subject, msg_id, &payload))
 }
 
 /// Fire-and-forget batch publish.
@@ -89,10 +97,11 @@ pub(crate) fn publish_sync_async(
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
+    msg_id: &[u8],
     payload: Bytes,
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
     let seq   = seq_alloc.next();
-    let frame = encode_pub_frame(seq, stream_id, subject, &payload);
+    let frame = encode_pub_frame(seq, stream_id, subject, msg_id, &payload);
     let rx    = pending.register(seq);
     let enqueue_result = enqueue(tx, frame);
     async move {

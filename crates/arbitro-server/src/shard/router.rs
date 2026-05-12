@@ -34,6 +34,12 @@ pub struct ShardRouter {
     stores: Arc<[SharedStore]>,
     gates: Arc<[Arc<Gate>]>,
     names: Arc<NameRegistry>,
+    /// Per-shard idempotency dedup state. Each entry is a
+    /// lazily-allocated tracker (`Option<...>` starts None, fills in
+    /// on first idempotent publish for that shard). Shared between
+    /// the dispatch publish path (membership check + record) and the
+    /// shard worker's tick loop (expiration sweep).
+    idempotency: Arc<[crate::shard::idempotency::SharedIdempotency]>,
     /// Optional persistent command log — set when `data_dir` is configured.
     /// Used by dispatch to record metadata mutations (create/delete stream/consumer)
     /// so they survive server restarts.
@@ -49,6 +55,7 @@ impl ShardRouter {
         let mut handles = Vec::with_capacity(shard_count);
         let mut stores = Vec::with_capacity(shard_count);
         let mut gates = Vec::with_capacity(shard_count);
+        let mut idempotency = Vec::with_capacity(shard_count);
         let names = Arc::new(NameRegistry::new());
 
         for id in 0..shard_count {
@@ -74,6 +81,13 @@ impl ShardRouter {
             let snapshot = Arc::new(SnapshotSwap::new(DrainSnapshot::empty()));
 
             let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+            // Per-shard idempotency tracker handle. None inside the
+            // Arc<Mutex<>> means not allocated yet — the publish hot
+            // path allocates on first idempotent stream. Both the
+            // command worker (tick loop) and dispatch_v2 (publish
+            // check + record) hold clones of this Arc.
+            let shard_idempotency = super::idempotency::new_shared_idempotency();
 
             // Notification ring: drain → command (deliveries + dead connections).
             // SPSC Ring — drain is the sole producer, command task is the sole consumer.
@@ -136,13 +150,14 @@ impl ShardRouter {
                 wheel: None,
                 wheel_buf: Vec::new(),
                 next_wheel_tick: None,
-                idempotency_tracker: None,
+                idempotency_tracker: Arc::clone(&shard_idempotency),
             };
 
             tokio::spawn(cmd_worker.run());
 
             stores.push(Arc::clone(&shared_store));
             gates.push(Arc::clone(&gate));
+            idempotency.push(Arc::clone(&shard_idempotency));
 
             handles.push(ShardHandle::new(
                 id as u32,
@@ -158,6 +173,7 @@ impl ShardRouter {
             stores: stores.into(),
             gates: gates.into(),
             names,
+            idempotency: idempotency.into(),
             command_log: None,
         }
     }
@@ -189,6 +205,20 @@ impl ShardRouter {
     pub fn gate_for(&self, stream_id: StreamId) -> &Arc<Gate> {
         let idx = stream_id.raw() as usize % self.gates.len();
         &self.gates[idx]
+    }
+
+    /// Per-shard idempotency tracker handle. The publish hot path
+    /// (`dispatch_v2::v2_publish`) uses this to check + record
+    /// dedup state when the stream has `idempotency_window_ms > 0`.
+    /// `Option<...>` inside the Mutex is `None` until the first
+    /// idempotent publish allocates it lazily.
+    #[inline]
+    pub fn idempotency_for(
+        &self,
+        stream_id: StreamId,
+    ) -> &super::idempotency::SharedIdempotency {
+        let idx = stream_id.raw() as usize % self.idempotency.len();
+        &self.idempotency[idx]
     }
 
     #[inline]
