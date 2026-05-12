@@ -163,6 +163,61 @@ impl TolerantStore {
         }
         Ok(())
     }
+
+    /// Append assuming the caller has already verified there is room
+    /// in the active segment for this entry. Used by `append_batch`
+    /// when the whole batch fits in one segment — we do ONE rotate
+    /// check up front, then call this per entry to skip the redundant
+    /// per-entry test and keep the inner loop tight.
+    ///
+    /// Precondition (caller MUST honour): the entry's `HEADER_SIZE +
+    /// subject.len() + payload.len()` bytes fit in the active mmap
+    /// starting at `current_segment_offset`. Violating this causes a
+    /// mmap bounds-check panic (no silent corruption).
+    fn append_no_rotate(&mut self, entry: EntryRef<'_>, timestamp: u64) -> u64 {
+        let entry_total = (entry.subject.len() + entry.payload.len()) as u64;
+        let total_needed = (HEADER_SIZE as u64) + entry_total;
+
+        let seq = self.next_seq;
+        let mmap = self.active_mmap.as_mut().expect("active mmap initialised");
+        let start = self.current_segment_offset as usize;
+
+        let slen = entry.subject.len() as u16;
+        let plen = entry.payload.len() as u32;
+
+        mmap[start] = MAGIC;
+        mmap[start + 1..start + 3].copy_from_slice(&slen.to_le_bytes());
+        mmap[start + 3..start + 7].copy_from_slice(&plen.to_le_bytes());
+        mmap[start + 7..start + 15].copy_from_slice(&timestamp.to_le_bytes());
+        mmap[start + 15..start + 23].copy_from_slice(&seq.to_le_bytes());
+        mmap[start + 23..start + 27].copy_from_slice(&entry.stream_id.to_le_bytes());
+        mmap[start + 27] = entry.flags;
+
+        let data_off = start + HEADER_SIZE;
+        mmap[data_off..data_off + entry.subject.len()].copy_from_slice(entry.subject);
+        mmap[data_off + entry.subject.len()..data_off + entry.subject.len() + entry.payload.len()]
+            .copy_from_slice(entry.payload);
+
+        // Zero-allocation push (capacity guaranteed by init() +
+        // reserve() in `append_batch` for batched callers).
+        let subject_hash = wire_hash_32(entry.subject);
+        self.index.push(LogMetadata {
+            seq,
+            ts: timestamp,
+            subj_len: slen,
+            payload_len: plen,
+            offset: data_off as u32,
+            segment_idx: self.sealed_segments.len() as u32,
+            subject_hash,
+            stream_id: entry.stream_id,
+            flags: entry.flags,
+        });
+
+        self.next_seq += 1;
+        self.total_bytes += entry_total;
+        self.current_segment_offset += total_needed as u32;
+        seq
+    }
 }
 
 impl Store for TolerantStore {
@@ -188,44 +243,7 @@ impl Store for TolerantStore {
             self.rotate()?;
         }
 
-        let seq = self.next_seq;
-        let mmap = self.active_mmap.as_mut().ok_or(StoreError::NotFound)?;
-        let start = self.current_segment_offset as usize;
-
-        let slen = entry.subject.len() as u16;
-        let plen = entry.payload.len() as u32;
-
-        mmap[start] = MAGIC;
-        mmap[start + 1..start + 3].copy_from_slice(&slen.to_le_bytes());
-        mmap[start + 3..start + 7].copy_from_slice(&plen.to_le_bytes());
-        mmap[start + 7..start + 15].copy_from_slice(&timestamp.to_le_bytes());
-        mmap[start + 15..start + 23].copy_from_slice(&seq.to_le_bytes());
-        mmap[start + 23..start + 27].copy_from_slice(&entry.stream_id.to_le_bytes());
-        mmap[start + 27] = entry.flags;
-
-        let data_off = start + HEADER_SIZE;
-        mmap[data_off..data_off + entry.subject.len()].copy_from_slice(entry.subject);
-        mmap[data_off + entry.subject.len()..data_off + entry.subject.len() + entry.payload.len()]
-            .copy_from_slice(entry.payload);
-
-        // WHY: Zero-allocation push (capacity guaranteed by init())
-        let subject_hash = wire_hash_32(entry.subject);
-        self.index.push(LogMetadata {
-            seq,
-            ts: timestamp,
-            subj_len: slen,
-            payload_len: plen,
-            offset: data_off as u32,
-            segment_idx: self.sealed_segments.len() as u32,
-            subject_hash,
-            stream_id: entry.stream_id,
-            flags: entry.flags,
-        });
-
-        self.next_seq += 1;
-        self.total_bytes += entry_total;
-        self.current_segment_offset += total_needed as u32;
-        Ok(seq)
+        Ok(self.append_no_rotate(entry, timestamp))
     }
 
     fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
@@ -331,9 +349,42 @@ impl Store for TolerantStore {
         if entries.is_empty() {
             return Ok(self.next_seq);
         }
+
+        // Reserve in the index Vec once — without this, the loop below
+        // pays for up to log2(N) reallocations of the index, each of
+        // which copies the whole existing index into a new buffer.
+        // For a 256-entry batch that's ~8 grows. This single line is
+        // by far the largest win available at the store level.
+        self.index.reserve(entries.len());
+
         let first = self.next_seq;
-        for e in entries {
-            self.append(*e, ts)?;
+
+        // Fast path: if the entire batch fits in the active segment,
+        // skip the rotate-check per entry. The check is a single
+        // integer compare so the win is small in absolute terms, but
+        // it also lets the compiler keep all the per-entry work in
+        // tight loop without a branch that's almost never taken.
+        let total_needed: u64 = entries.iter()
+            .map(|e| (HEADER_SIZE as u64)
+                + (e.subject.len() as u64)
+                + (e.payload.len() as u64))
+            .sum();
+
+        if (self.current_segment_offset as u64) + total_needed < MAX_SEGMENT_BYTES {
+            // Whole batch fits — single rotate check, no per-entry check.
+            for e in entries {
+                self.append_no_rotate(*e, ts);
+            }
+        } else {
+            // Batch crosses (or could cross) a segment boundary —
+            // fall back to the general path that re-checks per entry.
+            // This is the same cost as the old `append_batch`; we
+            // don't try to slice the batch at the boundary because
+            // the `rotate` boundary depends on each entry's actual
+            // size, not an upfront tally.
+            for e in entries {
+                self.append(*e, ts)?;
+            }
         }
         Ok(first)
     }
@@ -513,6 +564,112 @@ mod tests {
             .unwrap();
         assert_eq!(count, 5);
         assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// Large batch — exercises the fast path that pre-checks the total
+    /// size once, reserves `index` capacity, and calls
+    /// `append_no_rotate` per entry. Verifies seq monotonicity,
+    /// payload fidelity, and that no entries are dropped or
+    /// duplicated when the optimised loop runs at scale.
+    #[test]
+    fn append_batch_large_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        const N: usize = 1_000;
+        // Build owned buffers so the EntryRef borrows live the whole call.
+        let subjects: Vec<Vec<u8>> = (0..N).map(|i| format!("subj.{i:04}").into_bytes()).collect();
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| format!("payload-{i}").into_bytes()).collect();
+        let entries: Vec<EntryRef<'_>> = (0..N)
+            .map(|i| make_entry(&subjects[i], &payloads[i]))
+            .collect();
+
+        let first = store.append_batch(&entries, 42).unwrap();
+        assert_eq!(first, 1, "first seq of the batch must be 1 on fresh store");
+        assert_eq!(store.info().messages, N as u64);
+
+        // Read every entry by sequence and verify payload roundtrip.
+        for i in 0..N {
+            let seq = (i + 1) as u64;
+            let mut got_subject = Vec::new();
+            let mut got_payload = Vec::new();
+            let mut got_seq = 0u64;
+            let ok = store
+                .get(seq, &mut |entry| {
+                    got_seq = entry.seq;
+                    got_subject = entry.subject.to_vec();
+                    got_payload = entry.payload.to_vec();
+                })
+                .unwrap();
+            assert!(ok, "entry seq={seq} must be present");
+            assert_eq!(got_seq, seq, "stored seq must match expected");
+            assert_eq!(&got_subject, &subjects[i], "subject roundtrip mismatch at i={i}");
+            assert_eq!(&got_payload, &payloads[i], "payload roundtrip mismatch at i={i}");
+        }
+    }
+
+    /// Multiple consecutive batches — proves that `index.reserve` does
+    /// not corrupt state across calls (the Vec keeps its capacity
+    /// hint, subsequent batches still allocate correctly), and that
+    /// seq numbering continues monotonically across batch boundaries.
+    #[test]
+    fn append_batch_multiple_calls_preserve_monotonicity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        // 3 batches of 50 entries each, with content distinguishable
+        // by batch index so a misordering would show up.
+        let mut next_expected_first = 1u64;
+        for batch_idx in 0..3u32 {
+            let subjects: Vec<Vec<u8>> =
+                (0..50).map(|i| format!("b{batch_idx}.{i:02}").into_bytes()).collect();
+            let payloads: Vec<Vec<u8>> =
+                (0..50).map(|i| format!("v{batch_idx}-{i}").into_bytes()).collect();
+            let entries: Vec<EntryRef<'_>> = (0..50)
+                .map(|i| make_entry(&subjects[i], &payloads[i]))
+                .collect();
+            let first = store.append_batch(&entries, 100 + batch_idx as u64).unwrap();
+            assert_eq!(
+                first, next_expected_first,
+                "batch {batch_idx}: first seq must continue from previous batch",
+            );
+            next_expected_first += 50;
+        }
+        assert_eq!(store.info().messages, 150);
+
+        // Sanity: walk all 150 entries in order, no gaps, no dups.
+        let mut seqs = Vec::with_capacity(150);
+        store
+            .for_each(1, 151, &mut |entry| seqs.push(entry.seq))
+            .unwrap();
+        let expected: Vec<u64> = (1..=150).collect();
+        assert_eq!(seqs, expected, "150 entries across 3 batches must be 1..=150 in order");
+    }
+
+    /// Empty batch — must be a no-op that doesn't corrupt seq state
+    /// or touch the index. Defends the fast-path's `if empty → early
+    /// return` guard.
+    #[test]
+    fn append_batch_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = TolerantStore::new(dir.path().join("store"));
+        store.init().unwrap();
+
+        // Pre-seed with one entry so the store has state to corrupt.
+        store.append(make_entry(b"seed", b"before"), 1).unwrap();
+        assert_eq!(store.info().messages, 1);
+
+        // Empty batch must NOT advance next_seq or touch the index.
+        let first = store.append_batch(&[], 999).unwrap();
+        assert_eq!(first, 2, "empty batch returns next_seq, not 0");
+        assert_eq!(store.info().messages, 1, "empty batch must not change message count");
+
+        // Subsequent append still works and gets seq=2 (proves
+        // `next_seq` wasn't perturbed).
+        let seq = store.append(make_entry(b"after", b"value"), 2).unwrap();
+        assert_eq!(seq, 2);
     }
 
     #[test]

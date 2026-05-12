@@ -368,9 +368,19 @@ impl Store for MemoryStore {
         if entries.is_empty() {
             return Ok(self.next_seq);
         }
+        // Reserve in the index Vec once — avoids N reallocations as
+        // entries are pushed (each push could otherwise trigger a
+        // grow, copying O(index.len()) bytes).
         self.index.reserve(entries.len());
         let first = self.next_seq;
         for entry in entries {
+            // `push_entry` already handles per-entry rotate, hash,
+            // mmap write, and index push. Coalescing the rotate check
+            // up-front would be incorrect — entries can be huge enough
+            // that the batch needs mid-flight rotation, and a single
+            // up-front check would either over-allocate or miss the
+            // boundary. The per-entry check is one integer compare;
+            // dominant cost is the byte copy, which is unavoidable.
             self.push_entry(entry, timestamp);
         }
         Ok(first)
