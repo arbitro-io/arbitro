@@ -144,7 +144,7 @@ async fn main() {
     // ── Manager: create stream and N consumers sharing the same group ──
     let manager = connect(&addr).await;
     let resp = manager
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

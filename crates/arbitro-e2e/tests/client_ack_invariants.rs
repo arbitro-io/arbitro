@@ -66,7 +66,7 @@ async fn concurrent_publish_sync_correlation() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"corr", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"corr", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Obtain all futures synchronously before spawning — publish_sync returns
@@ -113,7 +113,7 @@ async fn many_inflight_publish_sync_wake_on_disconnect() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"orphan", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"orphan", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Launch N concurrent publish_sync, each carrying a slow-ish payload.
@@ -171,7 +171,7 @@ async fn publish_sync_recycles_env_seq() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let mut last_seq = 0u64;
@@ -212,7 +212,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"mix", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"mix", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -234,7 +234,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Side-channel: another stream, fire publish_syncs in parallel.
-    let resp = client.create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let side_stream_id = parse_id(&resp);
 
     // Publish N messages on the consumed stream.
@@ -300,7 +300,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"stale", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"stale", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -370,7 +370,7 @@ async fn publish_sync_on_dead_server_returns_error() {
     };
     let client = Client::connect(cfg).await.expect("client should connect");
 
-    let resp = client.create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Spawn the publish_sync future so it starts running concurrently with

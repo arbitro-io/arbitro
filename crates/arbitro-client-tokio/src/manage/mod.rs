@@ -47,11 +47,12 @@ pub(crate) async fn create_stream(
     name: &[u8], filter: &[u8],
     max_msgs: u64, max_bytes: u64, max_age_secs: u64,
     replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+    idempotency_window_ms: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     let buf = encode_create_stream_v2(
         seq, name, filter, max_msgs, max_bytes, max_age_secs,
-        replicas, journal_kind, retention, discard,
+        replicas, journal_kind, retention, discard, idempotency_window_ms,
     );
     request(tx, pending, seq, buf).await
 }

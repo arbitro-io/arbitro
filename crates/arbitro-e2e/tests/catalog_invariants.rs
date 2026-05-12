@@ -74,7 +74,7 @@ async fn create_stream(client: &Client, name: &[u8]) -> u32 {
     // (name, filter, max_msgs, max_bytes, max_age, replicas,
     //  journal_kind=Memory, retention=Limits, discard=Old)
     let resp = client
-        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream must succeed");
     parse_id(&resp)

@@ -62,7 +62,7 @@ async fn ensure_stream(client: &Client) -> u32 {
     // CreateStream — replicas=1, everything else default. Idempotent enough
     // for our purposes: if it already exists, reuse via `get_stream`.
     let resp = client
-        .create_stream(b"bench", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"bench", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await;
     let body = match resp {
         Ok(b) => b,

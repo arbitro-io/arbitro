@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_master = Client::connect(ClientConfig { addr: addr.clone(), ..ClientConfig::default() }).await?;
     let filter = format!("{}.>", std::str::from_utf8(&stream_name).unwrap());
     let stream_id = match client_master
-        .create_stream(&stream_name, filter.as_bytes(), 0, 0, 0, 1, journal_kind, 0, 0)
+        .create_stream(&stream_name, filter.as_bytes(), 0, 0, 0, 1, journal_kind, 0, 0, 0)
         .await
     {
         Ok(bytes) if bytes.len() >= 8 => {

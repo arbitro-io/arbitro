@@ -83,6 +83,12 @@ pub(crate) fn encode_pub_with_reply_v2(
 // ─── v2 manager encoders ──────────────────────────────────────────────
 
 /// CreateStream request frame.
+///
+/// `idempotency_window_ms = 0` disables idempotency for the stream
+/// (the default, matching pre-feature behaviour). A non-zero value
+/// turns on per-stream dedup: duplicate `msg_id` publishes within the
+/// window are rejected with `ErrorCode::IdempotencyDuplicate (203)`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_create_stream_v2(
     seq: u64,
     name: &[u8],
@@ -94,12 +100,13 @@ pub(crate) fn encode_create_stream_v2(
     journal_kind: u8,
     retention: u8,
     discard: u8,
+    idempotency_window_ms: u32,
 ) -> Bytes {
     let size = CreateStreamFrame::wire_size(name.len(), filter.len());
     let mut buf = vec![0u8; size];
     CreateStreamFrame::encode_into(
         &mut buf, seq, name, filter, max_msgs, max_bytes, max_age_secs, replicas, journal_kind,
-        retention, discard,
+        retention, discard, idempotency_window_ms,
     );
     Bytes::from(buf)
 }

@@ -127,7 +127,7 @@ async fn baseline_latency(iters: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
     let resp = client
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -173,7 +173,7 @@ async fn multi_client_isolated_latency(
             let client = connect(&addr).await;
             let stream = format!("limits_stream_c{i}");
             let resp = client
-                .create_stream(stream.as_bytes(), b">", 0, 0, 0, 1, 0, 0, 0)
+                .create_stream(stream.as_bytes(), b">", 0, 0, 0, 1, 0, 0, 0, 0)
                 .await
                 .unwrap();
             let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -231,7 +231,7 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
     let resp = client
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -308,7 +308,7 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
 
     let stream_name: &[u8] = b"dynamic_subjects";
     let resp = client
-        .create_stream(stream_name, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

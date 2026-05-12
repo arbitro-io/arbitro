@@ -55,7 +55,7 @@ async fn publish_after_close_returns_channel_closed_no_panic() {
     let client = connect(&addr).await;
 
     let resp = client
-        .create_stream(b"bp-close-test", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"bp-close-test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

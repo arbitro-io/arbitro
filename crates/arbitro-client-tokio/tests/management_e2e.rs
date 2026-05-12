@@ -48,7 +48,7 @@ async fn full_management_crud_roundtrip() {
 
     // ── create_stream ───────────────────────────────────────────────────
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     // RepOk body: first 8 bytes = ref_seq (the wire stream id, u64 LE).

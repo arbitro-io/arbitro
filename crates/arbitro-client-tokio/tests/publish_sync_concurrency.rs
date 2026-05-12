@@ -87,7 +87,7 @@ async fn concurrent_publish_sync_no_timeout_conn_1_2_4_8() {
     let root   = connect(&addr).await;
 
     let resp = root
-        .create_stream(b"conc-sync-gate", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"conc-sync-gate", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

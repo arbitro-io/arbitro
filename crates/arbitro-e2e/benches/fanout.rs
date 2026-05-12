@@ -238,7 +238,7 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
     // Setup: stream.
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -320,7 +320,7 @@ async fn run_distribution() {
     let addr = spawn_server().await;
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(DIST_STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(DIST_STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -449,7 +449,7 @@ async fn run_single_conn_multi_sub() {
     let addr = spawn_server().await;
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(SCMS_STREAM, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(SCMS_STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

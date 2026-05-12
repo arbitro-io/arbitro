@@ -79,7 +79,7 @@ async fn setup(
     stream_name.extend_from_slice(label);
 
     let resp = client
-        .create_stream(&stream_name, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(&stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -163,7 +163,7 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
     let control = connect(&addr).await;
     let stream_name = b"ack_bench_multi".to_vec();
     let resp = control
-        .create_stream(&stream_name, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(&stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -252,7 +252,7 @@ async fn correctness_probe(client: &Client, probe_count: u32) -> u32 {
     // Create a fresh stream for the probe.
     let probe_stream = b"ack_probe_stream".to_vec();
     let resp = client
-        .create_stream(&probe_stream, b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(&probe_stream, b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

@@ -40,14 +40,14 @@ fn stream_count(resp: &Bytes) -> usize {
 async fn test_create_stream() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_create_consumer() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     client.create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
 }
@@ -57,7 +57,7 @@ async fn test_list_streams() {
     let addr = start_server().await;
     let client = connect(&addr).await;
     for name in [b"orders".as_slice(), b"payments", b"events"] {
-        client.create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     }
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(stream_count(&resp), 3);
@@ -76,7 +76,7 @@ async fn test_publish_ack_cycle() {
     let addr = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let resp = client.create_consumer(sid, b"worker", b"", b"", 1000, 1, 0, 0, 0, 0).await.unwrap();
     let cid = parse_id(&resp);
@@ -97,7 +97,7 @@ async fn test_publish_ack_cycle() {
 async fn test_publish_batch() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"batch", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"batch", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let entries: Vec<BatchEntry<'_>> = (0..1000)
         .map(|_| BatchEntry::new(b"batch.msg", Bytes::copy_from_slice(b"data")))
@@ -109,7 +109,7 @@ async fn test_publish_batch() {
 async fn test_fanout_delivery() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"fanout", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"fanout", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let mut subs = Vec::new();
@@ -137,7 +137,7 @@ async fn test_fanout_delivery() {
 async fn test_nack_redelivery() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"nack_test", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"nack_test", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let resp = client.create_consumer(sid, b"nacker", b"", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
     let cid = parse_id(&resp);
@@ -153,7 +153,7 @@ async fn test_nack_redelivery() {
 async fn test_replay_publish_then_subscribe() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"replay", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"replay", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let entries: Vec<BatchEntry<'_>> = (0..500)
@@ -177,7 +177,7 @@ async fn test_replay_publish_then_subscribe() {
 async fn test_gate_auto_delivery_smoke() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"gate_smoke", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"gate_smoke", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let resp = client.create_consumer(sid, b"gater", b"", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
     let cid = parse_id(&resp);
@@ -199,7 +199,7 @@ async fn test_gate_auto_delivery_smoke() {
 async fn test_fanout_same_connection() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"fsc", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"fsc", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let mut subs = Vec::new();
@@ -231,7 +231,7 @@ async fn test_fanout_same_connection() {
 async fn test_queue_same_connection() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"qsc", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"qsc", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let resp = client.create_consumer(sid, b"qsc-w1", b"", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
@@ -268,7 +268,7 @@ async fn test_queue_same_connection() {
 async fn test_fanout_filtered_same_connection() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"ffsc", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"ffsc", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let resp = client.create_consumer(sid, b"ffsc-a", b"ga", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
@@ -324,7 +324,7 @@ async fn test_fanout_filtered_same_connection() {
 async fn test_publish_with_reply_delivers_reply_to() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"rpc", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"rpc", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let resp = client.create_consumer(sid, b"rpc-worker", b"", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
     let cid = parse_id(&resp);
@@ -349,7 +349,7 @@ async fn test_publish_with_reply_delivers_reply_to() {
 async fn test_publish_without_reply_has_empty_reply_to() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    let resp = client.create_stream(b"norpc", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"norpc", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
     let resp = client.create_consumer(sid, b"norpc-worker", b"", b"", 100, 1, 0, 0, 0, 0).await.unwrap();
     let cid = parse_id(&resp);
@@ -371,7 +371,7 @@ async fn test_publish_without_reply_has_empty_reply_to() {
 async fn test_graceful_shutdown() {
     let addr = start_server().await;
     let client = connect(&addr).await;
-    client.create_stream(b"shutdown_test", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"shutdown_test", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(stream_count(&resp), 1);
 }

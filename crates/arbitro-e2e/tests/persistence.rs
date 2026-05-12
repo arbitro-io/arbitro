@@ -81,7 +81,7 @@ async fn stream_survives_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
         shutdown(tx).await;
     }
@@ -108,8 +108,8 @@ async fn multiple_streams_survive_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
-        client.create_stream(b"events", b"events.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+        client.create_stream(b"events", b"events.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         shutdown(tx).await;
     }
 
@@ -136,7 +136,7 @@ async fn deleted_stream_stays_deleted_after_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        client.create_stream(b"temp", b"temp.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(b"temp", b"temp.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         client.delete_stream(b"temp").await.unwrap();
         assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 0);
         shutdown(tx).await;
@@ -170,7 +170,7 @@ async fn no_data_dir_works_without_persistence() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let client = connect(&addr).await;
-    client.create_stream(b"ephemeral", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"ephemeral", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1);
     let _ = tx.send(true);
 }
@@ -187,7 +187,7 @@ async fn command_log_file_is_created() {
 
     let (tx, addr) = start_server_with_dir(dir_str).await;
     let client = connect(&addr).await;
-    client.create_stream(b"logged", b"logged.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"logged", b"logged.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert!(log_path.exists(), "metadata.log should be created");
@@ -207,7 +207,7 @@ async fn consumer_survives_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
         client.create_consumer(sid, b"worker1", b"", b"", u16::MAX, 1, 0, 0, 0, 0).await.unwrap();
         assert_eq!(consumer_count(&client.list_consumers(0, 0, 1000).await.unwrap()), 1);
@@ -234,7 +234,7 @@ async fn messages_survive_restart_with_disk_store() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
         for i in 0u32..10 {
             let payload = format!("msg-{i}");
@@ -291,7 +291,7 @@ async fn multiple_restart_cycles() {
     { // Cycle 1: create stream A
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        client.create_stream(b"alpha", b"alpha.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(b"alpha", b"alpha.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         shutdown(tx).await;
     }
 
@@ -299,7 +299,7 @@ async fn multiple_restart_cycles() {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
         assert_eq!(stream_count(&client.list_streams(0, 1000).await.unwrap()), 1, "alpha should survive first restart");
-        client.create_stream(b"beta", b"beta.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        client.create_stream(b"beta", b"beta.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         shutdown(tx).await;
     }
 
@@ -326,8 +326,8 @@ async fn idempotent_create_after_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
-        let _ = client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0).await;
+        client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+        let _ = client.create_stream(b"unique", b"unique.>", 0, 0, 0, 1, 0, 0, 0, 0).await;
         shutdown(tx).await;
     }
 
@@ -354,7 +354,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
 
         for i in 0u32..5 {
@@ -364,7 +364,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         client.delete_stream(b"recycled").await.unwrap();
-        let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"recycled", b"recycled.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid2 = parse_id(&resp);
 
         for i in 0u32..2 {
@@ -411,7 +411,7 @@ async fn consumer_and_messages_survive_together() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"durable", b"durable.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
         client.create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0).await.unwrap();
         for i in 0u32..5 {
@@ -457,7 +457,7 @@ async fn publish_after_restart_continues() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"seq", b"seq.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"seq", b"seq.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
         for i in 0u32..3 {
             let payload = format!("before-{i}");
@@ -512,7 +512,7 @@ async fn messages_survive_multiple_restarts() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"multi", b"multi.>", 0, 0, 0, 1, 1, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"multi", b"multi.>", 0, 0, 0, 1, 1, 0, 0, 0).await.unwrap();
         let sid = parse_id(&resp);
         for i in 0u32..3 {
             let payload = format!("c1-{i}");
@@ -581,7 +581,7 @@ async fn consumer_survives_restart_with_same_id() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         let stream_id = parse_id(&resp);
         let resp = client
             .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
@@ -635,7 +635,7 @@ async fn deleted_consumer_stays_deleted_after_restart() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         let stream_id = parse_id(&resp);
         let resp = client
             .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
@@ -679,7 +679,7 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
     {
         let (tx, addr) = start_server_with_dir(dir_str).await;
         let client = connect(&addr).await;
-        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+        let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
         let stream_id = parse_id(&resp);
 
         let mut ids = Vec::new();

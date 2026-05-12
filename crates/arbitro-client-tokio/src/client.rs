@@ -246,17 +246,26 @@ impl Client {
 
     // ── manage ────────────────────────────────────────────────────────────────
 
+    /// Create a stream.
+    ///
+    /// `idempotency_window_ms = 0` disables idempotency for this
+    /// stream (legacy default — every publish is accepted, no dedup).
+    /// A non-zero value turns on per-stream dedup: publishes carrying
+    /// a `msg_id` header that the broker has seen for THIS stream
+    /// within the window are rejected with `ErrorCode::IdempotencyDuplicate`.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_stream(
         &self,
         name: &[u8], filter: &[u8],
         max_msgs: u64, max_bytes: u64, max_age_secs: u64,
         replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+        idempotency_window_ms: u32,
     ) -> Result<Bytes, ClientError> {
         crate::manage::create_stream(
             self.producer(), &self.inner.pending, &self.inner.seq_alloc,
             name, filter, max_msgs, max_bytes, max_age_secs,
             replicas, journal_kind, retention, discard,
+            idempotency_window_ms,
         ).await
     }
 

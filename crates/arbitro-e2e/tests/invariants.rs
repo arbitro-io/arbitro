@@ -79,7 +79,7 @@ async fn stream_create_then_list() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(stream_count(&resp), 1);
@@ -93,9 +93,9 @@ async fn stream_create_idempotent() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     // Second create should not fail
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(stream_count(&resp), 1);
@@ -107,7 +107,7 @@ async fn stream_delete_then_list() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(stream_count(&resp), 1);
 
@@ -142,7 +142,7 @@ async fn consumer_create_returns_id() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -159,7 +159,7 @@ async fn consumer_delete() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -186,7 +186,7 @@ async fn publish_single_delivers_correctly() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -216,7 +216,7 @@ async fn publish_batch_delivers_all() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -251,7 +251,7 @@ async fn publish_sequences_monotonic() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp1 = client
@@ -283,7 +283,7 @@ async fn replay_deliver_all_historical() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Publish 100 messages BEFORE any consumer exists.
@@ -336,7 +336,7 @@ async fn ack_prevents_redelivery() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -367,7 +367,7 @@ async fn nack_causes_redelivery() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -409,7 +409,7 @@ async fn delivery_preserves_order() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -453,7 +453,7 @@ async fn fanout_two_consumers_each_receive_all() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Two consumers with DIFFERENT groups → separate queues → fan-out
@@ -501,7 +501,7 @@ async fn queue_group_distributes_messages() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Two consumers with the SAME default group → same queue → round-robin
@@ -567,7 +567,7 @@ async fn fanout_with_subject_filters() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"filt", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"filt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -676,7 +676,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"qfilt", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"qfilt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -762,7 +762,7 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"qovlp", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"qovlp", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -831,9 +831,9 @@ async fn consumers_on_different_streams_isolated() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp1 = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp1 = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id1 = parse_id(&resp1);
-    let resp2 = client.create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp2 = client.create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id2 = parse_id(&resp2);
 
     let resp = client
@@ -881,7 +881,7 @@ async fn queue_group_multi_client() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"qtasks", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"qtasks", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -959,7 +959,7 @@ async fn fanout_multi_client() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"fevents", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"fevents", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -1023,7 +1023,7 @@ async fn queue_group_three_clients_100_msgs() {
 
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(b"q3", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"q3", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = parse_id(&resp);
@@ -1122,9 +1122,9 @@ async fn streams_are_isolated() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp_a = client.create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp_a = client.create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id_a = parse_id(&resp_a);
-    let resp_b = client.create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp_b = client.create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id_b = parse_id(&resp_b);
 
     let resp = client
@@ -1154,7 +1154,7 @@ async fn ack_sync_returns_ok() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -1199,7 +1199,7 @@ async fn max_inflight_caps_delivery() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client
@@ -1259,7 +1259,7 @@ async fn max_subject_inflight_multiple_patterns() {
     let (_tx, addr) = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     // Per-subject inflight caps: premium 3, freemium 1. `other.*` has no cap.

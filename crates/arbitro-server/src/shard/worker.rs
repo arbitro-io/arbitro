@@ -335,7 +335,7 @@ pub struct CommandWorker {
     /// Timing wheel for ack deadlines and nack-with-delay.
     /// Created lazily on first consumer with ack_wait_ms > 0.
     /// Resolution: 1 second per tick, 120 buckets = covers up to 120s.
-    pub(super) wheel: Option<arbitro_common::TimingWheel>,
+    pub(super) wheel: Option<arbitro_common::TimingWheel<arbitro_common::WheelEntry>>,
     /// Scratch buffer reused across wheel ticks to avoid allocation.
     pub(super) wheel_buf: Vec<arbitro_common::WheelEntry>,
     /// Next time to advance the wheel (1 tick per second).

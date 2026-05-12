@@ -250,7 +250,7 @@ fn main() {
         // (name, filter, max_msgs, max_bytes, max_age_secs, replicas,
         //  journal_kind=Memory, retention=Limits, discard=Old)
         let resp = publisher
-            .create_stream(b"mem_bench", b">", msgs as u64, 0, 0, 1, 0, 0, 0)
+            .create_stream(b"mem_bench", b">", msgs as u64, 0, 0, 1, 0, 0, 0, 0)
             .await
             .expect("create_stream");
         let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

@@ -115,7 +115,7 @@ async fn programmatic_shutdown_stops_accept() {
     let client = connect_no_retry(&addr).await;
 
     // Server is alive — basic ops work.
-    client.create_stream(b"sd_accept", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"sd_accept", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     // Signal shutdown.
     let _ = shutdown_tx.send(true);
@@ -156,7 +156,7 @@ async fn shutdown_wakes_inflight_publish_sync() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect_no_retry(&addr).await;
 
-    let resp = client.create_stream(b"sd_wake", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"sd_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     // Queue up several publish_sync futures BEFORE killing the server.
@@ -196,7 +196,7 @@ async fn acked_messages_survive_shutdown() {
     let client = connect_no_retry(&addr).await;
 
     let resp = client
-        .create_stream(b"sd_durable", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0)
+        .create_stream(b"sd_durable", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = parse_id(&resp);
@@ -254,7 +254,7 @@ async fn sigterm_triggers_graceful_shutdown() {
     let client = connect_no_retry(&addr).await;
 
     let resp = client
-        .create_stream(b"sd_sigterm", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0)
+        .create_stream(b"sd_sigterm", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = parse_id(&resp);
@@ -301,7 +301,7 @@ async fn sigterm_raw_signal_isolated() {
     let client = connect_no_retry(&addr).await;
 
     let resp = client
-        .create_stream(b"sd_raw_sig", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0)
+        .create_stream(b"sd_raw_sig", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = parse_id(&resp);
@@ -336,7 +336,7 @@ async fn sigterm_wakes_inflight_publish_sync() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect_no_retry(&addr).await;
 
-    let resp = client.create_stream(b"sd_sig_wake", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"sd_sig_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     let mut handles = Vec::new();
@@ -371,7 +371,7 @@ async fn sigterm_wakes_inflight_publish_sync() {
 async fn double_shutdown_is_idempotent() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect_no_retry(&addr).await;
-    client.create_stream(b"sd_double", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    client.create_stream(b"sd_double", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
 
     let _ = shutdown_tx.send(true);
     let _ = shutdown_tx.send(true); // second send — must not panic
@@ -390,7 +390,7 @@ async fn shutdown_under_concurrent_publish_load() {
     let (shutdown_tx, addr) = start_server().await;
     let client = connect_no_retry(&addr).await;
 
-    let resp = client.create_stream(b"sd_load", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"sd_load", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let sid = parse_id(&resp);
 
     // Spawn 4 concurrent publish_sync producers.

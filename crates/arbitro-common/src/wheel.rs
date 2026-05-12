@@ -30,7 +30,16 @@ pub struct WheelEntry {
 }
 const _: () = assert!(core::mem::size_of::<WheelEntry>() == 16);
 
-/// Hashed timing wheel with lazy cancel semantics.
+/// Hashed timing wheel with lazy cancel semantics. Generic over the
+/// entry type so the same structure backs multiple use cases:
+/// - `TimingWheel<WheelEntry>` for ack-timeout / nack-with-delay
+///   (`WheelEntry` carries seq + consumer_id + subject_hash).
+/// - Other entry types (e.g. idempotency dedup) can use the same
+///   wheel without duplicating the bucket / advance / clamp logic.
+///
+/// `T: Copy` keeps the implementation alloc-free per insert and lets
+/// `advance` return a `Vec<T>` cheaply (the entries themselves are
+/// pulled out of the bucket by ownership).
 ///
 /// The caller is responsible for:
 /// 1. Calling `advance()` at a fixed interval (e.g., every 1 second).
@@ -38,14 +47,14 @@ const _: () = assert!(core::mem::size_of::<WheelEntry>() == 16);
 ///
 /// The wheel does NOT track time — it only knows ticks. The caller
 /// converts wall-clock intervals into tick counts.
-pub struct TimingWheel {
-    buckets: Box<[Vec<WheelEntry>]>,
+pub struct TimingWheel<T: Copy> {
+    buckets: Box<[Vec<T>]>,
     current: usize,
     num_buckets: usize,
     len: usize,
 }
 
-impl TimingWheel {
+impl<T: Copy> TimingWheel<T> {
     /// Create a new wheel with the given number of buckets.
     ///
     /// Each bucket represents one tick. With 1-second resolution:
@@ -55,7 +64,7 @@ impl TimingWheel {
     /// Delays exceeding `num_buckets` ticks are clamped to the last bucket.
     pub fn new(num_buckets: usize) -> Self {
         assert!(num_buckets > 0, "wheel must have at least 1 bucket");
-        let buckets: Vec<Vec<WheelEntry>> = (0..num_buckets).map(|_| Vec::new()).collect();
+        let buckets: Vec<Vec<T>> = (0..num_buckets).map(|_| Vec::new()).collect();
         Self {
             buckets: buckets.into_boxed_slice(),
             current: 0,
@@ -69,7 +78,7 @@ impl TimingWheel {
     /// If `delay_ticks >= num_buckets`, it is clamped to `num_buckets - 1`.
     /// O(1) amortized (Vec::push).
     #[inline]
-    pub fn insert(&mut self, entry: WheelEntry, delay_ticks: u32) {
+    pub fn insert(&mut self, entry: T, delay_ticks: u32) {
         let ticks = (delay_ticks as usize).min(self.num_buckets - 1);
         let bucket = (self.current + ticks) % self.num_buckets;
         self.buckets[bucket].push(entry);
@@ -82,7 +91,7 @@ impl TimingWheel {
     /// The caller must verify each entry is still pending (lazy cancel).
     /// Call this once per tick interval (e.g., once per second).
     #[inline]
-    pub fn advance(&mut self) -> Vec<WheelEntry> {
+    pub fn advance(&mut self) -> Vec<T> {
         self.current = (self.current + 1) % self.num_buckets;
         let bucket = core::mem::take(&mut self.buckets[self.current]);
         self.len -= bucket.len();
@@ -92,7 +101,7 @@ impl TimingWheel {
     /// Advance the wheel by one tick, draining expired entries into the
     /// provided buffer. Avoids allocation when the caller reuses a buffer.
     #[inline]
-    pub fn advance_into(&mut self, out: &mut Vec<WheelEntry>) {
+    pub fn advance_into(&mut self, out: &mut Vec<T>) {
         self.current = (self.current + 1) % self.num_buckets;
         out.clear();
         out.append(&mut self.buckets[self.current]);

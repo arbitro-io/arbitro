@@ -46,7 +46,7 @@ async fn drop_client_cancels_all_tasks_under_500ms() {
     let client = connect(&addr).await;
 
     let resp = client
-        .create_stream(b"shutdown-test", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"shutdown-test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

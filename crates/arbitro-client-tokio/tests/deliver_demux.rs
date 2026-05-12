@@ -48,7 +48,7 @@ async fn wildcard_subject_fanout_correct() {
 
     // ── set up stream ────────────────────────────────────────────────────────
     let resp = client
-        .create_stream(b"deliver-test", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"deliver-test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -138,7 +138,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
 
     // ── Stream A + consumer A ─────────────────────────────────────────────────
     let resp_sa = client
-        .create_stream(b"demux-stream-a", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"demux-stream-a", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await.expect("create stream A");
     let stream_a = u64::from_le_bytes(resp_sa[..8].try_into().unwrap()) as u32;
 
@@ -149,7 +149,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
 
     // ── Stream B + consumer B ─────────────────────────────────────────────────
     let resp_sb = client
-        .create_stream(b"demux-stream-b", b">", 0, 0, 0, 1, 0, 0, 0)
+        .create_stream(b"demux-stream-b", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await.expect("create stream B");
     let stream_b = u64::from_le_bytes(resp_sb[..8].try_into().unwrap()) as u32;
 

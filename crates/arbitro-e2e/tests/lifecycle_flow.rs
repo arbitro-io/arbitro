@@ -42,7 +42,7 @@ async fn trace_publish_subscribe_ack_flow() {
     let addr = start_server().await;
     let client = connect(&addr).await;
 
-    let resp = client.create_stream(b"trace_stream", b">", 0, 0, 0, 1, 0, 0, 0).await.unwrap();
+    let resp = client.create_stream(b"trace_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = parse_id(&resp);
 
     let resp = client.create_consumer(stream_id, b"trace_worker", b"", b"", 10, 1, 0, 0, 0, 0)
