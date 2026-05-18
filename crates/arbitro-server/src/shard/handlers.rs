@@ -720,11 +720,26 @@ impl CommandWorker {
         &mut self,
         cmd: PurgeStreamCmd,
     ) {
-        let deleted = self.store.lock().purge();
-        // After a full purge the store's first_seq equals next_seq — no
-        // entries exist. The drain cursor may be behind next_seq; leave it
-        // where it is. New publishes will fire the gate and the drain will
-        // see them at their fresh sequences.
+        let new_last_seq = {
+            let mut g = self.store.lock();
+            let deleted = g.purge();
+            let info = g.info();
+            (deleted, info.last_seq)
+        };
+        let (deleted, last_seq) = new_last_seq;
+        // M4: snap the drain cursor forward to the store's last_seq so the
+        // drain doesn't try to deliver entries from a window that no
+        // longer exists (purge resets `first_seq` to `last_seq + 1`).
+        // Without this, the next drain cycle reads `for_each(prev_cursor+1
+        // .. last_seq+1)` and gets an empty walk forever, OR — worse on a
+        // store that re-issues seqs after purge — replays the brand new
+        // entries from the wrong cursor.
+        self.counters.set_cursor(last_seq);
+        // Drop any pending rewind that referenced the purged window;
+        // it would otherwise rewind into a non-existent range. M3-aware
+        // unconditional clear is fine here: purge is admin-cold-path and
+        // the drain is parked anyway.
+        self.counters.clear_rewind();
         let _ = cmd.reply.send(deleted);
     }
 

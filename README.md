@@ -95,7 +95,7 @@ cd /tmp/arbitro && ./arbitro-server
 ### Docker
 
 ```bash
-docker compose up -d   # default port: 4222
+docker compose up -d   # default port: 9898
 ```
 
 ## Environment
@@ -108,6 +108,15 @@ docker compose up -d   # default port: 4222
 | `ARBITRO_IDLE_TIMEOUT` | `300` | Idle timeout (s) |
 | `ARBITRO_KEEPALIVE_INTERVAL` | `30` | Keepalive ping interval (s) |
 | `ARBITRO_METRICS_INTERVAL` | `5` | Periodic metrics log interval (s). `0` disables. |
+| `ARBITRO_AUTH_TOKEN` | _unset_ | If set, every connection must send `Auth` (shared bearer token) before any other frame. |
+| `ARBITRO_DATA_DIR` | _unset_ | Directory for the persistent journal + command log. Disables in-memory store when set. |
+| `ARBITRO_TLS_CERT` | _unset_ | Path to a PEM cert. Enables TLS; `ARBITRO_TLS_KEY` required. |
+| `ARBITRO_TLS_KEY` | _unset_ | Path to the matching PEM private key. |
+| `ARBITRO_SHARDS` | `num_cpus` | Number of shard workers (one OS thread each). |
+| `ARBITRO_SHUTDOWN_TIMEOUT` | `10` | Grace period (s) for in-flight writes before force-close on shutdown. |
+| `ARBITRO_CHANNEL_CAPACITY` | `4096` | Per-shard command channel capacity. |
+| `ARBITRO_MAX_FEED_PER_CYCLE` | `256` | Max store entries fed into the drain per cycle. |
+| `ARBITRO_DRAIN_BATCH_SIZE` | `256` | Entries per `RepBatch` frame emitted by the drain. |
 
 ## Observability
 
@@ -196,7 +205,6 @@ client.publish_batch(b"ORDERS", &[
 ### Phase 2 — Persistence & Connectivity (done)
 - [x] Disk persistence (TolerantStore)
 - [x] Crash-safe journaling (Magic Byte 0xAF)
-- [x] Sync acks (`AckSync`)
 - [x] Per-entry `consumer_id` routing (broadcast collapse)
 - [ ] Subject scavenging (TTL-based inactive-slot cleanup)
 - [ ] Multi-language clients (TypeScript, Go)
