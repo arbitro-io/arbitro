@@ -125,36 +125,7 @@ impl CreateStreamFrame {
 // DeleteStream / GetStream / PurgeStream / DrainSubject migrated to serde —
 // see `v2::cold` module.
 
-// ── ListStreams — sized (no tail) ──────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ListStreamsBody {
-    pub offset: U32,
-    pub limit:  U32,
-}
-pub const LIST_STREAMS_BODY_SIZE: usize = core::mem::size_of::<ListStreamsBody>();
-const _: () = assert!(LIST_STREAMS_BODY_SIZE == 8);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ListStreamsFrame {
-    pub header: Header,
-    pub body:   ListStreamsBody,
-}
-const _: () = assert!(core::mem::size_of::<ListStreamsFrame>() == HEADER_SIZE + LIST_STREAMS_BODY_SIZE);
-
-impl ListStreamsFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + LIST_STREAMS_BODY_SIZE;
-
-    #[inline(always)]
-    pub fn new(seq: u64, offset: u32, limit: u32) -> Self {
-        Self {
-            header: Header::new(Action::ListStreams.as_u16(), LIST_STREAMS_BODY_SIZE as u32, seq),
-            body:   ListStreamsBody { offset: U32::new(offset), limit: U32::new(limit) },
-        }
-    }
-}
+// ListStreams migrated to serde — see `v2::cold` module.
 
 #[cfg(test)]
 mod tests {
@@ -178,15 +149,6 @@ mod tests {
         assert_eq!(frame.as_bytes(), &buf[..]);
     }
 
-    // delete_stream / drain_subject tests removed — frames migrated to v2::cold
-    // and tested there.
-
-    #[test]
-    fn list_streams_sized() {
-        assert_eq!(ListStreamsFrame::WIRE_SIZE, HEADER_SIZE + 8);
-        let f = ListStreamsFrame::new(1, 0, 100);
-        let bytes = f.as_bytes();
-        let p = ListStreamsFrame::ref_from_bytes(bytes).unwrap();
-        assert_eq!(p.body.limit.get(), 100);
-    }
+    // delete_stream / drain_subject / list_streams tests removed —
+    // frames migrated to v2::cold and tested there.
 }

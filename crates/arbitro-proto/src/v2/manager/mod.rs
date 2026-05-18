@@ -12,13 +12,10 @@ pub mod consumer_mgmt;
 
 pub use stream_mgmt::{
     CreateStreamBody, CreateStreamFrame, CREATE_STREAM_BODY_FIXED,
-    // Delete/Get/Purge/DrainSubject migrated to v2::cold (serde_json).
-    ListStreamsBody, ListStreamsFrame, LIST_STREAMS_BODY_SIZE,
+    // ListStreams + Delete/Get/Purge/DrainSubject migrated to v2::cold.
 };
 pub use consumer_mgmt::{
     CreateConsumerBody, CreateConsumerFrame, CREATE_CONSUMER_BODY_FIXED,
-    // Delete/Get/Pause/Resume migrated to v2::cold (serde_json).
-    ListConsumersBody, ListConsumersFrame, LIST_CONSUMERS_BODY_SIZE,
-    ConsumerStatsBody, ConsumerStatsFrame, CONSUMER_STATS_BODY_SIZE,
+    // ListConsumers + ConsumerStats + Delete/Get/Pause/Resume migrated to v2::cold.
     SubjectLimit, SUBJECT_LIMIT_HEADER_SIZE, subject_limits_tail_len,
 };

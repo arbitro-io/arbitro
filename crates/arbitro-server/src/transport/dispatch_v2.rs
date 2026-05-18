@@ -39,9 +39,7 @@ use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
-use arbitro_proto::v2::manager::consumer_mgmt::{
-    CreateConsumerFrame, ListConsumersFrame, ConsumerStatsFrame,
-};
+use arbitro_proto::v2::manager::consumer_mgmt::CreateConsumerFrame;
 use arbitro_proto::v2::manager::stream_mgmt::CreateStreamFrame;
 use bytes::{Bytes, BytesMut};
 use zerocopy::FromBytes;
@@ -1155,11 +1153,12 @@ async fn v2_consumer_stats(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match ConsumerStatsFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, ConsumerStats};
+    let body = match ConsumerStats::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
 
     // F14: route directly to the owning shard via NameRegistry — the
     // consumer lives on exactly one shard, no need to fan out queries.
@@ -1199,13 +1198,14 @@ async fn v2_list_consumers(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match ListConsumersFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, ListConsumers};
+    let body = match ListConsumers::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
     // Wire stream_id is the client-side hash; 0 = list all consumers.
     // Translate to the sequential engine id used inside the shard reply.
-    let wire_filter = f.body.stream_id.get();
+    let wire_filter = body.stream_id;
     // None = no filter (return all); Some(seq) = filter by engine seq_id.
     // Unknown wire hash → Some(u32::MAX) which matches nothing → empty list.
     let seq_filter: Option<u32> = if wire_filter == 0 {

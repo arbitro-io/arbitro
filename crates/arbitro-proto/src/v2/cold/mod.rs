@@ -151,6 +151,25 @@ cold_body! {
         pub name:    Vec<u8>,
         pub subject: Vec<u8>,
     },
+
+    // ── Listing (pagination cursor) ──────────────────────────────────
+    //
+    // `stream_id == 0` on ListConsumers means "every stream". Default
+    // server limit is 1000 — clients page with `offset`.
+    Action::ListStreams => pub struct ListStreams {
+        pub offset: u32,
+        pub limit:  u32,
+    },
+    Action::ListConsumers => pub struct ListConsumers {
+        pub stream_id: u32,
+        pub offset:    u32,
+        pub limit:     u32,
+    },
+
+    // ── ConsumerStats (one-off live pending-ack query) ───────────────
+    Action::ConsumerStats => pub struct ConsumerStats {
+        pub consumer_id: u32,
+    },
 }
 
 #[cfg(test)]

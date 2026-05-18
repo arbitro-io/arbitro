@@ -18,12 +18,11 @@ use arbitro_proto::v2::ingress::{
     BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubFrame,
 };
 use arbitro_proto::v2::manager::{
-    CreateConsumerFrame, CreateStreamFrame, ListConsumersFrame, ListStreamsFrame,
-    ConsumerStatsFrame, SubjectLimit, subject_limits_tail_len,
+    CreateConsumerFrame, CreateStreamFrame, SubjectLimit, subject_limits_tail_len,
 };
 use arbitro_proto::v2::cold::{
-    ColdBody, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer, GetStream,
-    PurgeStream, Unsubscribe,
+    ColdBody, ConsumerStats, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer, GetStream,
+    ListConsumers, ListStreams, PurgeStream, Unsubscribe,
 };
 
 // ─── BatchEntry ───────────────────────────────────────────────────────
@@ -152,10 +151,9 @@ pub(crate) fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> 
     DrainSubject { name: name.to_vec(), subject: subject.to_vec() }.encode(seq)
 }
 
-/// ListStreams request frame (sized).
+/// ListStreams request frame — cold path (v2::cold).
 pub(crate) fn encode_list_streams_v2(seq: u64, offset: u32, limit: u32) -> Bytes {
-    let f = ListStreamsFrame::new(seq, offset, limit);
-    Bytes::copy_from_slice(f.as_bytes())
+    ListStreams { offset, limit }.encode(seq)
 }
 
 /// CreateConsumer request frame.
@@ -193,10 +191,9 @@ pub(crate) fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
     DeleteConsumer { consumer_id }.encode(seq)
 }
 
-/// ConsumerStats request frame (sized, 8B body).
+/// ConsumerStats request frame — cold path (v2::cold).
 pub(crate) fn encode_consumer_stats_v2(seq: u64, consumer_id: u32) -> Bytes {
-    let f = ConsumerStatsFrame::new(seq, consumer_id);
-    Bytes::copy_from_slice(f.as_bytes())
+    ConsumerStats { consumer_id }.encode(seq)
 }
 
 /// GetConsumer — cold-path frame (v2::cold).
@@ -204,15 +201,14 @@ pub(crate) fn encode_get_consumer_v2(seq: u64, stream_id: u32, name: &[u8]) -> B
     GetConsumer { stream_id, name: name.to_vec() }.encode(seq)
 }
 
-/// ListConsumers request frame (sized).
+/// ListConsumers request frame — cold path (v2::cold).
 pub(crate) fn encode_list_consumers_v2(
     seq: u64,
     stream_id: u32,
     offset: u32,
     limit: u32,
 ) -> Bytes {
-    let f = ListConsumersFrame::new(seq, stream_id, offset, limit);
-    Bytes::copy_from_slice(f.as_bytes())
+    ListConsumers { stream_id, offset, limit }.encode(seq)
 }
 
 // ─── Tokio-only frames (no legacy counterpart) ────────────────────────

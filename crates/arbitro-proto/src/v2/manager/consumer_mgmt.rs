@@ -245,89 +245,8 @@ impl CreateConsumerFrame {
 
 // DeleteConsumer migrated to serde — see `v2::cold` module.
 
-// ── ConsumerStats (sized, 8 B body) ────────────────────────────────────
-//
-// Query a single consumer's live pending-ack count. Reply is a standard
-// `RepOk` frame whose 8-byte `ref_seq` body is reinterpreted as the
-// `u64` count of in-flight (delivered, unacked) messages for that
-// consumer. Wire-level cost: one round-trip; engine cost: one O(1) Vec
-// read of `consumer_inflight`.
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ConsumerStatsBody {
-    pub consumer_id: U32,
-    pub _pad:        U32,
-}
-pub const CONSUMER_STATS_BODY_SIZE: usize = core::mem::size_of::<ConsumerStatsBody>();
-const _: () = assert!(CONSUMER_STATS_BODY_SIZE == 8);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ConsumerStatsFrame {
-    pub header: Header,
-    pub body:   ConsumerStatsBody,
-}
-const _: () = assert!(core::mem::size_of::<ConsumerStatsFrame>() == HEADER_SIZE + CONSUMER_STATS_BODY_SIZE);
-
-impl ConsumerStatsFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + CONSUMER_STATS_BODY_SIZE;
-
-    #[inline(always)]
-    pub fn new(seq: u64, consumer_id: u32) -> Self {
-        Self {
-            header: Header::new(Action::ConsumerStats.as_u16(), CONSUMER_STATS_BODY_SIZE as u32, seq),
-            body:   ConsumerStatsBody { consumer_id: U32::new(consumer_id), _pad: U32::new(0) },
-        }
-    }
-}
-
-// ── Pause/Resume Consumer (M11) ─────────────────────────────────────────
-//
-// Sized 8B body, identical shape to DeleteConsumer. Reply = standard RepOk.
-
-// PauseConsumer / ResumeConsumer migrated to serde — see `v2::cold` module.
-// The wire bodies now ride as JSON inside the standard Header envelope.
-
-// GetConsumer migrated to serde — see `v2::cold` module.
-
-// ── ListConsumers (sized) ──────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ListConsumersBody {
-    pub stream_id: U32,
-    pub offset:    U32,
-    pub limit:     U32,
-    pub _pad:      U32,
-}
-pub const LIST_CONSUMERS_BODY_SIZE: usize = core::mem::size_of::<ListConsumersBody>();
-const _: () = assert!(LIST_CONSUMERS_BODY_SIZE == 16);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ListConsumersFrame {
-    pub header: Header,
-    pub body:   ListConsumersBody,
-}
-const _: () = assert!(core::mem::size_of::<ListConsumersFrame>() == HEADER_SIZE + LIST_CONSUMERS_BODY_SIZE);
-
-impl ListConsumersFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + LIST_CONSUMERS_BODY_SIZE;
-
-    #[inline(always)]
-    pub fn new(seq: u64, stream_id: u32, offset: u32, limit: u32) -> Self {
-        Self {
-            header: Header::new(Action::ListConsumers.as_u16(), LIST_CONSUMERS_BODY_SIZE as u32, seq),
-            body:   ListConsumersBody {
-                stream_id: U32::new(stream_id),
-                offset:    U32::new(offset),
-                limit:     U32::new(limit),
-                _pad:      U32::new(0),
-            },
-        }
-    }
-}
+// ConsumerStats / ListConsumers migrated to serde — see `v2::cold` module.
+// PauseConsumer / ResumeConsumer / GetConsumer / DeleteConsumer also migrated.
 
 #[cfg(test)]
 mod tests {
@@ -412,13 +331,6 @@ mod tests {
         assert_eq!(collected[1].1, 2);
     }
 
-    // delete_consumer test removed — frame migrated to v2::cold and tested there.
-
-    #[test]
-    fn list_consumers_sized() {
-        let f = ListConsumersFrame::new(1, 7, 0, 100);
-        let p = ListConsumersFrame::ref_from_bytes(f.as_bytes()).unwrap();
-        assert_eq!(p.body.stream_id.get(), 7);
-        assert_eq!(p.body.limit.get(), 100);
-    }
+    // delete_consumer / list_consumers / consumer_stats tests removed —
+    // frames migrated to v2::cold and tested there.
 }
