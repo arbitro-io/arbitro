@@ -213,6 +213,21 @@ impl ArbitroServer {
             }
         }
 
+        // H15: minimal Prometheus /metrics endpoint. Enabled when
+        // ARBITRO_METRICS_LISTEN is set (e.g. "0.0.0.0:9091"); off by
+        // default. Hand-rolled text-format, no hyper / no prometheus
+        // crate dep.
+        if let Ok(addr) = std::env::var("ARBITRO_METRICS_LISTEN") {
+            if !addr.is_empty() {
+                let m_server = self.server.clone();
+                let m_registry = self.registry.clone();
+                let m_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    run_metrics_endpoint(addr, m_server, m_registry, m_shutdown).await;
+                });
+            }
+        }
+
         // Per-connection ingress: each read_loop dispatches frames directly.
         // No central mpsc — TCP guarantees order per connection, and each
         // connection already runs in its own task, so we get free parallelism
@@ -913,6 +928,171 @@ async fn metrics_loop(
 
         prev = acc;
     }
+}
+
+/// H15: Prometheus `/metrics` HTTP endpoint.
+///
+/// Hand-rolled text-format exporter — no hyper, no `prometheus` crate.
+/// Aggregates per-shard counters and emits one line per metric. Any
+/// path other than `/metrics` returns 404.
+async fn run_metrics_endpoint(
+    addr: String,
+    server: ShardRouter,
+    registry: ConnectionRegistry,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target = "metrics", addr = %addr, error = %e, "bind failed");
+            return;
+        }
+    };
+    tracing::info!(target = "metrics", addr = %addr, "Prometheus exporter listening on /metrics");
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            res = listener.accept() => {
+                let (mut sock, _peer) = match res {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let srv = server.clone();
+                let reg = registry.clone();
+                tokio::spawn(async move {
+                    // Read request headers (up to 2 KiB).
+                    let mut buf = [0u8; 2048];
+                    let mut total = 0usize;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            while total < buf.len() {
+                                let n = match sock.read(&mut buf[total..]).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => n,
+                                };
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    return;
+                                }
+                            }
+                        },
+                    ).await;
+
+                    // Cheap path parse — first line is "GET /path HTTP/1.1".
+                    let path = parse_request_path(&buf[..total]);
+                    if path != "/metrics" {
+                        let body = b"not found";
+                        let resp = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                        let _ = sock.write_all(body).await;
+                        let _ = sock.shutdown().await;
+                        return;
+                    }
+
+                    let body = build_prometheus_text(&srv, &reg).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        }
+    }
+}
+
+/// Extract the path from a raw HTTP request. Returns "" on malformed input.
+fn parse_request_path(buf: &[u8]) -> &str {
+    // Find first '\n' or end.
+    let line_end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+    let line = &buf[..line_end];
+    // line == "GET /path HTTP/1.1\r"
+    let mut parts = line.split(|&b| b == b' ');
+    let _method = parts.next();
+    let path = match parts.next() {
+        Some(p) => p,
+        None => return "",
+    };
+    std::str::from_utf8(path).unwrap_or("")
+}
+
+/// Render Prometheus text-format from current broker state.
+async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegistry) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(2048);
+
+    // ── Per-shard counters ──────────────────────────────────────────
+    let _ = writeln!(out, "# HELP arbitro_publish_total Total publish entries accepted.");
+    let _ = writeln!(out, "# TYPE arbitro_publish_total counter");
+    let _ = writeln!(out, "# HELP arbitro_deliver_total Total deliveries to consumers.");
+    let _ = writeln!(out, "# TYPE arbitro_deliver_total counter");
+    let _ = writeln!(out, "# HELP arbitro_ack_total Total acks accepted.");
+    let _ = writeln!(out, "# TYPE arbitro_ack_total counter");
+    let _ = writeln!(out, "# HELP arbitro_nack_total Total nacks accepted.");
+    let _ = writeln!(out, "# TYPE arbitro_nack_total counter");
+
+    let mut total_streams = 0usize;
+    let mut total_consumers = 0usize;
+    let mut total_ack_pending = 0u64;
+    for i in 0..server.shard_count() {
+        let shard = server.shard(i);
+        if let Ok(snap) = shard.metrics().await {
+            let _ = writeln!(out, "arbitro_publish_total{{shard=\"{i}\"}} {}", snap.publish_entries_accepted);
+            let _ = writeln!(out, "arbitro_deliver_total{{shard=\"{i}\"}} {}", snap.claim_entries_delivered);
+            let _ = writeln!(out, "arbitro_ack_total{{shard=\"{i}\"}} {}", snap.ack_accepted);
+            let _ = writeln!(out, "arbitro_nack_total{{shard=\"{i}\"}} {}", snap.nack_accepted);
+        }
+        if let Ok(r) = shard.list_streams().await {
+            total_streams += r.streams.len();
+        }
+        if let Ok(states) = shard.consumer_states().await {
+            total_consumers += states.len();
+            for s in &states {
+                total_ack_pending += s.ack_pending as u64;
+            }
+        }
+    }
+
+    // ── Gauges ──────────────────────────────────────────────────────
+    let _ = writeln!(out, "# HELP arbitro_streams Number of streams.");
+    let _ = writeln!(out, "# TYPE arbitro_streams gauge");
+    let _ = writeln!(out, "arbitro_streams {total_streams}");
+
+    let _ = writeln!(out, "# HELP arbitro_consumers Number of consumers.");
+    let _ = writeln!(out, "# TYPE arbitro_consumers gauge");
+    let _ = writeln!(out, "arbitro_consumers {total_consumers}");
+
+    let _ = writeln!(out, "# HELP arbitro_connections Active TCP connections.");
+    let _ = writeln!(out, "# TYPE arbitro_connections gauge");
+    let _ = writeln!(out, "arbitro_connections {}", registry.active_count());
+
+    let _ = writeln!(out, "# HELP arbitro_ack_pending Total in-flight unacked deliveries.");
+    let _ = writeln!(out, "# TYPE arbitro_ack_pending gauge");
+    let _ = writeln!(out, "arbitro_ack_pending {total_ack_pending}");
+
+    // ── Silent drops ────────────────────────────────────────────────
+    let drops = server.silent_drops().snapshot();
+    let _ = writeln!(out, "# HELP arbitro_silent_drops_conn_write Frames dropped at conn writer queue.");
+    let _ = writeln!(out, "# TYPE arbitro_silent_drops_conn_write counter");
+    let _ = writeln!(out, "arbitro_silent_drops_conn_write {}", drops.conn_write);
+
+    let _ = writeln!(out, "# HELP arbitro_silent_drops_notify_ring Drain notify-ring drops.");
+    let _ = writeln!(out, "# TYPE arbitro_silent_drops_notify_ring counter");
+    let _ = writeln!(out, "arbitro_silent_drops_notify_ring {}", drops.notify_ring);
+
+    let _ = writeln!(out, "# HELP arbitro_silent_drops_drain_evt Drain-event drops.");
+    let _ = writeln!(out, "# TYPE arbitro_silent_drops_drain_evt counter");
+    let _ = writeln!(out, "arbitro_silent_drops_drain_evt {}", drops.drain_evt);
+
+    out
 }
 
 /// L15: build a JSON diagnostic snapshot — used by the SIGUSR1 handler.

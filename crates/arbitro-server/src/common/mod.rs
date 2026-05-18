@@ -11,10 +11,12 @@
 //! - `reply_v2` depends on `crate::transport::ConnectionRegistry`.
 //! - `session` depends on `tokio::sync::mpsc` (banned inside the engine).
 
+pub mod latency;
 pub mod reply_v2;
 pub mod session;
 pub mod silent_drops;
 
+pub use latency::Latency;
 pub use silent_drops::SilentDrops;
 
 pub use arbitro_common::{Gate, NameRegistry};
