@@ -270,6 +270,7 @@ impl ShardRouter {
                 silent_drops: Arc::clone(&silent_drops),
                 pending_consumer_remove: Vec::new(),
                 last_wheel_tick: None,
+                evict_resume_seq: 0,
             };
 
             // M15: supervise the command-worker task — if it panics

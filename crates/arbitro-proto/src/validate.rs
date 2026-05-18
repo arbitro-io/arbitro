@@ -66,10 +66,10 @@ pub fn validate_subject(subject: &[u8]) -> Result<(), ValidateError> {
     }
 
     // Token-level rules
-    let mut tokens = subject.split(|&b| b == b'.');
+    let tokens = subject.split(|&b| b == b'.');
     let mut last_token = b"" as &[u8];
 
-    while let Some(token) = tokens.next() {
+    for token in tokens {
         if token.is_empty() {
             // Empty token: ".." or leading/trailing dot
             return Err(ValidateError::InvalidChar(b'.'));
@@ -104,43 +104,33 @@ pub fn validate_subject(subject: &[u8]) -> Result<(), ValidateError> {
 ///   - `"orders.*"` vs `"orders.created"` → overlap
 ///   - `"*"` vs `"orders"` → overlap
 ///   - `">"` vs anything → overlap
+///
+/// **M12 / complexity**: iterative scan, O(min(len_a, len_b)) — every
+/// step advances BOTH cursors by exactly one token (`*` consumes one
+/// token on each side; `>` returns immediately; literal mismatch
+/// fails). No back-tracking, no recursion. TODO.md flagged this as
+/// "exponential worst case" but that referred to a previous version
+/// that explored multiple branches per `*`; the current shape can
+/// only choose one continuation per call.
 #[inline]
 pub fn subjects_overlap(a: &[u8], b: &[u8]) -> bool {
-    let a_tokens: Vec<&[u8]> = a.split(|&c| c == b'.').collect();
-    let b_tokens: Vec<&[u8]> = b.split(|&c| c == b'.').collect();
-    tokens_overlap(&a_tokens, 0, &b_tokens, 0)
-}
-
-fn tokens_overlap(a: &[&[u8]], ai: usize, b: &[&[u8]], bi: usize) -> bool {
-    // Both exhausted — full match
-    if ai == a.len() && bi == b.len() {
-        return true;
+    let mut ai = a.split(|&c| c == b'.');
+    let mut bi = b.split(|&c| c == b'.');
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return true,
+            (None, Some(_)) | (Some(_), None) => return false,
+            (Some(at), Some(bt)) => {
+                if at == b">" || bt == b">" {
+                    return true;
+                }
+                if at == b"*" || bt == b"*" || at == bt {
+                    continue; // single-token consumption, no branching
+                }
+                return false;
+            }
+        }
     }
-
-    // One exhausted, other still has tokens — no match (unless '>' already consumed)
-    if ai == a.len() || bi == b.len() {
-        return false;
-    }
-
-    let at = a[ai];
-    let bt = b[bi];
-
-    // '>' matches everything remaining
-    if at == b">" || bt == b">" {
-        return true;
-    }
-
-    // '*' matches any single token
-    if at == b"*" || bt == b"*" {
-        return tokens_overlap(a, ai + 1, b, bi + 1);
-    }
-
-    // Literal match
-    if at == bt {
-        return tokens_overlap(a, ai + 1, b, bi + 1);
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -295,5 +285,52 @@ mod tests {
     #[test]
     fn no_overlap_different_depth() {
         assert!(!subjects_overlap(b"a.b", b"a.b.c"));
+    }
+
+    /// M12 — pathological input that would have blown the call stack
+    /// or run for seconds if the implementation had branching per `*`.
+    /// Various 64-deep inputs; should complete in microseconds.
+    /// The hard guarantee is "doesn't stack-overflow" — the iterative
+    /// loop has zero recursion depth.
+    #[test]
+    fn m12_pathological_wildcards_complete_quickly() {
+        // 64 stars joined by '.'  →  tokens ["*", "*", …, "*"] (64).
+        let many_stars: Vec<u8> = (0..64)
+            .map(|_| "*")
+            .collect::<Vec<_>>()
+            .join(".")
+            .into_bytes();
+        // 64 unique literals.
+        let many_lits: Vec<u8> = (0..64)
+            .map(|i| format!("tok{i}"))
+            .collect::<Vec<_>>()
+            .join(".")
+            .into_bytes();
+
+        let start = std::time::Instant::now();
+
+        // Same pattern on both sides: every `*` matches `*` → continue.
+        assert!(subjects_overlap(&many_stars, &many_stars));
+        // 64 stars overlap 64 literals — each `*` absorbs one token.
+        assert!(subjects_overlap(&many_stars, &many_lits));
+        // `>` as a single token absorbs ANY non-empty remainder.
+        assert!(subjects_overlap(b">", &many_lits));
+        assert!(subjects_overlap(&many_lits, b">"));
+        // All literals, mismatch on the last token → no overlap.
+        let mut last_mismatch = many_lits.clone();
+        *last_mismatch.last_mut().unwrap() = b'Z';
+        assert!(!subjects_overlap(&many_lits, &last_mismatch));
+        // Different depth → no overlap (consistent with
+        // `no_overlap_different_depth`).
+        assert!(!subjects_overlap(&many_stars, b"a.b.c"));
+
+        // Generous bound — proper iterative impl runs in microseconds,
+        // the dreaded exponential would take ~minutes for 64 wildcards.
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(10),
+            "subjects_overlap must be linear in min(len_a, len_b) — \
+             took {:?}",
+            start.elapsed(),
+        );
     }
 }

@@ -80,6 +80,7 @@ impl PubWithHeadersFrame {
         HEADER_SIZE + PUB_WITH_HEADERS_BODY_FIXED + subject_len + headers_len + payload_len
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_into<'a>(
         out: &'a mut [u8],
         seq: u64,

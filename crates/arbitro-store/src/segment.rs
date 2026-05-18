@@ -22,6 +22,7 @@ pub fn create_active_segment(path: &Path) -> std::io::Result<MmapMut> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)?;
     file.set_len(MAX_SEGMENT_BYTES)?;
     unsafe { MmapMut::map_mut(&file) }

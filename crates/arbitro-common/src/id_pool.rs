@@ -129,7 +129,7 @@ impl IdPool {
         // Linear scan is O(free_list.len()); acceptable for low-frequency
         // delete ops. For very large churn a HashSet could be used but
         // adds memory overhead.
-        if self.free_slots.iter().any(|&s| s == slot) {
+        if self.free_slots.contains(&slot) {
             return Err(PoolError::DoubleFree);
         }
         self.free_slots.push(slot);
@@ -243,7 +243,7 @@ impl IdPool {
         if (slot as usize) >= self.generations.len() {
             return Err(PoolError::OutOfRange);
         }
-        if self.free_slots.iter().any(|&s| s == slot) {
+        if self.free_slots.contains(&slot) {
             return Err(PoolError::DoubleFree);
         }
         self.free_slots.push(slot);

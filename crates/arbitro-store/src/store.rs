@@ -118,5 +118,5 @@ pub trait Store: Send + Sync {
 /// Used by drain implementations.
 #[inline]
 pub fn entry_matches(entry: &Entry<'_>, pattern: &[u8]) -> bool {
-    subject_matches(pattern, &entry.subject)
+    subject_matches(pattern, entry.subject)
 }

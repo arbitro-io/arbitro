@@ -769,6 +769,11 @@ impl CommandWorker {
     /// minimum first-valid seq across all streams — we cannot evict
     /// past any stream's oldest valid entry. Streams without max_age
     /// implicitly constrain the truncation point to their oldest entry.
+    /// F16 — maximum entries to walk in a single `evict_expired` call.
+    /// Caps the per-call cost so a backlog cannot stall the cold path
+    /// loop for tens of milliseconds. Walks resume on the next call.
+    const EVICT_WALK_CAP: u64 = 10_000;
+
     pub(in crate::shard) fn evict_expired(&mut self) {
         // Quick check: any stream with max_age configured?
         let has_age_streams = self.stream_retention.values().any(|r| r.max_age_ms > 0);
@@ -803,6 +808,19 @@ impl CommandWorker {
             }
         }
 
+        // F16: bounded incremental walk. Start at the resume cursor or
+        // at `info.first_seq` (whichever is higher and still within the
+        // store) and scan at most EVICT_WALK_CAP entries. The cursor
+        // resets to 0 when we finish a pass (truncation or hit a valid
+        // entry that bounds truncation) so the next call restarts at
+        // the new `first_seq`. This caps the worst-case latency of a
+        // single evict tick to a bounded number of entries scanned
+        // regardless of store size — large stores with mostly-fresh
+        // data no longer pay the full walk cost every 5 seconds.
+        let start = info.first_seq.max(self.evict_resume_seq);
+        let cap_end = start.saturating_add(Self::EVICT_WALK_CAP);
+        let end = cap_end.min(info.last_seq.saturating_add(1));
+
         // Single pass: find the minimum first-valid seq across all streams.
         // For streams with max_age: first entry with timestamp >= cutoff.
         // For streams without max_age (cutoff_ts == 0): their first entry
@@ -811,7 +829,7 @@ impl CommandWorker {
         // Track which streams we've already resolved (found first valid entry).
         let mut resolved = vec![false; max_stream_idx + 1];
 
-        let _ = store.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+        let _ = store.for_each(start, end, &mut |entry| {
             let sid = entry.stream_id as usize;
             if sid >= resolved.len() {
                 // Unknown stream — conservative: constrain to this seq.
@@ -851,6 +869,17 @@ impl CommandWorker {
                     "evict_expired: truncated aged entries"
                 );
             }
+            // Restart at the new front next time.
+            self.evict_resume_seq = 0;
+        } else if end < info.last_seq.saturating_add(1) {
+            // Walk got capped before finishing; resume past the last
+            // scanned entry on the next call.
+            self.evict_resume_seq = end;
+        } else {
+            // Walk reached the tail without finding a boundary — all
+            // visible data is fresh. Reset so the next call starts at
+            // the current front again.
+            self.evict_resume_seq = 0;
         }
     }
 

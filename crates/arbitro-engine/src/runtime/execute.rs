@@ -27,7 +27,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
     match *cmd {
         Command::Delivered {
             binding_id,
-            ref entries,
+            entries,
             ..
         } => {
             m.claim_entries_delivered
@@ -66,7 +66,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
 
         Command::Ack {
             consumer_id,
-            ref entries,
+            entries,
         } => {
             m.ack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -98,7 +98,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
 
         Command::Nack {
             consumer_id,
-            ref entries,
+            entries,
         } => {
             m.nack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);

@@ -120,7 +120,6 @@ impl ArbitroEngine {
 
     /// Apply a single `Command` to engine state. Returns events for
     /// the worker to react to.
-    #[must_use]
     #[inline]
     pub fn execute(&mut self, cmd: &command::Command<'_>) -> DeltaEvents {
         runtime::execute::apply(&mut self.ctx, cmd)
@@ -147,7 +146,6 @@ impl ArbitroEngine {
     /// reverse indexes). Without that cascade, the next CreateConsumer
     /// with the same name on a recreated stream silently aliases to a
     /// defunct id pointing at a catalog slot this method just removed.
-    #[must_use]
     pub fn delete_stream(&mut self, id: StreamId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
 
@@ -193,7 +191,6 @@ impl ArbitroEngine {
     /// consumer. Reports the removed id in `events.consumers_removed`
     /// so the server mirrors the cleanup into NameRegistry — same
     /// signal the cascade from `delete_stream` produces.
-    #[must_use]
     pub fn delete_consumer(&mut self, id: ConsumerId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
 
@@ -224,7 +221,6 @@ impl ArbitroEngine {
 
     /// Subscribe: bind a subscription to a connection. Creates a binding,
     /// updates match table with connection_id, increments demand.
-    #[must_use]
     pub fn subscribe(
         &mut self,
         connection_id: ConnectionId,
@@ -239,7 +235,6 @@ impl ArbitroEngine {
     }
 
     /// Unsubscribe: retire a binding.
-    #[must_use]
     pub fn unsubscribe(&mut self, binding_id: BindingId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
         runtime::retire::retire_binding(&mut self.ctx, binding_id, &mut events);
@@ -252,7 +247,6 @@ impl ArbitroEngine {
     }
 
     /// Mark a connection as dead. Retires all bindings on this connection.
-    #[must_use]
     pub fn mark_connection_dead(&mut self, connection_id: ConnectionId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
         runtime::retire::retire_bindings_for_connection(

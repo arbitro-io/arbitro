@@ -114,7 +114,7 @@ impl TolerantStore {
             .map_err(|_| StoreError::NotFound)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "log"))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
             .collect();
         paths.sort();
 
@@ -1036,7 +1036,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().map_or(false, |x| x == "log"))
+            .find(|p| p.extension().is_some_and(|x| x == "log"))
             .expect("sealed segment");
         {
             let mut file = std::fs::OpenOptions::new()

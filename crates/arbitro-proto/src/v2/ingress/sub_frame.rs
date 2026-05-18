@@ -106,4 +106,34 @@ mod tests {
         assert_eq!(f.body.options_flags.get(), 0x01);
         assert_eq!(f.filter(), filter);
     }
+
+    /// L8 — `options_flags` is M18-reserved (no bit consumed yet) but
+    /// the field must survive a wire roundtrip bit-for-bit. A client
+    /// that already sets a future bit must observe it unchanged on
+    /// the other end — otherwise the M18 docstring is a lie.
+    #[test]
+    fn l8_options_flags_reserved_bits_roundtrip() {
+        let filter = b"x";
+        let size = SubFrame::wire_size(filter.len());
+
+        // Walk every bit position independently — the encoder must
+        // not mask, clobber, or normalize ANY of the 16 reserved bits.
+        for bit in 0..16 {
+            let flag = 1u16 << bit;
+            let mut buf = vec![0u8; size];
+            SubFrame::encode_into(&mut buf, 9, 1, 2, flag, filter);
+            let f = SubFrame::ref_from_bytes(&buf).unwrap();
+            assert_eq!(
+                f.body.options_flags.get(),
+                flag,
+                "options_flags must preserve bit {bit} (sent {flag:#06x})",
+            );
+        }
+
+        // Full 0xFFFF round-trip — every bit set simultaneously.
+        let mut buf = vec![0u8; size];
+        SubFrame::encode_into(&mut buf, 9, 1, 2, 0xFFFF, filter);
+        let f = SubFrame::ref_from_bytes(&buf).unwrap();
+        assert_eq!(f.body.options_flags.get(), 0xFFFF);
+    }
 }

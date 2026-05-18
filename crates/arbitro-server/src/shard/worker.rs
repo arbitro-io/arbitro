@@ -384,6 +384,12 @@ pub struct CommandWorker {
     /// `Option` stays `None` until the first command runs, so the
     /// behaviour for a quiescent shard is unchanged.
     pub(super) last_wheel_tick: Option<Instant>,
+    /// F16 — incremental eviction resume cursor. evict_expired walks the
+    /// store at most `EVICT_WALK_CAP` entries per call and stores the
+    /// next-to-scan seq here so the following call picks up from where
+    /// it left off. Reset back to `0` when the walk completes or the
+    /// store is rotated.
+    pub(super) evict_resume_seq: u64,
 }
 
 impl CommandWorker {

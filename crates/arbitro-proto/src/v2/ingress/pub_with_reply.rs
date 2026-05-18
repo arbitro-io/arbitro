@@ -89,6 +89,7 @@ impl PubWithReplyFrame {
         HEADER_SIZE + PUB_WITH_REPLY_BODY_FIXED + subject_len + reply_len + payload_len
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_into<'a>(
         out: &'a mut [u8],
         seq: u64,
