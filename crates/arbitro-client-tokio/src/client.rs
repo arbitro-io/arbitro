@@ -423,6 +423,88 @@ impl Client {
         ).await
     }
 
+    // ── L13: convenience helpers mirroring the TS client ──────────────
+
+    /// L13: `true` iff the broker has a stream registered under `name`.
+    /// Wraps `get_stream` and treats `StreamNotFound` as a negative answer
+    /// (any other wire error or transport failure propagates).
+    pub async fn stream_exists(&self, name: &[u8]) -> Result<bool, ClientError> {
+        match self.get_stream(name).await {
+            Ok(_) => Ok(true),
+            Err(ClientError::Broker {
+                code: arbitro_proto::error::ErrorCode::StreamNotFound,
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// L13: `true` iff the broker has a consumer registered under
+    /// `(stream_id, name)`. Same StreamNotFound/ConsumerNotFound mapping
+    /// as `stream_exists`.
+    pub async fn consumer_exists(
+        &self,
+        stream_id: u32,
+        name: &[u8],
+    ) -> Result<bool, ClientError> {
+        match self.get_consumer(stream_id, name).await {
+            Ok(_) => Ok(true),
+            Err(ClientError::Broker {
+                code: arbitro_proto::error::ErrorCode::ConsumerNotFound,
+            }) => Ok(false),
+            Err(ClientError::Broker {
+                code: arbitro_proto::error::ErrorCode::StreamNotFound,
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// L13: create-or-return-existing variant of `create_stream`. Returns
+    /// `Ok(true)` when the stream was freshly created, `Ok(false)` when an
+    /// existing definition was returned. `StreamAlreadyExists` is treated
+    /// as the idempotent path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_stream(
+        &self,
+        name: &[u8], filter: &[u8],
+        max_msgs: u64, max_bytes: u64, max_age_secs: u64,
+        replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+        idempotency_window_ms: u32,
+    ) -> Result<bool, ClientError> {
+        match self.create_stream(
+            name, filter, max_msgs, max_bytes, max_age_secs,
+            replicas, journal_kind, retention, discard,
+            idempotency_window_ms,
+        ).await {
+            Ok(_) => Ok(true),
+            Err(ClientError::Broker {
+                code: arbitro_proto::error::ErrorCode::StreamAlreadyExists,
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// L13: create-or-return-existing variant of `create_consumer`. Same
+    /// `Ok(true)`/`Ok(false)` semantics as `upsert_stream`. Treats
+    /// `ConsumerAlreadyExists` as the idempotent path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_consumer(
+        &self,
+        stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
+        max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
+        ack_wait_ms: u32, start_seq: u64,
+    ) -> Result<bool, ClientError> {
+        match self.create_consumer(
+            stream_id, name, group, subject, max_inflight,
+            ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+        ).await {
+            Ok(_) => Ok(true),
+            Err(ClientError::Broker {
+                code: arbitro_proto::error::ErrorCode::ConsumerAlreadyExists,
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Live pending-ack count for one consumer (broker round-trip).
     ///
     /// Returns the number of messages this consumer has been delivered

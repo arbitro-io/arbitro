@@ -318,6 +318,27 @@ impl ArbitroServer {
             use tokio::signal::unix::{signal, SignalKind};
             let mut sigterm = signal(SignalKind::terminate())
                 .expect("failed to register SIGTERM handler");
+
+            // L15: SIGUSR1 dumps a diagnostic JSON snapshot to
+            // /tmp/arbitro-dump-{pid}.json. Listens forever (until process
+            // exit) so the operator can request multiple dumps per
+            // process. Wrapped in #[cfg(unix)]; non-unix is a no-op.
+            if let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) {
+                let server_dump = self.server.clone();
+                let registry_dump = self.registry.clone();
+                tokio::spawn(async move {
+                    while sigusr1.recv().await.is_some() {
+                        let pid = std::process::id();
+                        let path = format!("/tmp/arbitro-dump-{}.json", pid);
+                        let dump = build_diagnostic_dump(&server_dump, &registry_dump).await;
+                        match std::fs::write(&path, &dump) {
+                            Ok(()) => tracing::info!(path = %path, "SIGUSR1 diagnostic dump written"),
+                            Err(e) => tracing::warn!(path = %path, error = ?e, "SIGUSR1 dump write failed"),
+                        }
+                    }
+                });
+            }
+
             tokio::select! {
                 _ = shutdown_process.changed() => {
                     tracing::info!("shutdown signal received");
@@ -894,4 +915,88 @@ async fn metrics_loop(
 
         prev = acc;
     }
+}
+
+/// L15: build a JSON diagnostic snapshot — used by the SIGUSR1 handler.
+///
+/// Writes a flat object with the broker's headline gauges, the silent-drop
+/// counters, and an array of per-stream `messages`/`bytes`. Kept tiny and
+/// dependency-free (hand-built JSON) so the dump itself is observable on
+/// the most-loaded broker, and so dumping doesn't pull serde_json into the
+/// server crate's dep graph.
+#[cfg(unix)]
+async fn build_diagnostic_dump(
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) -> String {
+    use arbitro_engine_v2::MetricsSnapshot;
+    let mut acc = MetricsSnapshot::default();
+    for i in 0..server.shard_count() {
+        if let Ok(snap) = server.shard(i).metrics().await {
+            acc.publish_entries_accepted += snap.publish_entries_accepted;
+            acc.claim_entries_delivered += snap.claim_entries_delivered;
+            acc.ack_accepted += snap.ack_accepted;
+            acc.nack_accepted += snap.nack_accepted;
+        }
+    }
+    let drops = server.silent_drops().snapshot();
+    let mut streams = 0usize;
+    let mut consumers = 0usize;
+    let mut total_msgs = 0u64;
+    let mut total_bytes = 0u64;
+    let mut per_stream = String::new();
+    for i in 0..server.shard_count() {
+        let shard = server.shard(i);
+        if let Ok(r) = shard.list_streams().await {
+            streams += r.streams.len();
+            for (sid, _) in &r.streams {
+                if let Ok(info) = shard
+                    .store_info(arbitro_engine_v2::types::StreamId(*sid))
+                    .await
+                {
+                    total_msgs += info.messages;
+                    total_bytes += info.bytes;
+                    if !per_stream.is_empty() {
+                        per_stream.push(',');
+                    }
+                    per_stream.push_str(&format!(
+                        "{{\"stream_id\":{},\"messages\":{},\"bytes\":{}}}",
+                        sid, info.messages, info.bytes
+                    ));
+                }
+            }
+        }
+        if let Ok(states) = shard.consumer_states().await {
+            consumers += states.len();
+        }
+    }
+    let conns = registry.active_count();
+    format!(
+        "{{\"pid\":{pid},\"ts_ms\":{ts},\"connections\":{conns},\
+         \"streams\":{streams},\"consumers\":{consumers},\
+         \"stream_messages\":{tm},\"stream_bytes\":{tb},\
+         \"publish_entries_accepted\":{pub_in},\
+         \"claim_entries_delivered\":{dl},\
+         \"ack_accepted\":{ak},\"nack_accepted\":{nk},\
+         \"silent_drops\":{{\"conn_write\":{cw},\"notify_ring\":{nr},\"drain_evt\":{de}}},\
+         \"per_stream\":[{ps}]}}",
+        pid = std::process::id(),
+        ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        conns = conns,
+        streams = streams,
+        consumers = consumers,
+        tm = total_msgs,
+        tb = total_bytes,
+        pub_in = acc.publish_entries_accepted,
+        dl = acc.claim_entries_delivered,
+        ak = acc.ack_accepted,
+        nk = acc.nack_accepted,
+        cw = drops.conn_write,
+        nr = drops.notify_ring,
+        de = drops.drain_evt,
+        ps = per_stream,
+    )
 }
