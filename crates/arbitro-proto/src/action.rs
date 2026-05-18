@@ -6,8 +6,9 @@
 pub enum Action {
     // 0x01xx — Publish family. Specific actions per body shape — no
     // discriminator byte inside the payload, no inner branching.
+    // TODO §5.1: 0x0102 (PublishAccumulate) deleted — v1-only, never
+    // dispatched by the v2 server. Reserved; do not reuse the slot.
     Publish                  = 0x0101,
-    PublishAccumulate        = 0x0102,
     PublishBatch             = 0x0103,
     PublishWithReply         = 0x0104, // + reply_to (RPC)
     PublishWithHeaders       = 0x0105, // + headers (tracing/metadata)
@@ -30,8 +31,9 @@ pub enum Action {
     RepBatch      = 0x0205,
     BatchAck      = 0x0206,
     FanoutBatch   = 0x0207,
-    AckSync       = 0x0208,
-    BatchAckSync  = 0x0209,
+    // TODO §5.1: 0x0208 (AckSync) and 0x0209 (BatchAckSync) deleted —
+    // collapsed into Ack / BatchAck (both wait for store fsync before
+    // replying). Reserved; do not reuse the slots.
     BatchNack     = 0x020A,
 
     // 0x03xx — Subscription
@@ -82,7 +84,7 @@ impl Action {
             0x0002 => Some(Self::Auth),
 
             0x0101 => Some(Self::Publish),
-            0x0102 => Some(Self::PublishAccumulate),
+            // 0x0102 reserved (deleted PublishAccumulate) — TODO §5.1.
             0x0103 => Some(Self::PublishBatch),
             0x0104 => Some(Self::PublishWithReply),
             0x0105 => Some(Self::PublishWithHeaders),
@@ -96,8 +98,7 @@ impl Action {
             0x0205 => Some(Self::RepBatch),
             0x0206 => Some(Self::BatchAck),
             0x0207 => Some(Self::FanoutBatch),
-            0x0208 => Some(Self::AckSync),
-            0x0209 => Some(Self::BatchAckSync),
+            // 0x0208, 0x0209 reserved (deleted AckSync/BatchAckSync) — TODO §5.1.
             0x020A => Some(Self::BatchNack),
 
             0x0301 => Some(Self::Subscribe),
@@ -139,7 +140,6 @@ impl Action {
         matches!(
             self,
             Self::Publish
-                | Self::PublishAccumulate
                 | Self::PublishBatch
                 | Self::PublishWithReply
                 | Self::PublishWithHeaders
@@ -147,8 +147,6 @@ impl Action {
                 | Self::Ack
                 | Self::Nack
                 | Self::BatchAck
-                | Self::AckSync
-                | Self::BatchAckSync
                 | Self::BatchNack
         )
     }
@@ -159,7 +157,6 @@ impl Action {
         matches!(
             self,
             Self::Publish
-                | Self::PublishAccumulate
                 | Self::PublishBatch
                 | Self::PublishWithReply
                 | Self::PublishWithHeaders
@@ -174,7 +171,6 @@ impl Action {
         matches!(
             self,
             Self::Publish
-                | Self::PublishAccumulate
                 | Self::PublishBatch
                 | Self::PublishWithReply
                 | Self::PublishWithHeaders
