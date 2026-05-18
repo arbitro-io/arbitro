@@ -304,23 +304,29 @@ pub(in crate::shard) fn drain_deliver(
                 "shard"
             );
 
-            let ok = writer.write_tx.try_send(frame.bytes.clone()).is_ok();
+            // F29: transfer ownership of `Bytes` directly to `try_send`
+            // instead of bumping its Arc refcount via `.clone()`. The
+            // closure owns `frame` (passed by value); on backpressure
+            // `try_send` hands the bytes back inside the Err so we can
+            // safely keep `frame.first_seq` for tracking.
+            let conn = frame.connection_id;
+            #[allow(unused_variables)]
+            let count = frame.count;
+            let first_seq = frame.first_seq;
+            let ok = writer.write_tx.try_send(frame.bytes).is_ok();
 
             if ok {
                 crate::lifecycle_trace!(
                     "30_send_bytes_done",
-                    frame.connection_id.0,
-                    frame.count as u64,
+                    conn.0,
+                    count as u64,
                     "shard"
                 );
-                flush_results.push((frame.connection_id, FlushOutcome::Ok));
+                flush_results.push((conn, FlushOutcome::Ok));
             } else {
                 // Channel full → backpressure, NOT dead. Record first_seq
                 // so the cursor doesn't advance past undelivered entries.
-                flush_results.push((
-                    frame.connection_id,
-                    FlushOutcome::Backpressured(frame.first_seq),
-                ));
+                flush_results.push((conn, FlushOutcome::Backpressured(first_seq)));
             }
             ok
         });
