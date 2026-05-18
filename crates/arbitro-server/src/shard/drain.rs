@@ -272,6 +272,7 @@ pub(in crate::shard) fn drain_deliver(
     scratch: &mut DrainScratch,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     notify_tx: &NotifyRing,
+    silent_drops: &crate::common::SilentDrops,
     mut result: DrainReadResult,
 ) {
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
@@ -399,6 +400,7 @@ pub(in crate::shard) fn drain_deliver(
             &flush_results,
             &mut scratch.sorted_notify,
             &mut scratch.notify_entries,
+            silent_drops,
         );
     }
     // Return the persistent flush buffer for the next cycle.
@@ -416,7 +418,12 @@ pub(in crate::shard) fn drain_deliver(
     // registry — permanent). Backpressured channels are NOT reported here;
     // they're transient and retried on the next cycle.
     for conn_id in scratch.dead_connections.drain(..) {
-        let _ = notify_tx.try_send(DrainNotification::ConnectionDead(conn_id));
+        if notify_tx
+            .try_send(DrainNotification::ConnectionDead(conn_id))
+            .is_err()
+        {
+            silent_drops.inc_notify_ring();
+        }
     }
 
     if result.more_pending {
@@ -441,6 +448,7 @@ pub(in crate::shard) fn drain_cycle(
     scratch: &mut DrainScratch,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     notify_tx: &NotifyRing,
+    silent_drops: &crate::common::SilentDrops,
     now_ms: u64,
 ) {
     match drain_read(counters, snap, store, cfg, scratch, consumer_subjects, now_ms) {
@@ -452,6 +460,7 @@ pub(in crate::shard) fn drain_cycle(
             scratch,
             consumer_subjects,
             notify_tx,
+            silent_drops,
             result,
         ),
         None => {
@@ -752,6 +761,7 @@ fn dispatch_recipients(
 /// turns each of those into a `Command::Delivered` which updates
 /// `Binding.pending` and `InFlightCounters` — the single source of
 /// truth for ack-matching.
+#[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
     notify_tx: &NotifyRing,
     bindings: &[ActiveBinding],
@@ -759,6 +769,7 @@ fn notify_delivered_grouped(
     flush_results: &[(ConnectionId, FlushOutcome)],
     sorted_buf: &mut Vec<PendingNotify>,
     entries_buf: &mut Vec<DeliveredEntry>,
+    silent_drops: &crate::common::SilentDrops,
 ) {
     // F11: replace the per-cycle HashMap<conn, bool> with a linear scan
     // over `flush_results` (typically 1–8 entries). Cache locality wins.
@@ -789,12 +800,17 @@ fn notify_delivered_grouped(
                     _pad: 0,
                 })
                 .collect();
-            let _ = notify_tx.try_send(DrainNotification::Delivered {
-                binding_id: binding.binding_id,
-                consumer_id: binding.consumer_id,
-                queue_id: binding.queue_id,
-                entries,
-            });
+            if notify_tx
+                .try_send(DrainNotification::Delivered {
+                    binding_id: binding.binding_id,
+                    consumer_id: binding.consumer_id,
+                    queue_id: binding.queue_id,
+                    entries,
+                })
+                .is_err()
+            {
+                silent_drops.inc_notify_ring();
+            }
             return;
         }
     }
@@ -860,12 +876,17 @@ fn notify_delivered_grouped(
         }
         let entries: Vec<DeliveredEntry> = entries_buf.clone();
         let binding = &bindings[idx];
-        let _ = notify_tx.try_send(DrainNotification::Delivered {
-            binding_id: binding.binding_id,
-            consumer_id: binding.consumer_id,
-            queue_id: binding.queue_id,
-            entries,
-        });
+        if notify_tx
+            .try_send(DrainNotification::Delivered {
+                binding_id: binding.binding_id,
+                consumer_id: binding.consumer_id,
+                queue_id: binding.queue_id,
+                entries,
+            })
+            .is_err()
+        {
+            silent_drops.inc_notify_ring();
+        }
     }
 }
 

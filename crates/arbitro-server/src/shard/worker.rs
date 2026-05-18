@@ -133,11 +133,9 @@ pub struct DrainWorker {
     /// `DrainEvent::ConsumerRemoved`. Single-thread owned by drain — no
     /// locks, no atomics. Replaces `SharedCounters.subject` (papaya).
     pub(super) consumer_subjects: Vec<Option<ConsumerSubjects>>,
-    /// H10: shared silent-drop counters. Reserved for the drain → cmd
-    /// notify-ring drop sites once `drain::drain_deliver` learns to
-    /// take the counter handle directly; kept on the struct now so the
-    /// router-side wiring is already in place.
-    #[allow(dead_code)]
+    /// H10: shared silent-drop counters. Wired into `drain::drain_deliver`
+    /// so the drain → cmd notify-ring drop sites bump
+    /// `silent_drops.notify_ring` instead of failing silently.
     pub(super) silent_drops: Arc<crate::common::SilentDrops>,
 }
 
@@ -222,6 +220,7 @@ impl DrainWorker {
                         &mut self.drain_scratch,
                         &mut self.consumer_subjects,
                         &self.notify_ring,
+                        &self.silent_drops,
                         result,
                     ),
                     None => {
