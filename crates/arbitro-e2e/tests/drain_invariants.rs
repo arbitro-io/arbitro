@@ -1219,3 +1219,73 @@ async fn resubscribe_continues_from_cursor() {
     }
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T13 — Single-shard saturation: channel-full causes back-pressure, no drops
+//
+// Pin the broker to shard_count = 1 and push more messages than the
+// drain can keep up with in real time. The contract is that publish ↔
+// drain ↔ ack counts MUST match — every accepted publish must be both
+// delivered and acked, with nothing silently dropped along the way.
+// Pre-H10 there were three `let _ = try_send(...)` sites that could
+// drop notifications silently; this test exercises the path that would
+// fire on a saturated drain → cmd notify ring.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t13_single_shard_saturation_no_silent_drops() {
+    // Pinning to one shard maximises contention on the drain → cmd
+    // notify ring (the silent-drop site H10 wired counters to).
+    let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"sat1", b">").await;
+
+    // Explicit ack + small inflight cap forces the broker to alternate
+    // between delivering and blocking, exercising the drain pause /
+    // resume cycle under load.
+    const TOTAL: usize = 1024;
+    const INFLIGHT: u16 = 32;
+    let consumer_id = create_consumer(
+        &client, stream_id, b"c1", b"", b"",
+        INFLIGHT,
+        1, /* Explicit */
+        0, /* All */
+        30_000,
+        0,
+    ).await;
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    // Fire-and-forget publishes — flood the publish channel.
+    for i in 0u32..TOTAL as u32 {
+        let p = format!("m-{i}");
+        let _ = client.publish(stream_id, b"sat1.event", Bytes::copy_from_slice(p.as_bytes()));
+    }
+
+    // Drain every message, acking inline so the inflight window stays
+    // open. The whole budget is generous so even a slow CI box gets
+    // through TOTAL messages.
+    let mut received = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while received < TOTAL {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, handle.recv()).await {
+            Ok(Some(m)) => {
+                m.ack();
+                received += 1;
+            }
+            _ => break,
+        }
+    }
+
+    assert_eq!(
+        received, TOTAL,
+        "single-shard saturation: publish/drain/ack counts must match; \
+         received only {received} of {TOTAL}. A delta means the drain → \
+         cmd notify ring dropped a Delivered without bumping a counter."
+    );
+
+    server.shutdown().await;
+}

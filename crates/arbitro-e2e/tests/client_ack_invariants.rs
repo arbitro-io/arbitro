@@ -405,3 +405,92 @@ async fn publish_sync_on_dead_server_returns_error() {
         Err(e) => panic!("unexpected error variant: {e:?}"),
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T11 — Reconnect with active subscription resumes from the unacked cursor
+//
+// Client A creates a consumer, subscribes, publishes 5, acks 3 (and drops
+// 2 unacked). Client A goes away. Client B connects to the same broker,
+// re-creates the consumer with the same name (returning the same id), and
+// resubscribes. The unacked tail (m-3, m-4) must arrive — the broker's
+// per-consumer cursor lives in the engine, not the client session, so a
+// fresh client handle gets the leftover frames.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t11_reconnect_resumes_unacked_tail() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let stream_name: &[u8] = b"sub-resume";
+    let consumer_name: &[u8] = b"worker";
+
+    let (stream_id, consumer_id) = {
+        // Client A
+        let client_a = server.connect().await;
+        let resp = client_a
+            .create_stream(stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        let stream_id = TestServer::parse_id(&resp);
+        let resp = client_a
+            .create_consumer(
+                stream_id, consumer_name, b"", b"", 100u16,
+                1u8, /* Explicit */ 0u8, 0u8, 30_000u32, 0u64,
+            )
+            .await
+            .unwrap();
+        let consumer_id = TestServer::parse_id(&resp);
+
+        let mut handle = client_a.subscribe(stream_id, consumer_id, b"").await.unwrap();
+        for i in 0u32..5 {
+            let p = format!("m-{i}");
+            client_a
+                .publish_sync(stream_id, b"sub.event", Bytes::copy_from_slice(p.as_bytes()))
+                .await
+                .expect("publish_sync");
+        }
+
+        // Receive and ack the first 3 only.
+        for _ in 0..3 {
+            let m = tokio::time::timeout(Duration::from_secs(2), handle.recv())
+                .await
+                .expect("recv must arrive within 2s")
+                .expect("subscription open");
+            m.ack();
+        }
+        // Drop handle + client_a — no further acks for the remaining 2.
+        drop(handle);
+        drop(client_a);
+
+        // Give the broker a moment to observe the disconnect & roll back
+        // any unacked deliveries to the cursor (ack_wait_ms == 30s so
+        // they'll come back via redelivery on resubscribe).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (stream_id, consumer_id)
+    };
+
+    // Client B — fresh handle, same consumer id (the broker keyed it by
+    // name so a `create_consumer` with the same name returns it).
+    let client_b = server.connect().await;
+    let mut handle = client_b.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    let mut received = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while received < 2 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, handle.recv()).await {
+            Ok(Some(m)) => {
+                m.ack();
+                received += 1;
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        received >= 2,
+        "after reconnect the unacked tail (m-3, m-4) must arrive; got {received}"
+    );
+    server.shutdown().await;
+}

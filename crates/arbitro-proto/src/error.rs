@@ -19,7 +19,16 @@ pub enum ErrorCode {
     StreamNotFound      = 0x0201,
     StreamAlreadyExists = 0x0202,
     StreamFull          = 0x0203,
+    /// **Reserved — TODO §5.2.** Wire this when a CreateStream `filter`
+    /// would overlap an existing stream's filter (currently H1's
+    /// validators reject only single-stream subject pathologies, not
+    /// cross-stream overlap). Returned by a future `v2_create_stream`
+    /// branch in `dispatch_v2.rs`.
     StreamFilterOverlap = 0x0204,
+    /// **Reserved — TODO §5.2.** Wire this on Subscribe / Publish to a
+    /// subject that does not match any registered stream's `filter`.
+    /// Currently such publishes silently drop into a "no_match" counter
+    /// and clients receive a RepOk.
     SubjectNotFound     = 0x0205,
     /// Publish carried a `msg_id` that the broker has already seen for
     /// this stream within `idempotency_window_ms`. The message was not
@@ -30,11 +39,31 @@ pub enum ErrorCode {
     // 0x03xx — Consumer
     ConsumerNotFound       = 0x0301,
     ConsumerAlreadyExists  = 0x0302,
+    /// **Reserved — TODO §5.2.** Wire this when a new consumer's
+    /// `subject` filter overlaps an existing consumer's filter on the
+    /// same stream in a way that would violate exclusive/queue
+    /// semantics. Currently the catalog accepts the overlap and lets
+    /// match-table dedup handle it (see F32).
     ConsumerFilterOverlap  = 0x0303,
 
     // 0x04xx — Delivery
+    /// **Reserved — TODO §5.2.** Wire this when an Ack frame carries a
+    /// `seq` outside the consumer's in-flight high-water mark.
+    /// Currently such acks silently no-op via `ack_not_found`. Wiring
+    /// this lets the client detect a bookkeeping desync (e.g. after a
+    /// rewind race) early.
     InvalidSequence     = 0x0401,
+    /// **Reserved — TODO §5.2.** Wire this on the publish reply path
+    /// when a consumer hit its `max_inflight` cap and the message is
+    /// being held (not dropped). Today the broker increments
+    /// `claim_skipped_max_inflight` and waits silently; clients have no
+    /// signal that they are throttled.
     MaxInflightReached  = 0x0402,
+    /// **Reserved — TODO §5.2.** Wire this when the timing wheel fires
+    /// an ack-timeout and rolls the entry back. The client could use
+    /// this asynchronous signal to react (e.g. nack-and-retry) instead
+    /// of waiting for its own deadline. Today the wheel triggers an
+    /// internal nack with no client-visible event.
     AckTimeout          = 0x0403,
 
     // 0x05xx — System
