@@ -173,17 +173,37 @@ const CONSUMER_STREAM_UNSET: u32 = u32::MAX;
 
 impl Inner {
     fn new() -> Self {
+        // M16: a fresh broker typically lands somewhere between 8 and 64
+        // streams + consumers. Pre-allocating a modest capacity avoids
+        // 4–6 grow-and-copy reallocations during startup recovery
+        // without burning real memory.
+        const PREALLOC: usize = 32;
         Self {
-            streams_by_wire: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            streams_seq_to_wire: Vec::new(),
-            streams_idempotency_window_ms: Vec::new(),
+            streams_by_wire: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
+            streams_seq_to_wire: Vec::with_capacity(PREALLOC),
+            streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
             next_stream: 0,
-            consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            consumer_stream: Vec::new(),
-            consumer_deliver: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumers_by_name: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
+            consumer_queue: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
+            consumer_stream: Vec::with_capacity(PREALLOC),
+            consumer_deliver: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
             next_consumer: 1,
-            queues_by_key: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            queues_by_key: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
             next_queue: 1,
         }
     }

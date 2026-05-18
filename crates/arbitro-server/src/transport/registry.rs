@@ -19,6 +19,11 @@ use arbitro_common::SharedClock;
 
 use crate::common::session::{ConnIdGen, Session, CONN_WRITE_CAP};
 
+/// Minimum allowed per-connection outbound buffer capacity. A value of 0
+/// from `ARBITRO_WRITE_BUFFER_CAP` would deadlock every write
+/// (`try_send` always returns `Full`), so we clamp to a safe floor.
+const MIN_WRITE_BUFFER_CAP: usize = 16;
+
 /// **F8 helper** — current "now" in milliseconds. Reads the shared
 /// clock if one is set on the registry, otherwise falls back to a
 /// per-call `SystemTime::now()` (used in unit-tests / standalone).
@@ -57,15 +62,24 @@ struct Inner {
     /// Server wires it in `set_clock()`; tests can leave it None and
     /// pay a per-call `SystemTime::now()` (rare paths).
     clock: parking_lot::RwLock<Option<SharedClock>>,
+    /// H13: per-connection mpsc capacity. Was previously ignored — every
+    /// channel allocated `CONN_WRITE_CAP` (4096) regardless of
+    /// `ARBITRO_WRITE_BUFFER_CAP`. Now honoured at `register()` time.
+    write_buffer_cap: usize,
 }
 
 impl ConnectionRegistry {
-    pub fn new(_write_buffer_cap: usize) -> Self {
+    pub fn new(write_buffer_cap: usize) -> Self {
+        // 0 would mean "every try_send returns Full" — clamp to a safe
+        // floor. Callers who genuinely want the historical 4096 default
+        // still get it via `CONN_WRITE_CAP` (config.rs uses 8192).
+        let cap = write_buffer_cap.max(MIN_WRITE_BUFFER_CAP);
         Self {
             inner: Arc::new(Inner {
                 sessions: parking_lot::Mutex::new(HashMap::with_hasher(foldhash::fast::FixedState::default())),
                 conn_id_gen: ConnIdGen::new(),
                 clock: parking_lot::RwLock::new(None),
+                write_buffer_cap: cap,
             }),
         }
     }
@@ -82,7 +96,14 @@ impl ConnectionRegistry {
     /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
     pub fn register(&self, writer: BoxedWriter) -> u64 {
         let conn_id = self.inner.conn_id_gen.next();
-        let (tx, rx) = mpsc::channel::<Bytes>(CONN_WRITE_CAP);
+        // H13: honour the configured per-connection capacity. Fallback
+        // is the historical default if the field is unset (zero).
+        let cap = if self.inner.write_buffer_cap == 0 {
+            CONN_WRITE_CAP
+        } else {
+            self.inner.write_buffer_cap
+        };
+        let (tx, rx) = mpsc::channel::<Bytes>(cap);
         tokio::spawn(conn_writer_task(rx, writer));
         let clock = self.inner.clock.read().clone();
         let session = Session {

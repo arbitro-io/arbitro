@@ -276,7 +276,12 @@ impl CommandWorker {
             self.apply_delta_and_sync(&delta);
 
             // Insert into wheel — delay_ms converted to ticks (1 tick = 1s).
-            let delay_ticks = ((cmd.delay_ms as u64 + 999) / 1000) as u32; // ceil(ms / 1000)
+            // M6: clamp to `WHEEL_BUCKETS - 1` so a caller passing
+            // delay_ms > 120_000 doesn't wrap the bucket index back to the
+            // current bucket (which would fire the entry immediately
+            // instead of after the requested delay).
+            let max_ticks = (Self::WHEEL_BUCKETS as u32).saturating_sub(1);
+            let delay_ticks = (((cmd.delay_ms as u64 + 999) / 1000) as u32).min(max_ticks);
             self.ensure_wheel();
             let wheel = self.wheel.as_mut().unwrap();
             for entry in &cmd.entries {

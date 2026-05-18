@@ -371,9 +371,10 @@ impl CommandWorker {
     /// Eviction interval — cold path, runs every 5 seconds.
     const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
     /// Wheel tick interval — 1 second resolution.
-    const WHEEL_TICK_INTERVAL: Duration = Duration::from_secs(1);
-    /// Number of wheel buckets (max delay in seconds).
-    const WHEEL_BUCKETS: usize = 120;
+    pub(super) const WHEEL_TICK_INTERVAL: Duration = Duration::from_secs(1);
+    /// Number of wheel buckets (max delay in seconds). Exposed to handlers
+    /// so M6 can clamp nack delay_ms without wrapping the bucket index.
+    pub(super) const WHEEL_BUCKETS: usize = 120;
 
     /// Async command loop — runs as a `tokio::spawn` task.
     pub async fn run(mut self) {
