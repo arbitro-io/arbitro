@@ -170,6 +170,85 @@ cold_body! {
     Action::ConsumerStats => pub struct ConsumerStats {
         pub consumer_id: u32,
     },
+
+    // ── CreateStream ─────────────────────────────────────────────────
+    //
+    // The zerocopy version had 40 B of fixed body + name + filter, with
+    // every limit field present (and meaningless when not set). serde
+    // lets us drop the noise: `Vec<u8>` for variable strings, defaults
+    // for retention / discard / journal_kind so callers only write the
+    // fields they care about.
+    //
+    // `idempotency_window_ms = 0` keeps the legacy semantics
+    // (idempotency disabled — every publish is accepted, no dedup).
+    Action::CreateStream => pub struct CreateStream {
+        pub name:                  Vec<u8>,
+        pub filter:                Vec<u8>,
+        pub max_msgs:              u64,
+        pub max_bytes:             u64,
+        pub max_age_secs:          u64,
+        pub replicas:              u8,
+        pub journal_kind:          u8,
+        pub retention:             u8,
+        pub discard:               u8,
+        pub idempotency_window_ms: u32,
+    },
+
+    // ── CreateConsumer ───────────────────────────────────────────────
+    //
+    // `subject_limits` is `Vec<(pattern, max_inflight)>` — was a
+    // hand-rolled wire trailer with a u16 count and per-entry length
+    // prefixes. The zerocopy version needed a custom `SubjectLimitIter`
+    // to traverse; here it's just a `Vec`.
+    //
+    // Per-subject limits are only enforced with `ack_policy ==
+    // AckPolicy::Explicit (1)`; the server silently drops them
+    // otherwise. Same contract as before — the wire layout simplifies,
+    // the semantics don't.
+    Action::CreateConsumer => pub struct CreateConsumer {
+        pub stream_id:      u32,
+        pub name:           Vec<u8>,
+        pub group:          Vec<u8>,
+        pub subject:        Vec<u8>,
+        pub max_inflight:   u16,
+        pub ack_policy:     u8,
+        pub deliver_policy: u8,
+        pub deliver_mode:   u8,
+        pub ack_wait_ms:    u32,
+        pub start_seq:      u64,
+        pub subject_limits: Vec<SubjectLimit>,
+    },
+
+    // ── Subscribe ────────────────────────────────────────────────────
+    //
+    // The zerocopy `SubFrame` carried one filter. The engine has always
+    // supported `SubscriptionConfig.filters: Vec<Vec<u8>>` per
+    // subscription, but the wire only exposed a single filter slot.
+    // This serde body unblocks that — clients can subscribe with a
+    // `Vec<filter>` and the broker applies all of them as OR'd match
+    // rules.
+    //
+    // `subscription_id == 0` means "use consumer_id as the subscription
+    // id" (legacy behaviour — one subscription per consumer). Non-zero
+    // values let a single consumer host multiple subscriptions in
+    // parallel. Future work; today's dispatcher still collapses both
+    // to consumer_id, but the field is on the wire so adding the
+    // multi-sub path doesn't need a wire change.
+    Action::Subscribe => pub struct Subscribe {
+        pub consumer_id:     u32,
+        pub subscription_id: u32,
+        pub filters:         Vec<Vec<u8>>,
+    },
+}
+
+/// Per-subject inflight cap. Carried inside `CreateConsumer.subject_limits`.
+///
+/// Empty `pattern` is rejected at dispatch time; wildcards (`*`, `>`)
+/// are supported the same way they are in stream / consumer filters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubjectLimit {
+    pub pattern: Vec<u8>,
+    pub limit:   u32,
 }
 
 #[cfg(test)]

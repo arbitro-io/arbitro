@@ -13,16 +13,15 @@ use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
 use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
-use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::ingress::{
     BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubFrame,
 };
-use arbitro_proto::v2::manager::{
-    CreateConsumerFrame, CreateStreamFrame, SubjectLimit, subject_limits_tail_len,
-};
+use arbitro_proto::v2::manager::SubjectLimit;
 use arbitro_proto::v2::cold::{
-    ColdBody, ConsumerStats, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer, GetStream,
-    ListConsumers, ListStreams, PurgeStream, Unsubscribe,
+    ColdBody, ConsumerStats, CreateConsumer as CreateConsumerCold,
+    CreateStream as CreateStreamCold, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer,
+    GetStream, ListConsumers, ListStreams, PurgeStream, SubjectLimit as ColdSubjectLimit,
+    Unsubscribe,
 };
 
 // ─── BatchEntry ───────────────────────────────────────────────────────
@@ -123,13 +122,19 @@ pub(crate) fn encode_create_stream_v2(
     discard: u8,
     idempotency_window_ms: u32,
 ) -> Bytes {
-    let size = CreateStreamFrame::wire_size(name.len(), filter.len());
-    let mut buf = vec![0u8; size];
-    CreateStreamFrame::encode_into(
-        &mut buf, seq, name, filter, max_msgs, max_bytes, max_age_secs, replicas, journal_kind,
-        retention, discard, idempotency_window_ms,
-    );
-    Bytes::from(buf)
+    CreateStreamCold {
+        name: name.to_vec(),
+        filter: filter.to_vec(),
+        max_msgs,
+        max_bytes,
+        max_age_secs,
+        replicas,
+        journal_kind,
+        retention,
+        discard,
+        idempotency_window_ms,
+    }
+    .encode(seq)
 }
 
 /// DeleteStream / GetStream / PurgeStream / DrainSubject — cold-path
@@ -176,14 +181,24 @@ pub(crate) fn encode_create_consumer_v2(
     start_seq: u64,
     subject_limits: &[SubjectLimit<'_>],
 ) -> Bytes {
-    let tail_len = subject_limits_tail_len(subject_limits);
-    let size = CreateConsumerFrame::wire_size(name.len(), group.len(), subject.len(), tail_len);
-    let mut buf = vec![0u8; size];
-    CreateConsumerFrame::encode_into(
-        &mut buf, seq, stream_id, name, group, subject, max_inflight, ack_policy, deliver_policy,
-        deliver_mode, ack_wait_ms, start_seq, subject_limits,
-    );
-    Bytes::from(buf)
+    let owned_limits: Vec<ColdSubjectLimit> = subject_limits
+        .iter()
+        .map(|s| ColdSubjectLimit { pattern: s.pattern.to_vec(), limit: s.limit })
+        .collect();
+    CreateConsumerCold {
+        stream_id,
+        name: name.to_vec(),
+        group: group.to_vec(),
+        subject: subject.to_vec(),
+        max_inflight,
+        ack_policy,
+        deliver_policy,
+        deliver_mode,
+        ack_wait_ms,
+        start_seq,
+        subject_limits: owned_limits,
+    }
+    .encode(seq)
 }
 
 /// DeleteConsumer — cold-path frame (v2::cold).
@@ -315,13 +330,16 @@ pub(crate) fn encode_unsub_v2(seq: u64, consumer_id: u32) -> Bytes {
 #[inline]
 pub(crate) fn encode_sub_v2(
     seq: u64,
-    conn_id: u32,
+    _conn_id: u32,
     consumer_id: u32,
-    options_flags: u16,
+    _options_flags: u16,
     filter: &[u8],
 ) -> Bytes {
-    let size = SubFrame::wire_size(filter.len());
-    let mut buf = vec![0u8; size];
-    SubFrame::encode_into(&mut buf, seq, conn_id, consumer_id, options_flags, filter);
-    Bytes::from(buf)
+    use arbitro_proto::v2::cold::Subscribe as SubscribeCold;
+    // Legacy callers pass a single filter; future multi-filter users
+    // will call a `_with_filters` variant. `subscription_id == 0`
+    // selects the legacy "subscription_id == consumer_id" path on the
+    // server.
+    let filters = if filter.is_empty() { Vec::new() } else { vec![filter.to_vec()] };
+    SubscribeCold { consumer_id, subscription_id: 0, filters }.encode(seq)
 }

@@ -38,7 +38,6 @@ use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
-use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::CreateConsumerFrame;
 use arbitro_proto::v2::manager::stream_mgmt::CreateStreamFrame;
 use bytes::{Bytes, BytesMut};
@@ -519,23 +518,23 @@ async fn v2_subscribe(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match SubFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, Subscribe as SubscribeCold};
+    let body = match SubscribeCold::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
-    if let Err(code) = f.validate() {
-        send_error_v2(registry, conn_id, req_seq, code);
-        return;
+    // H1: every filter validated. Empty `filters` = catch-all (legacy
+    // single-empty-filter behaviour); each non-empty entry must parse
+    // as a valid subject pattern.
+    for f in &body.filters {
+        if !f.is_empty()
+            && arbitro_proto::validate::validate_subject(f).is_err()
+        {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+            return;
+        }
     }
-    // H1: subscribe filter validated too.
-    let sub_filter = f.filter();
-    if !sub_filter.is_empty()
-        && arbitro_proto::validate::validate_subject(sub_filter).is_err()
-    {
-        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
-        return;
-    }
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound); return; }
@@ -546,8 +545,14 @@ async fn v2_subscribe(
         .unwrap_or_else(|| server.names().get_or_create_queue(seq_stream, b""));
     let shard = server.shard_for(seq_stream);
 
-    let filter = f.filter().to_vec();
-    let filters = if filter.is_empty() { vec![] } else { vec![filter] };
+    // Drop empty filters (legacy "single empty-filter == catch-all"
+    // contract). After filtering, an empty Vec also means catch-all —
+    // the engine handles both forms identically.
+    let filters: Vec<Vec<u8>> = body
+        .filters
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .collect();
 
     // deliver_policy from consumer config (stored at CreateConsumer time).
     // Default: 0 = All (replay from beginning). The NameRegistry can hold
@@ -571,7 +576,18 @@ async fn v2_subscribe(
                 ack_wait_ms: 0,
             },
             SubscriptionConfig {
-                id: SubscriptionId(consumer_id.0),
+                // body.subscription_id == 0 means "legacy default": use
+                // the consumer's own id as the subscription id (one sub
+                // per consumer). A non-zero value lets a single
+                // consumer host multiple subs in parallel, each with
+                // its own filter set. Engine already supports this
+                // (`subscriptions_for_consumer`); the wire bit was the
+                // gate.
+                id: SubscriptionId(if body.subscription_id == 0 {
+                    consumer_id.0
+                } else {
+                    body.subscription_id
+                }),
                 stream_id: seq_stream,
                 consumer_id,
                 filters,
@@ -636,11 +652,12 @@ async fn v2_create_stream(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match CreateStreamFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
+    let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
+    let name = body.name.as_slice();
     // H1: validate name + filter at the dispatch boundary BEFORE
     // allocating IDs. Rejects empty / oversized / weird-byte names so
     // catalog Vec indexes stay sane and DeleteStream/wire echoes
@@ -649,7 +666,7 @@ async fn v2_create_stream(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
-    let filter = f.filter();
+    let filter = body.filter.as_slice();
     if !filter.is_empty()
         && arbitro_proto::validate::validate_subject(filter).is_err()
     {
@@ -676,10 +693,10 @@ async fn v2_create_stream(
     }
     let shard = server.shard_for(seq_stream);
 
-    let max_msgs   = f.body.max_msgs.get();
-    let max_bytes  = f.body.max_bytes.get();
-    let max_age_ms = f.body.max_age_secs.get().saturating_mul(1_000);
-    let idempotency_window_ms = f.body.idempotency_window_ms.get();
+    let max_msgs   = body.max_msgs;
+    let max_bytes  = body.max_bytes;
+    let max_age_ms = body.max_age_secs.saturating_mul(1_000);
+    let idempotency_window_ms = body.idempotency_window_ms;
 
     match shard
         .create_stream(
@@ -703,8 +720,22 @@ async fn v2_create_stream(
             server.invalidate_list_cache();
 
             // Persist to command log on cold path — idempotent on replay.
+            // The metadata log keeps the legacy zerocopy body
+            // (CreateStreamFixed) so the recovery applier
+            // (CreateStreamView) is unchanged. Build it from the parsed
+            // cold body via the existing frame encoder, then strip the
+            // Header (CreateStreamFrame::encode_into produces
+            // `Header + body + tail`; the log only stores body+tail).
             if let Some(log) = server.command_log() {
-                let cmd = build_create_stream(&frame[HEADER_SIZE..]);
+                let total = CreateStreamFrame::wire_size(name.len(), filter.len());
+                let mut wire = vec![0u8; total];
+                CreateStreamFrame::encode_into(
+                    &mut wire, 0, name, filter,
+                    max_msgs, max_bytes, body.max_age_secs,
+                    body.replicas, body.journal_kind, body.retention, body.discard,
+                    idempotency_window_ms,
+                );
+                let cmd = build_create_stream(&wire[HEADER_SIZE..]);
                 if let Err(e) = log.record(&cmd) {
                     tracing::warn!(error = %e, "command log: create_stream record failed");
                 }
@@ -905,17 +936,18 @@ async fn v2_create_consumer(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match CreateConsumerFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
+    let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let wire_stream = f.body.stream_id.get();
+    let wire_stream = body.stream_id;
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
     };
-    let name = f.name();
-    let group = f.group();
+    let name = body.name.as_slice();
+    let group = body.group.as_slice();
     // H1: validate consumer name + (optional) group + (optional)
     // subject filter at the dispatch boundary. Same reasoning as
     // v2_create_stream — keep weird bytes from leaking into the
@@ -930,7 +962,7 @@ async fn v2_create_consumer(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
-    let subject_filter = f.subject();
+    let subject_filter = body.subject.as_slice();
     if !subject_filter.is_empty()
         && arbitro_proto::validate::validate_subject(subject_filter).is_err()
     {
@@ -938,24 +970,19 @@ async fn v2_create_consumer(
         return;
     }
 
-    let ack_policy = match f.body.ack_policy {
+    let ack_policy = match body.ack_policy {
         0 => AckPolicy::None,
         _ => AckPolicy::Explicit,
     };
 
-    // B6: parse subject_limits FIRST so a malformed trailer is rejected
-    // BEFORE we allocate a ConsumerId / queue / index entries — the
-    // previous order leaked one ConsumerId slot per malformed
-    // CreateConsumer, and combined with the (now-also-fixed) SLOT_COUNT
-    // panic turned a single hostile client into a 30-second DoS.
-    let subject_limits = if ack_policy == AckPolicy::Explicit {
-        match f.subject_limits() {
-            Some(v) => v,
-            None => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
-                return;
-            }
-        }
+    // B6: subject limits are only honored under Explicit ack. The wire
+    // body always carries the Vec, but we silently drop it for None-ack
+    // consumers (legacy contract — predates serde migration).
+    let subject_limits: Vec<(Vec<u8>, u32)> = if ack_policy == AckPolicy::Explicit {
+        body.subject_limits
+            .iter()
+            .map(|s| (s.pattern.clone(), s.limit))
+            .collect()
     } else {
         Vec::new()
     };
@@ -973,8 +1000,8 @@ async fn v2_create_consumer(
     server.names().set_consumer_stream(seq_consumer, seq_stream);
     server.names().set_consumer_deliver_policy(
         seq_consumer,
-        f.body.deliver_policy,
-        f.body.start_seq.get(),
+        body.deliver_policy,
+        body.start_seq,
     );
 
     match shard
@@ -985,12 +1012,12 @@ async fn v2_create_consumer(
                 stream_id: seq_stream,
                 durable: true,
                 ack_policy,
-                max_inflight: if f.body.max_inflight.get() == 0 {
+                max_inflight: if body.max_inflight == 0 {
                     u32::MAX
                 } else {
-                    f.body.max_inflight.get() as u32
+                    body.max_inflight as u32
                 },
-                ack_wait_ms: f.body.ack_wait_ms.get(),
+                ack_wait_ms: body.ack_wait_ms,
             },
             subject_limits,
         )
@@ -999,8 +1026,31 @@ async fn v2_create_consumer(
         Ok(true) => {
             // F37: a new consumer must show up in list_consumers reply.
             server.invalidate_list_cache();
+            // Metadata log keeps the legacy zerocopy
+            // (CreateConsumerFixed + tail) body so recovery
+            // (CreateConsumerView) is unchanged. Rebuild from the
+            // parsed cold body via the existing frame encoder.
             if let Some(log) = server.command_log() {
-                let cmd = build_create_consumer(&frame[HEADER_SIZE..]);
+                let limit_refs: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> =
+                    body.subject_limits.iter()
+                        .map(|s| arbitro_proto::v2::manager::SubjectLimit {
+                            pattern: s.pattern.as_slice(),
+                            limit: s.limit,
+                        })
+                        .collect();
+                let tail_len = arbitro_proto::v2::manager::subject_limits_tail_len(&limit_refs);
+                let total = CreateConsumerFrame::wire_size(
+                    name.len(), group.len(), subject_filter.len(), tail_len,
+                );
+                let mut wire = vec![0u8; total];
+                CreateConsumerFrame::encode_into(
+                    &mut wire, 0, wire_stream,
+                    name, group, subject_filter,
+                    body.max_inflight, body.ack_policy, body.deliver_policy,
+                    body.deliver_mode, body.ack_wait_ms, body.start_seq,
+                    &limit_refs,
+                );
+                let cmd = build_create_consumer(&wire[HEADER_SIZE..]);
                 if let Err(e) = log.record(&cmd) {
                     tracing::warn!(error = %e, "command log: create_consumer record failed");
                 }

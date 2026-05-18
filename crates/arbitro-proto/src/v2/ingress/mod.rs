@@ -17,7 +17,7 @@ pub mod nack_frame;
 pub mod pub_frame;
 pub mod pub_with_headers;
 pub mod pub_with_reply;
-pub mod sub_frame;
+// sub_frame removed — Subscribe migrated to `v2::cold::Subscribe`.
 
 pub use ack_frame::{
     ACK_BODY_SIZE, AckBody, AckFrame, BATCH_ACK_BODY_FIXED, BATCH_ACK_ENTRY_SIZE, BatchAckBody,
@@ -35,4 +35,3 @@ pub use hello::{HELLO_FRAME_SIZE, HelloFrame, Role};
 pub use pub_frame::{PUB_BODY_FIXED, PubBody, PubFrame};
 pub use pub_with_headers::{PUB_WITH_HEADERS_BODY_FIXED, PubWithHeadersBody, PubWithHeadersFrame};
 pub use pub_with_reply::{PUB_WITH_REPLY_BODY_FIXED, PubWithReplyBody, PubWithReplyFrame};
-pub use sub_frame::{SUB_BODY_FIXED, SubBody, SubFrame};
