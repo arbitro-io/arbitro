@@ -494,3 +494,82 @@ async fn t11_reconnect_resumes_unacked_tail() {
     );
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T7 — Cross-tenant ack injection must not affect the legitimate consumer.
+//
+// Owner client A has consumer C with 5 unacked deliveries. Rogue client B
+// (separate TcpStream / separate ConnectionId) sends a raw Ack frame
+// targeting C's consumer_id. The broker keys pending-by-conn, so the
+// rogue ack lands in B's empty bucket and ack_not_found increments.
+// A's `get_pending` must still report 5 afterwards — the legitimate
+// owner's bookkeeping is untouched.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
+    use arbitro_proto::v2::ingress::ack_frame::AckFrame;
+    use arbitro_proto::v2::ingress::hello::{HelloFrame, Role, cap};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use zerocopy::IntoBytes;
+
+    let mut server = TestServerBuilder::new().spawn().await;
+    let owner = server.connect().await;
+
+    // Owner sets up stream + consumer, publishes 5, subscribes, and
+    // intentionally does NOT ack — leaving 5 in flight.
+    let resp = owner
+        .create_stream(b"t7", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+    let resp = owner
+        .create_consumer(stream_id, b"t7_c", b"", b"", 100, 1, 0, 0, 30_000, 0)
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
+
+    let mut handle = owner.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    for i in 0u32..5 {
+        owner
+            .publish_sync(stream_id, b"t7.ev", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .await
+            .expect("publish");
+    }
+    let mut received = 0usize;
+    while received < 5 {
+        let _m = tokio::time::timeout(Duration::from_secs(2), handle.recv())
+            .await
+            .expect("recv")
+            .expect("open");
+        received += 1;
+        // do not ack
+    }
+    let pending_before = owner.get_pending(consumer_id).await.unwrap();
+    assert_eq!(pending_before, 5, "owner should have 5 unacked");
+
+    // Rogue: open a fresh TCP socket, send HELLO + a raw Ack frame
+    // targeting the owner's consumer_id. Broker keys pending by
+    // (conn_id, consumer_id, seq) — this ack lands in a foreign bucket.
+    let mut rogue = TcpStream::connect(&server.addr).await.unwrap();
+    let hello = HelloFrame::new(Role::Client, cap::REPLY);
+    rogue.write_all(hello.as_bytes()).await.unwrap();
+    // ack seq=1 — clearly something the owner is holding, but routed
+    // through the rogue conn.
+    let ack = AckFrame::new(0, consumer_id, 1, 0);
+    rogue.write_all(ack.as_bytes()).await.unwrap();
+    rogue.flush().await.unwrap();
+    // Give the broker a tick to process.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    drop(rogue);
+
+    // Owner's pending count must be unchanged.
+    let pending_after = owner.get_pending(consumer_id).await.unwrap();
+    assert_eq!(
+        pending_after, 5,
+        "cross-tenant ack must not affect owner: before={pending_before}, after={pending_after}"
+    );
+
+    server.shutdown().await;
+}
