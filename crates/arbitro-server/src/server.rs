@@ -45,6 +45,9 @@ impl ArbitroServer {
     pub fn new(config: Config) -> Self {
         let registry = ConnectionRegistry::new(config.write_buffer_cap);
         let server = ShardRouter::spawn(&config, &registry);
+        // F8: hook the registry up to the shared millisecond clock so
+        // `touch()` / sweeps don't need per-call `SystemTime::now()`.
+        registry.set_clock(server.clock());
 
         let services: Vec<Box<dyn LifeCycle>> = vec![Box::new(registry.clone())];
 

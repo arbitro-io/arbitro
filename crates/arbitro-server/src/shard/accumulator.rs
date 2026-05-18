@@ -164,6 +164,12 @@ pub struct Accumulator {
     /// buckets × ~668 emits/cycle — linear scan was the dominant cost in
     /// acquire_bucket. foldhash `FixedState` per `.agent/rules/performance.md`.
     index: HashMap<(u64, u32, bool), usize, foldhash::fast::FixedState>,
+    /// **F17** — explicit free list. The previous fallback (linear
+    /// `position(|b| !b.in_use)`) was O(B²) when many active
+    /// connections per cycle forced new acquires after the first free
+    /// slot was past the cache line. Pushing released slots onto a
+    /// stack keeps acquire to a single pop in the steady state.
+    free_buckets: Vec<usize>,
 }
 
 impl Default for Accumulator {
@@ -189,14 +195,22 @@ impl Accumulator {
                 16,
                 foldhash::fast::FixedState::default(),
             ),
+            free_buckets: Vec::with_capacity(16),
         }
     }
 
     /// Reset for a new cycle. Does not deallocate — `BytesMut` capacity
     /// stays resident for reuse.
     pub fn clear(&mut self) {
-        for b in &mut self.buckets {
-            if b.in_use { b.release(); }
+        // F17: rebuild the free list from the current `active` window;
+        // anything not active is already free. Also release any active
+        // bucket we forgot to flush.
+        self.free_buckets.clear();
+        for (i, b) in self.buckets.iter_mut().enumerate() {
+            if b.in_use {
+                b.release();
+            }
+            self.free_buckets.push(i);
         }
         self.active.clear();
         self.index.clear();
@@ -257,6 +271,7 @@ impl Accumulator {
             let b = &mut self.buckets[idx];
             if b.count == 0 {
                 b.release();
+                self.free_buckets.push(idx);
                 continue;
             }
 
@@ -284,6 +299,7 @@ impl Accumulator {
             };
             let _ = flush(frame);
             b.release();
+            self.free_buckets.push(idx);
         }
         self.active.clear();
         self.index.clear();
@@ -301,7 +317,9 @@ impl Accumulator {
         if let Some(&idx) = self.index.get(&key) {
             return idx;
         }
-        let idx = match self.buckets.iter().position(|b| !b.in_use) {
+        // F17: O(1) acquire via the free-list stack. Falls back to a
+        // fresh push when the pool is empty (cold-start growth).
+        let idx = match self.free_buckets.pop() {
             Some(i) => i,
             None => {
                 self.buckets.push(Bucket::new_blank());

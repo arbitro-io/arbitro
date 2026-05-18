@@ -7,7 +7,6 @@
 //! queue is full, preventing deadlocks in the shared tokio runtime.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -20,8 +19,11 @@ pub struct Session {
     /// Sender half of the per-connection frame queue. Non-blocking
     /// `try_send` pushes frames; the writer task drains them.
     pub write_tx: mpsc::Sender<Bytes>,
-    /// Last activity timestamp — for idle timeout / keepalive.
-    pub last_activity: Instant,
+    /// Last activity timestamp (epoch-millis since UNIX_EPOCH) — for
+    /// idle timeout / keepalive. **F8**: AtomicU64 instead of `Instant`
+    /// so `touch()` doesn't need to take the registry mutex; readers
+    /// (idle sweep + keepalive sweep) load with Relaxed.
+    pub last_activity: AtomicU64,
 }
 
 /// Atomic connection ID generator.

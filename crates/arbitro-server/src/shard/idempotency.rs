@@ -40,21 +40,59 @@
 //! medium-sized message store.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arbitro_engine_v2::types::StreamId;
 use arbitro_common::{TimingWheel, foldhash::fast::FixedState};
 
-/// Shared handle to a shard's idempotency tracker. The publish hot
-/// path in `dispatch_v2` and the worker's 1Hz tick loop hold the
-/// same Arc. `Option<...>` stays `None` until the first publish on
-/// an idempotent stream forces lazy allocation — shards that never
-/// see an idempotent stream pay zero memory cost.
-pub type SharedIdempotency = Arc<Mutex<Option<IdempotencyTracker>>>;
+/// Shared handle to a shard's idempotency state.
+///
+/// **F26 / TODO H4**: this used to be `Arc<Mutex<Option<IdempotencyTracker>>>`
+/// — a single per-shard lock that serialised every idempotent publish
+/// on the shard. Under load on one hot stream, every cold stream on
+/// the same shard would also stall.
+///
+/// Now: outer `RwLock` over a per-stream map of small per-stream
+/// trackers, each behind its own `parking_lot::Mutex`. The publish
+/// hot path:
+///   1. read-lock the outer map (lock-free in steady state),
+///   2. clone the per-stream `Arc<Mutex<Tracker>>` if present,
+///   3. drop the outer read lock, then lock the per-stream mutex.
+///
+/// Different streams take different locks → no false sharing. The
+/// worker tick iterates the map under a read lock and `tick()`s each
+/// tracker. The outer write-lock is only taken on first publish for a
+/// given stream (lazy allocation) and on stream deletion.
+pub type SharedIdempotency = Arc<parking_lot::RwLock<
+    HashMap<u32, Arc<parking_lot::Mutex<IdempotencyTracker>>, FixedState>,
+>>;
 
-/// Build a fresh shared handle with no tracker allocated yet.
+/// Build a fresh shared handle with no trackers allocated yet.
 pub fn new_shared_idempotency() -> SharedIdempotency {
-    Arc::new(Mutex::new(None))
+    Arc::new(parking_lot::RwLock::new(HashMap::with_hasher(FixedState::default())))
+}
+
+/// Get-or-create the per-stream tracker handle. Cheap when the entry
+/// already exists (read lock + Arc clone); takes the write lock once
+/// per fresh stream to insert. Caller then locks the returned Mutex.
+#[inline]
+pub fn idempotency_for_stream(
+    shared: &SharedIdempotency,
+    stream: StreamId,
+) -> Arc<parking_lot::Mutex<IdempotencyTracker>> {
+    let key = stream.0;
+    // Fast path: existing entry.
+    {
+        let g = shared.read();
+        if let Some(t) = g.get(&key) {
+            return Arc::clone(t);
+        }
+    }
+    // Slow path: insert under write lock.
+    let mut g = shared.write();
+    Arc::clone(g.entry(key).or_insert_with(|| {
+        Arc::new(parking_lot::Mutex::new(IdempotencyTracker::new()))
+    }))
 }
 
 /// Wheel resolution: each bucket represents one second. We round

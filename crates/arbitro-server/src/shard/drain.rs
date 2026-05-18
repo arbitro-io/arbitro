@@ -286,12 +286,27 @@ pub(in crate::shard) fn drain_deliver(
     let mut flush_results = std::mem::take(&mut scratch.flush_results);
     {
         let writers_by_conn = &snap.writers_by_conn;
+        // F18: one-entry cache for `find_writer`. Many frames in a
+        // single cycle belong to the same connection (subscribe-heavy
+        // workloads); caching the previous lookup turns the HashMap
+        // hit into a pointer compare. Cleared at the start of each
+        // for_each invocation (closure capture).
+        let mut last_conn: u64 = u64::MAX;
+        let mut last_writer: Option<&crate::shard::shared::WriterIndexEntry> = None;
         scratch.acc.for_each(names, |frame| {
             // F29: drop one Bytes::clone() per frame by transferring
             // ownership directly to try_send (consumes the Bytes).
             // `acc.for_each` already passes ownership of the inner buffer
             // via the &mut frame reference.
-            let Some(writer) = find_writer(writers_by_conn, frame.connection_id.0) else {
+            // F18: lookup via cache.
+            let writer = if frame.connection_id.0 == last_conn {
+                last_writer
+            } else {
+                last_conn = frame.connection_id.0;
+                last_writer = find_writer(writers_by_conn, frame.connection_id.0);
+                last_writer
+            };
+            let Some(writer) = writer else {
                 // Writer not found → connection truly gone (removed from
                 // registry). Mark dead so the engine retires bindings.
                 flush_results.push((frame.connection_id, FlushOutcome::WriterGone));

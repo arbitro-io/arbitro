@@ -432,14 +432,14 @@ impl CommandWorker {
                         // but contention is negligible (publish lock
                         // hold time = HashMap lookup, sub-microsecond).
                         self.wheel_tick();
-                        if let Some(t) = self
-                            .idempotency_tracker
-                            .lock()
-                            .expect("idempotency mutex poisoned")
-                            .as_mut()
-                        {
-                            t.tick();
+                        // F26: tick every per-stream tracker. Outer
+                        // read lock is uncontended in steady state;
+                        // each per-stream Mutex is taken only briefly.
+                        let guard = self.idempotency_tracker.read();
+                        for tracker_arc in guard.values() {
+                            tracker_arc.lock().tick();
                         }
+                        drop(guard);
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }
@@ -471,14 +471,14 @@ impl CommandWorker {
                         // but contention is negligible (publish lock
                         // hold time = HashMap lookup, sub-microsecond).
                         self.wheel_tick();
-                        if let Some(t) = self
-                            .idempotency_tracker
-                            .lock()
-                            .expect("idempotency mutex poisoned")
-                            .as_mut()
-                        {
-                            t.tick();
+                        // F26: tick every per-stream tracker. Outer
+                        // read lock is uncontended in steady state;
+                        // each per-stream Mutex is taken only briefly.
+                        let guard = self.idempotency_tracker.read();
+                        for tracker_arc in guard.values() {
+                            tracker_arc.lock().tick();
                         }
+                        drop(guard);
                         self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
                     }
                 }

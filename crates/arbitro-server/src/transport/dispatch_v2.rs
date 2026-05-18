@@ -168,25 +168,21 @@ fn v2_publish(
     let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
+        // F26: per-stream lock. Different streams contend on different
+        // mutexes. The outer map read-lock + Arc clone is sub-µs in
+        // steady state (no allocation, no contention).
         let shared = server.idempotency_for(seq_stream);
-        let mut guard = shared.lock().expect("idempotency mutex poisoned");
-        let was_none = guard.is_none();
-        let tracker = guard.get_or_insert_with(
-            crate::shard::idempotency::IdempotencyTracker::new,
-        );
-        // F10: announce allocation so the command worker stops locking
-        // this Arc just to test Option::is_some() on every iteration.
-        if was_none {
-            server.mark_idempotency_allocated(seq_stream);
-        }
-        if !tracker.record(seq_stream, hash, window_ms) {
-            // Duplicate within window — reject. The original write
-            // (whichever publish landed first) remains intact.
-            drop(guard);
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
+        let mut t = tracker_arc.lock();
+        // F10: announce allocation so the worker's select! predicate
+        // stops paying the lock to test Option::is_some.
+        server.mark_idempotency_allocated(seq_stream);
+        if !t.record(seq_stream, hash, window_ms) {
+            drop(t);
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
         }
-        drop(guard);
+        drop(t);
     }
 
     let entries = [arbitro_store::EntryRef {
@@ -330,18 +326,11 @@ fn v2_publish_batch(
     let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && f.iter().any(|v| !v.msg_id().is_empty()) {
         let shared = server.idempotency_for(seq_stream);
-        let mut guard = shared.lock().expect("idempotency mutex poisoned");
-        let was_none = guard.is_none();
-        let tracker = guard.get_or_insert_with(
-            crate::shard::idempotency::IdempotencyTracker::new,
-        );
-        if was_none {
-            server.mark_idempotency_allocated(seq_stream);
-        }
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
+        let mut tracker = tracker_arc.lock();
+        server.mark_idempotency_allocated(seq_stream);
 
-        // Track which (hash) keys we inserted on this call so we can
-        // roll them back if a later entry collides. Entries with an
-        // empty msg_id are skipped (per-entry opt-in dedup).
+        // Track inserted hashes for rollback on duplicate.
         let mut inserted_hashes: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
         let mut duplicate = false;
         for v in f.iter() {
@@ -357,17 +346,14 @@ fn v2_publish_batch(
             inserted_hashes.push(hash);
         }
         if duplicate {
-            // Roll back every record we just inserted — the batch
-            // as a whole is being rejected, so we must not leave the
-            // tracker poisoned with phantom ids.
             for hash in &inserted_hashes {
                 tracker.forget(seq_stream, *hash);
             }
-            drop(guard);
+            drop(tracker);
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
         }
-        drop(guard);
+        drop(tracker);
     }
 
     // Stream-build EntryRef vec — one allocation, no intermediate
