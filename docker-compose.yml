@@ -8,6 +8,10 @@ services:
       ARBITRO_MAX_CONNECTIONS: "10000"
       ARBITRO_IDLE_TIMEOUT: "300"
       ARBITRO_KEEPALIVE_INTERVAL: "30"
+      # M25: persistencia. El volumen `arbitro-data` apunta a /data; sin
+      # esta env var el broker corre en memoria pura y los datos del
+      # volumen no se usan — silently effímero.
+      ARBITRO_DATA_DIR: "/data"
     volumes:
       - arbitro-data:/data
     restart: unless-stopped

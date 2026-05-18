@@ -34,4 +34,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM scratch
 COPY --from=builder /tmp/arbitro-server /arbitro-server
 EXPOSE 9898
+# M26: run as non-root. `scratch` has no /etc/passwd so we use a
+# numeric UID/GID — 65532 is the conventional "nonroot" value used by
+# distroless. Containers running on k8s with `runAsNonRoot: true` need
+# this, and there's no reason to ship root by default.
+USER 65532:65532
+# Explicit signal so `docker stop` / k8s preStop triggers the broker's
+# graceful shutdown (signal handler in main.rs).
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/arbitro-server"]

@@ -81,7 +81,17 @@ Full architectural details, sharding strategy, and data-structure trade-offs liv
 
 ## Quick Start
 
-### Build and Run (WSL only — 9P on `/mnt` is slow)
+### Install from source
+
+```bash
+# Direct install of the broker binary from this repo
+cargo install --git https://github.com/zenozaga/arbitro-io arbitro-server
+
+# Or for the in-process client lib (add to your own Cargo.toml):
+#   arbitro-client-tokio = { git = "https://github.com/zenozaga/arbitro-io" }
+```
+
+### Build and Run from source (WSL only — 9P on `/mnt` is slow)
 
 ```bash
 # Compile from the Windows source
@@ -157,15 +167,33 @@ let _handle = consumer.subscribe_callback(Some(b"orders.premium.>"), move |msg| 
 }).await?;
 ```
 
-### Pull subscription (worker-paced)
+### Worker-paced consumption (pull semantics)
+
+Arbitro does not have a separate `Pull` action on the wire. Pull-style
+flow control is an emergent property of the existing primitives:
 
 ```rust
-let mut sub = consumer.subscribe(Some(b"orders.basic.>")).await?;
-while let Some(msg) = sub.next().await {
-    // Process at your own speed
+// Create the consumer with explicit acks + a bounded inflight cap.
+// `max_inflight = N` means the broker will deliver up to N messages,
+// then stop until the consumer acks — exactly the "fetch N, process,
+// fetch N more" loop you'd expect from a pull API.
+let consumer = ConsumerBuilder::new(b"worker")
+    .filter(b"orders.basic.>")
+    .max_inflight(10)
+    .ack_policy(AckPolicy::Explicit)
+    .create(&client, stream_id).await?;
+
+let mut sub = client.subscribe(stream_id, consumer, b"").await?;
+while let Some(msg) = sub.recv().await {
+    // Process at your own speed. The broker stops pushing once
+    // `max_inflight` is reached and resumes as you ack.
     msg.ack();
 }
 ```
+
+The `recv()` call drains a client-side buffer that the broker pushes
+into; flow control is enforced server-side by `max_inflight + Ack`.
+Set `max_inflight = u32::MAX` for firehose / pure-push behaviour.
 
 ### Negative acknowledgement with delay
 
