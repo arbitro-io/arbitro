@@ -164,6 +164,48 @@ mod tests {
         assert_eq!(parsed.body.subject_hash.get(), 0xDEADBEEF);
     }
 
+    /// T1 — B2 regression: a frame with a `count` that's larger than
+    /// what the tail can hold must NOT panic inside `try_entries`. The
+    /// dispatcher relies on `try_entries` returning `None` to drop the
+    /// frame cleanly without crashing the shard.
+    #[test]
+    fn batch_ack_try_entries_handles_lying_count() {
+        // Build a valid 2-entry frame, then bump `count` to a huge
+        // value. The tail has exactly 2*16 bytes — claiming 100k entries
+        // must not panic or read out of bounds.
+        let entries = [(1u64, 0u32), (2, 0)];
+        let size = BatchAckFrame::wire_size(entries.len());
+        let mut buf = vec![0u8; size];
+        BatchAckFrame::encode_into(&mut buf, 0, 1, &entries);
+
+        // Overwrite the count field (BatchAckBody.count is offset 4
+        // inside the body, which starts at HEADER_SIZE).
+        let count_off = HEADER_SIZE + 4;
+        buf[count_off]     = 0xFF;
+        buf[count_off + 1] = 0xFF;
+        buf[count_off + 2] = 0xFF;
+        buf[count_off + 3] = 0xFF;
+        let parsed = BatchAckFrame::ref_from_bytes(&buf).unwrap();
+        assert!(
+            parsed.try_entries().is_none(),
+            "lying count must return None, not panic"
+        );
+    }
+
+    /// T1 — also reject overflow on the multiplication itself.
+    #[test]
+    fn batch_ack_try_entries_handles_count_overflow() {
+        let entries = [(1u64, 0u32)];
+        let size = BatchAckFrame::wire_size(entries.len());
+        let mut buf = vec![0u8; size];
+        BatchAckFrame::encode_into(&mut buf, 0, 1, &entries);
+        // count = usize::MAX clearly overflows count * BATCH_ACK_ENTRY_SIZE.
+        let count_off = HEADER_SIZE + 4;
+        buf[count_off..count_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let parsed = BatchAckFrame::ref_from_bytes(&buf).unwrap();
+        assert!(parsed.try_entries().is_none());
+    }
+
     #[test]
     fn batch_ack_roundtrip() {
         let entries = [(100u64, 0x11u32), (101, 0x22), (102, 0x33), (103, 0x44)];

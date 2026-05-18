@@ -227,6 +227,49 @@ mod tests {
         assert_eq!(h.msg_len.get() as usize, PUB_BODY_FIXED + payload.len());
     }
 
+    /// T3 — B4 regression: an adversarial frame where
+    /// `subject_len + msg_id_len > tail.len()` must be rejected by
+    /// `validate()` instead of panicking inside `subject() / msg_id() /
+    /// payload()` slice arithmetic.
+    #[test]
+    fn b4_validate_rejects_oversized_subject_plus_msg_id() {
+        // Build a frame with a 4-byte payload, then forge the header
+        // claiming subject_len = 100. validate() must reject.
+        let payload = [0u8; 4];
+        let size = PubFrame::wire_size(0, 0, payload.len());
+        let mut buf = vec![0u8; size];
+        PubFrame::encode_into(&mut buf, 1, 0, 0, 0, &[], &[], &payload);
+        // Forge subject_len out of bounds — offset for subject_len
+        // is HEADER_SIZE + 4 (stream_id u32 first).
+        let off = HEADER_SIZE + 4;
+        buf[off]     = 0xFF;
+        buf[off + 1] = 0xFF; // subject_len = 65535
+        let f = PubFrame::ref_from_bytes(&buf).unwrap();
+        assert!(
+            f.validate().is_err(),
+            "subject_len > tail.len() must be rejected, not silently truncated"
+        );
+    }
+
+    /// T3 — also reject overflow in the addition itself.
+    #[test]
+    fn b4_validate_rejects_subject_msg_id_overflow() {
+        let payload = [0u8; 4];
+        let size = PubFrame::wire_size(0, 0, payload.len());
+        let mut buf = vec![0u8; size];
+        PubFrame::encode_into(&mut buf, 1, 0, 0, 0, &[], &[], &payload);
+        // subject_len = u16::MAX, msg_id_len = u16::MAX → sum overflows
+        // when treated as usize on a hypothetical 16-bit accumulator,
+        // and clearly exceeds tail.len() anyway.
+        let off = HEADER_SIZE + 4;
+        buf[off]     = 0xFF;
+        buf[off + 1] = 0xFF;
+        buf[off + 2] = 0xFF;
+        buf[off + 3] = 0xFF;
+        let f = PubFrame::ref_from_bytes(&buf).unwrap();
+        assert!(f.validate().is_err());
+    }
+
     #[test]
     fn entry_flags_in_header() {
         use crate::v2::header::entry_flag;
