@@ -24,7 +24,6 @@ pub use consumer_mgmt::{
     GetConsumerBody, GetConsumerFrame, GET_CONSUMER_BODY_FIXED,
     ListConsumersBody, ListConsumersFrame, LIST_CONSUMERS_BODY_SIZE,
     ConsumerStatsBody, ConsumerStatsFrame, CONSUMER_STATS_BODY_SIZE,
-    PauseConsumerBody, PauseConsumerFrame, PAUSE_CONSUMER_BODY_SIZE,
-    ResumeConsumerBody, ResumeConsumerFrame, RESUME_CONSUMER_BODY_SIZE,
+    // Pause/Resume migrated to v2::cold (serde_json).
     SubjectLimit, SUBJECT_LIMIT_HEADER_SIZE, subject_limits_tail_len,
 };

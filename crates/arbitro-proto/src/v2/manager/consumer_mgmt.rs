@@ -315,61 +315,8 @@ impl ConsumerStatsFrame {
 //
 // Sized 8B body, identical shape to DeleteConsumer. Reply = standard RepOk.
 
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct PauseConsumerBody {
-    pub consumer_id: U32,
-    pub _pad:        U32,
-}
-pub const PAUSE_CONSUMER_BODY_SIZE: usize = core::mem::size_of::<PauseConsumerBody>();
-const _: () = assert!(PAUSE_CONSUMER_BODY_SIZE == 8);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct PauseConsumerFrame {
-    pub header: Header,
-    pub body:   PauseConsumerBody,
-}
-const _: () = assert!(core::mem::size_of::<PauseConsumerFrame>() == HEADER_SIZE + PAUSE_CONSUMER_BODY_SIZE);
-
-impl PauseConsumerFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + PAUSE_CONSUMER_BODY_SIZE;
-    #[inline(always)]
-    pub fn new(seq: u64, consumer_id: u32) -> Self {
-        Self {
-            header: Header::new(Action::PauseConsumer.as_u16(), PAUSE_CONSUMER_BODY_SIZE as u32, seq),
-            body:   PauseConsumerBody { consumer_id: U32::new(consumer_id), _pad: U32::new(0) },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ResumeConsumerBody {
-    pub consumer_id: U32,
-    pub _pad:        U32,
-}
-pub const RESUME_CONSUMER_BODY_SIZE: usize = core::mem::size_of::<ResumeConsumerBody>();
-const _: () = assert!(RESUME_CONSUMER_BODY_SIZE == 8);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct ResumeConsumerFrame {
-    pub header: Header,
-    pub body:   ResumeConsumerBody,
-}
-const _: () = assert!(core::mem::size_of::<ResumeConsumerFrame>() == HEADER_SIZE + RESUME_CONSUMER_BODY_SIZE);
-
-impl ResumeConsumerFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + RESUME_CONSUMER_BODY_SIZE;
-    #[inline(always)]
-    pub fn new(seq: u64, consumer_id: u32) -> Self {
-        Self {
-            header: Header::new(Action::ResumeConsumer.as_u16(), RESUME_CONSUMER_BODY_SIZE as u32, seq),
-            body:   ResumeConsumerBody { consumer_id: U32::new(consumer_id), _pad: U32::new(0) },
-        }
-    }
-}
+// PauseConsumer / ResumeConsumer migrated to serde — see `v2::cold` module.
+// The wire bodies now ride as JSON inside the standard Header envelope.
 
 // ── GetConsumer (4B id + variable name) ────────────────────────────────
 

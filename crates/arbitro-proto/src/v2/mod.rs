@@ -26,6 +26,7 @@ pub mod ingress;
 pub mod store;
 pub mod egress;
 pub mod manager;
+pub mod cold;
 
 pub use header::{Header, HEADER_SIZE};
 pub use magic::{ARBITRO_MAGIC_V2, MAGIC_SIZE};

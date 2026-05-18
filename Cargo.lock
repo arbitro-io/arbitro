@@ -112,6 +112,7 @@ dependencies = [
  "bytes",
  "foldhash",
  "serde",
+ "serde_json",
  "tokio",
  "zerocopy",
 ]

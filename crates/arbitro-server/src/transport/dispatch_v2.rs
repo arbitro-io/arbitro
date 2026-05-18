@@ -41,7 +41,7 @@ use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::{
     CreateConsumerFrame, DeleteConsumerFrame, GetConsumerFrame, ListConsumersFrame,
-    ConsumerStatsFrame, PauseConsumerFrame, ResumeConsumerFrame,
+    ConsumerStatsFrame,
 };
 use arbitro_proto::v2::manager::stream_mgmt::{
     CreateStreamFrame, DeleteStreamFrame, DrainSubjectFrame, GetStreamFrame,
@@ -1073,11 +1073,12 @@ async fn v2_pause_consumer(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match PauseConsumerFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, PauseConsumer};
+    let body = match PauseConsumer::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
     let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
         .names()
         .consumer_stream(consumer_id)
@@ -1105,11 +1106,12 @@ async fn v2_resume_consumer(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match ResumeConsumerFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, ResumeConsumer};
+    let body = match ResumeConsumer::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
     let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
         .names()
         .consumer_stream(consumer_id)
