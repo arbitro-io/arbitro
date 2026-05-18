@@ -349,11 +349,13 @@ async fn prefill_streams(
 /// Returns elapsed time AND (stream_id, consumer_id) pairs for out-of-band cleanup.
 async fn run_replay(
     setup_client: &Client,
+    reader_clients: &[Client],
     stream_ids: &[u32],
     n: usize,
     msgs_per_stream: u32,
     iter: u32,
 ) -> (Duration, Vec<(u32, u32)>) {
+    assert_eq!(reader_clients.len(), n, "one reader client per consumer");
     let mut consumer_pairs = Vec::with_capacity(n);
     for i in 0..n {
         let stream_id = stream_ids[i % stream_ids.len()];
@@ -380,8 +382,8 @@ async fn run_replay(
 
     let start = Instant::now();
     let mut js = tokio::task::JoinSet::new();
-    for (stream_id, consumer_id) in consumer_pairs.clone() {
-        let client = setup_client.clone();
+    for (idx, (stream_id, consumer_id)) in consumer_pairs.clone().into_iter().enumerate() {
+        let client = reader_clients[idx].clone();
         let expected = msgs_per_stream;
         js.spawn(async move {
             let t_sub = Instant::now();
@@ -782,7 +784,7 @@ fn main() {
         println!("\n[ replay_drain — {replay_msgs} msgs pre-loaded/stream, DeliverPolicy::All ]");
         print_header();
 
-        for &n in REPLAY_CONCURRENCY {
+        let _replay_conc = env_concurrency(REPLAY_CONCURRENCY); for &n in &_replay_conc {
             let total_msgs_per_iter = replay_msgs as u64 * n as u64;
             let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
@@ -794,6 +796,14 @@ fn main() {
 
                 prefill_streams(&setup_client, &rp_ids, n, replay_msgs, &payload).await;
 
+                // One real TCP connection per consumer — matches the publish
+                // mode topology and lets replay throughput scale with conns.
+                let reader_clients: Vec<Client> = {
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n { v.push(connect(&addr).await); }
+                    v
+                };
+
                 let rss_before = rss_kb();
                 let cpu_before = cpu_time_ns();
                 let mut total_time = Duration::ZERO;
@@ -801,7 +811,7 @@ fn main() {
                 for iter in 0..replay_iterations {
                     match tokio::time::timeout(
                         REPLAY_TIMEOUT,
-                        run_replay(&setup_client, &rp_ids, n, replay_msgs, iter),
+                        run_replay(&setup_client, &reader_clients, &rp_ids, n, replay_msgs, iter),
                     )
                     .await
                     {
