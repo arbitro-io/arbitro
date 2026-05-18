@@ -565,14 +565,19 @@ impl CommandWorker {
         self.apply_delta_and_sync(&events);
 
         // Tell the drain to release this consumer's per-subject state.
-        // Best-effort: if the ring is full the slot just leaks until the
-        // drain next runs an Ack for this consumer (it won't — consumer
-        // is gone) so we accept a one-slot leak in the truly-stuck case.
-        let _ = self.drain_evt_tx.try_send(
+        // H11: if the ring is full now, queue the cleanup on
+        // `pending_consumer_remove` so the worker's main loop retries
+        // it on the next iteration — leaving the slot allocated would
+        // wedge the ConsumerSubjects index forever once the consumer
+        // is gone (no future Ack will arrive to dec the count).
+        if self.drain_evt_tx.try_send(
             crate::shard::drain_events::DrainEvent::ConsumerRemoved {
                 consumer_id: cmd.consumer_id,
             },
-        );
+        ).is_err() {
+            self.silent_drops.inc_drain_evt();
+            self.pending_consumer_remove.push(cmd.consumer_id);
+        }
         self.gate.release();
 
         self.rebuild_and_swap_snapshot();

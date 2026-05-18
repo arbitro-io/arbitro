@@ -66,6 +66,10 @@ struct Inner {
     /// channel allocated `CONN_WRITE_CAP` (4096) regardless of
     /// `ARBITRO_WRITE_BUFFER_CAP`. Now honoured at `register()` time.
     write_buffer_cap: usize,
+    /// H10: counter bumped every time an `enqueue()` dropped a frame
+    /// because the per-connection mpsc was full. Optional so tests can
+    /// continue to construct a registry without wiring it up.
+    silent_drops: Option<Arc<crate::common::SilentDrops>>,
 }
 
 impl ConnectionRegistry {
@@ -80,7 +84,20 @@ impl ConnectionRegistry {
                 conn_id_gen: ConnIdGen::new(),
                 clock: parking_lot::RwLock::new(None),
                 write_buffer_cap: cap,
+                silent_drops: None,
             }),
+        }
+    }
+
+    /// H10: wire the silent-drop counters. Called by the server after
+    /// construction so the registry can bump `conn_write` on every
+    /// dropped outbound frame.
+    pub fn set_silent_drops(&mut self, sd: Arc<crate::common::SilentDrops>) {
+        // We hold the only Arc<Inner> at this point (called from
+        // `ArbitroServer::new` before any clone). Use `get_mut` for a
+        // safe in-place update.
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.silent_drops = Some(sd);
         }
     }
 
@@ -198,7 +215,18 @@ impl ConnectionRegistry {
     fn enqueue(&self, conn_id: u64, frame: Bytes) -> bool {
         let sessions = self.inner.sessions.lock();
         match sessions.get(&conn_id) {
-            Some(s) => s.write_tx.try_send(frame).is_ok(),
+            Some(s) => match s.write_tx.try_send(frame) {
+                Ok(_) => true,
+                Err(_) => {
+                    // H10: count every dropped frame so operators see
+                    // the slow-consumer signal in the metrics line
+                    // instead of guessing from broken application logs.
+                    if let Some(sd) = &self.inner.silent_drops {
+                        sd.inc_conn_write();
+                    }
+                    false
+                }
+            },
             None => false,
         }
     }

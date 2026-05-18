@@ -133,6 +133,12 @@ pub struct DrainWorker {
     /// `DrainEvent::ConsumerRemoved`. Single-thread owned by drain — no
     /// locks, no atomics. Replaces `SharedCounters.subject` (papaya).
     pub(super) consumer_subjects: Vec<Option<ConsumerSubjects>>,
+    /// H10: shared silent-drop counters. Reserved for the drain → cmd
+    /// notify-ring drop sites once `drain::drain_deliver` learns to
+    /// take the counter handle directly; kept on the struct now so the
+    /// router-side wiring is already in place.
+    #[allow(dead_code)]
+    pub(super) silent_drops: Arc<crate::common::SilentDrops>,
 }
 
 impl DrainWorker {
@@ -365,6 +371,12 @@ pub struct CommandWorker {
     /// allocation per `flush_accumulator()` call (200/s at the default
     /// 5 ms interval per shard).
     pub(super) flush_stream_ids: Vec<StreamId>,
+    /// H10: shared silent-drop counters.
+    pub(super) silent_drops: Arc<crate::common::SilentDrops>,
+    /// H11: ConsumerRemoved events that lost a `try_send` to the drain
+    /// ring. Drained at the top of every command loop iteration so a
+    /// transient ring-full doesn't leak the per-consumer subject slot.
+    pub(super) pending_consumer_remove: Vec<ConsumerId>,
 }
 
 impl CommandWorker {
@@ -384,6 +396,27 @@ impl CommandWorker {
         loop {
             // Process any pending drain notifications first (non-blocking).
             self.drain_notifications();
+
+            // H11: retry any ConsumerRemoved events the previous cycle
+            // couldn't push because the drain-event ring was full. We
+            // keep retrying until the ring has room — losing a
+            // ConsumerRemoved leaks the consumer's subject inflight
+            // slot inside the drain thread forever.
+            if !self.pending_consumer_remove.is_empty() {
+                let mut i = 0;
+                while i < self.pending_consumer_remove.len() {
+                    let cid = self.pending_consumer_remove[i];
+                    if self.drain_evt_tx.try_send(
+                        crate::shard::drain_events::DrainEvent::ConsumerRemoved {
+                            consumer_id: cid,
+                        },
+                    ).is_ok() {
+                        self.pending_consumer_remove.swap_remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
 
             // Check if eviction is due.
             let eviction_sleep = self
@@ -746,10 +779,12 @@ impl CommandWorker {
         // is silently dropped — see `drain_events.rs` overflow policy.
         if !delta.subject_hashes_acked.is_empty() {
             for &(cid, sh) in &delta.subject_hashes_acked {
-                let _ = self.drain_evt_tx.try_send(DrainEvent::Ack {
+                if self.drain_evt_tx.try_send(DrainEvent::Ack {
                     consumer_id: ConsumerId(cid),
                     subject_hash: sh,
-                });
+                }).is_err() {
+                    self.silent_drops.inc_drain_evt();
+                }
             }
             // Wake drain so it processes the ring even if no new publishes
             // arrive. Multiple releases coalesce via `fetch_or`.

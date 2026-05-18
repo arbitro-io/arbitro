@@ -13,6 +13,9 @@
 
 pub mod reply_v2;
 pub mod session;
+pub mod silent_drops;
+
+pub use silent_drops::SilentDrops;
 
 pub use arbitro_common::{Gate, NameRegistry};
 pub use reply_v2::{send_error_v2, send_rep_ok_v2};

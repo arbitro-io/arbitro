@@ -67,6 +67,10 @@ pub struct ShardRouter {
     /// Shared monotonic millisecond clock (F7). Replaces per-publish
     /// `SystemTime::now()` syscalls with a single relaxed atomic load.
     clock: SharedClock,
+    /// H10: shared silent-drop counters across all shards. Bumped at
+    /// every `try_send` failure on the conn-write / notify-ring /
+    /// drain-event paths and surfaced in the periodic metrics log.
+    silent_drops: Arc<crate::common::SilentDrops>,
 }
 
 impl ShardRouter {
@@ -83,6 +87,8 @@ impl ShardRouter {
         let mut drain_joins = Vec::with_capacity(shard_count);
         let mut drain_running = Vec::with_capacity(shard_count);
         let names = Arc::new(NameRegistry::new());
+        // H10: one SilentDrops shared by every shard + the registry.
+        let silent_drops = Arc::new(crate::common::SilentDrops::new());
 
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
@@ -141,6 +147,7 @@ impl ShardRouter {
                 notify_ring: Arc::clone(&notify_ring),
                 drain_evt_rx: Arc::clone(&drain_evt_ring),
                 consumer_subjects: Vec::new(),
+                silent_drops: Arc::clone(&silent_drops),
             };
 
             // H5: keep the JoinHandle. shutdown() will flip `running`
@@ -184,6 +191,8 @@ impl ShardRouter {
                 idempotency_tracker: Arc::clone(&shard_idempotency),
                 has_idempotency: Arc::clone(&shard_has_idempotency),
                 flush_stream_ids: Vec::new(),
+                silent_drops: Arc::clone(&silent_drops),
+                pending_consumer_remove: Vec::new(),
             };
 
             tokio::spawn(cmd_worker.run());
@@ -232,7 +241,15 @@ impl ShardRouter {
             has_idempotency: has_idempotency.into(),
             command_log: None,
             clock,
+            silent_drops,
         }
+    }
+
+    /// H10: handle to the shared silent-drop counters. The metrics loop
+    /// snapshots this every interval; tests can read it for assertions.
+    #[inline]
+    pub fn silent_drops(&self) -> Arc<crate::common::SilentDrops> {
+        Arc::clone(&self.silent_drops)
     }
 
     /// Cached "now" in milliseconds since the UNIX epoch. Hot path —

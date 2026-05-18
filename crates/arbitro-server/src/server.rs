@@ -43,11 +43,14 @@ pub struct ArbitroServer {
 
 impl ArbitroServer {
     pub fn new(config: Config) -> Self {
-        let registry = ConnectionRegistry::new(config.write_buffer_cap);
+        let mut registry = ConnectionRegistry::new(config.write_buffer_cap);
         let server = ShardRouter::spawn(&config, &registry);
         // F8: hook the registry up to the shared millisecond clock so
         // `touch()` / sweeps don't need per-call `SystemTime::now()`.
         registry.set_clock(server.clock());
+        // H10: wire the shared SilentDrops so `enqueue()` can bump the
+        // conn-write counter and the metrics loop can read deltas.
+        registry.set_silent_drops(server.silent_drops());
 
         let services: Vec<Box<dyn LifeCycle>> = vec![Box::new(registry.clone())];
 
@@ -628,6 +631,8 @@ async fn metrics_loop(
     // Skip the first immediate tick — first emission is one interval in.
     ticker.tick().await;
     let mut prev = MetricsSnapshot::default();
+    let silent_drops = server.silent_drops();
+    let mut prev_drops = silent_drops.snapshot();
 
     loop {
         tokio::select! {
@@ -703,6 +708,13 @@ async fn metrics_loop(
         }
         let connections = registry.active_count();
 
+        // H10: per-tick silent-drop deltas.
+        let drops_now = silent_drops.snapshot();
+        let drop_conn_write = drops_now.conn_write.saturating_sub(prev_drops.conn_write);
+        let drop_notify_ring = drops_now.notify_ring.saturating_sub(prev_drops.notify_ring);
+        let drop_drain_evt = drops_now.drain_evt.saturating_sub(prev_drops.drain_evt);
+        prev_drops = drops_now;
+
         tracing::info!(
             interval_s    = interval.as_secs(),
             // ── Gauges (current state) ─────────────────────────────────
@@ -725,6 +737,10 @@ async fn metrics_loop(
             pub_no_match  = acc.publish_no_match.saturating_sub(prev.publish_no_match),
             held_inflight = acc.claim_skipped_max_inflight.saturating_sub(prev.claim_skipped_max_inflight),
             held_subject  = acc.claim_skipped_subject_limit.saturating_sub(prev.claim_skipped_subject_limit),
+            // H10: silent drops at the conn-write / drain-event / notify-ring sites.
+            drop_conn_write = drop_conn_write,
+            drop_notify_ring = drop_notify_ring,
+            drop_drain_evt = drop_drain_evt,
             "metrics",
         );
 
