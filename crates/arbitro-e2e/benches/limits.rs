@@ -1,41 +1,47 @@
-//! Subject-limit isolation bench — VIP delivery latency under basic load.
+//! Subject-limit isolation bench — measures latency / throughput when
+//! `max_subject_inflight` is actually configured.
 //!
-//! Verifies that a high-priority subject (`orders.premium.*`) keeps
-//! delivering with bounded latency even while `orders.basic.*` holds a
-//! large backlog at its `max_subject_inflight`.
+//! Every stage in this file builds its consumer with the
+//! [`ConsumerBuilder`] and pins per-subject caps via
+//! [`ConsumerBuilder::max_subject_inflight`] so the numbers reflect the
+//! cost of enforcing the cap, not the cost of a bare consumer with no
+//! limits. The previous version of this bench used the flat
+//! `Client::create_consumer(...)` helper (no `SubjectLimit`s) and was
+//! silently testing the wrong thing.
 //!
-//! ## Semantics being verified
+//! ## Semantics
 //!
-//! `max_subject_inflight(pattern, N)` sets a **per-subject** limit whose
-//! VALUE comes from the pattern. Each unique subject that matches the
-//! pattern keeps its own atomic counter capped at N — they do NOT share
-//! one counter per pattern.
+//! `max_subject_inflight(pattern, N)` sets a per-*subject* cap whose
+//! value `N` comes from the pattern. Each unique subject that matches
+//! the pattern keeps its own atomic counter — 100 distinct
+//! `orders.basic.user_{i}` subjects with `("orders.basic.>", 1)` give
+//! 100 independent 1/1 counters.
 //!
-//! ## Setup (once per stage)
-//!   - Consumer:
-//!       max_inflight = 10_000
-//!       AckPolicy::Explicit
-//!   - 100 UNIQUE basic subjects published and drained without ack so the
-//!     consumer has 100 independent basic counters each at 1/1 inflight.
+//! ## Stages
 //!
-//! Loop (BENCH_LIMITS_ITERS iters, default 1000):
-//!   - Publish a fresh "orders.premium.vip_{i}" message.
-//!   - Measure time until delivery.
-//!   - ack to free the premium subject inflight slot for next iter.
-//!
-//! Reports avg / p50 / p99 latency. Constant latency across iterations
-//! confirms the basic load does not bleed into premium.
+//!   1. **baseline** — single subject, no contention. Pure publish→deliver
+//!      latency with the cap configured (but never saturated).
+//!   2. **isolated** — 100 basic subjects each pinned at 1/1 (unacked
+//!      backlog); fresh premium subject every iter. Premium has its own
+//!      `(orders.premium.>, 1)` counter, so the basic pin must not bleed.
+//!   3. **multi-client isolated** — 4 parallel clients, each pinning
+//!      100 basic subjects on its own stream.
+//!   4. **dynamic subjects throughput** — N unique subjects under
+//!      `(notif.user.>, 1)` exercises HashMap insert+remove on every
+//!      ack-driven dec → key removal.
 //!
 //! Run:
 //!   wsl bash -lc "cd /mnt/.../arbitro && \
 //!     cargo bench --bench limits --no-run 2>&1"
-//!   wsl bash -lc "cp .../target/release/deps/limits-* /tmp/arbitro-bench/ && \
-//!     cd /tmp/arbitro-bench && timeout 60 ./limits-* --bench"
+//!   wsl bash -lc "cp .../target/release/deps/limits-* /tmp/arbitro/ && \
+//!     cd /tmp/arbitro && timeout 120 ./limits-* --bench"
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, SubscriptionHandle};
+use arbitro_client_tokio::{
+    AckPolicy, BatchEntry, Client, ClientConfig, ConsumerBuilder, SubscriptionHandle,
+};
 use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
 
@@ -45,6 +51,11 @@ const PAYLOAD_SIZE: usize = 64;
 const STREAM: &[u8] = b"limits_e2e";
 /// Default users for Stage 4 (dynamic subjects throughput).
 const DEFAULT_DYNAMIC_USERS: u64 = 10_000;
+
+/// Subject patterns used across all stages.
+const PAT_BASIC: &[u8] = b"orders.basic.>";
+const PAT_PREMIUM: &[u8] = b"orders.premium.>";
+const PAT_DYNAMIC: &[u8] = b"notif.user.>";
 
 fn env_u64(var: &str, fallback: u64) -> u64 {
     std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
@@ -77,6 +88,14 @@ async fn connect(addr: &str) -> Client {
         .expect("client connects")
 }
 
+async fn create_stream(client: &Client, name: &[u8]) -> u32 {
+    let resp = client
+        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .expect("create_stream");
+    u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
+}
+
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
@@ -85,13 +104,13 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Run `iters` VIP publish + deliver rounds, measuring each.
-/// Takes client wrapped in Arc so this async fn is Send (Client is Send but not Sync,
-/// so &Client is not Send; Arc<Client> with only sync usage of publish is also not Send,
-/// so we clone the arc and take by value but only call sync methods before await).
-///
-/// Note: We can't use `&Client` in an async fn that is `Send` because Client is not Sync.
-/// Solution: pass client by value. Caller should clone before passing.
+// ── VIP latency measurement ─────────────────────────────────────────
+
+/// Run `iters` VIP publish + deliver rounds, measuring each. The
+/// consumer is created with `(orders.premium.>, 1)` so each fresh
+/// `orders.premium.vip_{i}` subject has its own 0/1 counter; the ack
+/// at the end of the iteration drops the counter back to 0 (and
+/// removes the entry from the per-consumer HashMap).
 async fn measure_vip_latency(
     client: Client,
     stream_id: u32,
@@ -103,7 +122,6 @@ async fn measure_vip_latency(
     for i in 0..iters {
         let subj = format!("orders.premium.vip_{i}");
         let start = Instant::now();
-        // publish is sync — loop on ring full
         loop {
             match client.publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&payload)) {
                 Ok(()) => break,
@@ -123,43 +141,90 @@ async fn measure_vip_latency(
     (latencies, client, sub)
 }
 
+// ── Stage 1 — baseline ─────────────────────────────────────────────
+
+/// Consumer with `(orders.premium.>, 1)` set but never under pressure
+/// (only one VIP in flight at a time, acked immediately). Measures
+/// the steady-state cost of having the cap configured.
 async fn baseline_latency(iters: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let resp = client
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await
-        .unwrap();
-    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+    let stream_id = create_stream(&client, STREAM).await;
 
-    // No subject-inflight limits — pure baseline.
-    // AckPolicy::Explicit=1, DeliverPolicy::All=0
-    let resp = client
-        .create_consumer(
-            stream_id,
-            b"baseline",
-            b"",
-            b">",
-            10_000,
-            1, // ack_policy = Explicit
-            0, // deliver_policy = All
-            0, // deliver_mode = Push/Fanout
-            30_000,
-            0,
-        )
+    let consumer_id = ConsumerBuilder::new(b"baseline")
+        .filter(b">")
+        .max_inflight(10_000)
+        .ack_policy(AckPolicy::Explicit)
+        .ack_wait_ms(30_000)
+        .max_subject_inflight(PAT_PREMIUM, 1)
+        .create(&client, stream_id)
         .await
-        .unwrap();
-    let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+        .expect("baseline consumer");
+
     let sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
     let payload = vec![0u8; PAYLOAD_SIZE];
 
-    let (latencies, _client, _sub) = measure_vip_latency(client, stream_id, sub, payload, iters).await;
+    let (latencies, _client, _sub) =
+        measure_vip_latency(client, stream_id, sub, payload, iters).await;
     latencies
 }
 
-/// Multi-client isolation: N parallel clients, each on its own STREAM
-/// with its own consumer. Runs concurrently via join_all (no tokio::spawn
-/// since Client futures are not Send).
+// ── Stage 2 — isolated under per-subject backlog ───────────────────
+
+/// Consumer with caps on BOTH families: `(orders.basic.>, 1)` and
+/// `(orders.premium.>, 1)`. We then pin every basic subject by
+/// publishing one msg per subject and NOT acking — each basic counter
+/// is now stuck at 1/1.
+///
+/// Premium subjects keep their own (orders.premium.>, 1) counters,
+/// which are independent of the basic counters. So VIP must keep
+/// delivering with the same latency as Stage 1.
+async fn isolated_latency(iters: u64) -> Vec<Duration> {
+    let addr = spawn_server().await;
+    let client = connect(&addr).await;
+    let stream_id = create_stream(&client, STREAM).await;
+
+    let consumer_id = ConsumerBuilder::new(b"isolation_tester")
+        .filter(b">")
+        .max_inflight(10_000)
+        .ack_policy(AckPolicy::Explicit)
+        .ack_wait_ms(30_000)
+        .max_subject_inflight(PAT_BASIC, 1)
+        .max_subject_inflight(PAT_PREMIUM, 1)
+        .create(&client, stream_id)
+        .await
+        .expect("isolated consumer");
+    let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let payload = vec![0u8; PAYLOAD_SIZE];
+
+    // Pin 100 unique basic subjects at 1/1.
+    let basic_subjects: Vec<String> =
+        (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
+    let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
+        .iter()
+        .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
+        .collect();
+    client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
+
+    let mut got = 0u32;
+    while got < BASIC_BACKLOG {
+        let _msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("basic backlog timeout")
+            .expect("subscription closed");
+        got += 1;
+    }
+    // Do NOT ack — basic subjects stay pinned at 1/1 for the whole
+    // measurement window.
+
+    let (latencies, _c, _s) =
+        measure_vip_latency(client, stream_id, sub, payload, iters).await;
+    latencies
+}
+
+// ── Stage 3 — multi-client isolated ────────────────────────────────
+
+/// Same as Stage 2 but with N parallel clients on N independent streams.
 async fn multi_client_isolated_latency(
     iters: u64,
     n_clients: u64,
@@ -171,30 +236,20 @@ async fn multi_client_isolated_latency(
         let addr = addr.clone();
         futs.push(async move {
             let client = connect(&addr).await;
-            let stream = format!("limits_stream_c{i}");
-            let resp = client
-                .create_stream(stream.as_bytes(), b">", 0, 0, 0, 1, 0, 0, 0, 0)
-                .await
-                .unwrap();
-            let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+            let stream_name = format!("limits_stream_c{i}");
+            let stream_id = create_stream(&client, stream_name.as_bytes()).await;
 
-            let consumer_name = format!("isolation_tester_c{i}");
-            let resp = client
-                .create_consumer(
-                    stream_id,
-                    consumer_name.as_bytes(),
-                    b"",
-                    b">",
-                    10_000,
-                    1, // ack_policy = Explicit
-                    0, // deliver_policy = All
-                    0, // deliver_mode = Push/Fanout
-                    30_000,
-                    0,
-                )
+            let name = format!("isolation_tester_c{i}");
+            let consumer_id = ConsumerBuilder::new(name.as_bytes())
+                .filter(b">")
+                .max_inflight(10_000)
+                .ack_policy(AckPolicy::Explicit)
+                .ack_wait_ms(30_000)
+                .max_subject_inflight(PAT_BASIC, 1)
+                .max_subject_inflight(PAT_PREMIUM, 1)
+                .create(&client, stream_id)
                 .await
-                .unwrap();
-            let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+                .expect("multi-client consumer");
             let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
             let payload = vec![0u8; PAYLOAD_SIZE];
 
@@ -204,10 +259,7 @@ async fn multi_client_isolated_latency(
                 .iter()
                 .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
                 .collect();
-            client
-                .publish_batch_sync(stream_id, &basic_entries)
-                .await
-                .unwrap();
+            client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
 
             let mut got = 0u32;
             while got < BASIC_BACKLOG {
@@ -227,57 +279,7 @@ async fn multi_client_isolated_latency(
     futures::future::join_all(futs).await
 }
 
-async fn isolated_latency(iters: u64) -> Vec<Duration> {
-    let addr = spawn_server().await;
-    let client = connect(&addr).await;
-    let resp = client
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await
-        .unwrap();
-    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
-
-    let resp = client
-        .create_consumer(
-            stream_id,
-            b"isolation_tester",
-            b"",
-            b">",
-            10_000,
-            1, // ack_policy = Explicit
-            0, // deliver_policy = All
-            0, // deliver_mode = Push/Fanout
-            30_000,
-            0,
-        )
-        .await
-        .unwrap();
-    let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
-    let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
-    let payload = vec![0u8; PAYLOAD_SIZE];
-
-    // ── Saturate basic: publish 100 unique basic subjects, drain without ack.
-    let basic_subjects: Vec<String> =
-        (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
-    let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
-        .iter()
-        .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
-        .collect();
-    client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
-
-    // Receive all BASIC_BACKLOG but do NOT ack — keep pressure on.
-    let mut got = 0u32;
-    while got < BASIC_BACKLOG {
-        let _msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("basic backlog timeout")
-            .expect("subscription closed");
-        got += 1;
-    }
-
-    // ── Measure premium-VIP delivery while 100 basic pendings hold.
-    let (latencies, _c, _s) = measure_vip_latency(client, stream_id, sub, payload, iters).await;
-    latencies
-}
+// ── Reporting ──────────────────────────────────────────────────────
 
 fn report(label: &str, latencies: &[Duration]) {
     let mut sorted = latencies.to_vec();
@@ -301,35 +303,29 @@ fn report(label: &str, latencies: &[Duration]) {
     );
 }
 
-/// Stage 4 — high-cardinality dynamic subjects throughput.
+// ── Stage 4 — high-cardinality dynamic subjects ────────────────────
+
+/// One consumer with `(notif.user.>, 1)`. Publish N msgs to N distinct
+/// `notif.user.{i}` subjects, then drain+ack all. Each delivery hits
+/// the per-(consumer, subject_hash) counter inc; each ack drives
+/// dec→0→remove. The HashMap touches the maximum number of unique
+/// keys possible.
 async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
 
     let stream_name: &[u8] = b"dynamic_subjects";
-    let resp = client
-        .create_stream(stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await
-        .unwrap();
-    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+    let stream_id = create_stream(&client, stream_name).await;
 
-    // Consumer with AckPolicy::Explicit=1
-    let resp = client
-        .create_consumer(
-            stream_id,
-            b"dyn_consumer",
-            b"",
-            b">",
-            60_000,
-            1, // ack_policy = Explicit
-            0, // deliver_policy = All
-            0, // deliver_mode = Push/Fanout
-            30_000,
-            0,
-        )
+    let consumer_id = ConsumerBuilder::new(b"dyn_consumer")
+        .filter(b">")
+        .max_inflight(60_000)
+        .ack_policy(AckPolicy::Explicit)
+        .ack_wait_ms(30_000)
+        .max_subject_inflight(PAT_DYNAMIC, 1)
+        .create(&client, stream_id)
         .await
-        .unwrap();
-    let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+        .expect("dynamic consumer");
     let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
     let payload = vec![0u8; PAYLOAD_SIZE];
 
@@ -343,7 +339,6 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let start = Instant::now();
-
     client.publish_batch_sync(stream_id, &entries).await.unwrap();
 
     let mut got = 0u64;
@@ -356,10 +351,11 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
             _ => break,
         }
     }
-
     let elapsed = start.elapsed();
     (elapsed, got)
 }
+
+// ── Main ───────────────────────────────────────────────────────────
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -372,25 +368,25 @@ async fn main() {
     println!("                  Subject limits bench");
     println!("========================================================");
     println!("  iters={iters}   payload={PAYLOAD_SIZE}B");
-    println!("  basic backlog held unacked during isolated run: {BASIC_BACKLOG}");
+    println!("  All stages use max_subject_inflight via ConsumerBuilder.");
+    println!("  Stage 2/3 hold {BASIC_BACKLOG} basic subjects at 1/1.");
     println!();
 
     // Stage 1 — baseline
     println!("--------------------------------------------------------");
-    println!("  Stage 1 — baseline (no subject limits, no backlog)");
+    println!("  Stage 1 — baseline (orders.premium.> capped at 1, never saturated)");
     println!("--------------------------------------------------------");
     let base = baseline_latency(iters).await;
     report("baseline VIP publish -> deliver", &base);
 
-    // Stage 2 — isolated under load
+    // Stage 2 — isolated under per-subject backlog
     println!();
     println!("--------------------------------------------------------");
-    println!("  Stage 2 — isolated (100 basic held unacked)");
+    println!("  Stage 2 — isolated (100 basic subjects pinned at 1/1)");
     println!("--------------------------------------------------------");
     let iso = isolated_latency(iters).await;
     report("VIP under basic load", &iso);
 
-    // Summary
     let avg_base: Duration =
         base.iter().sum::<Duration>() / base.len() as u32;
     let avg_iso: Duration =
@@ -401,18 +397,16 @@ async fn main() {
     println!();
     println!("--------------------------------------------------------");
     println!(
-        "  Stage 3 — multi-client isolated ({n_clients} parallel clients, each with 100 basic held)"
+        "  Stage 3 — multi-client isolated ({n_clients} parallel clients, each pinning 100 basic)"
     );
     println!("--------------------------------------------------------");
     let per_client = multi_client_isolated_latency(iters, n_clients).await;
-    let iters_per_client = iters;
     for (i, lats) in per_client.iter().enumerate() {
         let label = format!("client {i} VIP under load");
         report(&label, lats);
     }
 
-    // Aggregate latency across all clients.
-    let mut all: Vec<Duration> = Vec::with_capacity((iters_per_client * n_clients) as usize);
+    let mut all: Vec<Duration> = Vec::with_capacity((iters * n_clients) as usize);
     for lats in &per_client {
         all.extend_from_slice(lats);
     }
@@ -423,9 +417,9 @@ async fn main() {
     println!("--------------------------------------------------------");
     println!("  Summary");
     println!("--------------------------------------------------------");
-    println!("  baseline (1 client, no load)    avg : {:>9.2?}", avg_base);
-    println!("  isolated (1 client, basic load) avg : {:>9.2?}", avg_iso);
-    println!("  multi    ({n_clients} clients, basic load each) avg : {:>9.2?}", avg_multi);
+    println!("  baseline (1 client, no backlog)        avg : {:>9.2?}", avg_base);
+    println!("  isolated (1 client, 100 basic at 1/1)  avg : {:>9.2?}", avg_iso);
+    println!("  multi    ({n_clients} clients, 100 basic each)   avg : {:>9.2?}", avg_multi);
     println!("  ratios (vs baseline):  isolated={ratio:.2}x   multi={ratio_multi:.2}x");
     println!("  (closer to 1.0 = better isolation)");
     println!();
@@ -435,7 +429,7 @@ async fn main() {
     println!(
         "  Stage 4 — dynamic subjects throughput ({dynamic_users} unique users)"
     );
-    println!("  Pattern: `notif.user.<id>` with AckPolicy::Explicit");
+    println!("  Pattern: notif.user.<id> with max_subject_inflight(notif.user.>, 1)");
     println!("  Exercises: HashMap insert+remove on every msg lifecycle");
     println!("--------------------------------------------------------");
     let (elapsed, delivered) = dynamic_subjects_throughput(dynamic_users).await;
@@ -458,6 +452,5 @@ async fn main() {
     );
     println!();
 
-    // suppress unused warnings
     let _ = (ratio, ratio_multi, Arc::new(()));
 }

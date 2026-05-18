@@ -29,6 +29,7 @@
 // Module skeleton — implementations land in subsequent steps of the plan.
 pub mod client;
 pub mod config;
+pub mod consumer_builder;
 pub mod error;
 pub mod metrics;
 
@@ -63,4 +64,16 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// Per-subject inflight cap (pattern + limit). Pass a slice of these to
 /// [`Client::create_consumer_with_limits`].
 pub use arbitro_proto::v2::manager::SubjectLimit;
+
+/// Fluent builder for `CreateConsumer` that validates invariants
+/// (`max_subject_inflight` requires `AckPolicy::Explicit`, etc.) before
+/// hitting the wire. Prefer this over [`Client::create_consumer_with_limits`]
+/// at call sites — it's an explicit no-broker-round-trip cost when
+/// validation fails, and the API stays readable as the config grows.
+pub use consumer_builder::ConsumerBuilder;
+
+/// Consumer-config enums lifted from `arbitro-proto` so callers don't
+/// have to depend on the proto crate directly to set `ack_policy`,
+/// `deliver_policy`, or `deliver_mode` on the builder.
+pub use arbitro_proto::config::{AckPolicy, DeliverMode, DeliverPolicy};
 

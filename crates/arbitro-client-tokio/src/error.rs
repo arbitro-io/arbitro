@@ -43,6 +43,14 @@ pub enum ClientError {
     /// Internal channel closed (writer task gone, runtime shutting down).
     #[error("channel closed")]
     ChannelClosed,
+
+    /// Local config validation failed before the request hit the wire.
+    /// Returned by the `ConsumerBuilder` / `StreamBuilder` helpers when
+    /// invariants on `ConsumerConfigBuilder::build` (or equivalent) are
+    /// violated — e.g. `max_subject_inflight` set with `AckPolicy::None`,
+    /// `DeliverPolicy::ByStartSeq` without a non-zero `start_seq`, etc.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 impl From<ProtoError> for ClientError {
