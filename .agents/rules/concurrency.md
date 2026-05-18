@@ -16,8 +16,13 @@ Each `ArbitroEngine` is **exclusively owned** by one `ShardWorker` thread. No sh
 ## CHANNEL PATTERNS
 
 ### Shard channel: `mpsc::channel<ShardCommand>`
-- held by `ShardHandle`, cloneable. `ShardWorker` uses `try_recv()` + `thread::park()`.
-- **Wake**: `ShardHandle.send()` calls `shard_thread.unpark()` after `tx.send()`.
+- held by `ShardHandle`, cloneable. The **`CommandWorker`** (one tokio
+  task per shard, lives in `shard/worker.rs`) drains it via
+  `tokio::select!`. The **`DrainWorker`** (one OS thread per shard,
+  same file) is a separate primitive and never touches the command
+  channel — it sleeps on the Gate.
+- **Wake**: `ShardHandle.send().await` is sufficient; we no longer use
+  `try_recv() + thread::park()` on the command path.
 - **Direction**: always transport → shard. Never shard → shard.
 
 ### Reply channel: `oneshot::channel`

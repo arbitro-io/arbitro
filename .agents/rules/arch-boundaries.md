@@ -36,20 +36,36 @@ fn map_stream_config(wire: &proto::config::StreamConfig) -> engine::catalog::Str
 }
 ```
 
-## MODULE RESPONSIBILITIES
+## MODULE RESPONSIBILITIES (current layout — M28 refresh)
+
+The server is split into `shard/`, `transport/`, `common/`, and
+`persistence/` modules. The historical single `shard.rs` / `transport.rs`
+files no longer exist.
 
 | Module | Responsibility | Depends On |
 |---|---|---|
-| `command.rs` | ShardCommand enum + reply types | `arbitro-engine` |
-| `shard.rs` | ShardWorker: recv, calls engine, owns Store | `command`, `arbitro-engine`, `arbitro-store` |
-| `handle.rs` | ShardHandle: async API with oneshot replies | `command`, `tokio::sync` |
-| `router.rs` | Server: spawn shards, route by stream_id | `handle`, `shard` |
-| `transport.rs`| TCP accept, read/write loops, Registry | `arbitro-proto`, `router`, `command` |
-| `wire_parse.rs`| Frame body parsing (zerocopy) | `arbitro-proto::wire` |
-| `recovery.rs` | MetadataApplier impl + startup replay | `command_log`, `handle` |
+| `shard/command.rs` | `ShardCommand` enum + reply types | `arbitro-engine` |
+| `shard/worker.rs` | `DrainWorker` (OS thread) + `CommandWorker` (tokio task); owns engine | `arbitro-engine`, `arbitro-store` |
+| `shard/drain.rs` | `drain_read` / `drain_deliver` for the DrainWorker | `worker`, `arbitro-store` |
+| `shard/handlers.rs` | Per-command handler impls on `CommandWorker` | `worker`, `arbitro-engine` |
+| `shard/idempotency.rs` | Per-shard dedup tracker | `arbitro-engine` |
+| `shard/consumer_subjects.rs` | Drain-owned per-(consumer,subject) inflight | — |
+| `shard/drain_events.rs` | SPSC ring (command → drain) | — |
+| `shard/handle.rs` | `ShardHandle`: async API w/ oneshot replies | `command`, `tokio::sync` |
+| `shard/router.rs` | `ShardRouter`: spawn shards, route by stream_id | `handle`, `worker` |
+| `shard/shared.rs` | `SharedCounters` + `DrainSnapshot` + ring types | — |
+| `transport/dispatch_v2.rs` | v2 frame dispatch (HOT publishes + COLD mgmt) | `arbitro-proto`, `router` |
+| `transport/registry.rs` | `ConnectionRegistry` + per-conn writer tasks | `tokio::sync`, `common::session` |
+| `transport/tls.rs` | Optional TLS acceptor | `tokio-rustls` (feature-gated) |
+| `common/silent_drops.rs` | H10 silent-drop counters (Arc<atomics>) | — |
+| `common/reply_v2.rs` | RepOk / RepError builders | `transport::registry` |
+| `common/session.rs` | `Session`, `ConnIdGen`, write-buffer cap | `tokio::sync` |
+| `persistence/command_log.rs` | Optional metadata journal | `arbitro-store` |
+| `persistence/recovery.rs` | `ReplayApplier` for startup replay | `command_log`, `router` |
+| `server.rs` | Accept loop, keepalive, metrics_loop, shutdown | every module above |
 
 ### Dependency direction (strict)
-`handle -> command -> engine` | `router -> handle, shard, config` | `transport -> proto, router, command`. No circular dependencies.
+`handle -> command -> engine` | `router -> handle, worker, drain, shared` | `transport -> proto, router, common`. No circular dependencies.
 
 ## ADDING NEW OPERATIONS
 1. Add variant to `ShardCommand` and owned structs in `command.rs`.

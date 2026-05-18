@@ -339,6 +339,71 @@ mod tests {
         assert_eq!(v[2].payload(), b"c");
     }
 
+    /// T2 — Adversarial: declared count > valid entries. The
+    /// iterator must yield exactly the number of well-formed entries
+    /// it can decode and then stop; it must NOT panic or report the
+    /// fictional count.
+    #[test]
+    fn t2_count_overstates_actual_entries() {
+        // Build a frame with one real entry, then forge `count = 2`.
+        let entries: &[(&[u8], &[u8], &[u8])] = &[(b"only", b"", b"P")];
+        let mut tail_bytes = 0usize;
+        for (s, m, p) in entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
+        }
+        let size = BatchPubFrame::wire_size(tail_bytes);
+        let mut buf = vec![0u8; size];
+        BatchPubFrame::encode_into(&mut buf, 1, 7, 0, 0, entries);
+        // Forge count=2 in the body. body sits at offset HEADER_SIZE+4.
+        let count_off = HEADER_SIZE + 4;
+        buf[count_off..count_off + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        let frame = BatchPubFrame::ref_from_bytes(&buf).expect("layout");
+        let collected: Vec<_> = frame.iter().collect();
+        // Iterator stops cleanly after the first (real) entry — the
+        // tail has no room for a second 8B per-entry header.
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].subject(), b"only");
+    }
+
+    /// T2 — Adversarial: a per-entry header with `subject_len = 0xFFFF`
+    /// (or any length that cannot fit in the remaining tail). The
+    /// iterator must yield `None` instead of slicing past the buffer
+    /// or panicking.
+    #[test]
+    fn t2_subject_len_overflows_tail() {
+        // Tail just large enough for the 8 B per-entry header — nothing else.
+        let tail = vec![0u8; BATCH_PUB_ENTRY_HEADER_SIZE];
+        let size = BatchPubFrame::wire_size(tail.len());
+        let mut buf = vec![0u8; size];
+
+        // Build the outer header + body manually (we want count = 1,
+        // subject_len = 0xFFFF; no real subject/payload bytes follow).
+        let msg_len = (BATCH_PUB_BODY_FIXED + tail.len()) as u32;
+        let frame_view = BatchPubFrame::mut_from_bytes(&mut buf).expect("layout");
+        frame_view.header = Header::new(
+            crate::action::Action::PublishBatch.as_u16(),
+            msg_len,
+            1,
+        );
+        frame_view.body = BatchPubBody {
+            stream_id: U32::new(0),
+            count:     U32::new(1),
+        };
+        // Write the lying entry header.
+        let bad = BatchPubEntryHeader {
+            subject_len: U16::new(0xFFFF),
+            msg_id_len:  U16::new(0),
+            payload_len: U32::new(0),
+        };
+        frame_view.tail[..BATCH_PUB_ENTRY_HEADER_SIZE]
+            .copy_from_slice(bad.as_bytes());
+
+        let frame = BatchPubFrame::ref_from_bytes(&buf).expect("layout");
+        let collected: Vec<_> = frame.iter().collect();
+        assert!(collected.is_empty(), "iterator must reject oversize subject_len");
+    }
+
     #[test]
     fn as_bytes_is_identity_after_decode() {
         let entries: &[(&[u8], &[u8], &[u8])] = &[(b"s", b"", b"P"), (b"ss", b"", b"PP")];
