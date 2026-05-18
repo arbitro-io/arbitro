@@ -17,18 +17,34 @@
 //! Thread safety: **not needed**. The wheel lives inside the single-owner
 //! CommandWorker (one per shard). No Arc, no Mutex.
 
-/// Entry stored in the timing wheel. 16 bytes, Copy.
+/// Discriminates the two wheel-entry workloads. M5: replaces the previous
+/// "subject_hash == 0 ⇒ nack-delay" hack with an explicit tag so the
+/// worker doesn't depend on FNV-1a never hashing to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WheelEntryKind {
+    /// Delivered entry awaiting ack. On expiry the worker re-checks
+    /// `binding.pending` and auto-nacks if still in flight.
+    AckTimeout = 0,
+    /// Nack-with-delay: cursor rewind only, message is already nacked.
+    NackDelay  = 1,
+}
+
+/// Entry stored in the timing wheel. 24 bytes, Copy.
 ///
 /// The caller uses `consumer_id` + `seq` to look up whether the entry
-/// is still pending. If already acked → skip (lazy cancel).
+/// is still pending. If already acked, skip (lazy cancel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct WheelEntry {
     pub seq: u64,
     pub consumer_id: u32,
     pub subject_hash: u32,
+    pub kind: WheelEntryKind,
 }
-const _: () = assert!(core::mem::size_of::<WheelEntry>() == 16);
+// Size is now 24 (16 + 1 byte tag + 7 bytes alignment padding). Compiler
+// keeps the struct 8-byte aligned because of the u64 seq.
+const _: () = assert!(core::mem::size_of::<WheelEntry>() == 24);
 
 /// Hashed timing wheel with lazy cancel semantics. Generic over the
 /// entry type so the same structure backs multiple use cases:
@@ -134,7 +150,7 @@ mod tests {
     #[test]
     fn basic_insert_and_advance() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 100, consumer_id: 1, subject_hash: 0xAB };
+        let e = WheelEntry { seq: 100, consumer_id: 1, subject_hash: 0xAB, kind: WheelEntryKind::AckTimeout };
 
         w.insert(e, 2); // expires 2 ticks from now
         assert_eq!(w.len(), 1);
@@ -152,9 +168,9 @@ mod tests {
     #[test]
     fn multiple_entries_same_bucket() {
         let mut w = TimingWheel::new(8);
-        let e1 = WheelEntry { seq: 1, consumer_id: 10, subject_hash: 0 };
-        let e2 = WheelEntry { seq: 2, consumer_id: 20, subject_hash: 0 };
-        let e3 = WheelEntry { seq: 3, consumer_id: 10, subject_hash: 0 };
+        let e1 = WheelEntry { seq: 1, consumer_id: 10, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e2 = WheelEntry { seq: 2, consumer_id: 20, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e3 = WheelEntry { seq: 3, consumer_id: 10, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
 
         w.insert(e1, 3);
         w.insert(e2, 3);
@@ -171,7 +187,7 @@ mod tests {
     #[test]
     fn delay_clamped_to_max() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 42, consumer_id: 1, subject_hash: 0 };
+        let e = WheelEntry { seq: 42, consumer_id: 1, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
 
         // delay=100 but wheel only has 4 buckets → clamped to 3
         w.insert(e, 100);
@@ -190,7 +206,7 @@ mod tests {
         w.advance();
         w.advance();
 
-        let e = WheelEntry { seq: 7, consumer_id: 1, subject_hash: 0 };
+        let e = WheelEntry { seq: 7, consumer_id: 1, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
         w.insert(e, 2); // should land in bucket (3+2)%4 = 1
 
         w.advance(); // current=0, no entries
@@ -202,8 +218,8 @@ mod tests {
     #[test]
     fn advance_into_reuses_buffer() {
         let mut w = TimingWheel::new(4);
-        w.insert(WheelEntry { seq: 1, consumer_id: 0, subject_hash: 0 }, 1);
-        w.insert(WheelEntry { seq: 2, consumer_id: 0, subject_hash: 0 }, 1);
+        w.insert(WheelEntry { seq: 1, consumer_id: 0, subject_hash: 0, kind: WheelEntryKind::AckTimeout }, 1);
+        w.insert(WheelEntry { seq: 2, consumer_id: 0, subject_hash: 0, kind: WheelEntryKind::AckTimeout }, 1);
 
         let mut buf = Vec::new();
         w.advance_into(&mut buf);
@@ -214,7 +230,7 @@ mod tests {
     #[test]
     fn zero_delay_fires_next_tick() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 99, consumer_id: 5, subject_hash: 0 };
+        let e = WheelEntry { seq: 99, consumer_id: 5, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
 
         // delay=0 means "insert at current bucket". But current advances
         // BEFORE checking, so delay=0 → lands at current, fires on NEXT

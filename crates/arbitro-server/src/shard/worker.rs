@@ -560,14 +560,13 @@ impl CommandWorker {
 
         let wheel = self.wheel.as_mut().unwrap();
         for entry in entries {
-            // subject_hash != 0 signals ack-timeout entry to wheel_tick.
-            // Ensure it's never 0 (extremely rare: only if FNV-1a produces 0).
-            let hash = if entry.subject_hash == 0 { 1 } else { entry.subject_hash };
+            // M5: explicit kind tag — no more "subject_hash == 0" hack.
             wheel.insert(
                 arbitro_common::WheelEntry {
                     seq: entry.seq,
                     consumer_id: consumer_id.0,
-                    subject_hash: hash,
+                    subject_hash: entry.subject_hash,
+                    kind: arbitro_common::WheelEntryKind::AckTimeout,
                 },
                 delay_ticks,
             );
@@ -593,14 +592,16 @@ impl CommandWorker {
         // For (1) "lazy cancel" means: if acked since insertion → skip entirely.
         // For (2) entry is never pending (already nacked) → always rewind.
         //
-        // Distinguish: subject_hash == 0 ⇒ nack-delay entry (guaranteed not
-        // pending, just needs cursor rewind). subject_hash != 0 ⇒ ack-timeout.
+        // M5: explicit `entry.kind` tag distinguishes the two paths.
         let mut min_rewind: Option<u64> = None;
         let mut expired_count: u32 = 0;
 
         for entry in &self.wheel_buf {
             let consumer_id = ConsumerId(entry.consumer_id);
-            let is_nack_delay = entry.subject_hash == 0;
+            let is_nack_delay = matches!(
+                entry.kind,
+                arbitro_common::WheelEntryKind::NackDelay,
+            );
 
             if is_nack_delay {
                 // Nack-delay: message was already nacked, just rewind cursor.

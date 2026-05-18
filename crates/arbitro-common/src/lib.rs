@@ -25,7 +25,7 @@ pub use clock::SharedClock;
 pub use gate::Gate;
 pub use id_pool::{IdPool, PoolError, PoolSnapshot};
 pub use name_registry::NameRegistry;
-pub use wheel::{TimingWheel, WheelEntry};
+pub use wheel::{TimingWheel, WheelEntry, WheelEntryKind};
 
 /// Re-export of the foldhash crate so downstream crates can build
 /// HashMaps with the same hasher choice we already pull transitively.

@@ -290,6 +290,7 @@ impl CommandWorker {
                         seq: entry.seq,
                         consumer_id: cmd.consumer_id.0,
                         subject_hash: 0, // not needed for nack-delay rewind
+                        kind: arbitro_common::WheelEntryKind::NackDelay,
                     },
                     delay_ticks,
                 );
