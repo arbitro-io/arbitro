@@ -445,4 +445,53 @@ mod tests {
         assert!(!t.contains(s(1), hash, b"a"));
         assert!(t.contains(s(1), hash, b"b"), "non-matching id stays");
     }
+
+    /// T18 — `forget()` leaves the wheel entry in place by design (see
+    /// the docstring). The wheel must NOT panic or break the dedup
+    /// contract when it later fires for a key that's already gone from
+    /// `seen` because the caller forgot it. The two structures are
+    /// allowed to drift on `forget`, but `tick()` must remain a
+    /// no-op-on-miss instead of corrupting state.
+    #[test]
+    fn t18_forget_does_not_desync_wheel_tick() {
+        let mut t = IdempotencyTracker::new();
+        // Record + forget the same key immediately. The wheel still
+        // holds a phantom entry for it; `seen` is empty.
+        t.record(s(1), 0xAAA1, b"x", 1000);
+        t.forget(s(1), 0xAAA1, b"x");
+        assert!(!t.contains(s(1), 0xAAA1, b"x"));
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.id_count(), 0);
+
+        // Tick past the wheel slot — the wheel will pop the phantom
+        // entry. It must NOT panic and must NOT corrupt `seen` (which
+        // could re-introduce the forgotten id with a wrong count).
+        t.tick();
+        assert!(!t.contains(s(1), 0xAAA1, b"x"));
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.id_count(), 0);
+    }
+
+    /// T18 follow-up — forget one id from a collision slot, leaving
+    /// the other. When the wheel later fires it must retire ONE entry
+    /// (the surviving id), not double-retire.
+    #[test]
+    fn t18_forget_one_of_two_then_tick_retires_survivor() {
+        let mut t = IdempotencyTracker::new();
+        let hash = 0xBEEF_0001u64;
+        t.record(s(1), hash, b"alpha", 1000);
+        t.record(s(1), hash, b"beta", 1000);
+        // Forget the first one. Wheel still has TWO entries (one for
+        // each `record` call). `seen` has one id under the hash key.
+        t.forget(s(1), hash, b"alpha");
+        assert_eq!(t.id_count(), 1);
+        // Tick past both. First tick pops the phantom (alpha) — should
+        // FIFO-retire the surviving id (beta), per the documented
+        // contract in `tick()`. Then the second tick pops the real beta
+        // entry but the slot is already gone, so it's a no-op.
+        t.tick();
+        t.tick();
+        assert!(!t.contains(s(1), hash, b"beta"));
+        assert_eq!(t.id_count(), 0);
+    }
 }

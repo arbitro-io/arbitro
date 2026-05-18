@@ -353,3 +353,66 @@ pub enum DrainNotification {
     /// calls `engine.mark_connection_dead()` to retire bindings.
     ConnectionDead(ConnectionId),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T19 — `signal_rewind` takes the MIN of the existing pending
+    /// value and the new target. The CAS loop must converge even under
+    /// concurrent contention.
+    #[test]
+    fn t19_signal_rewind_takes_min() {
+        let c = SharedCounters::new();
+        c.signal_rewind(100);
+        c.signal_rewind(50); // smaller wins
+        c.signal_rewind(75); // larger ignored
+        assert_eq!(c.take_rewind(), Some(50));
+        // After take, sentinel restored.
+        assert_eq!(c.take_rewind(), None);
+    }
+
+    /// T19 — `clear_rewind_if_eq` only clears when the observed value
+    /// matches. A racing signal that arrived after the observation
+    /// must survive the clear. This is the M3 race: wheel_tick
+    /// observes `R1`, processes, then clears — but in the meantime
+    /// the command thread signalled `R2 < R1`. The CAS form rejects
+    /// the clear and leaves `R2` intact.
+    #[test]
+    fn t19_clear_rewind_if_eq_does_not_clobber_concurrent_signal() {
+        let c = SharedCounters::new();
+        c.signal_rewind(100);
+        // Observer reads 100, races: another producer signals a smaller
+        // value (50) before the observer's CAS-clear runs.
+        c.signal_rewind(50);
+        // Observer's clear, scoped to its observed value, must FAIL.
+        assert!(
+            !c.clear_rewind_if_eq(100),
+            "clear with stale expected must be a no-op",
+        );
+        // 50 survives.
+        assert_eq!(c.take_rewind(), Some(50));
+    }
+
+    /// T19 — when observed value matches, `clear_rewind_if_eq` clears.
+    #[test]
+    fn t19_clear_rewind_if_eq_clears_on_match() {
+        let c = SharedCounters::new();
+        c.signal_rewind(42);
+        assert!(c.clear_rewind_if_eq(42));
+        assert_eq!(c.take_rewind(), None);
+    }
+
+    /// T19 — unconditional `clear_rewind` always clears (used on
+    /// shutdown/restart paths). Documents the contract difference
+    /// from `clear_rewind_if_eq` in a test that fails if someone
+    /// makes the two methods equivalent by accident.
+    #[test]
+    fn t19_clear_rewind_unconditional_wipes_any_signal() {
+        let c = SharedCounters::new();
+        c.signal_rewind(10);
+        c.signal_rewind(20); // 10 wins via min
+        c.clear_rewind();
+        assert_eq!(c.take_rewind(), None);
+    }
+}
