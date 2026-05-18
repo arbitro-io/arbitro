@@ -180,7 +180,9 @@ fn v2_publish(
         // F10: announce allocation so the worker's select! predicate
         // stops paying the lock to test Option::is_some.
         server.mark_idempotency_allocated(seq_stream);
-        if !t.record(seq_stream, hash, window_ms) {
+        // M2: pass the full msg_id so a hash collision between two
+        // distinct ids doesn't silently dedup the second publish.
+        if !t.record(seq_stream, hash, msg_id, window_ms) {
             drop(t);
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
@@ -333,8 +335,13 @@ fn v2_publish_batch(
         let mut tracker = tracker_arc.lock();
         server.mark_idempotency_allocated(seq_stream);
 
-        // Track inserted hashes for rollback on duplicate.
-        let mut inserted_hashes: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+        // M2: track inserted `(hash, msg_id bytes)` for rollback on
+        // duplicate. We hold the msg_id slice borrowed from `frame`
+        // (lives for the duration of this dispatch), so the rollback
+        // doesn't need owned copies — except `forget` expects a slice,
+        // which we still have.
+        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> =
+            smallvec::SmallVec::new();
         let mut duplicate = false;
         for v in f.iter() {
             let id = v.msg_id();
@@ -342,15 +349,15 @@ fn v2_publish_batch(
                 continue;
             }
             let hash = idempotency_hash(id);
-            if !tracker.record(seq_stream, hash, window_ms) {
+            if !tracker.record(seq_stream, hash, id, window_ms) {
                 duplicate = true;
                 break;
             }
-            inserted_hashes.push(hash);
+            inserted.push((hash, id));
         }
         if duplicate {
-            for hash in &inserted_hashes {
-                tracker.forget(seq_stream, *hash);
+            for (hash, id) in &inserted {
+                tracker.forget(seq_stream, *hash, id);
             }
             drop(tracker);
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
