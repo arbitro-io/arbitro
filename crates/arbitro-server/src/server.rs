@@ -199,6 +199,20 @@ impl ArbitroServer {
             }))
         };
 
+        // H14: minimal HTTP /health endpoint. Enabled when
+        // ARBITRO_HEALTH_LISTEN is set (e.g. "0.0.0.0:9090"); off by
+        // default. Replies "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        // if the shard router reports at least one live shard.
+        if let Ok(addr) = std::env::var("ARBITRO_HEALTH_LISTEN") {
+            if !addr.is_empty() {
+                let health_server = self.server.clone();
+                let health_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    run_healthcheck(addr, health_server, health_shutdown).await;
+                });
+            }
+        }
+
         // Per-connection ingress: each read_loop dispatches frames directly.
         // No central mpsc — TCP guarantees order per connection, and each
         // connection already runs in its own task, so we get free parallelism
@@ -685,6 +699,70 @@ async fn log_startup_state(server: &ShardRouter) {
         bytes = total_bytes,
         "broker state ready",
     );
+}
+
+/// H14: tiny HTTP healthcheck server.
+///
+/// Accepts one connection at a time, reads up to the end of the request
+/// line + headers (`\r\n\r\n`), and replies 200 OK if the shard router
+/// has at least one live shard. No HTTP parser dependency — we never
+/// inspect method/path beyond confirming the request terminates.
+async fn run_healthcheck(
+    addr: String,
+    server: ShardRouter,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(target = "healthcheck", addr = %addr, error = %e, "bind failed");
+            return;
+        }
+    };
+    tracing::info!(target = "healthcheck", addr = %addr, "healthcheck listening on /health");
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return,
+            res = listener.accept() => {
+                let (mut sock, _peer) = match res {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let healthy = server.shard_count() > 0;
+                tokio::spawn(async move {
+                    // Read until \r\n\r\n or 1 KiB, whichever first.
+                    let mut buf = [0u8; 1024];
+                    let mut total = 0usize;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        async {
+                            while total < buf.len() {
+                                let n = match sock.read(&mut buf[total..]).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => n,
+                                };
+                                total += n;
+                                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    return;
+                                }
+                            }
+                        },
+                    ).await;
+                    let body: &[u8] = if healthy { b"OK" } else { b"NO" };
+                    let status = if healthy { "200 OK" } else { "503 Service Unavailable" };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        }
+    }
 }
 
 /// Periodic metrics task. Sums `MetricsSnapshot` across all shards every

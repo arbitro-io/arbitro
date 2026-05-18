@@ -1171,14 +1171,39 @@ async fn v2_list_consumers(
 // ── System ─────────────────────────────────────────────────────────────────
 
 /// Server-side disconnect: drain across all shards, drop the connection.
+///
+/// H9: previously this iterated `0..shard_count()` serially and awaited
+/// each `drain_connection` round-trip in turn. With N shards and a
+/// p99 shard reply of a few hundred µs, a slow shard would gate the
+/// entire disconnect path and create a window where a recycled
+/// connection_id could see ack injections on a still-bound shard.
+/// We now build per-shard futures up front and poll them concurrently
+/// via `tokio::join!` semantics (collect + await each). Total wall
+/// time becomes `max(per-shard)` instead of `sum(per-shard)`.
 pub(crate) async fn v2_disconnect(
     conn_id: u64,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    for i in 0..server.shard_count() {
-        let _ = server.shard(i).drain_connection(ConnectionId(conn_id)).await;
+    let shards = server.shard_count();
+    let cid = ConnectionId(conn_id);
+    tracing::debug!(target = "dispatch", conn = conn_id, shards, "v2_disconnect: draining all shards");
+
+    // Spawn each drain_connection onto the same runtime so they execute
+    // concurrently. We must await all before removing the connection
+    // from the registry (writer task still alive).
+    let mut handles = Vec::with_capacity(shards);
+    for i in 0..shards {
+        let handle = server.shard(i).clone();
+        handles.push(tokio::spawn(async move {
+            let _ = handle.drain_connection(cid).await;
+        }));
     }
+    for h in handles {
+        let _ = h.await;
+    }
+
+    tracing::debug!(target = "dispatch", conn = conn_id, "v2_disconnect: drains complete");
     registry.remove(conn_id);
 }
 

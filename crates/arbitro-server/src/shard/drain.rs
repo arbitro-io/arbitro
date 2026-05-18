@@ -799,30 +799,65 @@ fn notify_delivered_grouped(
         }
     }
 
-    // F12: slow path — mixed bindings and/or partial frame success.
+    // F12 + F28: slow path — mixed bindings and/or partial frame success.
     // Reuse the persistent `sorted_buf` and `entries_buf` so we don't
-    // allocate per cycle. The `entries` Vec passed into the
-    // DrainNotification still needs to be owned (cross-thread), but
-    // building each group via drain() amortises the allocator pressure.
+    // allocate per cycle. F28: counting sort on `binding_idx` (bounded
+    // by bindings.len()) replaces the comparison sort — O(N + K) vs
+    // O(N log N) where K = bindings.len().
     sorted_buf.clear();
     sorted_buf.extend(deliveries.iter().copied().filter(|d| frame_ok(d.conn)));
-    sorted_buf.sort_unstable_by_key(|d| d.binding_idx);
 
-    let mut i = 0;
-    while i < sorted_buf.len() {
-        let idx = sorted_buf[i].binding_idx;
+    if sorted_buf.is_empty() {
+        return;
+    }
+
+    let n = sorted_buf.len();
+    let k = bindings.len();
+    // F28 counting sort: two-pass into bucket_starts scratch.
+    // bucket_starts[i] = where bucket i begins in the placed array.
+    // We reuse entries_buf as raw scratch for placement; it is cleared
+    // and recapped to N before use.
+    let mut bucket_counts: Vec<u32> = vec![0u32; k + 1];
+    for d in sorted_buf.iter() {
+        let idx = d.binding_idx;
+        debug_assert!(idx < k, "binding_idx out of range");
+        bucket_counts[idx + 1] += 1;
+    }
+    // Prefix sum -> bucket_starts.
+    for i in 1..=k {
+        bucket_counts[i] += bucket_counts[i - 1];
+    }
+    // Place into a scratch of PendingNotify; we reuse entries_buf only
+    // for the final per-group DeliveredEntry copy, so allocate a small
+    // local placement vec sized exactly N (single alloc/cycle in slow
+    // path; the fast path above handles the steady state).
+    // Sentinel value reused as default for placement scratch.
+    let sentinel = sorted_buf[0];
+    let mut placed: Vec<PendingNotify> = vec![sentinel; n];
+    // Use bucket_counts as the moving write cursor.
+    let mut cursors = bucket_counts.clone();
+    for d in sorted_buf.iter() {
+        let idx = d.binding_idx;
+        let p = cursors[idx] as usize;
+        placed[p] = *d;
+        cursors[idx] += 1;
+    }
+
+    // Walk groups via bucket_starts -> bucket_starts[next].
+    for idx in 0..k {
+        let start = bucket_counts[idx] as usize;
+        let end = bucket_counts[idx + 1] as usize;
+        if start == end {
+            continue;
+        }
         entries_buf.clear();
-        while i < sorted_buf.len() && sorted_buf[i].binding_idx == idx {
+        for p in &placed[start..end] {
             entries_buf.push(DeliveredEntry {
-                seq: sorted_buf[i].seq,
-                subject_hash: sorted_buf[i].subject_hash,
+                seq: p.seq,
+                subject_hash: p.subject_hash,
                 _pad: 0,
             });
-            i += 1;
         }
-        // Move the contents into a fresh owned Vec for the ring.
-        // `Vec::clone()` is unavoidable across the SPSC ring boundary,
-        // but at least the scratch capacity is reused.
         let entries: Vec<DeliveredEntry> = entries_buf.clone();
         let binding = &bindings[idx];
         let _ = notify_tx.try_send(DrainNotification::Delivered {

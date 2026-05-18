@@ -124,7 +124,22 @@ impl ConnectionRegistry {
         // H6: writer task removes the session from the registry on
         // write error so a half-dead peer cannot pile up forever.
         let inner = Arc::clone(&self.inner);
-        tokio::spawn(conn_writer_task(rx, writer, conn_id, inner));
+        // M15: supervise the writer task — panics here would silently
+        // strand the connection's mpsc receiver. Watcher logs and exits
+        // when the child resolves (normal or panic).
+        let writer_handle = tokio::spawn(conn_writer_task(rx, writer, conn_id, inner));
+        let cid_for_log = conn_id;
+        tokio::spawn(async move {
+            match writer_handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    tracing::error!(target = "supervisor", conn = cid_for_log, "conn writer task panicked: {e}");
+                }
+                Err(e) => {
+                    tracing::warn!(target = "supervisor", conn = cid_for_log, "conn writer join error: {e}");
+                }
+            }
+        });
         let clock = self.inner.clock.read().clone();
         let session = Session {
             write_tx: tx,

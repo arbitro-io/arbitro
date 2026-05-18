@@ -196,7 +196,25 @@ impl ShardRouter {
                 last_wheel_tick: None,
             };
 
-            tokio::spawn(cmd_worker.run());
+            // M15: supervise the command-worker task — if it panics
+            // we want a loud log line in operators' eyes instead of a
+            // silently-dead shard. The `JoinHandle` is awaited in a
+            // watcher task that logs and exits when the child resolves.
+            let shard_id_for_log = id;
+            let cmd_handle = tokio::spawn(cmd_worker.run());
+            tokio::spawn(async move {
+                match cmd_handle.await {
+                    Ok(()) => {
+                        tracing::debug!(target = "supervisor", shard = shard_id_for_log, "command worker exited cleanly");
+                    }
+                    Err(e) if e.is_panic() => {
+                        tracing::error!(target = "supervisor", shard = shard_id_for_log, "command worker panicked: {e}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(target = "supervisor", shard = shard_id_for_log, "command worker join error: {e}");
+                    }
+                }
+            });
 
             stores.push(Arc::clone(&shared_store));
             gates.push(Arc::clone(&gate));
