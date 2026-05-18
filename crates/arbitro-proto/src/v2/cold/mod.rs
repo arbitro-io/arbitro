@@ -29,11 +29,21 @@
 //!
 //! Hot-path frames stay zerocopy. This split is permanent.
 //!
-//! ## Contract
+//! ## Adding a new cold frame
 //!
-//! Any cold-path body type implements `ColdBody` (just a `serde` blanket
-//! impl). `encode(seq)` produces `Bytes` ready for `try_send`. The
-//! dispatcher feeds the post-Header slice into `decode_body`.
+//! Use the [`cold_body!`] macro. One line per type:
+//!
+//! ```ignore
+//! cold_body! {
+//!     Action::MyNewAction => pub struct MyNewBody {
+//!         pub field_a: u32,
+//!         pub field_b: Vec<u8>,
+//!     },
+//! }
+//! ```
+//!
+//! This expands to: the struct with `#[derive(Serialize, Deserialize)]`,
+//! and an `impl ColdBody` wiring the action. Nothing else.
 
 use bytes::Bytes;
 use serde::{de::DeserializeOwned, Serialize};
@@ -41,10 +51,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::action::Action;
 use crate::v2::header::{Header, HEADER_SIZE};
 
-/// A cold-path frame body. Auto-implemented for any
-/// `Serialize + DeserializeOwned` type via the blanket impl below.
+/// A cold-path frame body. The `encode` method wraps `self` in a v2
+/// Header and serializes the body as JSON; `decode_body` parses the
+/// reverse from the post-Header slice.
 pub trait ColdBody: Serialize + DeserializeOwned {
-    /// Wire action this body decodes as. Dispatcher uses
+    /// Wire action this body decodes as. The dispatcher uses
     /// `header.action` to pick the right `T::decode_body`.
     const ACTION: Action;
 
@@ -67,27 +78,79 @@ pub trait ColdBody: Serialize + DeserializeOwned {
     }
 }
 
-// ── Per-action body types ────────────────────────────────────────────────
+/// Declare one or more cold-path body types in a single block.
+///
+/// Each entry produces a `#[derive(Serialize, Deserialize)]` struct
+/// plus an `impl ColdBody` wired to the given `Action`. All fields are
+/// public; the struct is `Debug + Clone`.
+///
+/// Example:
+/// ```ignore
+/// cold_body! {
+///     Action::DeleteConsumer => pub struct DeleteConsumer { pub consumer_id: u32 },
+///     Action::DeleteStream   => pub struct DeleteStream   { pub name: Vec<u8> },
+/// }
+/// ```
+#[macro_export]
+macro_rules! cold_body {
+    (
+        $(
+            $action:expr => pub struct $name:ident {
+                $( pub $field:ident : $ty:ty ),* $(,)?
+            }
+        ),+ $(,)?
+    ) => {
+        $(
+            #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+            pub struct $name {
+                $( pub $field: $ty, )*
+            }
 
-/// `PauseConsumer` body. Replaces the zerocopy `PauseConsumerBody`
-/// (`consumer_id: u32 + _pad: u32`).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PauseConsumer {
-    pub consumer_id: u32,
+            impl $crate::v2::cold::ColdBody for $name {
+                const ACTION: $crate::action::Action = $action;
+            }
+        )+
+    };
 }
 
-impl ColdBody for PauseConsumer {
-    const ACTION: Action = Action::PauseConsumer;
-}
+// ── Cold body types ──────────────────────────────────────────────────────
+//
+// Every management frame whose body is a plain struct lives here. Add new
+// ones inside the single `cold_body!` block — keeps the wire surface and
+// the action table in one place.
 
-/// `ResumeConsumer` body. Same shape as `PauseConsumer`, different action.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ResumeConsumer {
-    pub consumer_id: u32,
-}
+cold_body! {
+    // ── Consumer lifecycle (Pause/Resume/Delete/Unsubscribe) ─────────
+    //
+    // Same shape — `consumer_id: u32`. The action discriminates the
+    // semantics on the broker side. `Unsubscribe` lives in
+    // `Action::Unsubscribe` (subscription family) but has identical
+    // body, so we share the structure with a per-action newtype to
+    // keep the dispatcher's match arms unambiguous.
+    Action::PauseConsumer  => pub struct PauseConsumer  { pub consumer_id: u32 },
+    Action::ResumeConsumer => pub struct ResumeConsumer { pub consumer_id: u32 },
+    Action::DeleteConsumer => pub struct DeleteConsumer { pub consumer_id: u32 },
+    Action::Unsubscribe    => pub struct Unsubscribe    { pub consumer_id: u32 },
 
-impl ColdBody for ResumeConsumer {
-    const ACTION: Action = Action::ResumeConsumer;
+    // ── Stream lookup / lifecycle (by name) ──────────────────────────
+    //
+    // `name` carries the wire-side stream name (UTF-8 or arbitrary
+    // bytes). `Vec<u8>` keeps the API agnostic to encoding.
+    Action::DeleteStream => pub struct DeleteStream { pub name: Vec<u8> },
+    Action::GetStream    => pub struct GetStream    { pub name: Vec<u8> },
+    Action::PurgeStream  => pub struct PurgeStream  { pub name: Vec<u8> },
+
+    // ── Consumer lookup (by (stream_id, name)) ───────────────────────
+    Action::GetConsumer => pub struct GetConsumer {
+        pub stream_id: u32,
+        pub name:      Vec<u8>,
+    },
+
+    // ── DrainSubject (stream name + subject pattern) ─────────────────
+    Action::DrainSubject => pub struct DrainSubject {
+        pub name:    Vec<u8>,
+        pub subject: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -95,33 +158,39 @@ mod tests {
     use super::*;
     use zerocopy::FromBytes;
 
+    /// Generic header invariant: every cold body roundtrips through
+    /// `encode(seq) → Header parse → decode_body`. Done for one
+    /// representative; the macro guarantees the rest follow.
     #[test]
     fn pause_roundtrip() {
         let original = PauseConsumer { consumer_id: 42 };
         let bytes = original.encode(99);
-        // Header parses
         let header = Header::ref_from_bytes(&bytes[..HEADER_SIZE]).unwrap();
         assert_eq!(header.action.get(), Action::PauseConsumer.as_u16());
         assert_eq!(header.seq.get(), 99);
         assert_eq!(header.msg_len.get() as usize, bytes.len() - HEADER_SIZE);
-        // Body decodes
         let decoded = PauseConsumer::decode_body(&bytes[HEADER_SIZE..]).unwrap();
         assert_eq!(decoded.consumer_id, 42);
     }
 
+    /// Tail-bearing body — confirms `Vec<u8>` survives encode/decode
+    /// and the Header carries the correct action discriminator.
     #[test]
-    fn resume_roundtrip() {
-        let original = ResumeConsumer { consumer_id: 7 };
+    fn drain_subject_roundtrip() {
+        let original = DrainSubject {
+            name:    b"orders".to_vec(),
+            subject: b"orders.eu.*".to_vec(),
+        };
         let bytes = original.encode(1);
         let header = Header::ref_from_bytes(&bytes[..HEADER_SIZE]).unwrap();
-        assert_eq!(header.action.get(), Action::ResumeConsumer.as_u16());
-        let decoded = ResumeConsumer::decode_body(&bytes[HEADER_SIZE..]).unwrap();
-        assert_eq!(decoded.consumer_id, 7);
+        assert_eq!(header.action.get(), Action::DrainSubject.as_u16());
+        let decoded = DrainSubject::decode_body(&bytes[HEADER_SIZE..]).unwrap();
+        assert_eq!(decoded.name, b"orders");
+        assert_eq!(decoded.subject, b"orders.eu.*");
     }
 
-    /// Cross-action bytes don't decode silently — JSON tolerates
-    /// extra fields but not missing required ones, so we wrap that
-    /// invariant in a test so a future evolution doesn't break it.
+    /// Missing required fields surface as decode errors — guards
+    /// against silently accepting partial bodies after a wire change.
     #[test]
     fn missing_required_field_is_an_error() {
         let body = br#"{}"#;

@@ -243,36 +243,7 @@ impl CreateConsumerFrame {
     }
 }
 
-// ── DeleteConsumer (sized, 8 B body) ───────────────────────────────────
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct DeleteConsumerBody {
-    pub consumer_id: U32,
-    pub _pad:        U32,
-}
-pub const DELETE_CONSUMER_BODY_SIZE: usize = core::mem::size_of::<DeleteConsumerBody>();
-const _: () = assert!(DELETE_CONSUMER_BODY_SIZE == 8);
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct DeleteConsumerFrame {
-    pub header: Header,
-    pub body:   DeleteConsumerBody,
-}
-const _: () = assert!(core::mem::size_of::<DeleteConsumerFrame>() == HEADER_SIZE + DELETE_CONSUMER_BODY_SIZE);
-
-impl DeleteConsumerFrame {
-    pub const WIRE_SIZE: usize = HEADER_SIZE + DELETE_CONSUMER_BODY_SIZE;
-
-    #[inline(always)]
-    pub fn new(seq: u64, consumer_id: u32) -> Self {
-        Self {
-            header: Header::new(Action::DeleteConsumer.as_u16(), DELETE_CONSUMER_BODY_SIZE as u32, seq),
-            body:   DeleteConsumerBody { consumer_id: U32::new(consumer_id), _pad: U32::new(0) },
-        }
-    }
-}
+// DeleteConsumer migrated to serde — see `v2::cold` module.
 
 // ── ConsumerStats (sized, 8 B body) ────────────────────────────────────
 //
@@ -318,52 +289,7 @@ impl ConsumerStatsFrame {
 // PauseConsumer / ResumeConsumer migrated to serde — see `v2::cold` module.
 // The wire bodies now ride as JSON inside the standard Header envelope.
 
-// ── GetConsumer (4B id + variable name) ────────────────────────────────
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct GetConsumerBody {
-    pub stream_id: U32,
-    pub name_len:  U16,
-    pub _pad:      [u8; 2],
-}
-pub const GET_CONSUMER_BODY_FIXED: usize = core::mem::size_of::<GetConsumerBody>();
-const _: () = assert!(GET_CONSUMER_BODY_FIXED == 8);
-
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct GetConsumerFrame {
-    pub header: Header,
-    pub body:   GetConsumerBody,
-    pub tail:   [u8],
-}
-
-impl GetConsumerFrame {
-    #[inline(always)]
-    pub const fn wire_size(name_len: usize) -> usize {
-        HEADER_SIZE + GET_CONSUMER_BODY_FIXED + name_len
-    }
-
-    #[inline(always)]
-    pub fn name(&self) -> &[u8] {
-        let n = self.body.name_len.get() as usize;
-        &self.tail[..n]
-    }
-
-    pub fn encode_into<'a>(out: &'a mut [u8], seq: u64, stream_id: u32, name: &[u8]) -> &'a mut Self {
-        debug_assert_eq!(out.len(), Self::wire_size(name.len()));
-        let msg_len = (GET_CONSUMER_BODY_FIXED + name.len()) as u32;
-        let frame = Self::mut_from_bytes(out).expect("GetConsumerFrame layout");
-        frame.header = Header::new(Action::GetConsumer.as_u16(), msg_len, seq);
-        frame.body = GetConsumerBody {
-            stream_id: U32::new(stream_id),
-            name_len:  U16::new(name.len() as u16),
-            _pad:      [0u8; 2],
-        };
-        frame.tail[..name.len()].copy_from_slice(name);
-        frame
-    }
-}
+// GetConsumer migrated to serde — see `v2::cold` module.
 
 // ── ListConsumers (sized) ──────────────────────────────────────────────
 
@@ -486,13 +412,7 @@ mod tests {
         assert_eq!(collected[1].1, 2);
     }
 
-    #[test]
-    fn delete_consumer_sized() {
-        let f = DeleteConsumerFrame::new(1, 42);
-        let bytes = f.as_bytes();
-        let p = DeleteConsumerFrame::ref_from_bytes(bytes).unwrap();
-        assert_eq!(p.body.consumer_id.get(), 42);
-    }
+    // delete_consumer test removed — frame migrated to v2::cold and tested there.
 
     #[test]
     fn list_consumers_sized() {

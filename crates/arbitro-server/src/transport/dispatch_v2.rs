@@ -40,13 +40,9 @@ use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::{
-    CreateConsumerFrame, DeleteConsumerFrame, GetConsumerFrame, ListConsumersFrame,
-    ConsumerStatsFrame,
+    CreateConsumerFrame, ListConsumersFrame, ConsumerStatsFrame,
 };
-use arbitro_proto::v2::manager::stream_mgmt::{
-    CreateStreamFrame, DeleteStreamFrame, DrainSubjectFrame, GetStreamFrame,
-    PurgeStreamFrame,
-};
+use arbitro_proto::v2::manager::stream_mgmt::CreateStreamFrame;
 use bytes::{Bytes, BytesMut};
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
@@ -615,16 +611,12 @@ async fn v2_unsubscribe(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    // Body shape is identical to Subscribe (see module comment).
-    let f = match SubFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, Unsubscribe};
+    let body = match Unsubscribe::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
-    if let Err(code) = f.validate() {
-        send_error_v2(registry, conn_id, req_seq, code);
-        return;
-    }
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound); return; }
@@ -733,11 +725,12 @@ async fn v2_delete_stream(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match DeleteStreamFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, DeleteStream};
+    let body = match DeleteStream::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
+    let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -765,7 +758,15 @@ async fn v2_delete_stream(
             // are gone, both list RPCs must rebuild on next call.
             server.invalidate_list_cache();
             if let Some(log) = server.command_log() {
-                let cmd = build_delete_stream(&frame[HEADER_SIZE..]);
+                // Metadata log keeps the legacy zerocopy body so the
+                // recovery applier (DeleteStreamView) is unchanged.
+                // Wire body is now JSON; we rebuild the on-disk body
+                // here from the parsed name.
+                let mut body = Vec::with_capacity(8 + name.len());
+                body.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                body.extend_from_slice(&[0u8; 6]);
+                body.extend_from_slice(name);
+                let cmd = build_delete_stream(&body);
                 if let Err(e) = log.record(&cmd) {
                     tracing::warn!(error = %e, "command log: delete_stream record failed");
                 }
@@ -783,11 +784,12 @@ async fn v2_get_stream(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match GetStreamFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, GetStream};
+    let body = match GetStream::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
+    let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     match server.names().stream_seq(wire_stream) {
         Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64),
@@ -802,11 +804,12 @@ async fn v2_purge_stream(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match PurgeStreamFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, PurgeStream};
+    let body = match PurgeStream::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
+    let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -826,12 +829,13 @@ async fn v2_drain_subject(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match DrainSubjectFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, DrainSubject};
+    let body = match DrainSubject::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
-    let subject = f.subject().to_vec();
+    let name = body.name.as_slice();
+    let subject = body.subject;
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -1017,11 +1021,12 @@ async fn v2_delete_consumer(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match DeleteConsumerFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, DeleteConsumer};
+    let body = match DeleteConsumer::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let consumer_id = ConsumerId(body.consumer_id);
 
     // F14: route directly to the owning shard when we know it.
     // Fall back to fanning out if the consumer→stream mapping is unknown
@@ -1051,7 +1056,14 @@ async fn v2_delete_consumer(
             server.invalidate_list_cache();
 
             if let Some(log) = server.command_log() {
-                let cmd = build_delete_consumer(&frame[HEADER_SIZE..]);
+                // Metadata log keeps the legacy zerocopy body
+                // (DeleteConsumerAction: consumer_id u32 + _pad u32)
+                // so the recovery applier (DeleteConsumerView) is
+                // unchanged. Rebuild from the parsed consumer_id.
+                let mut body = Vec::with_capacity(8);
+                body.extend_from_slice(&consumer_id.0.to_le_bytes());
+                body.extend_from_slice(&[0u8; 4]);
+                let cmd = build_delete_consumer(&body);
                 if let Err(e) = log.record(&cmd) {
                     tracing::warn!(error = %e, "command log: delete_consumer record failed");
                 }
@@ -1168,11 +1180,12 @@ async fn v2_get_consumer(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
-    let f = match GetConsumerFrame::ref_from_bytes(&frame[..]) {
-        Ok(f) => f,
+    use arbitro_proto::v2::cold::{ColdBody, GetConsumer};
+    let body = match GetConsumer::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
-    let name = f.name();
+    let name = body.name.as_slice();
     match server.names().consumer_id(name) {
         Some(id) => send_rep_ok_v2(registry, conn_id, req_seq, id.0 as u64),
         None     => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),

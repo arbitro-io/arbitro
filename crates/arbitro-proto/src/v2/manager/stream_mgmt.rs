@@ -122,114 +122,8 @@ impl CreateStreamFrame {
     }
 }
 
-// ── DeleteStream / GetStream / PurgeStream — same shape (8B + name) ────
-
-macro_rules! simple_named_frame {
-    ($body:ident, $frame:ident, $size_const:ident, $action:expr) => {
-        #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-        #[repr(C)]
-        pub struct $body {
-            pub name_len: U16,
-            pub _pad:     [u8; 6],
-        }
-        pub const $size_const: usize = core::mem::size_of::<$body>();
-        const _: () = assert!($size_const == 8);
-
-        #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-        #[repr(C)]
-        pub struct $frame {
-            pub header: Header,
-            pub body:   $body,
-            pub tail:   [u8],
-        }
-
-        impl $frame {
-            #[inline(always)]
-            pub const fn wire_size(name_len: usize) -> usize {
-                HEADER_SIZE + $size_const + name_len
-            }
-
-            #[inline(always)]
-            pub fn name(&self) -> &[u8] {
-                let n = self.body.name_len.get() as usize;
-                &self.tail[..n]
-            }
-
-            pub fn encode_into<'a>(out: &'a mut [u8], seq: u64, name: &[u8]) -> &'a mut Self {
-                debug_assert_eq!(out.len(), Self::wire_size(name.len()));
-                let msg_len = ($size_const + name.len()) as u32;
-                let frame = Self::mut_from_bytes(out).expect("layout");
-                frame.header = Header::new($action.as_u16(), msg_len, seq);
-                frame.body = $body {
-                    name_len: U16::new(name.len() as u16),
-                    _pad:     [0u8; 6],
-                };
-                frame.tail[..name.len()].copy_from_slice(name);
-                frame
-            }
-        }
-    };
-}
-
-simple_named_frame!(DeleteStreamBody, DeleteStreamFrame, DELETE_STREAM_BODY_FIXED, Action::DeleteStream);
-simple_named_frame!(GetStreamBody, GetStreamFrame, GET_STREAM_BODY_FIXED, Action::GetStream);
-simple_named_frame!(PurgeStreamBody, PurgeStreamFrame, PURGE_STREAM_BODY_FIXED, Action::PurgeStream);
-
-// ── DrainSubject — 8B body (name_len + subj_len) + name + subject ──────
-
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct DrainSubjectBody {
-    pub name_len: U16,
-    pub subj_len: U16,
-    pub _pad:     [u8; 4],
-}
-pub const DRAIN_SUBJECT_BODY_FIXED: usize = core::mem::size_of::<DrainSubjectBody>();
-const _: () = assert!(DRAIN_SUBJECT_BODY_FIXED == 8);
-
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-pub struct DrainSubjectFrame {
-    pub header: Header,
-    pub body:   DrainSubjectBody,
-    pub tail:   [u8],
-}
-
-impl DrainSubjectFrame {
-    #[inline(always)]
-    pub const fn wire_size(name_len: usize, subj_len: usize) -> usize {
-        HEADER_SIZE + DRAIN_SUBJECT_BODY_FIXED + name_len + subj_len
-    }
-
-    #[inline(always)]
-    pub fn name(&self) -> &[u8] {
-        let n = self.body.name_len.get() as usize;
-        &self.tail[..n]
-    }
-
-    #[inline(always)]
-    pub fn subject(&self) -> &[u8] {
-        let n = self.body.name_len.get() as usize;
-        let s = self.body.subj_len.get() as usize;
-        &self.tail[n..n + s]
-    }
-
-    pub fn encode_into<'a>(out: &'a mut [u8], seq: u64, name: &[u8], subject: &[u8]) -> &'a mut Self {
-        debug_assert_eq!(out.len(), Self::wire_size(name.len(), subject.len()));
-        let msg_len = (DRAIN_SUBJECT_BODY_FIXED + name.len() + subject.len()) as u32;
-        let frame = Self::mut_from_bytes(out).expect("DrainSubjectFrame layout");
-        frame.header = Header::new(Action::DrainSubject.as_u16(), msg_len, seq);
-        frame.body = DrainSubjectBody {
-            name_len: U16::new(name.len() as u16),
-            subj_len: U16::new(subject.len() as u16),
-            _pad:     [0u8; 4],
-        };
-        let n = name.len();
-        frame.tail[..n].copy_from_slice(name);
-        frame.tail[n..n + subject.len()].copy_from_slice(subject);
-        frame
-    }
-}
+// DeleteStream / GetStream / PurgeStream / DrainSubject migrated to serde —
+// see `v2::cold` module.
 
 // ── ListStreams — sized (no tail) ──────────────────────────────────────
 
@@ -284,25 +178,8 @@ mod tests {
         assert_eq!(frame.as_bytes(), &buf[..]);
     }
 
-    #[test]
-    fn delete_stream_roundtrip() {
-        let size = DeleteStreamFrame::wire_size(3);
-        let mut buf = vec![0u8; size];
-        DeleteStreamFrame::encode_into(&mut buf, 9, b"abc");
-        let frame = DeleteStreamFrame::ref_from_bytes(&buf).unwrap();
-        assert_eq!(frame.header.action.get(), Action::DeleteStream.as_u16());
-        assert_eq!(frame.name(), b"abc");
-    }
-
-    #[test]
-    fn drain_subject_roundtrip() {
-        let size = DrainSubjectFrame::wire_size(3, 5);
-        let mut buf = vec![0u8; size];
-        DrainSubjectFrame::encode_into(&mut buf, 7, b"str", b"a.b.c");
-        let f = DrainSubjectFrame::ref_from_bytes(&buf).unwrap();
-        assert_eq!(f.name(), b"str");
-        assert_eq!(f.subject(), b"a.b.c");
-    }
+    // delete_stream / drain_subject tests removed — frames migrated to v2::cold
+    // and tested there.
 
     #[test]
     fn list_streams_sized() {

@@ -18,9 +18,12 @@ use arbitro_proto::v2::ingress::{
     BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubFrame,
 };
 use arbitro_proto::v2::manager::{
-    CreateConsumerFrame, CreateStreamFrame, DeleteConsumerFrame, DeleteStreamFrame,
-    DrainSubjectFrame, GetConsumerFrame, GetStreamFrame, ListConsumersFrame, ListStreamsFrame,
-    PurgeStreamFrame, ConsumerStatsFrame, SubjectLimit, subject_limits_tail_len,
+    CreateConsumerFrame, CreateStreamFrame, ListConsumersFrame, ListStreamsFrame,
+    ConsumerStatsFrame, SubjectLimit, subject_limits_tail_len,
+};
+use arbitro_proto::v2::cold::{
+    ColdBody, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer, GetStream,
+    PurgeStream, Unsubscribe,
 };
 
 // ─── BatchEntry ───────────────────────────────────────────────────────
@@ -130,36 +133,23 @@ pub(crate) fn encode_create_stream_v2(
     Bytes::from(buf)
 }
 
-/// DeleteStream request frame.
+/// DeleteStream / GetStream / PurgeStream / DrainSubject — cold-path
+/// frames migrated to `v2::cold`. These thin shims keep the caller
+/// API unchanged while the bodies now ride as JSON.
 pub(crate) fn encode_delete_stream_v2(seq: u64, name: &[u8]) -> Bytes {
-    let size = DeleteStreamFrame::wire_size(name.len());
-    let mut buf = vec![0u8; size];
-    DeleteStreamFrame::encode_into(&mut buf, seq, name);
-    Bytes::from(buf)
+    DeleteStream { name: name.to_vec() }.encode(seq)
 }
 
-/// GetStream request frame.
 pub(crate) fn encode_get_stream_v2(seq: u64, name: &[u8]) -> Bytes {
-    let size = GetStreamFrame::wire_size(name.len());
-    let mut buf = vec![0u8; size];
-    GetStreamFrame::encode_into(&mut buf, seq, name);
-    Bytes::from(buf)
+    GetStream { name: name.to_vec() }.encode(seq)
 }
 
-/// PurgeStream request frame.
 pub(crate) fn encode_purge_stream_v2(seq: u64, name: &[u8]) -> Bytes {
-    let size = PurgeStreamFrame::wire_size(name.len());
-    let mut buf = vec![0u8; size];
-    PurgeStreamFrame::encode_into(&mut buf, seq, name);
-    Bytes::from(buf)
+    PurgeStream { name: name.to_vec() }.encode(seq)
 }
 
-/// DrainSubject request frame.
 pub(crate) fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> Bytes {
-    let size = DrainSubjectFrame::wire_size(name.len(), subject.len());
-    let mut buf = vec![0u8; size];
-    DrainSubjectFrame::encode_into(&mut buf, seq, name, subject);
-    Bytes::from(buf)
+    DrainSubject { name: name.to_vec(), subject: subject.to_vec() }.encode(seq)
 }
 
 /// ListStreams request frame (sized).
@@ -198,10 +188,9 @@ pub(crate) fn encode_create_consumer_v2(
     Bytes::from(buf)
 }
 
-/// DeleteConsumer request frame (sized, 8B body).
+/// DeleteConsumer — cold-path frame (v2::cold).
 pub(crate) fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
-    let f = DeleteConsumerFrame::new(seq, consumer_id);
-    Bytes::copy_from_slice(f.as_bytes())
+    DeleteConsumer { consumer_id }.encode(seq)
 }
 
 /// ConsumerStats request frame (sized, 8B body).
@@ -210,12 +199,9 @@ pub(crate) fn encode_consumer_stats_v2(seq: u64, consumer_id: u32) -> Bytes {
     Bytes::copy_from_slice(f.as_bytes())
 }
 
-/// GetConsumer request frame.
+/// GetConsumer — cold-path frame (v2::cold).
 pub(crate) fn encode_get_consumer_v2(seq: u64, stream_id: u32, name: &[u8]) -> Bytes {
-    let size = GetConsumerFrame::wire_size(name.len());
-    let mut buf = vec![0u8; size];
-    GetConsumerFrame::encode_into(&mut buf, seq, stream_id, name);
-    Bytes::from(buf)
+    GetConsumer { stream_id, name: name.to_vec() }.encode(seq)
 }
 
 /// ListConsumers request frame (sized).
@@ -327,15 +313,7 @@ pub(crate) fn encode_batch_nack_v2(
 /// filter is empty. Server routes by `consumer_id` only. Total: 28B (≤ INLINE_CAP).
 #[inline]
 pub(crate) fn encode_unsub_v2(seq: u64, consumer_id: u32) -> Bytes {
-    // Wire layout: [Header 16B][SubBody 12B] — filter_len = 0, no tail bytes.
-    let size = SubFrame::wire_size(0);
-    let mut buf = vec![0u8; size];
-    // Re-use SubFrame::encode_into which writes Action::Subscribe, then patch action.
-    SubFrame::encode_into(&mut buf, seq, 0, consumer_id, 0, b"");
-    // Patch the action bytes (LE u16 at offset 0) to Unsubscribe = 0x0302.
-    let action = arbitro_proto::action::Action::Unsubscribe.as_u16();
-    buf[0..2].copy_from_slice(&action.to_le_bytes());
-    Bytes::from(buf)
+    Unsubscribe { consumer_id }.encode(seq)
 }
 
 #[inline]
