@@ -12,7 +12,7 @@
 
 use crate::common::SubjectTrie;
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Sentinel value for `MatchEntry::binding_idx` meaning "unbound" — the
 /// subscription exists in the match table but no active binding has been
@@ -94,9 +94,17 @@ pub struct MatchTable {
     /// with publish traffic — see struct docs.
     exact: HashMap<u32, Vec<MatchEntry>, foldhash::fast::FixedState>,
 
+    /// F32: parallel HashSet keyed by subject_hash that mirrors `exact`
+    /// for O(1) dedup on `add_exact` — the Vec is still the source of
+    /// truth for ordered iteration at lookup time.
+    exact_dedup: HashMap<u32, HashSet<MatchEntry, foldhash::fast::FixedState>, foldhash::fast::FixedState>,
+
     /// Wildcard subscriptions that match all subjects on a stream.
     /// These are appended to every lookup result.
     catch_all: Vec<MatchEntry>,
+
+    /// F32: HashSet shadowing `catch_all` for O(1) dedup.
+    catch_all_dedup: HashSet<MatchEntry, foldhash::fast::FixedState>,
 
     /// Pattern subscriptions: (pattern_bytes, entry).
     /// Kept for mutation tracking (add/remove). Trie is rebuilt on change.
@@ -129,7 +137,9 @@ impl MatchTable {
     pub fn new() -> Self {
         Self {
             exact: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            exact_dedup: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             catch_all: Vec::new(),
+            catch_all_dedup: HashSet::with_hasher(foldhash::fast::FixedState::default()),
             patterns: Vec::new(),
             pattern_trie: SubjectTrie::new(),
             pattern_entries: Vec::new(),
@@ -141,17 +151,22 @@ impl MatchTable {
     }
 
     /// Add a subscription with no filter (catch-all: receives everything).
+    /// F32: HashSet-backed O(1) dedup; Vec remains source of truth.
     pub fn add_catch_all(&mut self, entry: MatchEntry) {
-        if !self.catch_all.contains(&entry) {
+        if self.catch_all_dedup.insert(entry) {
             self.catch_all.push(entry);
         }
     }
 
     /// Add a subscription for an exact subject hash.
+    /// F32: HashSet-backed O(1) dedup; Vec remains source of truth.
     pub fn add_exact(&mut self, subject_hash: u32, entry: MatchEntry) {
-        let entries = self.exact.entry(subject_hash).or_default();
-        if !entries.contains(&entry) {
-            entries.push(entry);
+        let set = self
+            .exact_dedup
+            .entry(subject_hash)
+            .or_insert_with(|| HashSet::with_hasher(foldhash::fast::FixedState::default()));
+        if set.insert(entry) {
+            self.exact.entry(subject_hash).or_default().push(entry);
         }
     }
 
@@ -166,16 +181,40 @@ impl MatchTable {
     /// Remove all entries for a subscription.
     pub fn remove_subscription(&mut self, subscription_id: SubscriptionId) {
         self.catch_all.retain(|e| e.subscription_id != subscription_id);
+        self.catch_all_dedup.retain(|e| e.subscription_id != subscription_id);
 
         self.exact.retain(|_, entries| {
             entries.retain(|e| e.subscription_id != subscription_id);
             !entries.is_empty()
+        });
+        self.exact_dedup.retain(|_, set| {
+            set.retain(|e| e.subscription_id != subscription_id);
+            !set.is_empty()
         });
 
         let had_patterns = self.patterns.iter().any(|(_, e)| e.subscription_id == subscription_id);
         self.patterns.retain(|(_, e)| e.subscription_id != subscription_id);
         if had_patterns {
             self.rebuild_pattern_trie();
+        }
+    }
+
+    /// F32: rebuild dedup sets from current Vec sources of truth. Called
+    /// after bind/unbind mutates `connection_id` in place (which is part
+    /// of MatchEntry's Hash/Eq), invalidating set membership.
+    fn rebuild_dedup_sets(&mut self) {
+        self.catch_all_dedup.clear();
+        for e in &self.catch_all {
+            self.catch_all_dedup.insert(*e);
+        }
+        self.exact_dedup.clear();
+        for (h, entries) in &self.exact {
+            let mut set =
+                HashSet::with_hasher(foldhash::fast::FixedState::default());
+            for e in entries {
+                set.insert(*e);
+            }
+            self.exact_dedup.insert(*h, set);
         }
     }
 
@@ -315,6 +354,10 @@ impl MatchTable {
                 e.connection_id = connection_id;
             }
         }
+        // F32: connection_id is part of Hash/Eq — rebuild dedup sets so
+        // future `add_exact` / `add_catch_all` calls see the correct
+        // post-mutation hashes.
+        self.rebuild_dedup_sets();
     }
 
     /// Clear the connection_id on all match entries for a subscription.
@@ -404,7 +447,9 @@ impl MatchTable {
     /// Clear everything.
     pub fn clear(&mut self) {
         self.exact.clear();
+        self.exact_dedup.clear();
         self.catch_all.clear();
+        self.catch_all_dedup.clear();
         self.patterns.clear();
         self.pattern_trie.clear();
         self.pattern_entries.clear();

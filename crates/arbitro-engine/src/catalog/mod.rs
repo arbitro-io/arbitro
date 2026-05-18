@@ -8,7 +8,7 @@
 
 pub mod match_table;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{EngineError, EngineResult};
 use crate::events::DeltaEvents;
@@ -104,6 +104,18 @@ pub struct Binding {
     /// In-flight messages awaiting ack. Inline in the binding —
     /// `Vec<Pending>` for now, `SmallVec<[Pending; 4]>` once dep lands.
     pub pending: Vec<Pending>,
+    /// F15: O(1) "is this seq pending on this binding?" lookup, kept in
+    /// sync with `pending`. The wheel-tick ack-timeout path queries this
+    /// per scheduled entry — a Vec walk was O(N) per scheduled timer.
+    pub pending_seqs: HashSet<u64, foldhash::fast::FixedState>,
+}
+
+impl Binding {
+    /// F15: O(1) pending lookup for wheel-tick / ack-timeout path.
+    #[inline]
+    pub fn is_pending(&self, seq: u64) -> bool {
+        self.pending_seqs.contains(&seq)
+    }
 }
 
 /// Recipient resolved by `resolve_recipients` — ready for dispatch.
@@ -438,6 +450,7 @@ impl Catalog {
             paused: consumer.paused,
             fire_and_forget: consumer.ack_policy == AckPolicy::None,
             pending: Vec::new(),
+            pending_seqs: HashSet::with_hasher(foldhash::fast::FixedState::default()),
         };
 
         self.bindings.insert(binding_id, binding);

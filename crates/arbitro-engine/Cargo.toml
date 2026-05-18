@@ -8,6 +8,7 @@ description = "Pure oracle engine for Arbitro — sync, zero-copy, single-thread
 foldhash = "0.1"
 bytes = "1"
 zerocopy = { version = "0.8", features = ["derive"] }
+smallvec = "1.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

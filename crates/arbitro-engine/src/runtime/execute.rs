@@ -56,6 +56,8 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                                 subject_hash: entry.subject_hash,
                                 _pad: 0,
                             });
+                            // F15: keep pending_seqs in sync with pending.
+                            binding.pending_seqs.insert(entry.seq);
                         }
                     }
                 }
@@ -70,7 +72,10 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
             // Find bindings for this consumer and release matching pendings.
-            let binding_ids: Vec<_> = ctx.catalog.bindings_for_consumer(consumer_id).to_vec();
+            // F3+F4: SmallVec<[BindingId; 4]> — most consumers have 1-3 bindings,
+            // avoids a heap alloc per ack batch.
+            let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
+                smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             for bid in binding_ids {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
@@ -79,6 +84,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             binding.pending.iter().position(|p| p.seq == ack.seq)
                         {
                             let pending = binding.pending.swap_remove(pos);
+                            binding.pending_seqs.remove(&pending.seq);
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
@@ -98,7 +104,9 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
             // Release inflight — redelivery handled by drain.
-            let binding_ids: Vec<_> = ctx.catalog.bindings_for_consumer(consumer_id).to_vec();
+            // F3+F4: SmallVec for binding ids.
+            let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
+                smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             for bid in binding_ids {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
@@ -107,6 +115,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                             binding.pending.iter().position(|p| p.seq == ack.seq)
                         {
                             let pending = binding.pending.swap_remove(pos);
+                            binding.pending_seqs.remove(&pending.seq);
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));

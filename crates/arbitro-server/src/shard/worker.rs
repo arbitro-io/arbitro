@@ -662,7 +662,7 @@ impl CommandWorker {
                         .ctx()
                         .catalog
                         .binding(bid)
-                        .map(|b| b.pending.iter().any(|p| p.seq == entry.seq))
+                        .map(|b| b.is_pending(entry.seq))
                         .unwrap_or(false)
                 });
 
