@@ -171,7 +171,7 @@ async fn ack_wait_timeout_redelivers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn max_inflight_pauses_then_resumes_on_ack() {
-    let mut server = TestServerBuilder::new().spawn().await;
+    let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"flow", b">").await;
 
@@ -325,7 +325,7 @@ async fn wildcard_single_token_filter_matches_correctly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn wildcard_multi_token_filter_matches_everything_below() {
-    let mut server = TestServerBuilder::new().spawn().await;
+    let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"wcmulti", b">").await;
 
@@ -410,7 +410,7 @@ async fn delete_consumer_mid_drain_stops_delivery() {
 
     // Consume a few, then delete the consumer.
     let pre = drain_n(&mut handle, 3, Duration::from_secs(2)).await;
-    assert!(pre.len() >= 1, "must deliver something before delete");
+    assert!(!pre.is_empty(), "must deliver something before delete");
     for m in pre {
         m.ack();
     }
@@ -666,7 +666,7 @@ async fn ack_policy_none_ignores_max_inflight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_explicit_does_enforce_max_inflight() {
-    let mut server = TestServerBuilder::new().spawn().await;
+    let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"explicit-cap", b">").await;
     let consumer_id = create_consumer(
@@ -723,7 +723,7 @@ async fn ack_policy_explicit_does_enforce_max_inflight() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ack_policy_none_ignores_max_subject_inflight() {
     use arbitro_client_tokio::SubjectLimit;
-    let mut server = TestServerBuilder::new().spawn().await;
+    let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"fire-subj", b">").await;
 
@@ -782,7 +782,7 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deliver_policy_by_start_seq_skips_earlier() {
-    let mut server = TestServerBuilder::new().spawn().await;
+    let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"seq", b">").await;
 
@@ -809,7 +809,7 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
 
     let got = drain_n(&mut handle, 5, Duration::from_secs(5)).await;
     assert!(
-        got.len() >= 1,
+        !got.is_empty(),
         "ByStartSeq must deliver something from the requested offset"
     );
     // First delivery should be one of msg-5 .. msg-9 (the broker is

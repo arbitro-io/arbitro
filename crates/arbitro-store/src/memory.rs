@@ -576,8 +576,8 @@ mod tests {
         assert_eq!(seq, 1);
 
         let e = s.read(1).unwrap().unwrap();
-        assert_eq!(&*e.subject, b"orders.created");
-        assert_eq!(&*e.payload, b"{}");
+        assert_eq!(e.subject, b"orders.created");
+        assert_eq!(e.payload, b"{}");
         assert_eq!(e.timestamp, 1000);
     }
 
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(s.info().messages, 3);
 
         let e2 = s.read(2).unwrap().unwrap();
-        assert_eq!(&*e2.subject, b"b");
+        assert_eq!(e2.subject, b"b");
     }
 
     #[test]
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(s.info().messages, 1);
 
         let remaining = s.read(3).unwrap().unwrap();
-        assert_eq!(&*remaining.subject, b"payments.done");
+        assert_eq!(remaining.subject, b"payments.done");
     }
 
     #[test]
@@ -718,7 +718,7 @@ mod tests {
         let found = s
             .get(1, &mut |e| {
                 captured_ts = e.timestamp;
-                assert_eq!(&*e.subject, b"hello");
+                assert_eq!(e.subject, b"hello");
             })
             .unwrap();
         assert!(found);
@@ -741,7 +741,7 @@ mod tests {
         }
         // 6 entries, 2 segments expected (4 + 2 = 6 under 4096 each).
         assert_eq!(s.info().messages, 6);
-        assert!(s.sealed.len() >= 1, "at least one segment should be sealed");
+        assert!(!s.sealed.is_empty(), "at least one segment should be sealed");
 
         // Verify we can still read across segments.
         for i in 1..=6 {

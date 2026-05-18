@@ -43,10 +43,12 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # L17: clippy is now a required gate (-D warnings). Crate-level
+  # #![allow] attributes silence the stylistic lints the project has
+  # accepted (too_many_arguments, type_complexity, doc_overindented_list_items).
   clippy:
-    name: clippy (informational)
+    name: clippy (required, -D warnings)
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -62,7 +64,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --lib --tests
+      # Clippy gates on the library surface — test helpers naturally
+       # have shared dead code across binaries (each integration test
+       # only uses a subset of the helper API).
+      - run: cargo clippy --workspace --lib -- -D warnings
 
   # ── Unit tests (per-crate, fast) ──────────────────────────────────────
   unit-tests:

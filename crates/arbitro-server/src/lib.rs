@@ -1,3 +1,15 @@
+// L17: stylistic clippy lints the project accepts crate-wide. Drain /
+// router / accumulator builder signatures are intentionally wide (they
+// thread scratch buffers + counters + shared state), and the F37
+// list-cache type was chosen for cache locality over `type` alias
+// readability. The redundant_pattern_matching call site already exists
+// for clarity in the disconnect flow.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::doc_overindented_list_items)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::redundant_pattern_matching)]
+
 //! arbitro-server — sharded, single-writer message broker.
 //!
 //! Module layout:

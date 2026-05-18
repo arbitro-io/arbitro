@@ -270,10 +270,10 @@ fn drain_event_ring(
 /// Mutable accessor for a consumer's subject inflight, creating the slot
 /// on demand. Slot index = `ConsumerId.raw() as usize`.
 #[inline]
-pub(in crate::shard) fn consumer_subjects_slot_mut<'a>(
-    consumer_subjects: &'a mut Vec<Option<ConsumerSubjects>>,
+pub(in crate::shard) fn consumer_subjects_slot_mut(
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     consumer_id: u32,
-) -> &'a mut ConsumerSubjects {
+) -> &mut ConsumerSubjects {
     let idx = consumer_id as usize;
     if idx >= consumer_subjects.len() {
         consumer_subjects.resize_with(idx + 1, || None);
@@ -284,10 +284,10 @@ pub(in crate::shard) fn consumer_subjects_slot_mut<'a>(
 /// Read-only accessor. Returns `None` if the consumer has no tracked
 /// subjects yet — caller treats that as "0 inflight" (always has room).
 #[inline]
-pub(in crate::shard) fn consumer_subjects_slot<'a>(
-    consumer_subjects: &'a [Option<ConsumerSubjects>],
+pub(in crate::shard) fn consumer_subjects_slot(
+    consumer_subjects: &[Option<ConsumerSubjects>],
     consumer_id: u32,
-) -> Option<&'a ConsumerSubjects> {
+) -> Option<&ConsumerSubjects> {
     consumer_subjects.get(consumer_id as usize).and_then(|s| s.as_ref())
 }
 

@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn t2_subject_len_overflows_tail() {
         // Tail just large enough for the 8 B per-entry header — nothing else.
-        let tail = vec![0u8; BATCH_PUB_ENTRY_HEADER_SIZE];
+        let tail = [0u8; BATCH_PUB_ENTRY_HEADER_SIZE];
         let size = BatchPubFrame::wire_size(tail.len());
         let mut buf = vec![0u8; size];
 

@@ -57,6 +57,12 @@ pub struct SharedCounters {
     rewind: AtomicU64,
 }
 
+impl Default for SharedCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedCounters {
     pub fn new() -> Self {
         let mk_u32 = || -> Box<[AtomicU32]> {
@@ -285,10 +291,10 @@ impl DrainSnapshot {
 
 /// Writer lookup for a given connection. HashMap+foldhash, O(1) amortised.
 #[inline]
-pub fn find_writer<'a>(
-    index: &'a HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,
+pub fn find_writer(
+    index: &HashMap<u64, WriterIndexEntry, foldhash::fast::FixedState>,
     connection_id: u64,
-) -> Option<&'a WriterIndexEntry> {
+) -> Option<&WriterIndexEntry> {
     index.get(&connection_id)
 }
 

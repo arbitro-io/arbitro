@@ -4,7 +4,7 @@ use test_helper::{TestServer, TestServerBuilder};
 use std::collections::HashSet;
 use std::time::Duration;
 
-use arbitro_client_tokio::{Client, ClientConfig, ClientError};
+use arbitro_client_tokio::{Client, ClientError};
 use bytes::Bytes;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -272,7 +272,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     assert_eq!(side_results.len(), N);
     for (i, r) in side_results.iter().enumerate() {
         assert!(
-            matches!(r, Ok(_)),
+            r.is_ok(),
             "side publish_sync #{i} failed: {:?}",
             r.as_ref().err()
         );

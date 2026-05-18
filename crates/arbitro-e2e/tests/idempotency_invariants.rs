@@ -1,8 +1,7 @@
 mod test_helper;
 use test_helper::{TestServer, TestServerBuilder};
 
-use std::time::Duration;
-use arbitro_client_tokio::{BatchEntry, Client, ClientError};
+use arbitro_client_tokio::{BatchEntry, ClientError};
 use arbitro_proto::error::ErrorCode;
 use bytes::Bytes;
 

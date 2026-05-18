@@ -136,7 +136,7 @@ impl CommandWorker {
                                 // Simple heuristic: drop proportionally using average message size.
                                 let avg = if info.messages > 0 { info.bytes / info.messages } else { 1 };
                                 let over = info.bytes - ret.max_bytes;
-                                (over + avg - 1) / avg  // ceiling division
+                                over.div_ceil(avg)  // ceiling division
                             } else {
                                 0
                             };
@@ -281,7 +281,7 @@ impl CommandWorker {
             // current bucket (which would fire the entry immediately
             // instead of after the requested delay).
             let max_ticks = (Self::WHEEL_BUCKETS as u32).saturating_sub(1);
-            let delay_ticks = (((cmd.delay_ms as u64 + 999) / 1000) as u32).min(max_ticks);
+            let delay_ticks = ((cmd.delay_ms as u64).div_ceil(1000) as u32).min(max_ticks);
             self.ensure_wheel();
             let wheel = self.wheel.as_mut().unwrap();
             for entry in &cmd.entries {

@@ -25,6 +25,12 @@
 
 #![doc(html_no_source)]
 #![warn(missing_debug_implementations)]
+// L17: stylistic clippy lints that the project has deliberately accepted —
+// the broker / client wire layer has wide builder fn signatures
+// (CreateStream / CreateConsumer mirror the wire body verbatim) and the
+// doc lists use deliberate hanging indents for the design pillars.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::doc_overindented_list_items)]
 
 // Module skeleton — implementations land in subsequent steps of the plan.
 pub mod client;

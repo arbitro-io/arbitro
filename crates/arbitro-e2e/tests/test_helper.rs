@@ -11,6 +11,12 @@ pub struct TestServerBuilder {
     shutdown_timeout: Duration,
 }
 
+impl Default for TestServerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestServerBuilder {
     pub fn new() -> Self {
         Self {
@@ -105,7 +111,7 @@ impl TestServer {
     pub async fn shutdown(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = self.shutdown_tx.send(true);
-            let _ = handle.await.expect("server task failed");
+            handle.await.expect("server task failed");
         }
     }
 

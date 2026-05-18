@@ -231,7 +231,7 @@ impl ArbitroServer {
 
         let auth_token_shared: Option<Arc<str>> = self.config.auth_token
             .as_deref()
-            .map(|s| Arc::from(s));
+            .map(Arc::from);
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -433,8 +433,8 @@ async fn read_loop(
 
     'outer: loop {
         // ---- Mandatory v2 handshake ---------------------------------------
-        if !hello_done {
-            if acc.len() >= 4 {
+        if !hello_done
+            && acc.len() >= 4 {
                 let m = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]);
                 if m != ARBITRO_MAGIC_V2 {
                     tracing::warn!(conn_id, magic = format!("{m:#010x}"), "non-v2 client, closing");
@@ -447,11 +447,10 @@ async fn read_loop(
                     tracing::debug!(conn_id, "v2 HELLO accepted");
                 }
             }
-        }
 
         // ---- Auth check (first frame after Hello must be Auth) ------------
-        if hello_done && !auth_done {
-            if acc.len() >= HEADER_SIZE_V2 {
+        if hello_done && !auth_done
+            && acc.len() >= HEADER_SIZE_V2 {
                 let msg_len = u32::from_le_bytes([
                     acc[4], acc[5], acc[6], acc[7],
                 ]) as usize;
@@ -501,7 +500,6 @@ async fn read_loop(
                     tracing::debug!(conn_id, "auth accepted");
                 }
             }
-        }
 
         // ---- Drain whole v2 frames already in the accumulator -------------
         if hello_done && auth_done {
