@@ -104,7 +104,10 @@ impl ConnectionRegistry {
             self.inner.write_buffer_cap
         };
         let (tx, rx) = mpsc::channel::<Bytes>(cap);
-        tokio::spawn(conn_writer_task(rx, writer));
+        // H6: writer task removes the session from the registry on
+        // write error so a half-dead peer cannot pile up forever.
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(conn_writer_task(rx, writer, conn_id, inner));
         let clock = self.inner.clock.read().clone();
         let session = Session {
             write_tx: tx,
@@ -202,13 +205,29 @@ impl ConnectionRegistry {
 }
 
 /// Per-connection writer task — owns the writer (plain TCP or TLS), drains the channel.
-async fn conn_writer_task(mut rx: mpsc::Receiver<Bytes>, mut w: BoxedWriter) {
+///
+/// H6: on a write error we synchronously remove the session from the
+/// registry. Otherwise the `Sender` half kept by the registry would
+/// keep the channel open forever and stale entries would accumulate
+/// for every disconnect that hit a write error before the read loop
+/// noticed the EOF.
+async fn conn_writer_task(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut w: BoxedWriter,
+    conn_id: u64,
+    inner: Arc<Inner>,
+) {
+    let mut write_err = false;
     while let Some(frame) = rx.recv().await {
         if w.write_all(&frame).await.is_err() {
+            write_err = true;
             break;
         }
     }
     let _ = w.shutdown().await;
+    if write_err {
+        inner.sessions.lock().remove(&conn_id);
+    }
 }
 
 impl LifeCycle for ConnectionRegistry {

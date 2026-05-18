@@ -54,6 +54,11 @@ pub enum Action {
     /// Query a single consumer's live pending-ack count. Reply is a
     /// standard `RepOk` whose `ref_seq` field carries the count as a u64.
     ConsumerStats  = 0x0505,
+    /// M11: pause delivery to a consumer. Body = u32 consumer_id.
+    /// Reply is `RepOk` (ref_seq mirrors req_seq).
+    PauseConsumer  = 0x0506,
+    /// M11: resume delivery to a previously paused consumer.
+    ResumeConsumer = 0x0507,
 
     // 0x06xx — System
     Ping          = 0x0601,
@@ -110,6 +115,8 @@ impl Action {
             0x0503 => Some(Self::GetConsumer),
             0x0504 => Some(Self::ListConsumers),
             0x0505 => Some(Self::ConsumerStats),
+            0x0506 => Some(Self::PauseConsumer),
+            0x0507 => Some(Self::ResumeConsumer),
 
             0x0601 => Some(Self::Ping),
             0x0602 => Some(Self::Pong),

@@ -41,7 +41,7 @@ use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::ingress::sub_frame::SubFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::{
     CreateConsumerFrame, DeleteConsumerFrame, GetConsumerFrame, ListConsumersFrame,
-    ConsumerStatsFrame,
+    ConsumerStatsFrame, PauseConsumerFrame, ResumeConsumerFrame,
 };
 use arbitro_proto::v2::manager::stream_mgmt::{
     CreateStreamFrame, DeleteStreamFrame, DrainSubjectFrame, GetStreamFrame,
@@ -109,6 +109,8 @@ pub async fn dispatch_frame_v2(
         Action::GetConsumer    => v2_get_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::ListConsumers  => v2_list_consumers(conn_id, req_seq, &frame, server, registry).await,
         Action::ConsumerStats  => v2_consumer_stats(conn_id, req_seq, &frame, server, registry).await,
+        Action::PauseConsumer  => v2_pause_consumer(conn_id, req_seq, &frame, server, registry).await,
+        Action::ResumeConsumer => v2_resume_consumer(conn_id, req_seq, &frame, server, registry).await,
 
         // ── System ──────────────────────────────────────────────────
         Action::Disconnect     => v2_disconnect(conn_id, server, registry).await,
@@ -971,6 +973,72 @@ async fn v2_delete_consumer(
         }
     }
     send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+}
+
+/// M11: pause delivery to a consumer. Routes to the owning shard via the
+/// names registry when known; otherwise fans out. Reply = RepOk if any
+/// shard reported success, else ConsumerNotFound.
+async fn v2_pause_consumer(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match PauseConsumerFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
+        .names()
+        .consumer_stream(consumer_id)
+    {
+        Some(stream) => {
+            let idx = stream.raw() as usize % server.shard_count();
+            smallvec::smallvec![idx]
+        }
+        None => (0..server.shard_count()).collect(),
+    };
+    for i in candidate_shards {
+        if let Ok(true) = server.shard(i).pause_consumer(consumer_id).await {
+            send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
+            return;
+        }
+    }
+    send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
+}
+
+/// M11: resume delivery to a previously paused consumer.
+async fn v2_resume_consumer(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match ResumeConsumerFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
+        .names()
+        .consumer_stream(consumer_id)
+    {
+        Some(stream) => {
+            let idx = stream.raw() as usize % server.shard_count();
+            smallvec::smallvec![idx]
+        }
+        None => (0..server.shard_count()).collect(),
+    };
+    for i in candidate_shards {
+        if let Ok(true) = server.shard(i).resume_consumer(consumer_id).await {
+            send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
+            return;
+        }
+    }
+    send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
 }
 
 /// Get the live pending-ack count for one consumer. The reply is a
