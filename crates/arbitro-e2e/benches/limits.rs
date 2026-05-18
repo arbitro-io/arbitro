@@ -57,6 +57,20 @@ const PAT_BASIC: &[u8] = b"orders.basic.>";
 const PAT_PREMIUM: &[u8] = b"orders.premium.>";
 const PAT_DYNAMIC: &[u8] = b"notif.user.>";
 
+/// Per-subject caps actually configured on the consumers. Basic is
+/// pinned at 1 because that's the cheapest way to force every basic
+/// subject into the "1/1 saturated" state for the isolation tests.
+///
+/// Premium uses a HIGHER cap so the bench can prove the limit is
+/// observable: Stage 0 publishes `PAT_PREMIUM_CAP + 10` messages to a
+/// single premium subject and asserts the server delivers **exactly**
+/// `PAT_PREMIUM_CAP` (the 10 extra must stay held). With `cap = 1` the
+/// test was a tautology — every VIP iteration used a fresh subject
+/// whose counter started at `0/1`, so we never saw the cap engage.
+const PAT_BASIC_CAP: u32 = 1;
+const PAT_PREMIUM_CAP: u32 = 100;
+const PAT_DYNAMIC_CAP: u32 = 1;
+
 fn env_u64(var: &str, fallback: u64) -> u64 {
     std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
 }
@@ -141,6 +155,172 @@ async fn measure_vip_latency(
     (latencies, client, sub)
 }
 
+// ── Stage 0 — proof that the cap is enforced ──────────────────────
+
+/// Functional check that doubles as the bench's "trust marker": if the
+/// server is honouring `max_subject_inflight(PAT_PREMIUM, PAT_PREMIUM_CAP)`,
+/// then publishing `PAT_PREMIUM_CAP + 10` messages to ONE single premium
+/// subject without acking must deliver **exactly** `PAT_PREMIUM_CAP`
+/// messages and stall on the next one. If the broker delivers any of
+/// the extra 10 inside the timeout window, the cap is not being
+/// enforced and the whole bench is a lie — we panic loudly so the
+/// failure is impossible to miss.
+///
+/// Returns (delivered_within_cap, extras_seen_after_cap, elapsed).
+async fn stage0_cap_enforced() -> (u32, u32, Duration) {
+    let addr = spawn_server().await;
+    let client = connect(&addr).await;
+    let stream_id = create_stream(&client, b"limits_cap_enforced").await;
+
+    let consumer_id = ConsumerBuilder::new(b"cap_enforced")
+        .filter(b">")
+        .max_inflight(10_000)
+        .ack_policy(AckPolicy::Explicit)
+        .ack_wait_ms(30_000)
+        .max_subject_inflight(PAT_PREMIUM, PAT_PREMIUM_CAP)
+        .create(&client, stream_id)
+        .await
+        .expect("cap_enforced consumer");
+    let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    // All messages go to ONE subject so they share the same counter.
+    let one_subject = b"orders.premium.singleton";
+    let payload = vec![0u8; PAYLOAD_SIZE];
+    let total = PAT_PREMIUM_CAP + 10;
+    let entries: Vec<BatchEntry<'_>> = (0..total)
+        .map(|_| BatchEntry::new(one_subject, Bytes::copy_from_slice(payload.as_slice())))
+        .collect();
+    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+
+    // Receive up to PAT_PREMIUM_CAP — must succeed inside a short budget.
+    let start = Instant::now();
+    let mut delivered = 0u32;
+    while delivered < PAT_PREMIUM_CAP {
+        let msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("premium cap delivery timeout — cap is suspiciously slow")
+            .expect("subscription closed before cap reached");
+        // Do NOT ack — we want the counter to STAY at PAT_PREMIUM_CAP.
+        let _ = msg;
+        delivered += 1;
+    }
+    let elapsed = start.elapsed();
+
+    // Now wait for an extra message. If the server respects the cap,
+    // none should arrive (the next 10 are all blocked behind the same
+    // saturated subject counter). Use a tight 250ms budget — that's
+    // ~10× the steady-state delivery latency we measure elsewhere.
+    let mut extras = 0u32;
+    let extra_window = Duration::from_millis(250);
+    let extras_start = Instant::now();
+    while extras_start.elapsed() < extra_window {
+        match tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
+            Ok(Some(_)) => extras += 1,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        extras, 0,
+        "cap_enforcement FAILED — published {total} msgs to one subject \
+         with cap={PAT_PREMIUM_CAP}, expected exactly {PAT_PREMIUM_CAP} to \
+         deliver and the next {} to be held. Got {} extras inside a \
+         250 ms window. The server is NOT enforcing max_subject_inflight.",
+        total - PAT_PREMIUM_CAP,
+        extras,
+    );
+
+    (delivered, extras, elapsed)
+}
+
+// ── Stage 2b — burst isolation under per-subject backlog ──────────
+
+/// Stage 2 with teeth: 100 basic subjects pinned at 1/1 AND a burst of
+/// `PAT_PREMIUM_CAP + 50` messages to a SINGLE premium subject (so the
+/// premium counter saturates at `PAT_PREMIUM_CAP`). Asserts:
+///   - exactly `PAT_PREMIUM_CAP` premium messages deliver
+///   - none of the 50 extras leak through inside the timeout
+///   - the basic backlog does not unblock anything (it never gets acked)
+///
+/// This is the strongest functional proof that isolation is real.
+async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
+    let addr = spawn_server().await;
+    let client = connect(&addr).await;
+    let stream_id = create_stream(&client, b"limits_burst_isolation").await;
+
+    let consumer_id = ConsumerBuilder::new(b"burst_isolation")
+        .filter(b">")
+        .max_inflight(10_000)
+        .ack_policy(AckPolicy::Explicit)
+        .ack_wait_ms(30_000)
+        .max_subject_inflight(PAT_BASIC, PAT_BASIC_CAP)
+        .max_subject_inflight(PAT_PREMIUM, PAT_PREMIUM_CAP)
+        .create(&client, stream_id)
+        .await
+        .expect("burst_isolation consumer");
+    let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let payload = vec![0u8; PAYLOAD_SIZE];
+
+    // Pin 100 basic subjects at 1/1 — drain without ack.
+    let basic_subjects: Vec<String> =
+        (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
+    let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
+        .iter()
+        .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
+        .collect();
+    client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
+    let mut got = 0u32;
+    while got < BASIC_BACKLOG {
+        let _msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("basic backlog timeout")
+            .expect("subscription closed");
+        got += 1;
+    }
+
+    // Burst of PAT_PREMIUM_CAP + 50 to ONE premium subject.
+    let one_subject = b"orders.premium.singleton";
+    let total = PAT_PREMIUM_CAP + 50;
+    let entries: Vec<BatchEntry<'_>> = (0..total)
+        .map(|_| BatchEntry::new(one_subject, Bytes::copy_from_slice(payload.as_slice())))
+        .collect();
+    let start = Instant::now();
+    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+
+    let mut delivered = 0u32;
+    while delivered < PAT_PREMIUM_CAP {
+        let msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+            .await
+            .expect("burst delivery timeout — basic backlog is contaminating premium")
+            .expect("subscription closed before cap reached");
+        let _ = msg;
+        delivered += 1;
+    }
+    let elapsed = start.elapsed();
+
+    // Wait for any of the 50 extras.
+    let mut extras = 0u32;
+    let extra_window = Duration::from_millis(250);
+    let extras_start = Instant::now();
+    while extras_start.elapsed() < extra_window {
+        match tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
+            Ok(Some(_)) => extras += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        extras, 0,
+        "burst_isolation FAILED — under 100 basic pinned at 1/1 and a \
+         burst of {total} premium to one subject (cap={PAT_PREMIUM_CAP}), \
+         expected exactly {PAT_PREMIUM_CAP} premium to deliver. Got {} \
+         extras — premium counter is either not being enforced or basic \
+         backlog is leaking into premium isolation.",
+        extras,
+    );
+
+    (delivered, extras, elapsed)
+}
+
 // ── Stage 1 — baseline ─────────────────────────────────────────────
 
 /// Consumer with `(orders.premium.>, 1)` set but never under pressure
@@ -156,7 +336,7 @@ async fn baseline_latency(iters: u64) -> Vec<Duration> {
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
-        .max_subject_inflight(PAT_PREMIUM, 1)
+        .max_subject_inflight(PAT_PREMIUM, PAT_PREMIUM_CAP)
         .create(&client, stream_id)
         .await
         .expect("baseline consumer");
@@ -189,8 +369,8 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
-        .max_subject_inflight(PAT_BASIC, 1)
-        .max_subject_inflight(PAT_PREMIUM, 1)
+        .max_subject_inflight(PAT_BASIC, PAT_BASIC_CAP)
+        .max_subject_inflight(PAT_PREMIUM, PAT_PREMIUM_CAP)
         .create(&client, stream_id)
         .await
         .expect("isolated consumer");
@@ -322,7 +502,7 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
         .max_inflight(60_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
-        .max_subject_inflight(PAT_DYNAMIC, 1)
+        .max_subject_inflight(PAT_DYNAMIC, PAT_DYNAMIC_CAP)
         .create(&client, stream_id)
         .await
         .expect("dynamic consumer");
@@ -369,7 +549,39 @@ async fn main() {
     println!("========================================================");
     println!("  iters={iters}   payload={PAYLOAD_SIZE}B");
     println!("  All stages use max_subject_inflight via ConsumerBuilder.");
+    println!(
+        "  Caps: basic={PAT_BASIC_CAP}, premium={PAT_PREMIUM_CAP}, dynamic={PAT_DYNAMIC_CAP}"
+    );
     println!("  Stage 2/3 hold {BASIC_BACKLOG} basic subjects at 1/1.");
+    println!();
+
+    // ── Stage 0 — cap enforcement check (panics on failure) ─────────
+    println!("--------------------------------------------------------");
+    println!(
+        "  Stage 0 — cap_enforcement (publish {} to ONE subject, expect exactly {})",
+        PAT_PREMIUM_CAP + 10,
+        PAT_PREMIUM_CAP,
+    );
+    println!("--------------------------------------------------------");
+    let (delivered_s0, extras_s0, elapsed_s0) = stage0_cap_enforced().await;
+    println!(
+        "  delivered={delivered_s0}  extras={extras_s0}  elapsed={:.2?}  → cap IS enforced",
+        elapsed_s0
+    );
+
+    // ── Stage 2b — burst isolation under basic backlog ──────────────
+    println!();
+    println!("--------------------------------------------------------");
+    println!(
+        "  Stage 2b — burst_isolation (100 basic pinned + {} premium burst to ONE subject)",
+        PAT_PREMIUM_CAP + 50,
+    );
+    println!("--------------------------------------------------------");
+    let (delivered_s2b, extras_s2b, elapsed_s2b) = stage2b_burst_isolation().await;
+    println!(
+        "  delivered={delivered_s2b}  extras={extras_s2b}  elapsed={:.2?}  → premium isolated from basic",
+        elapsed_s2b
+    );
     println!();
 
     // Stage 1 — baseline
