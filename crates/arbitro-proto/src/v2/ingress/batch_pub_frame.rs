@@ -230,14 +230,36 @@ pub struct BatchPubIter<'a> {
 impl<'a> Iterator for BatchPubIter<'a> {
     type Item = BatchPubEntryView<'a>;
 
+    /// **B3 safety**: each step validates that the per-entry header
+    /// (8 B) AND the per-entry `subject + msg_id + payload` body fit
+    /// inside the remaining tail. On any mismatch we yield `None` and
+    /// stop advancing — the dispatcher treats premature termination
+    /// as `InvalidEntryCount`. The previous version panicked when the
+    /// caller invoked `view.subject()` on a frame with lying length
+    /// fields; that path is remote-triggerable.
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
+        let rest = self.buf.get(self.offset..)?;
+        if rest.len() < BATCH_PUB_ENTRY_HEADER_SIZE {
+            self.remaining = 0;
+            return None;
+        }
+        let header = BatchPubEntryHeader::ref_from_bytes(&rest[..BATCH_PUB_ENTRY_HEADER_SIZE]).ok()?;
+        let s = header.subject_len.get() as usize;
+        let m = header.msg_id_len.get() as usize;
+        let p = header.payload_len.get() as usize;
+        let body_total = s.checked_add(m)?.checked_add(p)?;
+        let entry_total = BATCH_PUB_ENTRY_HEADER_SIZE.checked_add(body_total)?;
+        if entry_total > rest.len() {
+            self.remaining = 0;
+            return None;
+        }
         self.remaining -= 1;
-        let view = BatchPubEntryView { buf: &self.buf[self.offset..] };
-        self.offset += view.wire_len();
+        let view = BatchPubEntryView { buf: &rest[..entry_total] };
+        self.offset += entry_total;
         Some(view)
     }
 

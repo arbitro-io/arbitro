@@ -44,6 +44,26 @@ pub struct PubWithReplyFrame {
 }
 
 impl PubWithReplyFrame {
+    /// **B4 safety**: `subject_len + reply_len <= tail.len()` so the
+    /// per-field slicing in `subject() / reply_to() / payload()` cannot
+    /// underflow on a malicious header.
+    #[inline]
+    pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
+        let s = self.body.subject_len.get() as usize;
+        let r = self.body.reply_len.get() as usize;
+        let head_total = s.checked_add(r).ok_or(crate::error::ErrorCode::InvalidLength)?;
+        if head_total > self.tail.len() {
+            return Err(crate::error::ErrorCode::InvalidLength);
+        }
+        let msg = self.header.msg_len.get() as usize;
+        let lower = PUB_WITH_REPLY_BODY_FIXED.checked_add(head_total)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?;
+        if msg < lower {
+            return Err(crate::error::ErrorCode::InvalidLength);
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub fn subject(&self) -> &[u8] {
         let s = self.body.subject_len.get() as usize;

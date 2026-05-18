@@ -60,6 +60,29 @@ pub struct PubFrame {
 }
 
 impl PubFrame {
+    /// **B4 safety**: verify `subject_len + msg_id_len <= tail.len()`
+    /// so the slice arithmetic in `subject() / msg_id() / payload()`
+    /// cannot underflow on a malicious header. Returns the wire error
+    /// code the dispatcher should send back if the frame is rejected.
+    #[inline]
+    pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
+        let s = self.body.subject_len.get() as usize;
+        let m = self.body.msg_id_len.get() as usize;
+        let head_total = s.checked_add(m).ok_or(crate::error::ErrorCode::InvalidLength)?;
+        if head_total > self.tail.len() {
+            return Err(crate::error::ErrorCode::InvalidLength);
+        }
+        // payload_len() computes msg_len - PUB_BODY_FIXED - s - m.
+        // The fixed parts must fit inside `msg_len`.
+        let msg = self.header.msg_len.get() as usize;
+        let lower = PUB_BODY_FIXED.checked_add(head_total)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?;
+        if msg < lower {
+            return Err(crate::error::ErrorCode::InvalidLength);
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub fn subject(&self) -> &[u8] {
         let s = self.body.subject_len.get() as usize;

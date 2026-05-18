@@ -36,6 +36,16 @@ pub struct SubFrame {
 }
 
 impl SubFrame {
+    /// **B4 safety**: `filter_len <= tail.len()`.
+    #[inline]
+    pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
+        let n = self.body.filter_len.get() as usize;
+        if n > self.tail.len() {
+            return Err(crate::error::ErrorCode::InvalidLength);
+        }
+        Ok(())
+    }
+
     #[inline(always)]
     pub const fn wire_size(filter_len: usize) -> usize {
         HEADER_SIZE + SUB_BODY_FIXED + filter_len

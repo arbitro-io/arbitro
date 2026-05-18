@@ -139,8 +139,15 @@ fn v2_publish(
 ) {
     let f = match PubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
+    // B4: bounds-check subject_len + msg_id_len against tail BEFORE
+    // touching subject() / msg_id() / payload(). Without this a crafted
+    // frame with subject_len > tail.len() panics the broker.
+    if let Err(code) = f.validate() {
+        send_error_v2(registry, conn_id, req_seq, code);
+        return;
+    }
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -234,8 +241,12 @@ fn v2_publish_with_reply(
 ) {
     let f = match PubWithReplyFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
+    if let Err(code) = f.validate() {
+        send_error_v2(registry, conn_id, req_seq, code);
+        return;
+    }
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -287,8 +298,21 @@ fn v2_publish_batch(
 ) {
     let f = match BatchPubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
+    // B3: walk the iterator once to count yielded entries; if fewer
+    // than `count` come back, the frame's per-entry length fields are
+    // inconsistent and we reject with InvalidEntryCount BEFORE any
+    // store mutation. The iterator validates each entry safely (no
+    // panic) — we just check it ran to completion.
+    {
+        let expected = f.body.count.get();
+        let actual: u32 = f.iter().count() as u32;
+        if actual != expected {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidEntryCount);
+            return;
+        }
+    }
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
@@ -406,9 +430,11 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         None => return,
     };
     let shard = server.shard_for(seq_stream);
-    // The shard handle requires `Vec<AckEntry>` for channel transport.
-    // Stream-build with capacity to avoid mid-fill reallocation.
-    let raw = f.entries();
+    // B2: bounds-checked entries view — silently drop the frame if the
+    // count field is lying. Fire-and-forget ack has no reply channel
+    // to surface the InvalidEntryCount, so we just terminate the
+    // current frame; the connection stays alive for subsequent frames.
+    let Some(raw) = f.try_entries() else { return };
     let mut entries: Vec<AckEntry> = Vec::with_capacity(raw.len());
     for e in raw {
         entries.push(AckEntry { stream_id: seq_stream, seq: e.seq.get() });
@@ -450,18 +476,15 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         None => return,
     };
     let shard = server.shard_for(seq_stream);
-    let entries: Vec<AckEntry> = f
-        .entries()
+    // B2: bounds-checked entries view — silently drop the frame on
+    // lying count (fire-and-forget, no reply channel).
+    let Some(raw) = f.try_entries() else { return };
+    let entries: Vec<AckEntry> = raw
         .iter()
         .map(|e| AckEntry { stream_id: seq_stream, seq: e.seq.get() })
         .collect();
-    // All entries in a batch share the same delay — take max from all entries.
-    let delay_ms = f
-        .entries()
-        .iter()
-        .map(|e| e.delay_ms.get())
-        .max()
-        .unwrap_or(0);
+    // All entries in a batch share the same delay — take max.
+    let delay_ms = raw.iter().map(|e| e.delay_ms.get()).max().unwrap_or(0);
     let _ = shard.nack(consumer_id, conn_id, entries, delay_ms).await;
 }
 
@@ -474,8 +497,12 @@ async fn v2_subscribe(
 ) {
     let f = match SubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
+    if let Err(code) = f.validate() {
+        send_error_v2(registry, conn_id, req_seq, code);
+        return;
+    }
     let consumer_id = ConsumerId(f.body.consumer_id.get());
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
@@ -539,8 +566,12 @@ async fn v2_unsubscribe(
     // Body shape is identical to Subscribe (see module comment).
     let f = match SubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
     };
+    if let Err(code) = f.validate() {
+        send_error_v2(registry, conn_id, req_seq, code);
+        return;
+    }
     let consumer_id = ConsumerId(f.body.consumer_id.get());
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
@@ -570,6 +601,11 @@ async fn v2_create_stream(
     let name = f.name();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
+    // B1: registry refused — slot pool exhausted.
+    if seq_stream.raw() == u32::MAX {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+        return;
+    }
     let shard = server.shard_for(seq_stream);
 
     let max_msgs   = f.body.max_msgs.get();
@@ -773,7 +809,35 @@ async fn v2_create_consumer(
     };
     let name = f.name();
     let group = f.group();
+
+    let ack_policy = match f.body.ack_policy {
+        0 => AckPolicy::None,
+        _ => AckPolicy::Explicit,
+    };
+
+    // B6: parse subject_limits FIRST so a malformed trailer is rejected
+    // BEFORE we allocate a ConsumerId / queue / index entries — the
+    // previous order leaked one ConsumerId slot per malformed
+    // CreateConsumer, and combined with the (now-also-fixed) SLOT_COUNT
+    // panic turned a single hostile client into a 30-second DoS.
+    let subject_limits = if ack_policy == AckPolicy::Explicit {
+        match f.subject_limits() {
+            Some(v) => v,
+            None => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let (seq_consumer, _created) = server.names().get_or_create_consumer(name);
+    // B1: registry refused — consumer slot pool exhausted.
+    if seq_consumer.raw() == u32::MAX {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
+        return;
+    }
     let shard = server.shard_for(seq_stream);
 
     let queue_id = server.names().get_or_create_queue(seq_stream, group);
@@ -784,25 +848,6 @@ async fn v2_create_consumer(
         f.body.deliver_policy,
         f.body.start_seq.get(),
     );
-
-    let ack_policy = match f.body.ack_policy {
-        0 => AckPolicy::None,
-        _ => AckPolicy::Explicit,
-    };
-
-    // Parse subject_limits from frame tail. Silently ignored if
-    // ack_policy == None (engine rejects pairing — match that here too).
-    let subject_limits = if ack_policy == AckPolicy::Explicit {
-        match f.subject_limits() {
-            Some(v) => v,
-            None => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
-                return;
-            }
-        }
-    } else {
-        Vec::new()
-    };
 
     match shard
         .create_consumer(

@@ -99,12 +99,24 @@ impl BatchNackFrame {
         HEADER_SIZE + BATCH_NACK_BODY_FIXED + count * BATCH_NACK_ENTRY_SIZE
     }
 
-    /// Typed slice view over the entries.
+    /// Typed slice view over the entries — **panics** on a lying `count`.
+    /// Hot-path callers must validate via `try_entries()` first.
     #[inline(always)]
     pub fn entries(&self) -> &[BatchNackEntry] {
         let n = self.body.count.get() as usize;
         <[BatchNackEntry]>::ref_from_bytes(&self.tail[..n * BATCH_NACK_ENTRY_SIZE])
             .expect("BatchNackEntry layout")
+    }
+
+    /// **B2 safety**: bounds-checked entries view.
+    #[inline]
+    pub fn try_entries(&self) -> Option<&[BatchNackEntry]> {
+        let n = self.body.count.get() as usize;
+        let bytes = n.checked_mul(BATCH_NACK_ENTRY_SIZE)?;
+        if bytes > self.tail.len() {
+            return None;
+        }
+        <[BatchNackEntry]>::ref_from_bytes(&self.tail[..bytes]).ok()
     }
 
     /// Encode a batch nack frame. Each entry is `(seq, subject_hash, delay_ms)`.

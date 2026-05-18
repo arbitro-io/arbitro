@@ -94,13 +94,28 @@ impl BatchAckFrame {
         HEADER_SIZE + BATCH_ACK_BODY_FIXED + count * BATCH_ACK_ENTRY_SIZE
     }
 
-    /// Typed slice view over the entries.
+    /// Typed slice view over the entries — **panics** on a lying `count`.
+    /// Hot-path callers MUST validate via `try_entries()` first.
     #[inline(always)]
     pub fn entries(&self) -> &[BatchAckEntry] {
         // Safe: tail is exactly count * 16 bytes, BatchAckEntry is align-1.
         let n = self.body.count.get() as usize;
         <[BatchAckEntry]>::ref_from_bytes(&self.tail[..n * BATCH_ACK_ENTRY_SIZE])
             .expect("BatchAckEntry layout")
+    }
+
+    /// **B2 safety**: same as `entries()` but returns `None` if `count`
+    /// doesn't match the tail length. Dispatchers parsing untrusted
+    /// network frames must use this — the panic-on-lying-count path is
+    /// remote-trigerrable.
+    #[inline]
+    pub fn try_entries(&self) -> Option<&[BatchAckEntry]> {
+        let n = self.body.count.get() as usize;
+        let bytes = n.checked_mul(BATCH_ACK_ENTRY_SIZE)?;
+        if bytes > self.tail.len() {
+            return None;
+        }
+        <[BatchAckEntry]>::ref_from_bytes(&self.tail[..bytes]).ok()
     }
 
     pub fn encode_into<'a>(

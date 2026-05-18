@@ -199,6 +199,28 @@ impl NameRegistry {
     /// here so this crate can clamp without depending on the server.
     pub const MAX_IDEMPOTENCY_WINDOW_MS: u32 = 5 * 60 * 1000;
 
+    /// Maximum number of streams **or** consumers the broker accepts.
+    /// Matches `arbitro_server::shard::shared::SLOT_COUNT` — the server's
+    /// `SharedCounters` arrays are pre-allocated `Box<[AtomicU32; N]>`
+    /// and indexed directly by `consumer_id.0 as usize`. Indexing past
+    /// the array panics the shard worker thread (B1 — remote-triggerable
+    /// DoS). Allocations beyond this point are rejected at the registry
+    /// boundary BEFORE any slot is consumed.
+    pub const MAX_SLOT_COUNT: u32 = 4096;
+
+    /// `true` iff a fresh `get_or_create_stream` would succeed today.
+    /// `false` once `next_stream` has hit `MAX_SLOT_COUNT`.
+    pub fn stream_slots_available(&self) -> bool {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.next_stream < Self::MAX_SLOT_COUNT
+    }
+
+    /// `true` iff a fresh `get_or_create_consumer` would succeed today.
+    pub fn consumer_slots_available(&self) -> bool {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.next_consumer < Self::MAX_SLOT_COUNT
+    }
+
     /// Take the inner mutex, run a mutator, then atomically swap a
     /// fresh `HotSnapshot` into `self.hot`. Centralises the
     /// "admin mutation → snapshot rebuild" invariant.
@@ -225,6 +247,16 @@ impl NameRegistry {
         self.with_inner_swap(|g| {
             if let Some(&id) = g.streams_by_wire.get(&wire_id) {
                 return (id, false);
+            }
+            // B1: refuse to mint a fresh StreamId past MAX_SLOT_COUNT —
+            // the engine indexes per-stream arrays directly by `.0 as
+            // usize` and panics on OOB. Returning the sentinel
+            // `StreamId(u32::MAX)` with `created=false` lets the
+            // dispatcher map it to `ErrorCode::StreamFull` (closest
+            // existing wire code for "no room") without inventing a new
+            // variant or letting the panic escape.
+            if g.next_stream >= Self::MAX_SLOT_COUNT {
+                return (StreamId(u32::MAX), false);
             }
             let id = StreamId(g.next_stream);
             g.next_stream += 1;
@@ -315,6 +347,12 @@ impl NameRegistry {
         self.with_inner_swap(|g| {
             if let Some(&id) = g.consumers_by_name.get(name) {
                 return (id, false);
+            }
+            // B1: same admission check as `get_or_create_stream`.
+            // Sentinel `ConsumerId(u32::MAX)` with `created=false`
+            // signals "no slots" to the dispatcher.
+            if g.next_consumer >= Self::MAX_SLOT_COUNT {
+                return (ConsumerId(u32::MAX), false);
             }
             let id = ConsumerId(g.next_consumer);
             g.next_consumer += 1;
