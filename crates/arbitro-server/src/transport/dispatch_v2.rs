@@ -593,8 +593,16 @@ async fn v2_subscribe(
     // reply is a `bool`; the only legitimate way to see `Ok(false)` is
     // an unknown consumer at this layer (everything else is reported as
     // a separate command outcome).
+    //
+    // F35: `ref_seq` on a successful Subscribe reply carries the bound
+    // `consumer_id` (cast to u64). The previous shape echoed `req_seq`,
+    // which was redundant — the client already correlated via
+    // `header.seq`. Returning the consumer_id lets a client that
+    // multi-subscribes (or follows a redirect) confirm WHICH consumer
+    // is now active without an extra round-trip. Backward compatible
+    // for clients that ignore `ref_seq`.
     match reply {
-        Ok(true)  => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
+        Ok(true)  => send_rep_ok_v2(registry, conn_id, req_seq, consumer_id.0 as u64),
         Ok(false) => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
         Err(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }

@@ -36,3 +36,26 @@ Always use timeout 120.
 Always log with tee /tmp/bench.log.
 Run one benchmark at a time.
 Never run benchmarks in background.
+
+## Feature flags — never bench with `--features lifecycle_trace`
+
+F30: the `lifecycle_trace!` macro in `arbitro-server/src/lifecycle_trace.rs`
+takes a global Mutex on every hot-path call site when the feature is
+**on** (`record()` writes to a shared trace buffer). Compiles to a
+zero-instruction no-op when **off**. Enabling it costs ~50% of throughput
+on the publish/ack hot path.
+
+Bench rule: every `cargo bench` invocation MUST run without the
+`lifecycle_trace` feature. The feature is for one-shot end-to-end
+profiling of a single message — not steady-state measurement.
+
+```bash
+# CORRECT — feature off
+cargo bench --bench throughput --no-run
+
+# WRONG — locks every hot-path call site, numbers are useless
+cargo bench --bench throughput --no-run --features lifecycle_trace
+```
+
+If you need lifecycle traces, run them as a separate one-shot test or
+unit test, never as a benchmark.
