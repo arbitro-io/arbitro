@@ -43,6 +43,13 @@ pub struct ArbitroServer {
 
 impl ArbitroServer {
     pub fn new(config: Config) -> Self {
+        // M1: persist shard_count on first boot, refuse to start if it
+        // diverges from the marker on subsequent boots. Mismatched
+        // shard_count would silently misroute every stream (hashing is
+        // `stream_id % shard_count`) so we fail hard instead.
+        if let Some(dir) = config.data_dir.as_deref() {
+            check_or_persist_shard_count(dir, config.shard_count);
+        }
         let mut registry = ConnectionRegistry::new(config.write_buffer_cap);
         let server = ShardRouter::spawn(&config, &registry);
         // F8: hook the registry up to the shared millisecond clock so
@@ -537,6 +544,69 @@ fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
 fn send_error_frame(registry: &ConnectionRegistry, conn_id: u64, code: ErrorCode) {
     let frame = RepErrFrame::new(0, 0, code.as_u16());
     registry.send_parts(conn_id, &[frame.as_bytes()]);
+}
+
+/// M1: per-data-dir marker recording the `shard_count` the broker
+/// originally booted with. If the file is absent, write it; if it
+/// disagrees with the current config, log an error and abort the
+/// process. Routing depends on `stream_id % shard_count` so a silent
+/// change here would deliver every existing stream to the wrong shard.
+fn check_or_persist_shard_count(data_dir: &str, shard_count: usize) {
+    let marker_path = std::path::Path::new(data_dir).join("shards.toml");
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        tracing::error!(error = %e, dir = %data_dir, "M1: failed to create data dir");
+        std::process::exit(2);
+    }
+    match std::fs::read_to_string(&marker_path) {
+        Ok(contents) => {
+            // Format: `shard_count = N`. Tolerant of extra whitespace and
+            // unrelated keys so a future v2 can add fields without
+            // breaking older binaries.
+            let parsed = contents
+                .lines()
+                .filter_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    if k.trim() == "shard_count" {
+                        v.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .next();
+            match parsed {
+                Some(stored) if stored == shard_count => {
+                    tracing::info!(stored, "M1: shard_count marker matches");
+                }
+                Some(stored) => {
+                    tracing::error!(
+                        stored,
+                        configured = shard_count,
+                        path = %marker_path.display(),
+                        "M1: shard_count mismatch between data dir and config — refusing to start",
+                    );
+                    std::process::exit(2);
+                }
+                None => {
+                    tracing::warn!(
+                        path = %marker_path.display(),
+                        "M1: shard_count marker present but unparseable, rewriting",
+                    );
+                    let _ = std::fs::write(&marker_path, format!("shard_count = {shard_count}\n"));
+                }
+            }
+        }
+        Err(_) => {
+            // First boot for this data dir — write the marker.
+            if let Err(e) = std::fs::write(
+                &marker_path,
+                format!("shard_count = {shard_count}\n"),
+            ) {
+                tracing::error!(error = %e, path = %marker_path.display(), "M1: failed to write shard_count marker");
+                std::process::exit(2);
+            }
+            tracing::info!(shard_count, "M1: shard_count marker created");
+        }
+    }
 }
 
 async fn reject_connection(mut stream: tokio::net::TcpStream) -> std::io::Result<()> {

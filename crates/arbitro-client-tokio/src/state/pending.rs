@@ -13,6 +13,14 @@ use arbitro_kit::route::{OneShotAsync, OneShotAsyncReceiver, OneShotAsyncSender}
 
 use crate::error::{ClientError, RequestResult};
 
+/// H19: hard cap on the number of in-flight requests one client can have
+/// outstanding. Without this, a server that has stopped replying (or a
+/// reply path bug) keeps growing the `Pending` map until the host runs
+/// out of memory. 100k entries × ~80 B/entry ≈ 8 MiB, well below any
+/// modern client's memory budget but large enough that benign bursts
+/// never hit the limit.
+const DEFAULT_MAX_INFLIGHT: usize = 100_000;
+
 #[derive(Default)]
 pub(crate) struct Pending {
     map: Mutex<HashMap<u64, OneShotAsyncSender<RequestResult>>>,
@@ -33,9 +41,26 @@ impl Pending {
 
     /// Reserve a slot for `seq`; the returned receiver yields the reply
     /// (or `Disconnected` on shutdown).
+    ///
+    /// H19: enforces a hard cap (`DEFAULT_MAX_INFLIGHT`) on the size of
+    /// the map. When the cap is hit the receiver is returned already
+    /// resolved with `ClientError::ChannelClosed`, and the slot is
+    /// **not** inserted — so the wire frame the caller is about to send
+    /// will never get a reply slot to fill, but the caller learns about
+    /// it immediately on the next `.recv_async().await`. This bounds
+    /// memory under a server that's stopped responding while keeping
+    /// the call shape identical for every existing call site.
     pub fn register(&self, seq: u64) -> OneShotAsyncReceiver<RequestResult> {
         let (tx, rx) = OneShotAsync::<RequestResult>::new();
         let mut g = self.map.lock().unwrap();
+        if g.len() >= DEFAULT_MAX_INFLIGHT {
+            // Drop the lock before resolving so the receiver wake doesn't
+            // run under it (defensive — the wake is cheap, but no point
+            // holding contention).
+            drop(g);
+            tx.send(Err(ClientError::ChannelClosed));
+            return rx;
+        }
         // Replace if duplicate (shouldn't happen — seq is allocated atomically).
         g.insert(seq, tx);
         rx

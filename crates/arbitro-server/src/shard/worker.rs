@@ -377,6 +377,13 @@ pub struct CommandWorker {
     /// ring. Drained at the top of every command loop iteration so a
     /// transient ring-full doesn't leak the per-consumer subject slot.
     pub(super) pending_consumer_remove: Vec<ConsumerId>,
+    /// H12: timestamp of the last `wheel_tick + idempotency tick` pass.
+    /// The `tokio::select!` sleep arm can be starved when commands are
+    /// arriving continuously; this field lets `dispatch_command` force
+    /// a tick after every WHEEL_TICK_INTERVAL of wall time. The
+    /// `Option` stays `None` until the first command runs, so the
+    /// behaviour for a quiescent shard is unchanged.
+    pub(super) last_wheel_tick: Option<Instant>,
 }
 
 impl CommandWorker {
@@ -701,6 +708,36 @@ impl CommandWorker {
         }
     }
 
+    /// H12: run the wheel + idempotency tick if at least
+    /// `WHEEL_TICK_INTERVAL` has elapsed since the last pass. Called
+    /// after every dispatched command so a busy shard doesn't starve
+    /// the timer arm of the `tokio::select!`. Idle shards still fall
+    /// back to the sleep-driven branch in `run()`.
+    fn maybe_tick_periodic(&mut self) {
+        let now = Instant::now();
+        let due = match self.last_wheel_tick {
+            Some(last) => now.duration_since(last) >= Self::WHEEL_TICK_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        if !(self.wheel.is_some()
+            || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.last_wheel_tick = Some(now);
+            return;
+        }
+        self.wheel_tick();
+        let guard = self.idempotency_tracker.read();
+        for tracker_arc in guard.values() {
+            tracker_arc.lock().tick();
+        }
+        drop(guard);
+        self.last_wheel_tick = Some(now);
+        self.next_wheel_tick = Some(now + Self::WHEEL_TICK_INTERVAL);
+    }
+
     /// Returns `true` if shutdown was requested.
     fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
         if matches!(cmd, ShardCommand::Shutdown) {
@@ -714,6 +751,8 @@ impl CommandWorker {
             return true;
         }
         self.dispatch_command(cmd);
+        // H12: keep the periodic tick deterministic under sustained load.
+        self.maybe_tick_periodic();
         false
     }
 

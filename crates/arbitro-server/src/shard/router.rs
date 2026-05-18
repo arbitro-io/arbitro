@@ -193,6 +193,7 @@ impl ShardRouter {
                 flush_stream_ids: Vec::new(),
                 silent_drops: Arc::clone(&silent_drops),
                 pending_consumer_remove: Vec::new(),
+                last_wheel_tick: None,
             };
 
             tokio::spawn(cmd_worker.run());
