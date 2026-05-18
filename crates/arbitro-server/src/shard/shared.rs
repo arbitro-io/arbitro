@@ -207,7 +207,21 @@ impl SharedCounters {
         }
     }
 
-    /// Reset rewind signal (e.g., after cursor set to 0 on subscribe).
+    /// Reset rewind signal — but ONLY if the slot still holds the value
+    /// the caller observed. M3: the previous unconditional `store` lost a
+    /// concurrent rewind signal that came in between the caller's read
+    /// and its clear (e.g., wheel_tick consumes, finishes its work, then
+    /// blindly stores NO_REWIND, wiping out a rewind another command
+    /// signalled in the meantime). The CAS now leaves a later signal
+    /// alone.
+    pub fn clear_rewind_if_eq(&self, expected: u64) -> bool {
+        self.rewind
+            .compare_exchange(expected, NO_REWIND, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Unconditional reset (e.g., on shard restart / clean shutdown).
+    /// Hot-path callers should prefer `clear_rewind_if_eq`.
     pub fn clear_rewind(&self) {
         self.rewind.store(NO_REWIND, Ordering::Relaxed);
     }

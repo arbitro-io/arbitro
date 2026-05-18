@@ -414,8 +414,12 @@ async fn read_loop(
                 if acc.len() >= total {
                     let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
                     if action_raw != Action::Auth.as_u16() {
+                        // H2: surface the real reason (AuthRequired) instead
+                        // of pretending the server is shutting down. The
+                        // client needs to distinguish "send a token" from
+                        // "stop trying, the broker is down".
                         tracing::warn!(conn_id, "auth required but first frame is not Auth, closing");
-                        send_shutdown_frame(&registry, conn_id);
+                        send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
                         break 'outer;
                     }
                     // Token is the body (after 16-byte header)
@@ -440,8 +444,11 @@ async fn read_loop(
                         }
                     };
                     if !token_ok {
+                        // H2: a wrong token is AuthFailed, not a server
+                        // shutdown signal. Mis-coding this confuses
+                        // bootstrap loops and credential-rotation logic.
                         tracing::warn!(conn_id, "auth failed: invalid token");
-                        send_shutdown_frame(&registry, conn_id);
+                        send_error_frame(&registry, conn_id, ErrorCode::AuthFailed);
                         break 'outer;
                     }
                     let _ = acc.split_to(total);
@@ -517,6 +524,15 @@ async fn read_loop(
 
 fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
     let frame = RepErrFrame::new(0, 0, ErrorCode::ServerShuttingDown.as_u16());
+    registry.send_parts(conn_id, &[frame.as_bytes()]);
+}
+
+/// Send a single RepError frame with the given error code. Used by the
+/// auth path to surface the real reason a connection is being closed
+/// (AuthRequired / AuthFailed) instead of misrepresenting it as a
+/// server-side shutdown. H2.
+fn send_error_frame(registry: &ConnectionRegistry, conn_id: u64, code: ErrorCode) {
+    let frame = RepErrFrame::new(0, 0, code.as_u16());
     registry.send_parts(conn_id, &[frame.as_bytes()]);
 }
 
@@ -687,13 +703,16 @@ async fn metrics_loop(
             stream_messages  = stream_messages,
             stream_bytes     = stream_bytes,
             // ── Deltas this tick (per-interval rate) ───────────────────
-            published     = acc.publish_entries_accepted   - prev.publish_entries_accepted,
-            delivered     = acc.claim_entries_delivered    - prev.claim_entries_delivered,
-            acked         = acc.ack_accepted               - prev.ack_accepted,
-            nacked        = acc.nack_accepted              - prev.nack_accepted,
-            pub_no_match  = acc.publish_no_match           - prev.publish_no_match,
-            held_inflight = acc.claim_skipped_max_inflight - prev.claim_skipped_max_inflight,
-            held_subject  = acc.claim_skipped_subject_limit - prev.claim_skipped_subject_limit,
+            // L7: saturating_sub so a counter that fell below the previous
+            // snapshot (shard restart, recovery rebuild) emits 0 instead of
+            // wrapping into a 2^63 spike in the dashboard.
+            published     = acc.publish_entries_accepted.saturating_sub(prev.publish_entries_accepted),
+            delivered     = acc.claim_entries_delivered.saturating_sub(prev.claim_entries_delivered),
+            acked         = acc.ack_accepted.saturating_sub(prev.ack_accepted),
+            nacked        = acc.nack_accepted.saturating_sub(prev.nack_accepted),
+            pub_no_match  = acc.publish_no_match.saturating_sub(prev.publish_no_match),
+            held_inflight = acc.claim_skipped_max_inflight.saturating_sub(prev.claim_skipped_max_inflight),
+            held_subject  = acc.claim_skipped_subject_limit.saturating_sub(prev.claim_skipped_subject_limit),
             "metrics",
         );
 

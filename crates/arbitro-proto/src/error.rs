@@ -40,6 +40,11 @@ pub enum ErrorCode {
     // 0x05xx — System
     ServerShuttingDown  = 0x0501,
     InternalError       = 0x0502,
+    /// The broker recognised the wire action code but no handler is wired
+    /// (yet) — distinguishes "I don't know this code" (UnknownAction) from
+    /// "I know it but won't service it in this build". Used for protocol
+    /// surface that is reserved but not implemented. L2.
+    Unimplemented       = 0x0503,
 }
 
 impl ErrorCode {
@@ -71,6 +76,7 @@ impl ErrorCode {
 
             0x0501 => Some(Self::ServerShuttingDown),
             0x0502 => Some(Self::InternalError),
+            0x0503 => Some(Self::Unimplemented),
 
             _ => None,
         }

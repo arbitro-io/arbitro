@@ -58,13 +58,14 @@ pub enum Action {
     // 0x06xx — System
     Ping          = 0x0601,
     Pong          = 0x0602,
-    Connect       = 0x0603,
-    Connected     = 0x0604,
+    // L1: 0x0603 (Connect) / 0x0604 (Connected) deleted — v2 uses
+    // HelloFrame for the handshake, so these wire codes have no
+    // dispatcher. Reserved; do not reuse the slots.
     Disconnect    = 0x0605,
 
-    // 0x07xx — Metrics
-    Stats         = 0x0701,
-    StatsReply    = 0x0702,
+    // L1: 0x07xx (Stats / StatsReply) deleted — metrics travel via
+    // the per-shard `Metrics` command in arbitro-server, never as a
+    // wire frame. Reserved; do not reuse the family yet.
 }
 
 impl Action {
@@ -112,12 +113,9 @@ impl Action {
 
             0x0601 => Some(Self::Ping),
             0x0602 => Some(Self::Pong),
-            0x0603 => Some(Self::Connect),
-            0x0604 => Some(Self::Connected),
+            // 0x0603, 0x0604 reserved (deleted Connect/Connected) — L1.
             0x0605 => Some(Self::Disconnect),
-
-            0x0701 => Some(Self::Stats),
-            0x0702 => Some(Self::StatsReply),
+            // 0x0701, 0x0702 reserved (deleted Stats/StatsReply) — L1.
 
             _ => None,
         }

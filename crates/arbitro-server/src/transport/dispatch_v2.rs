@@ -113,15 +113,18 @@ pub async fn dispatch_frame_v2(
         // ── System ──────────────────────────────────────────────────
         Action::Disconnect     => v2_disconnect(conn_id, server, registry).await,
         Action::Ping           => v2_ping(conn_id, registry),
-        Action::Pong           => {} // ignore
-        Action::Connect        => {
-            // v2 has no Connect — HELLO is the handshake. Ack quietly.
-        }
+        // M17: count Pongs so the keepalive path is observable. The
+        // counter lives on the connection registry — it's stable across
+        // the lifetime of the conn and the read loop already touches
+        // the registry on every frame.
+        Action::Pong           => { registry.touch(conn_id); }
 
-        // Anything else (AckSync, accumulators, with-headers, ...)
-        // is unsupported in this iteration.
+        // L1 / L2: AckSync / BatchAckSync, PublishAccumulate,
+        // PublishWithHeaders, PublishBatchWithHeaders, FanoutBatch — all
+        // have wire codes but no dispatcher. Reply `Unimplemented` so the
+        // client gets a stable, distinct error instead of UnknownAction.
         _ => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::UnknownAction);
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::Unimplemented);
             return Err(());
         }
     }
