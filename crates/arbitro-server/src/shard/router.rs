@@ -71,6 +71,82 @@ pub struct ShardRouter {
     /// every `try_send` failure on the conn-write / notify-ring /
     /// drain-event paths and surfaced in the periodic metrics log.
     silent_drops: Arc<crate::common::SilentDrops>,
+    /// F37: 1-second TTL cache for `list_streams` / `list_consumers`
+    /// fan-out replies. Cold-path RPCs that fan out to every shard;
+    /// caching avoids paying the 16-shard round-trip on every call from
+    /// dashboards / health checks. Lock contention is irrelevant —
+    /// these RPCs are not on any hot path.
+    list_cache: Arc<parking_lot::Mutex<ListCache>>,
+}
+
+/// F37 — list_streams / list_consumers TTL cache. 1-second freshness
+/// window. Built lazily on read; the cache is invalidated by the next
+/// expiry, no explicit eviction on writes (create/delete) needed.
+#[derive(Default)]
+struct ListCache {
+    streams: Option<(std::time::Instant, Arc<Vec<(u32, Vec<u8>)>>)>,
+    consumers: Option<(std::time::Instant, Arc<Vec<(u32, u32, u32, bool)>>)>,
+}
+
+impl ShardRouter {
+    /// F37: cache duration. Picked so that operator dashboards (1Hz
+    /// poll) see ~1 cache miss per second per shard cluster, but
+    /// scripts hammering `list_streams` don't fan out N×.
+    const LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Return a cached `list_streams` aggregate if fresh.
+    /// The caller falls back to the fan-out path on `None`.
+    #[inline]
+    pub fn cached_list_streams(&self) -> Option<Arc<Vec<(u32, Vec<u8>)>>> {
+        let guard = self.list_cache.lock();
+        if let Some((ts, v)) = guard.streams.as_ref() {
+            if ts.elapsed() < Self::LIST_CACHE_TTL {
+                return Some(Arc::clone(v));
+            }
+        }
+        None
+    }
+
+    /// Store a freshly-built aggregate. Replaces any existing entry.
+    #[inline]
+    pub fn store_list_streams(&self, v: Vec<(u32, Vec<u8>)>) -> Arc<Vec<(u32, Vec<u8>)>> {
+        let v = Arc::new(v);
+        self.list_cache.lock().streams =
+            Some((std::time::Instant::now(), Arc::clone(&v)));
+        v
+    }
+
+    /// Cached `list_consumers` aggregate if fresh.
+    #[inline]
+    pub fn cached_list_consumers(&self) -> Option<Arc<Vec<(u32, u32, u32, bool)>>> {
+        let guard = self.list_cache.lock();
+        if let Some((ts, v)) = guard.consumers.as_ref() {
+            if ts.elapsed() < Self::LIST_CACHE_TTL {
+                return Some(Arc::clone(v));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn store_list_consumers(
+        &self,
+        v: Vec<(u32, u32, u32, bool)>,
+    ) -> Arc<Vec<(u32, u32, u32, bool)>> {
+        let v = Arc::new(v);
+        self.list_cache.lock().consumers =
+            Some((std::time::Instant::now(), Arc::clone(&v)));
+        v
+    }
+
+    /// Invalidate both list caches. Called from create/delete paths so
+    /// the next `list_streams` / `list_consumers` reflects the write.
+    #[inline]
+    pub fn invalidate_list_cache(&self) {
+        let mut g = self.list_cache.lock();
+        g.streams = None;
+        g.consumers = None;
+    }
 }
 
 impl ShardRouter {
@@ -261,6 +337,9 @@ impl ShardRouter {
             command_log: None,
             clock,
             silent_drops,
+            // F37: empty cache; first list_streams / list_consumers
+            // populates it.
+            list_cache: Arc::new(parking_lot::Mutex::new(ListCache::default())),
         }
     }
 

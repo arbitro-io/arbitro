@@ -83,6 +83,20 @@ pub async fn dispatch_frame_v2(
     };
     let req_seq = header.seq.get();
 
+    // H16: per-dispatch tracing event. Compiles to a near no-op when
+    // the subscriber filter excludes TRACE (an atomic load + branch).
+    // We use an event instead of a span guard so that nothing has to
+    // be held across the `.await` points in the match arms (a Span
+    // `Entered` guard is `!Send`). The event captures the same fields
+    // a span would and is sufficient for per-dispatch tracing.
+    tracing::event!(
+        tracing::Level::TRACE,
+        conn_id,
+        req_seq,
+        action = ?action,
+        "dispatch_v2"
+    );
+
     match action {
         // ── Hot path ────────────────────────────────────────────────
         Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry),
@@ -657,6 +671,10 @@ async fn v2_create_stream(
             // the dedup window on `v2_publish` / `v2_publish_batch`.
             server.names().set_stream_idempotency(seq_stream, idempotency_window_ms);
 
+            // F37: invalidate the list_streams / list_consumers TTL
+            // cache so the next list-RPC reflects this new stream.
+            server.invalidate_list_cache();
+
             // Persist to command log on cold path — idempotent on replay.
             if let Some(log) = server.command_log() {
                 let cmd = build_create_stream(&frame[HEADER_SIZE..]);
@@ -706,6 +724,9 @@ async fn v2_delete_stream(
                 server.names().remove_consumer_by_id(cid);
             }
             server.names().remove_stream(wire_stream);
+            // F37: invalidate list caches — stream + cascaded consumers
+            // are gone, both list RPCs must rebuild on next call.
+            server.invalidate_list_cache();
             if let Some(log) = server.command_log() {
                 let cmd = build_delete_stream(&frame[HEADER_SIZE..]);
                 if let Err(e) = log.record(&cmd) {
@@ -799,16 +820,26 @@ async fn v2_list_streams(
     // partial views never reach the client. Trade-off: a single
     // crashed shard kills the whole `list_streams` reply, but that's
     // strictly safer than fabricating an incomplete list.
-    let mut all_streams: Vec<(u32, Vec<u8>)> = Vec::new();
-    for i in 0..server.shard_count() {
-        match server.shard(i).list_streams().await {
-            Ok(reply) => all_streams.extend(reply.streams),
-            Err(_) => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
-                return;
+    //
+    // F37: 1-second TTL cache short-circuits the 16-shard round-trip
+    // when the cache is fresh. Invalidated explicitly by
+    // create/delete (see v2_create_stream / v2_delete_stream).
+    let all_streams: std::sync::Arc<Vec<(u32, Vec<u8>)>> =
+        if let Some(cached) = server.cached_list_streams() {
+            cached
+        } else {
+            let mut acc: Vec<(u32, Vec<u8>)> = Vec::new();
+            for i in 0..server.shard_count() {
+                match server.shard(i).list_streams().await {
+                    Ok(reply) => acc.extend(reply.streams),
+                    Err(_) => {
+                        send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                        return;
+                    }
+                }
             }
-        }
-    }
+            server.store_list_streams(acc)
+        };
 
     let body_len: usize = 4 + all_streams.iter().map(|(_, n)| 6 + n.len()).sum::<usize>();
     let total = HEADER_SIZE + body_len;
@@ -817,7 +848,7 @@ async fn v2_list_streams(
     let header = Header::new(Action::ListStreams.as_u16(), body_len as u32, req_seq);
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(&(all_streams.len() as u32).to_le_bytes());
-    for (seq_id, name) in &all_streams {
+    for (seq_id, name) in all_streams.iter() {
         let wire_id = server.names().stream_wire(StreamId(*seq_id)).unwrap_or(*seq_id);
         buf.extend_from_slice(&wire_id.to_le_bytes());
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -927,6 +958,8 @@ async fn v2_create_consumer(
         .await
     {
         Ok(true) => {
+            // F37: a new consumer must show up in list_consumers reply.
+            server.invalidate_list_cache();
             if let Some(log) = server.command_log() {
                 let cmd = build_create_consumer(&frame[HEADER_SIZE..]);
                 if let Err(e) = log.record(&cmd) {
@@ -977,6 +1010,8 @@ async fn v2_delete_consumer(
             // leaks one entry per deleted consumer (the maps grow forever
             // under a create→delete→recreate workload).
             server.names().remove_consumer_by_id(consumer_id);
+            // F37: invalidate list_consumers cache.
+            server.invalidate_list_cache();
 
             if let Some(log) = server.command_log() {
                 let cmd = build_delete_consumer(&frame[HEADER_SIZE..]);
@@ -1131,22 +1166,34 @@ async fn v2_list_consumers(
     // listing. Same trade-off as `v2_list_streams` — one crashed shard
     // takes the whole reply, but the alternative is silently lying to
     // the operator about what consumers exist.
-    let mut all_consumers: Vec<(u32, u32, u32, bool)> = Vec::new();
-    for i in 0..server.shard_count() {
-        match server.shard(i).list_consumers().await {
-            Ok(reply) => all_consumers.extend(reply.consumers),
-            Err(_) => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
-                return;
+    //
+    // F37: TTL cache covers the (always full, no client filter) fan-out
+    // step; the per-request `stream_id` filter is applied on top of the
+    // cached aggregate, so different filter values can still share the
+    // same underlying snapshot.
+    let all_consumers: std::sync::Arc<Vec<(u32, u32, u32, bool)>> =
+        if let Some(cached) = server.cached_list_consumers() {
+            cached
+        } else {
+            let mut acc: Vec<(u32, u32, u32, bool)> = Vec::new();
+            for i in 0..server.shard_count() {
+                match server.shard(i).list_consumers().await {
+                    Ok(reply) => acc.extend(reply.consumers),
+                    Err(_) => {
+                        send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                        return;
+                    }
+                }
             }
-        }
-    }
+            server.store_list_consumers(acc)
+        };
 
     // Apply stream filter when the client requested it.
     let filtered: Vec<(u32, u32, u32, bool)> = match seq_filter {
-        None      => all_consumers,
+        None      => all_consumers.as_ref().clone(),
         Some(seq) => all_consumers
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|(_, sid, _, _)| *sid == seq)
             .collect(),
     };
