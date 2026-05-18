@@ -395,7 +395,7 @@ impl ArbitroServer {
         }
 
         // Shutdown shard workers
-        self.server.shutdown();
+        self.server.shutdown().await;
 
         // Wait briefly for write loops to drain
         tokio::time::sleep(self.config.shutdown_timeout).await;

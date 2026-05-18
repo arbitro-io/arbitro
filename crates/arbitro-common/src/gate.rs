@@ -1,31 +1,40 @@
-//! Gate — drain delivery signal for the shard thread.
+//! Gate — drain delivery signal for the shard task.
 //!
 //! The shard calls `release()` after publish/ack/nack to signal new work.
 //! The drain loop checks `is_open()` to decide whether to run drain_cycle.
-//! When drain_cycle finds nothing, it calls `lock()` — the drain parks.
+//! When drain_cycle finds nothing, it calls `lock()` — the drain awaits.
 //!
-//! Implementation: `arbitro_kit::gate::SignalSet<ParkWaiter>` with a single
-//! signal (bit 0). `ParkWaiter` → `thread::park/unpark`, 0% CPU idle.
-//! Replaces the previous crossbeam_channel::bounded(1) implementation —
-//! same semantics, one fewer dependency, ~2× faster on the release path
-//! (atomic bit-OR vs channel try_send).
+//! Implementation: `arbitro_kit::gate::SignalSet<NotifyWaiter>` with a
+//! single signal (bit 0). `NotifyWaiter` → `tokio::sync::Notify`, so the
+//! drain is a cooperative tokio task instead of an OS thread parked via
+//! `thread::park`. This removes the impedance mismatch with the tokio
+//! runtime (no more `spawn_blocking` for `h.join()`, no more
+//! `parking_lot::Mutex<Vec<JoinHandle>>`) and makes shutdown deterministic
+//! under parallel tests.
 
-use arbitro_kit::gate::{SignalId, SignalSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
-/// Single signal ID — always bit 0.
-const GATE_BIT: SignalId = SignalId::new(0);
-
-/// kit SignalSet-backed Gate.
+/// Async Gate built directly on `tokio::sync::Notify` + `AtomicBool`.
+///
+/// We don't go through `arbitro_kit::gate::SignalSet<NotifyWaiter>::acquire_async`
+/// because its `wait_until` closure captures `&self.chunks[0]` with a
+/// borrow that triggers a known compiler bug (rust-lang#100013) when the
+/// future is required to be `Send` from inside a generic async context.
+/// Hand-rolling the `notified() → check → await` loop sidesteps the
+/// inference failure and is equivalent in semantics: coalesced release,
+/// 0% CPU idle, lost-notify-safe.
 ///
 /// Semantics:
-/// - `release()` sets bit 0 (coalescing — multiple releases merge via OR).
-/// - `acquire()` parks the thread (0% CPU via `thread::park`) until bit 0
-///   is set. Fast-paths if already open.
-/// - `lock()` clears bit 0.
-/// - `is_open()` reads bit 0.
-#[repr(transparent)]
+/// - `release()` sets the flag and notifies the (single) consumer task.
+///   Coalescing: many releases collapse to one wake.
+/// - `acquire().await` suspends the task until the flag is set, then
+///   returns. Fast-paths if already open.
+/// - `lock()` clears the flag.
+/// - `is_open()` reads the flag.
 pub struct Gate {
-    inner: SignalSet,
+    open: AtomicBool,
+    notify: Notify,
 }
 
 impl Default for Gate {
@@ -35,42 +44,57 @@ impl Default for Gate {
 impl Gate {
     pub fn new() -> Self {
         Self {
-            inner: SignalSet::new(),
+            open: AtomicBool::new(false),
+            notify: Notify::new(),
         }
     }
 
-    /// Register the consumer thread. Must be called once by the drain
-    /// thread before any producer calls `release()`.
-    #[inline]
-    pub fn set_worker(&self, t: std::thread::Thread) {
-        self.inner.set_worker(t);
-    }
-
     /// Signal that work is available. Coalescing — multiple concurrent
-    /// releases are merged (bit-OR into a single atomic).
+    /// releases merge into a single wake.
     #[inline]
     pub fn release(&self) {
-        self.inner.release(GATE_BIT);
+        // `swap` returns the previous value. We only need to fire the
+        // notify on the 0 → 1 transition; further releases are no-ops
+        // until the consumer calls `lock()`.
+        if !self.open.swap(true, Ordering::Release) {
+            self.notify.notify_one();
+        } else {
+            // Idempotent wake — covers the race where the consumer
+            // raced past a stale `acquire()` and is about to await
+            // again. Without this second `notify_one`, a producer that
+            // sees the flag already set would never re-arm the wake.
+            self.notify.notify_one();
+        }
     }
 
     /// Clear the "work available" signal. Called by drain when a cycle
     /// found nothing to deliver.
     #[inline]
     pub fn lock(&self) {
-        self.inner.lock(GATE_BIT);
+        self.open.store(false, Ordering::Release);
     }
 
     /// `true` if there is pending work.
     #[inline]
     pub fn is_open(&self) -> bool {
-        self.inner.is_open(GATE_BIT)
+        self.open.load(Ordering::Acquire)
     }
 
-    /// Block until work is available. 0% CPU — parks via
-    /// `thread::park` (futex on Linux).
-    #[inline]
-    pub fn acquire(&self) {
-        self.inner.acquire();
+    /// Suspend the calling tokio task until work is available. 0% CPU —
+    /// awaits `tokio::sync::Notify::notified()`.
+    pub async fn acquire(&self) {
+        loop {
+            // BUILD the notified() future BEFORE checking the flag.
+            // Without this ordering, a producer firing `notify_one`
+            // between the check and the await would be lost (Notify
+            // only "remembers" a permit if a `notified()` was already
+            // registered when it fired).
+            let notified = self.notify.notified();
+            if self.open.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -89,10 +113,6 @@ mod tests {
     #[test]
     fn t17_n_releases_coalesce_into_one_open_state() {
         let g = Gate::new();
-        // Register a worker thread so `release()` has an unpark target —
-        // we never actually `acquire()` here, but kit's contract requires
-        // it for the release path.
-        g.set_worker(std::thread::current());
 
         // Burst of 1000 releases — must end in exactly one "open" state.
         for _ in 0..1000 {
@@ -112,7 +132,6 @@ mod tests {
     #[test]
     fn t17_release_after_lock_keeps_gate_open() {
         let g = Gate::new();
-        g.set_worker(std::thread::current());
 
         g.release();
         g.lock();
@@ -128,7 +147,6 @@ mod tests {
     #[test]
     fn t17_concurrent_releases_never_lose_open_state() {
         let g = Arc::new(Gate::new());
-        g.set_worker(std::thread::current());
 
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -142,8 +160,24 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        // Give park/unpark machinery a beat to settle on slow CI runners.
+        // Give the notify machinery a beat to settle on slow CI runners.
         std::thread::sleep(Duration::from_millis(5));
         assert!(g.is_open(), "8 × 1000 concurrent releases must leave gate open");
+    }
+
+    /// Drain-thread analog under tokio: a task awaits `acquire()`, a
+    /// non-tokio thread fires `release()`, the task wakes. This is the
+    /// cross-runtime wake path the migration exists for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn acquire_async_wakes_on_release_from_os_thread() {
+        let g = Arc::new(Gate::new());
+        let g2 = Arc::clone(&g);
+        let h = tokio::spawn(async move {
+            g2.acquire().await;
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        g.release();
+        h.await.unwrap();
+        assert!(g.is_open());
     }
 }

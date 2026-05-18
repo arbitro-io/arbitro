@@ -140,10 +140,10 @@ pub struct DrainWorker {
 }
 
 impl DrainWorker {
-    /// Pure drain loop — nothing else runs on this thread.
-    pub fn run(mut self) {
-        self.gate.set_worker(std::thread::current());
-
+    /// Pure drain loop — runs as a tokio task. `gate.acquire().await`
+    /// suspends the task on `tokio::sync::Notify` (via kit's
+    /// `NotifyWaiter`). No `std::thread`, no `JoinHandle<()>` of OS threads.
+    pub async fn run(mut self) {
         // ── Store init ───────────────────────────────────────────────────
         {
             let mut store_guard = self.store.lock();
@@ -158,7 +158,7 @@ impl DrainWorker {
 
         loop {
             crate::lifecycle_trace!("19_1_gate_waiting", 0, 0, "shard");
-            self.gate.acquire();
+            self.gate.acquire().await;
             crate::lifecycle_trace!("19_2_gate_acquired", 0, 0, "shard");
 
             if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
@@ -233,7 +233,7 @@ impl DrainWorker {
 
                 // Backpressure: cursor didn't advance → downstream full.
                 if stalled && self.gate.is_open() {
-                    std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                     break;
                 }
             }

@@ -38,15 +38,16 @@ pub struct ShardRouter {
     stores: Arc<[SharedStore]>,
     gates: Arc<[Arc<Gate>]>,
     names: Arc<NameRegistry>,
-    /// H5: drain thread join handles, one per shard. Kept inside a
-    /// `parking_lot::Mutex<Option<...>>` so `shutdown()` can take
-    /// ownership and join. Without this the OS thread is leaked on
-    /// server shutdown — fine in practice but breaks tests that
-    /// expect all sockets/files closed by the time `shutdown()`
-    /// returns.
-    drain_joins: Arc<parking_lot::Mutex<Vec<Option<std::thread::JoinHandle<()>>>>>,
+    /// H5: drain task join handles, one per shard. After the migration
+    /// from `std::thread` to `tokio::spawn`, these are `tokio::task::JoinHandle`
+    /// — `shutdown()` awaits them so all per-shard state is released
+    /// (mmaps closed, drain ring empty) before the function returns.
+    /// Tokio's `JoinHandle` is `Send` so the surrounding
+    /// `parking_lot::Mutex<Option<...>>` is only there to let `shutdown`
+    /// take ownership of the handles from a `&self` method.
+    drain_joins: Arc<parking_lot::Mutex<Vec<Option<tokio::task::JoinHandle<()>>>>>,
     /// Per-shard "running" flags, used by `shutdown` to flip drain
-    /// threads off so they exit their inner loop cleanly.
+    /// tasks off so they exit their inner loop cleanly.
     drain_running: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
     /// Per-shard idempotency dedup state. Each entry is a
     /// lazily-allocated tracker (`Option<...>` starts None, fills in
@@ -227,11 +228,10 @@ impl ShardRouter {
             };
 
             // H5: keep the JoinHandle. shutdown() will flip `running`
-            // to false, release the gate, and join.
-            let join = std::thread::Builder::new()
-                .name(format!("drain-{id}"))
-                .spawn(move || drain_worker.run())
-                .expect("failed to spawn drain thread");
+            // to false, release the gate, and await. After migrating to
+            // an async drain, this is a tokio task — no OS-thread join,
+            // no `spawn_blocking`, no impedance mismatch with the runtime.
+            let join = tokio::spawn(drain_worker.run());
             drain_joins.push(Some(join));
             drain_running.push(Arc::clone(&running));
 
@@ -434,7 +434,7 @@ impl ShardRouter {
         self.shards.len()
     }
 
-    pub fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         for shard in self.shards.iter() {
             shard.send_shutdown();
         }
@@ -450,12 +450,16 @@ impl ShardRouter {
         for g in self.gates.iter() {
             g.release();
         }
-        let mut joins = self.drain_joins.lock();
-        for slot in joins.iter_mut() {
-            if let Some(h) = slot.take() {
-                if let Err(e) = h.join() {
-                    tracing::warn!(?e, "drain thread join failed");
-                }
+        // Drain ownership out of the mutex first, then drop the lock
+        // before awaiting. Each drain is a tokio task — `await` is
+        // cooperative and does not block the worker.
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut joins = self.drain_joins.lock();
+            joins.iter_mut().filter_map(|s| s.take()).collect()
+        };
+        for h in handles {
+            if let Err(e) = h.await {
+                tracing::warn!(?e, "drain task join failed");
             }
         }
     }
