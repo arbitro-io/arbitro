@@ -131,6 +131,7 @@ dependencies = [
  "parking_lot",
  "rustls-pemfile",
  "smallvec",
+ "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",

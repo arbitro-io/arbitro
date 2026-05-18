@@ -489,6 +489,14 @@ async fn v2_subscribe(
         send_error_v2(registry, conn_id, req_seq, code);
         return;
     }
+    // H1: subscribe filter validated too.
+    let sub_filter = f.filter();
+    if !sub_filter.is_empty()
+        && arbitro_proto::validate::validate_subject(sub_filter).is_err()
+    {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
     let consumer_id = ConsumerId(f.body.consumer_id.get());
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
@@ -585,6 +593,21 @@ async fn v2_create_stream(
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
     let name = f.name();
+    // H1: validate name + filter at the dispatch boundary BEFORE
+    // allocating IDs. Rejects empty / oversized / weird-byte names so
+    // catalog Vec indexes stay sane and DeleteStream/wire echoes
+    // don't have to handle pathological input.
+    if arbitro_proto::validate::validate_name(name).is_err() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
+    let filter = f.filter();
+    if !filter.is_empty()
+        && arbitro_proto::validate::validate_subject(filter).is_err()
+    {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
     // B1: registry refused — slot pool exhausted.
@@ -795,6 +818,27 @@ async fn v2_create_consumer(
     };
     let name = f.name();
     let group = f.group();
+    // H1: validate consumer name + (optional) group + (optional)
+    // subject filter at the dispatch boundary. Same reasoning as
+    // v2_create_stream — keep weird bytes from leaking into the
+    // engine catalog / NameRegistry maps.
+    if arbitro_proto::validate::validate_name(name).is_err() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
+    if !group.is_empty()
+        && arbitro_proto::validate::validate_name(group).is_err()
+    {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
+    let subject_filter = f.subject();
+    if !subject_filter.is_empty()
+        && arbitro_proto::validate::validate_subject(subject_filter).is_err()
+    {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        return;
+    }
 
     let ack_policy = match f.body.ack_policy {
         0 => AckPolicy::None,

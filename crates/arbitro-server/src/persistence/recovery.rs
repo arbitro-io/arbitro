@@ -21,6 +21,13 @@ enum ReplayCommand {
         stream_id: StreamId,
         config: StreamConfig,
         journal_kind: u8,
+        // H3: persisted retention limits — without these, recovery
+        // recreates streams with unbounded retention, so a max_msgs /
+        // max_bytes / max_age the operator originally configured is
+        // silently lost across restart.
+        max_msgs: u64,
+        max_bytes: u64,
+        max_age_ms: u64,
     },
     DeleteStream {
         stream_id: StreamId,
@@ -66,10 +73,13 @@ impl ReplayApplier {
                     stream_id,
                     config,
                     journal_kind,
+                    max_msgs,
+                    max_bytes,
+                    max_age_ms,
                 } => {
                     let shard = self.server.shard_for(stream_id);
                     let _ = journal_kind; // no longer needed — single store per shard
-                    match shard.create_stream(config, 0, 0, 0).await {
+                    match shard.create_stream(config, max_msgs, max_bytes, max_age_ms).await {
                         Ok(true) => {
                             streams_recovered += 1;
                             tracing::debug!(?stream_id, "replayed CreateStream");
@@ -190,6 +200,12 @@ impl MetadataApplier for ReplayApplier {
                         name: name.to_vec(),
                     },
                     journal_kind: sv.journal_kind(),
+                    // H3: extract retention from the wire body, so a
+                    // restart restores what the operator configured at
+                    // CreateStream time.
+                    max_msgs:   sv.max_msgs(),
+                    max_bytes:  sv.max_bytes(),
+                    max_age_ms: sv.max_age_secs().saturating_mul(1_000),
                 });
             }
             CMD_DELETE_STREAM => {

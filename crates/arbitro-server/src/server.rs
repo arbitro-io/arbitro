@@ -132,13 +132,36 @@ impl ArbitroServer {
 
         // ── TLS acceptor (optional) ────────────────────────────────────
         #[cfg(feature = "tls")]
-        let tls_acceptor = self.config.tls_cert.as_ref().map(|cert| {
-            let key = self.config.tls_key.as_ref()
-                .expect("ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set");
-            let acceptor = crate::transport::tls::build_acceptor(cert, key);
-            tracing::info!("TLS enabled");
-            acceptor
-        });
+        let tls_acceptor = match self.config.tls_cert.as_ref() {
+            Some(cert) => {
+                let key = match self.config.tls_key.as_ref() {
+                    Some(k) => k,
+                    None => {
+                        tracing::error!(
+                            "ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set"
+                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set",
+                        ));
+                    }
+                };
+                match crate::transport::tls::build_acceptor(cert, key) {
+                    Ok(a) => {
+                        tracing::info!("TLS enabled");
+                        Some(a)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "TLS setup failed");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            e.to_string(),
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
 
         // Internal shutdown signal
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -398,7 +421,25 @@ async fn read_loop(
                     // Token is the body (after 16-byte header)
                     let token_bytes = &acc[HEADER_SIZE_V2..total];
                     let expected = auth_token.as_ref().unwrap();
-                    if token_bytes != expected.as_bytes() {
+                    // M14: constant-time comparison so a network
+                    // observer can't recover the token byte-by-byte
+                    // via timing of `!=`. We keep the early
+                    // length-mismatch reject (constant against a known
+                    // expected length is fine — the attacker already
+                    // knows it from a single failed attempt).
+                    let token_ok = {
+                        let e = expected.as_bytes();
+                        if token_bytes.len() != e.len() {
+                            false
+                        } else {
+                            let mut diff: u8 = 0;
+                            for (a, b) in token_bytes.iter().zip(e.iter()) {
+                                diff |= a ^ b;
+                            }
+                            diff == 0
+                        }
+                    };
+                    if !token_ok {
                         tracing::warn!(conn_id, "auth failed: invalid token");
                         send_shutdown_frame(&registry, conn_id);
                         break 'outer;

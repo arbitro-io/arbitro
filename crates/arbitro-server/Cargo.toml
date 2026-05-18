@@ -21,7 +21,7 @@ default = []
 # profile end-to-end timings of a single message through the server.
 lifecycle_trace = []
 # TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:thiserror"]
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
@@ -43,6 +43,7 @@ arc-swap          = { workspace = true }
 # TLS (optional)
 tokio-rustls      = { version = "0.26", optional = true }
 rustls-pemfile    = { version = "2", optional = true }
+thiserror         = { version = "1", optional = true }
 
 [dev-dependencies]
 # (intentionally empty — benches now use only workspace deps)
