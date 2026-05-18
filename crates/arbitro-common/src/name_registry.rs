@@ -43,17 +43,29 @@
 //! (for idempotent re-creates and recovery) and hands out sequential
 //! `ConsumerId`s directly.
 //!
-//! ## Semantics
+//! ## Hot-path lock-free reads (F1 / S1)
 //!
-//! * Sequential IDs start at 0 and only grow. Removal frees the mapping but
-//!   does NOT recycle the integer — recycling would clash with in-flight
-//!   references and complicate recovery.
-//! * Recovery replays Create commands in journal order, so post-restart IDs
-//!   match pre-restart IDs as long as the registry is fresh per process.
-//! * All operations are cold/control path (CRUD over the wire). A single
-//!   `Mutex` is enough — the hot publish/ack path never touches this.
+//! The publish hot path needs `stream_seq(wire_id)` AND
+//! `stream_idempotency_window_ms(seq)` on *every* publish. The ack hot
+//! path needs `consumer_stream(consumer_id)` on every ack. Under
+//! 64-conn × 100 k msg/s, hitting a global `Mutex` for every read
+//! serialises every publish/ack across every other publish/ack on
+//! the broker.
+//!
+//! Refactor: split the registry into two parts.
+//!
+//! - **Read-mostly hot-path lookups** live in `Snapshot`, swapped
+//!   atomically via `ArcSwap`. Drains/dispatchers do `load()` →
+//!   pointer-bump (~1–2 ns), no contention. The snapshot is rebuilt
+//!   only on cold admin events (create/delete stream or consumer).
+//! - **Sparse / less-hot maps** (`consumers_by_name`, `consumer_queue`,
+//!   `consumer_deliver`, `queues_by_key`) stay behind a single
+//!   `Mutex<Inner>`. Admin paths take it; the hot path doesn't.
+//!
+//! Public method signatures are unchanged.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId};
@@ -61,59 +73,86 @@ use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId};
 /// Shared wire-id → engine-id registry.
 #[derive(Debug)]
 pub struct NameRegistry {
+    /// Cold/admin path — sparse maps, allocation counters.
     inner: Mutex<Inner>,
+    /// Hot path — read-mostly dense snapshots. Replaced on admin events.
+    hot: arc_swap::ArcSwap<HotSnapshot>,
 }
 
 impl Default for NameRegistry {
     fn default() -> Self {
-        Self { inner: Mutex::new(Inner::new()) }
+        Self {
+            inner: Mutex::new(Inner::new()),
+            hot: arc_swap::ArcSwap::from_pointee(HotSnapshot::default()),
+        }
+    }
+}
+
+/// Hot-path lookups. Lives behind `ArcSwap` — readers do a single
+/// pointer-bump load.
+#[derive(Debug, Default)]
+struct HotSnapshot {
+    /// Forward translation: wire stream_id → small sequential `StreamId`.
+    /// Sparse key → foldhash.
+    streams_by_wire: HashMap<u32, StreamId, foldhash::fast::FixedState>,
+    /// Reverse translation: engine seq → wire stream_id. Indexed by
+    /// `StreamId.0`; gaps stay as `0`.
+    streams_seq_to_wire: Vec<u32>,
+    /// Per-stream idempotency window in milliseconds — fast-bail check
+    /// for the publish hot path. Indexed by `StreamId.0`. A value of `0`
+    /// means the stream has dedup disabled.
+    streams_idempotency_window_ms: Vec<u32>,
+    /// Per-consumer stream binding — needed on every ack/nack frame to
+    /// recover the stream id (v2 ack body has no stream_id field).
+    /// Indexed by `ConsumerId.0`; gaps stay as `u32::MAX` (sentinel).
+    consumer_stream: Vec<u32>,
+}
+
+impl HotSnapshot {
+    /// Build a fresh snapshot from the authoritative `Inner` state.
+    fn rebuild_from(inner: &Inner) -> Self {
+        // Clone the small dense vectors directly.
+        let streams_by_wire = inner.streams_by_wire.clone();
+        let streams_seq_to_wire = inner.streams_seq_to_wire.clone();
+        let streams_idempotency_window_ms = inner.streams_idempotency_window_ms.clone();
+        let consumer_stream = inner.consumer_stream.clone();
+        Self {
+            streams_by_wire,
+            streams_seq_to_wire,
+            streams_idempotency_window_ms,
+            consumer_stream,
+        }
     }
 }
 
 #[derive(Debug)]
 struct Inner {
     /// Forward translation: wire stream_id (`wire_hash_32(name)`, client-computed)
-    /// → small sequential engine `StreamId`.
-    /// Sparse key (wire_hash_32 hash) → ahash (rule: sparse IDs).
+    /// → small sequential engine `StreamId`. Authoritative copy mirrored
+    /// into `HotSnapshot` on every admin mutation.
     streams_by_wire: HashMap<u32, StreamId, foldhash::fast::FixedState>,
-    /// Reverse translation: engine `StreamId.0` → wire stream_id. Indexed
-    /// directly by seq id; gaps from removed streams stay as `0`. Used by
-    /// `ListStreams` to give the client the same wire IDs it computes
-    /// locally with `wire_hash_32`.
+    /// Reverse translation: engine `StreamId.0` → wire stream_id. Same shape.
     streams_seq_to_wire: Vec<u32>,
-    /// Per-stream idempotency window in milliseconds. Indexed directly
-    /// by `StreamId.0` — same shape as `streams_seq_to_wire`. A value
-    /// of `0` means idempotency is DISABLED for that stream (legacy
-    /// default, no per-publish dedup overhead). A non-zero value
-    /// activates dedup with that window.
-    ///
-    /// This Vec is the fast-bail check on the publish hot path: a
-    /// single indexed `u32` load + compare-with-zero. Branch predictor
-    /// learns the value (almost always 0) within a few publishes per
-    /// stream, so the steady-state cost for non-idempotent traffic is
-    /// effectively a free load.
+    /// Per-stream idempotency window in milliseconds. Indexed by
+    /// `StreamId.0`. Authoritative copy.
     streams_idempotency_window_ms: Vec<u32>,
     next_stream: u32,
 
     /// Consumers are keyed by name because the wire never carries a
     /// pre-computed consumer id — the server allocates one and the client
     /// echoes it back. Re-creates with the same name return the same id.
-    /// Sparse key (arbitrary bytes) → ahash (rule: sparse IDs).
+    /// Sparse key (arbitrary bytes) → foldhash.
     consumers_by_name: HashMap<Vec<u8>, ConsumerId, foldhash::fast::FixedState>,
     /// Per-consumer queue mapping. Populated at create time so that
     /// `dispatch_subscribe` can recover the same queue id without parsing
     /// the (group-less) Subscribe wire body — guarantees that the binding
     /// reads from the same ready ring `ensure_subscription` writes to via
     /// the match table.
-    /// Dense key (ConsumerId) but admin path — HashMap+ahash still
-    /// dominates the SipHash default (rule: dense IDs may still use ahash
-    /// when direct indexing is impractical across callers).
     consumer_queue: HashMap<ConsumerId, QueueId, foldhash::fast::FixedState>,
-    /// Per-consumer stream binding. The v2 wire `SubFrame` body carries no
-    /// `stream_id` (it's recoverable from the consumer), so dispatch needs
-    /// a way to resolve `ConsumerId → StreamId`. Populated alongside
-    /// `consumer_queue` at create time so both lookups stay consistent.
-    consumer_stream: HashMap<ConsumerId, StreamId, foldhash::fast::FixedState>,
+    /// Per-consumer stream binding, indexed by `ConsumerId.0`. Gaps are
+    /// `u32::MAX` (sentinel). Authoritative copy; mirrored to
+    /// `HotSnapshot.consumer_stream`.
+    consumer_stream: Vec<u32>,
     /// Per-consumer deliver policy (0=All, 1=New, 2=ByStartSeq) + start_seq.
     /// Set at CreateConsumer time, consumed at Subscribe time for cursor positioning.
     consumer_deliver: HashMap<ConsumerId, (u8, u64), foldhash::fast::FixedState>,
@@ -125,12 +164,12 @@ struct Inner {
 
     /// Content-addressed queue ids: `(seq_stream, group_bytes) → QueueId`.
     /// Two consumers with the same group on the same stream MUST resolve
-    /// to the same queue id (queue-group semantics). Allocation is shared
-    /// across all queue creates so a single counter advances per request.
-    /// Composite key with a sparse `Vec<u8>` → ahash (rule: sparse IDs).
+    /// to the same queue id (queue-group semantics).
     queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId, foldhash::fast::FixedState>,
     next_queue: u32,
 }
+
+const CONSUMER_STREAM_UNSET: u32 = u32::MAX;
 
 impl Inner {
     fn new() -> Self {
@@ -141,13 +180,10 @@ impl Inner {
             next_stream: 0,
             consumers_by_name: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumer_queue: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            consumer_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumer_stream: Vec::new(),
             consumer_deliver: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_consumer: 1,
             queues_by_key: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            // Queue ids start at 1 for the same reason as consumers — leave
-            // 0 as "unset" so accidental zeroed-out queue ids are easy to
-            // spot in logs.
             next_queue: 1,
         }
     }
@@ -158,6 +194,26 @@ impl NameRegistry {
         Self::default()
     }
 
+    /// Maximum window the broker honours. Matches
+    /// `arbitro_server::shard::idempotency::MAX_WINDOW_MS`. Duplicated
+    /// here so this crate can clamp without depending on the server.
+    pub const MAX_IDEMPOTENCY_WINDOW_MS: u32 = 5 * 60 * 1000;
+
+    /// Take the inner mutex, run a mutator, then atomically swap a
+    /// fresh `HotSnapshot` into `self.hot`. Centralises the
+    /// "admin mutation → snapshot rebuild" invariant.
+    #[inline]
+    fn with_inner_swap<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Inner) -> R,
+    {
+        let mut g = self.inner.lock().expect("name registry poisoned");
+        let out = f(&mut g);
+        let snap = HotSnapshot::rebuild_from(&g);
+        self.hot.store(Arc::new(snap));
+        out
+    }
+
     // ── Streams ────────────────────────────────────────────────────────────
 
     /// Translate or allocate: given the client-computed `wire_id`, return
@@ -166,64 +222,56 @@ impl NameRegistry {
     /// on first allocation so callers can distinguish a fresh create from
     /// an idempotent retry.
     pub fn get_or_create_stream(&self, wire_id: u32) -> (StreamId, bool) {
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        if let Some(&id) = g.streams_by_wire.get(&wire_id) {
-            return (id, false);
-        }
-        let id = StreamId(g.next_stream);
-        g.next_stream += 1;
-        g.streams_by_wire.insert(wire_id, id);
-        // Reverse map — grow to cover the new seq slot.
-        if (id.0 as usize) >= g.streams_seq_to_wire.len() {
-            g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
-        }
-        g.streams_seq_to_wire[id.0 as usize] = wire_id;
-        // Idempotency vec mirrors the seq → wire indexing. Default 0
-        // means "idempotency disabled for this stream"; callers that
-        // want it on must call `set_stream_idempotency` separately.
-        if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
-            g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
-        }
-        g.streams_idempotency_window_ms[id.0 as usize] = 0;
-        (id, true)
+        self.with_inner_swap(|g| {
+            if let Some(&id) = g.streams_by_wire.get(&wire_id) {
+                return (id, false);
+            }
+            let id = StreamId(g.next_stream);
+            g.next_stream += 1;
+            g.streams_by_wire.insert(wire_id, id);
+            if (id.0 as usize) >= g.streams_seq_to_wire.len() {
+                g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_seq_to_wire[id.0 as usize] = wire_id;
+            if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
+                g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_idempotency_window_ms[id.0 as usize] = 0;
+            (id, true)
+        })
     }
 
     /// Lookup only — returns `None` if `wire_id` was never registered.
-    /// Used by hot dispatch handlers (publish/ack/subscribe) where allocate
-    /// would mask "stream does not exist" as "everything is fine".
+    /// **F1 hot path**: lock-free `ArcSwap` load, then HashMap lookup.
+    #[inline]
     pub fn stream_seq(&self, wire_id: u32) -> Option<StreamId> {
-        self.inner
-            .lock()
-            .expect("name registry poisoned")
-            .streams_by_wire
-            .get(&wire_id)
-            .copied()
+        self.hot.load().streams_by_wire.get(&wire_id).copied()
     }
 
-    /// Reverse translation: engine seq id → wire id. Used by `ListStreams`
-    /// when assembling the reply for the client.
+    /// Reverse translation: engine seq id → wire id.
+    #[inline]
     pub fn stream_wire(&self, seq: StreamId) -> Option<u32> {
-        let g = self.inner.lock().expect("name registry poisoned");
-        g.streams_seq_to_wire.get(seq.0 as usize).copied().filter(|&w| w != 0)
+        self.hot
+            .load()
+            .streams_seq_to_wire
+            .get(seq.0 as usize)
+            .copied()
+            .filter(|&w| w != 0)
     }
 
     /// Drop a stream mapping. The integer is intentionally NOT recycled.
     pub fn remove_stream(&self, wire_id: u32) -> Option<StreamId> {
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        let removed = g.streams_by_wire.remove(&wire_id)?;
-        if let Some(slot) = g.streams_seq_to_wire.get_mut(removed.0 as usize) {
-            *slot = 0;
-        }
-        if let Some(slot) = g.streams_idempotency_window_ms.get_mut(removed.0 as usize) {
-            *slot = 0;
-        }
-        Some(removed)
+        self.with_inner_swap(|g| {
+            let removed = g.streams_by_wire.remove(&wire_id)?;
+            if let Some(slot) = g.streams_seq_to_wire.get_mut(removed.0 as usize) {
+                *slot = 0;
+            }
+            if let Some(slot) = g.streams_idempotency_window_ms.get_mut(removed.0 as usize) {
+                *slot = 0;
+            }
+            Some(removed)
+        })
     }
-
-    /// Maximum window the broker honours. Matches
-    /// `arbitro_server::shard::idempotency::MAX_WINDOW_MS`. Duplicated
-    /// here so this crate can clamp without depending on the server.
-    pub const MAX_IDEMPOTENCY_WINDOW_MS: u32 = 5 * 60 * 1000;
 
     /// Set the idempotency window for an already-allocated stream. A
     /// non-zero value enables per-stream dedup on the publish hot
@@ -231,29 +279,27 @@ impl NameRegistry {
     /// A zero value disables it. Setting on an unknown `seq` is a
     /// silent no-op (defensive — recovery may replay out of order).
     ///
-    /// **F39**: clamp once here at set time. The publish hot path
-    /// (`IdempotencyTracker::record`) used to clamp on every record;
-    /// doing it once on the cold create/update path drops a `.min()`
-    /// from the per-publish budget.
+    /// **F39**: clamp once here at set time.
     pub fn set_stream_idempotency(&self, seq: StreamId, window_ms: u32) {
         let clamped = window_ms.min(Self::MAX_IDEMPOTENCY_WINDOW_MS);
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        let idx = seq.0 as usize;
-        if idx >= g.streams_idempotency_window_ms.len() {
-            g.streams_idempotency_window_ms.resize(idx + 1, 0);
-        }
-        g.streams_idempotency_window_ms[idx] = clamped;
+        self.with_inner_swap(|g| {
+            let idx = seq.0 as usize;
+            if idx >= g.streams_idempotency_window_ms.len() {
+                g.streams_idempotency_window_ms.resize(idx + 1, 0);
+            }
+            g.streams_idempotency_window_ms[idx] = clamped;
+        });
     }
 
     /// Get the idempotency window for a stream. Returns `0` when the
-    /// stream doesn't exist or when idempotency is disabled. This is
-    /// the fast-bail check used by the publish hot path — a single
-    /// indexed `u32` load + compare-with-zero.
+    /// stream doesn't exist or when idempotency is disabled.
+    ///
+    /// **F1 hot path**: lock-free `ArcSwap` load + indexed `Vec<u32>`
+    /// access — branch-predictor learns the value almost always is 0.
     #[inline]
     pub fn stream_idempotency_window_ms(&self, seq: StreamId) -> u32 {
-        self.inner
-            .lock()
-            .expect("name registry poisoned")
+        self.hot
+            .load()
             .streams_idempotency_window_ms
             .get(seq.0 as usize)
             .copied()
@@ -266,14 +312,22 @@ impl NameRegistry {
     /// first time the name is seen. The `created` flag is `true` only on
     /// first allocation.
     pub fn get_or_create_consumer(&self, name: &[u8]) -> (ConsumerId, bool) {
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        if let Some(&id) = g.consumers_by_name.get(name) {
-            return (id, false);
-        }
-        let id = ConsumerId(g.next_consumer);
-        g.next_consumer += 1;
-        g.consumers_by_name.insert(name.to_vec(), id);
-        (id, true)
+        self.with_inner_swap(|g| {
+            if let Some(&id) = g.consumers_by_name.get(name) {
+                return (id, false);
+            }
+            let id = ConsumerId(g.next_consumer);
+            g.next_consumer += 1;
+            g.consumers_by_name.insert(name.to_vec(), id);
+            // Reserve a slot in `consumer_stream` so future
+            // `set_consumer_stream` writes can land directly. Until the
+            // caller binds a stream, the slot stays UNSET.
+            let idx = id.0 as usize;
+            if idx >= g.consumer_stream.len() {
+                g.consumer_stream.resize(idx + 1, CONSUMER_STREAM_UNSET);
+            }
+            (id, true)
+        })
     }
 
     /// Lookup only — returns `None` if the name has never been registered.
@@ -290,17 +344,16 @@ impl NameRegistry {
     /// and every reverse index keyed by that id, so a subsequent
     /// `consumer_id(name)`, `consumer_queue(id)`, `consumer_stream(id)` or
     /// `consumer_deliver_policy(id)` all return `None`.
-    ///
-    /// The integer id is intentionally NOT recycled — a re-create with the
-    /// same name allocates a fresh id (so stale references can never
-    /// silently re-route to a different consumer).
     pub fn remove_consumer(&self, name: &[u8]) -> Option<ConsumerId> {
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        let removed = g.consumers_by_name.remove(name)?;
-        g.consumer_queue.remove(&removed);
-        g.consumer_stream.remove(&removed);
-        g.consumer_deliver.remove(&removed);
-        Some(removed)
+        self.with_inner_swap(|g| {
+            let removed = g.consumers_by_name.remove(name)?;
+            g.consumer_queue.remove(&removed);
+            if let Some(slot) = g.consumer_stream.get_mut(removed.0 as usize) {
+                *slot = CONSUMER_STREAM_UNSET;
+            }
+            g.consumer_deliver.remove(&removed);
+            Some(removed)
+        })
     }
 
     /// Return the `ConsumerId`s currently registered against
@@ -311,39 +364,42 @@ impl NameRegistry {
     /// a cold admin path.
     pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
         let g = self.inner.lock().expect("name registry poisoned");
+        let target = stream_id.0;
         g.consumer_stream
             .iter()
-            .filter_map(|(cid, sid)| if *sid == stream_id { Some(*cid) } else { None })
+            .enumerate()
+            .filter_map(|(i, &sid)| {
+                if sid != CONSUMER_STREAM_UNSET && sid == target {
+                    Some(ConsumerId(i as u32))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
-    /// Drop a consumer mapping by ID. Used by `DeleteConsumer` wire
-    /// handling, which carries only the `ConsumerId` (the original name is
-    /// not in the request body). Walks `consumers_by_name` once to find
-    /// the name — O(N) but `DeleteConsumer` is a cold admin path.
-    ///
-    /// Returns the name that was removed, or `None` if the id was unknown
-    /// or already removed.
+    /// Drop a consumer mapping by ID.
     pub fn remove_consumer_by_id(&self, id: ConsumerId) -> Option<Vec<u8>> {
-        let mut g = self.inner.lock().expect("name registry poisoned");
-        let name = g.consumers_by_name
-            .iter()
-            .find_map(|(n, &v)| if v == id { Some(n.clone()) } else { None })?;
-        g.consumers_by_name.remove(&name);
-        g.consumer_queue.remove(&id);
-        g.consumer_stream.remove(&id);
-        g.consumer_deliver.remove(&id);
-        Some(name)
+        self.with_inner_swap(|g| {
+            let name = g.consumers_by_name
+                .iter()
+                .find_map(|(n, &v)| if v == id { Some(n.clone()) } else { None })?;
+            g.consumers_by_name.remove(&name);
+            g.consumer_queue.remove(&id);
+            if let Some(slot) = g.consumer_stream.get_mut(id.0 as usize) {
+                *slot = CONSUMER_STREAM_UNSET;
+            }
+            g.consumer_deliver.remove(&id);
+            Some(name)
+        })
     }
 
     // ── Queues ─────────────────────────────────────────────────────────────
 
     /// Resolve `(seq_stream, group)` → `QueueId`, allocating a fresh
-    /// sequential id the first time the tuple is seen. **Crucially** the
-    /// same `(stream, group)` pair always returns the same id, which is
-    /// what gives queue groups their round-robin semantics: two consumers
-    /// created with the same group share a single ready ring.
+    /// sequential id the first time the tuple is seen.
     pub fn get_or_create_queue(&self, stream: StreamId, group: &[u8]) -> QueueId {
+        // Queues only live in `Inner`; no snapshot rebuild needed for them.
         let mut g = self.inner.lock().expect("name registry poisoned");
         let key = (stream, group.to_vec());
         if let Some(&id) = g.queues_by_key.get(&key) {
@@ -369,11 +425,13 @@ impl NameRegistry {
     /// `stream_id` in its body) can recover the routing target from just
     /// the `ConsumerId`. Should be set together with `set_consumer_queue`.
     pub fn set_consumer_stream(&self, consumer: ConsumerId, stream: StreamId) {
-        self.inner
-            .lock()
-            .expect("name registry poisoned")
-            .consumer_stream
-            .insert(consumer, stream);
+        self.with_inner_swap(|g| {
+            let idx = consumer.0 as usize;
+            if idx >= g.consumer_stream.len() {
+                g.consumer_stream.resize(idx + 1, CONSUMER_STREAM_UNSET);
+            }
+            g.consumer_stream[idx] = stream.0;
+        });
     }
 
     /// Look up the queue id previously associated with `consumer`.
@@ -387,13 +445,18 @@ impl NameRegistry {
     }
 
     /// Look up the owning stream of `consumer`.
+    ///
+    /// **F1 hot path**: lock-free `ArcSwap` load + indexed `Vec<u32>`
+    /// access — every ack/nack/disconnect frame hits this path.
+    #[inline]
     pub fn consumer_stream(&self, consumer: ConsumerId) -> Option<StreamId> {
-        self.inner
-            .lock()
-            .expect("name registry poisoned")
-            .consumer_stream
-            .get(&consumer)
-            .copied()
+        let snap = self.hot.load();
+        let slot = *snap.consumer_stream.get(consumer.0 as usize)?;
+        if slot == CONSUMER_STREAM_UNSET {
+            None
+        } else {
+            Some(StreamId(slot))
+        }
     }
 
     /// Store deliver policy for a consumer (set at CreateConsumer time).
@@ -495,5 +558,30 @@ mod tests {
         assert_eq!(r.get_or_create_consumer(b"bob"), (ConsumerId(2), true));
         assert_eq!(r.get_or_create_consumer(b"alice"), (ConsumerId(1), false));
         assert_eq!(r.consumer_id(b"alice"), Some(ConsumerId(1)));
+    }
+
+    #[test]
+    fn consumer_stream_lookup_is_lock_free_round_trip() {
+        let r = NameRegistry::new();
+        let (c, _) = r.get_or_create_consumer(b"alice");
+        let s = StreamId(7);
+        r.set_consumer_stream(c, s);
+        assert_eq!(r.consumer_stream(c), Some(s));
+        assert_eq!(r.consumer_stream(ConsumerId(999)), None);
+    }
+
+    #[test]
+    fn consumers_for_stream_via_dense_index() {
+        let r = NameRegistry::new();
+        let (c1, _) = r.get_or_create_consumer(b"alice");
+        let (c2, _) = r.get_or_create_consumer(b"bob");
+        let (c3, _) = r.get_or_create_consumer(b"carol");
+        let s = StreamId(3);
+        r.set_consumer_stream(c1, s);
+        r.set_consumer_stream(c2, StreamId(4));
+        r.set_consumer_stream(c3, s);
+        let mut found = r.consumers_for_stream(s);
+        found.sort_by_key(|c| c.0);
+        assert_eq!(found, vec![c1, c3]);
     }
 }

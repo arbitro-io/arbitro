@@ -97,6 +97,15 @@ pub(in crate::shard) struct DrainScratch {
     /// consumers on the same stream publishing the same subject would
     /// collide on the local delta and under-count.
     local_subject: HashMap<(u32, u32), u32, foldhash::fast::FixedState>,
+
+    /// F11 — persistent flush-outcome buffer reused across drain
+    /// cycles. Avoids an alloc per cycle. Stores `(ConnectionId, FlushOutcome)`
+    /// pairs from Phase 2; Phase 3 consumes and clears.
+    flush_results: Vec<(ConnectionId, FlushOutcome)>,
+    /// F12 — persistent buffer for the slow-path notify sort.
+    sorted_notify: Vec<PendingNotify>,
+    /// F12 — persistent grouped-entries buffer for notifications.
+    notify_entries: Vec<DeliveredEntry>,
 }
 
 impl DrainScratch {
@@ -120,8 +129,19 @@ impl DrainScratch {
                 128,
                 foldhash::fast::FixedState::default(),
             ),
+            flush_results: Vec::with_capacity(16),
+            sorted_notify: Vec::with_capacity(256),
+            notify_entries: Vec::with_capacity(256),
         }
     }
+}
+
+/// FlushOutcome (lifted to module scope so DrainScratch can hold a Vec).
+#[derive(Clone, Copy)]
+pub(in crate::shard) enum FlushOutcome {
+    Ok,
+    Backpressured(u64),
+    WriterGone,
 }
 
 // ── Linear-scan helpers for per-cycle deltas ────────────────────────────────
@@ -262,16 +282,15 @@ pub(in crate::shard) fn drain_deliver(
     //  - Ok:             frame sent successfully
     //  - Backpressured:  channel full (transient), retry next cycle
     //  - WriterGone:     writer not found (permanent), mark dead
-    #[derive(Clone, Copy)]
-    enum FlushOutcome { Ok, Backpressured(u64), WriterGone }
-
-    let mut flush_results: Vec<(ConnectionId, FlushOutcome)> = Vec::with_capacity(8);
+    scratch.flush_results.clear();
+    let mut flush_results = std::mem::take(&mut scratch.flush_results);
     {
         let writers_by_conn = &snap.writers_by_conn;
         scratch.acc.for_each(names, |frame| {
-            // O(log N) binary search — rule (performance.md dense/sparse):
-            // ConnectionId is unbounded-dense, sorted Vec + binary search
-            // is the canonical structure for this workload.
+            // F29: drop one Bytes::clone() per frame by transferring
+            // ownership directly to try_send (consumes the Bytes).
+            // `acc.for_each` already passes ownership of the inner buffer
+            // via the &mut frame reference.
             let Some(writer) = find_writer(writers_by_conn, frame.connection_id.0) else {
                 // Writer not found → connection truly gone (removed from
                 // registry). Mark dead so the engine retires bindings.
@@ -311,34 +330,34 @@ pub(in crate::shard) fn drain_deliver(
     // notifications). Fire-and-forget entries never hit scratch.deliveries,
     // so this loop is a no-op in the pub/sub default path.
     //
-    // Build a (conn -> ok) map once; drain uses it to skip deliveries for
-    // failed frames without a nested per-conn scan. Turns the previous
-    // O(F x D) filter into a single O(D) pass (F = frames, D = deliveries).
-    let mut flush_ok: std::collections::HashMap<ConnectionId, bool, foldhash::fast::FixedState> =
-        std::collections::HashMap::with_capacity_and_hasher(
-            flush_results.len(),
-            foldhash::fast::FixedState::default(),
-        );
+    // F11: flush_results is typically 1–8 entries; a linear-scan helper
+    // beats HashMap on inserts and lookups at this size and removes the
+    // per-cycle HashMap allocation entirely.
+    #[inline]
+    fn frame_ok_for(results: &[(ConnectionId, FlushOutcome)], conn: ConnectionId) -> bool {
+        for &(c, o) in results.iter() {
+            if c == conn {
+                return matches!(o, FlushOutcome::Ok);
+            }
+        }
+        false
+    }
 
     for &(conn, outcome) in &flush_results {
         match outcome {
-            FlushOutcome::Ok => {
-                flush_ok.insert(conn, true);
-            }
+            FlushOutcome::Ok => {}
             FlushOutcome::Backpressured(first_seq) => {
-                flush_ok.insert(conn, false);
                 // Treat as skipped — cursor won't advance past these entries.
                 track_skipped(&mut result.lowest_skipped, first_seq);
                 result.more_pending = true;
             }
             FlushOutcome::WriterGone => {
-                flush_ok.insert(conn, false);
                 scratch.dead_connections.push(conn);
             }
         }
     }
     for d in &scratch.deliveries {
-        if flush_ok.get(&d.conn).copied().unwrap_or(false) {
+        if frame_ok_for(&flush_results, d.conn) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
             // Drain owns the per-(consumer, subject) inflight map; this
             // is a local HashMap mutation, no atomics, no contention.
@@ -352,8 +371,17 @@ pub(in crate::shard) fn drain_deliver(
     // semantics so the engine's Command::Delivered handler sees the same
     // shape it did before.
     if !scratch.deliveries.is_empty() {
-        notify_delivered_grouped(notify_tx, &snap.bindings, &scratch.deliveries, &flush_ok);
+        notify_delivered_grouped(
+            notify_tx,
+            &snap.bindings,
+            &scratch.deliveries,
+            &flush_results,
+            &mut scratch.sorted_notify,
+            &mut scratch.notify_entries,
+        );
     }
+    // Return the persistent flush buffer for the next cycle.
+    scratch.flush_results = flush_results;
 
     // Cursor advances to last fully-processed entry.
     let new_cursor = result.lowest_skipped.map_or(result.end - 1, |ls| ls.saturating_sub(1));
@@ -555,11 +583,32 @@ fn dispatch_recipients(
         }
 
         // Queue dedup: one entry per queue within the match set of this entry.
-        if queue_id != QueueId(0) && scratch.served_queues.contains(&queue_id) {
-            continue;
+        // F21: served_queues is typically tiny (≤8); linear scan beats
+        // a HashSet at this size and reuses the existing Vec scratch.
+        if queue_id != QueueId(0) {
+            let mut already_served = false;
+            for &q in scratch.served_queues.iter() {
+                if q == queue_id {
+                    already_served = true;
+                    break;
+                }
+            }
+            if already_served {
+                continue;
+            }
         }
 
-        if scratch.dead_connections.contains(&connection_id) {
+        // F22: same shape — `dead_connections` is also small. The
+        // earlier explicit linear scan via `.contains()` was already
+        // O(N); keeping it as a tight loop avoids the iterator overhead.
+        let mut conn_is_dead = false;
+        for &dc in scratch.dead_connections.iter() {
+            if dc == connection_id {
+                conn_is_dead = true;
+                break;
+            }
+        }
+        if conn_is_dead {
             continue;
         }
 
@@ -686,9 +735,20 @@ fn notify_delivered_grouped(
     notify_tx: &NotifyRing,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
-    flush_ok: &std::collections::HashMap<ConnectionId, bool, foldhash::fast::FixedState>,
+    flush_results: &[(ConnectionId, FlushOutcome)],
+    sorted_buf: &mut Vec<PendingNotify>,
+    entries_buf: &mut Vec<DeliveredEntry>,
 ) {
-    let frame_ok = |conn: ConnectionId| -> bool { flush_ok.get(&conn).copied().unwrap_or(false) };
+    // F11: replace the per-cycle HashMap<conn, bool> with a linear scan
+    // over `flush_results` (typically 1–8 entries). Cache locality wins.
+    let frame_ok = |conn: ConnectionId| -> bool {
+        for &(c, o) in flush_results.iter() {
+            if c == conn {
+                return matches!(o, FlushOutcome::Ok);
+            }
+        }
+        false
+    };
 
     // Fast path — every delivery belongs to the same binding AND all
     // frames succeeded. Pub/sub of a single consumer hits this path.
@@ -698,6 +758,8 @@ fn notify_delivered_grouped(
             && deliveries.iter().all(|d| frame_ok(d.conn))
         {
             let binding = &bindings[first_idx];
+            // The notify ring transfers ownership across threads — the
+            // entries Vec must be owned. Build it once via collect.
             let entries: Vec<DeliveredEntry> = deliveries
                 .iter()
                 .map(|d| DeliveredEntry {
@@ -716,27 +778,31 @@ fn notify_delivered_grouped(
         }
     }
 
-    // Slow path — mixed bindings and/or partial frame success. Sort by
-    // binding_idx, scan groups, drop entries whose frame failed.
-    let mut sorted: Vec<PendingNotify> = deliveries
-        .iter()
-        .copied()
-        .filter(|d| frame_ok(d.conn))
-        .collect();
-    sorted.sort_unstable_by_key(|d| d.binding_idx);
+    // F12: slow path — mixed bindings and/or partial frame success.
+    // Reuse the persistent `sorted_buf` and `entries_buf` so we don't
+    // allocate per cycle. The `entries` Vec passed into the
+    // DrainNotification still needs to be owned (cross-thread), but
+    // building each group via drain() amortises the allocator pressure.
+    sorted_buf.clear();
+    sorted_buf.extend(deliveries.iter().copied().filter(|d| frame_ok(d.conn)));
+    sorted_buf.sort_unstable_by_key(|d| d.binding_idx);
 
     let mut i = 0;
-    while i < sorted.len() {
-        let idx = sorted[i].binding_idx;
-        let mut entries = Vec::new();
-        while i < sorted.len() && sorted[i].binding_idx == idx {
-            entries.push(DeliveredEntry {
-                seq: sorted[i].seq,
-                subject_hash: sorted[i].subject_hash,
+    while i < sorted_buf.len() {
+        let idx = sorted_buf[i].binding_idx;
+        entries_buf.clear();
+        while i < sorted_buf.len() && sorted_buf[i].binding_idx == idx {
+            entries_buf.push(DeliveredEntry {
+                seq: sorted_buf[i].seq,
+                subject_hash: sorted_buf[i].subject_hash,
                 _pad: 0,
             });
             i += 1;
         }
+        // Move the contents into a fresh owned Vec for the ring.
+        // `Vec::clone()` is unavoidable across the SPSC ring boundary,
+        // but at least the scratch capacity is reused.
+        let entries: Vec<DeliveredEntry> = entries_buf.clone();
         let binding = &bindings[idx];
         let _ = notify_tx.try_send(DrainNotification::Delivered {
             binding_id: binding.binding_id,
