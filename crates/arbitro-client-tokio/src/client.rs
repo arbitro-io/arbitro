@@ -253,7 +253,27 @@ impl Client {
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, reply_to, payload,
+            stream_id, subject, reply_to, b"", payload,
+        )
+    }
+
+    /// M10: PublishWithReply with idempotency dedup. Non-empty `msg_id`
+    /// routes the publish through the per-stream `IdempotencyTracker` so
+    /// retries from the same client return the original RepOk without a
+    /// second write to the store.
+    pub fn publish_with_reply_msg_id(
+        &self,
+        stream_id: u32,
+        subject:   &[u8],
+        reply_to:  &[u8],
+        msg_id:    &[u8],
+        payload:   Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        crate::publish::publish_with_reply_async(
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id, subject, reply_to, msg_id, payload,
         )
     }
 

@@ -270,6 +270,24 @@ fn v2_publish_with_reply(
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
     };
 
+    // M10: idempotency for PublishWithReply — same pattern as v2_publish.
+    // Fast-bail when no per-stream window or no msg_id.
+    let msg_id = f.msg_id();
+    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    if window_ms > 0 && !msg_id.is_empty() {
+        let hash = idempotency_hash(msg_id);
+        let shared = server.idempotency_for(seq_stream);
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
+        let mut t = tracker_arc.lock();
+        server.mark_idempotency_allocated(seq_stream);
+        if !t.record(seq_stream, hash, msg_id, window_ms) {
+            drop(t);
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            return;
+        }
+        drop(t);
+    }
+
     // F5: Encode reply_to into the payload prefix using a `SmallVec` —
     // most reply addresses + small payloads fit inline (no heap alloc).
     // Format: [reply_len:u16 LE][reply_to][payload]. The drain extracts
@@ -641,10 +659,21 @@ async fn v2_create_stream(
         return;
     }
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
-    let (seq_stream, _created) = server.names().get_or_create_stream(wire_stream);
-    // B1: registry refused — slot pool exhausted.
-    if seq_stream.raw() == u32::MAX {
+    // M7: collision-detecting variant. Two distinct names hashing to the
+    // same u32 are rejected with StreamAlreadyExists rather than silently
+    // merged. See `name_registry::STREAM_COLLISION_SENTINEL`.
+    let (seq_stream, _created) = server.names().get_or_create_stream_named(wire_stream, name);
+    if seq_stream.raw() == arbitro_common::name_registry::NameRegistry::STREAM_SLOT_FULL_SENTINEL {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+        return;
+    }
+    if seq_stream.raw() == arbitro_common::name_registry::NameRegistry::STREAM_COLLISION_SENTINEL {
+        tracing::error!(
+            wire_id = wire_stream,
+            name = ?String::from_utf8_lossy(name),
+            "wire_hash_32 collision — distinct stream name maps to an in-use wire id; rejected"
+        );
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists);
         return;
     }
     let shard = server.shard_for(seq_stream);

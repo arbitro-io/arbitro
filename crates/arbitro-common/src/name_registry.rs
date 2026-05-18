@@ -136,6 +136,12 @@ struct Inner {
     /// Per-stream idempotency window in milliseconds. Indexed by
     /// `StreamId.0`. Authoritative copy.
     streams_idempotency_window_ms: Vec<u32>,
+    /// M7: original stream name stored alongside the wire_id so we can
+    /// detect `wire_hash_32` collisions (two distinct names hashing to the
+    /// same u32). Keyed by wire_id; bytes match the original CreateStream
+    /// `name` field. Authoritative copy; cold path — never read by the
+    /// publish hot path.
+    streams_name_by_wire: HashMap<u32, Vec<u8>, foldhash::fast::FixedState>,
     next_stream: u32,
 
     /// Consumers are keyed by name because the wire never carries a
@@ -185,6 +191,10 @@ impl Inner {
             ),
             streams_seq_to_wire: Vec::with_capacity(PREALLOC),
             streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
+            streams_name_by_wire: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
             next_stream: 0,
             consumers_by_name: HashMap::with_capacity_and_hasher(
                 PREALLOC,
@@ -293,6 +303,63 @@ impl NameRegistry {
         })
     }
 
+    /// M7: collision-detecting variant of `get_or_create_stream`. When the
+    /// `wire_id` is already mapped, compares the previously-recorded
+    /// `name` to `expected_name`. On mismatch returns
+    /// `(StreamId(u32::MAX - 1), false)` so the dispatcher can map it
+    /// to `ErrorCode::StreamAlreadyExists`.
+    ///
+    /// The "name-by-wire" map is populated on **first** allocation; older
+    /// streams created via `get_or_create_stream` (no-name variant) have
+    /// no entry and are treated as compatible with any name. This keeps
+    /// the change backwards compatible with recovery and tests.
+    pub fn get_or_create_stream_named(
+        &self,
+        wire_id: u32,
+        expected_name: &[u8],
+    ) -> (StreamId, bool) {
+        self.with_inner_swap(|g| {
+            if let Some(&id) = g.streams_by_wire.get(&wire_id) {
+                if let Some(prev) = g.streams_name_by_wire.get(&wire_id) {
+                    if prev.as_slice() != expected_name {
+                        // arbitro-common has no `tracing` dependency by
+                        // design (kept off the hot-path crate's MSRV).
+                        // The dispatcher (which DOES depend on tracing)
+                        // is responsible for logging on the
+                        // STREAM_COLLISION_SENTINEL return path.
+                        // STREAM_COLLISION_SENTINEL — distinct from
+                        // SLOT_FULL_SENTINEL (`u32::MAX`) so the
+                        // dispatcher can pick the right wire code.
+                        return (StreamId(u32::MAX - 1), false);
+                    }
+                }
+                return (id, false);
+            }
+            if g.next_stream >= Self::MAX_SLOT_COUNT {
+                return (StreamId(u32::MAX), false);
+            }
+            let id = StreamId(g.next_stream);
+            g.next_stream += 1;
+            g.streams_by_wire.insert(wire_id, id);
+            g.streams_name_by_wire.insert(wire_id, expected_name.to_vec());
+            if (id.0 as usize) >= g.streams_seq_to_wire.len() {
+                g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_seq_to_wire[id.0 as usize] = wire_id;
+            if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
+                g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_idempotency_window_ms[id.0 as usize] = 0;
+            (id, true)
+        })
+    }
+
+    /// Sentinels returned by `get_or_create_stream_named`. Public so the
+    /// dispatcher can distinguish slot-full vs collision without inventing
+    /// a wire error code.
+    pub const STREAM_SLOT_FULL_SENTINEL: u32 = u32::MAX;
+    pub const STREAM_COLLISION_SENTINEL: u32 = u32::MAX - 1;
+
     /// Lookup only — returns `None` if `wire_id` was never registered.
     /// **F1 hot path**: lock-free `ArcSwap` load, then HashMap lookup.
     #[inline]
@@ -315,6 +382,7 @@ impl NameRegistry {
     pub fn remove_stream(&self, wire_id: u32) -> Option<StreamId> {
         self.with_inner_swap(|g| {
             let removed = g.streams_by_wire.remove(&wire_id)?;
+            g.streams_name_by_wire.remove(&wire_id);
             if let Some(slot) = g.streams_seq_to_wire.get_mut(removed.0 as usize) {
                 *slot = 0;
             }
@@ -545,6 +613,28 @@ impl NameRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn m7_named_variant_detects_collision() {
+        let r = NameRegistry::new();
+        // Two distinct names colliding on the same wire_id.
+        let wire = 0xC0FF_EE00;
+        let (id_a, created_a) = r.get_or_create_stream_named(wire, b"alpha");
+        assert!(created_a);
+        assert_eq!(id_a, StreamId(0));
+
+        // Same name + same wire — idempotent reuse.
+        let (id_again, created_again) = r.get_or_create_stream_named(wire, b"alpha");
+        assert!(!created_again);
+        assert_eq!(id_again, id_a);
+
+        // Different name + same wire — collision sentinel.
+        let (id_collide, created_collide) = r.get_or_create_stream_named(wire, b"beta");
+        assert!(!created_collide);
+        assert_eq!(id_collide.raw(), NameRegistry::STREAM_COLLISION_SENTINEL);
+        // Slot count unchanged: collision must not burn a fresh id.
+        assert!(r.stream_slots_available());
+    }
 
     #[test]
     fn streams_translate_wire_to_sequential() {

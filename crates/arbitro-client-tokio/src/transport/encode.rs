@@ -81,16 +81,21 @@ pub(crate) fn encode_pub_batch_v2(
 }
 
 /// Build a v2 PUB-WITH-REPLY frame in one contiguous `Bytes`.
+///
+/// M10: `msg_id` is an optional idempotency token. Empty = no dedup (legacy
+/// behaviour). When non-empty the broker routes the publish through the
+/// per-stream `IdempotencyTracker`.
 pub(crate) fn encode_pub_with_reply_v2(
     seq: u64,
     stream_id: u32,
     subject: &[u8],
     reply_to: &[u8],
+    msg_id: &[u8],
     payload: &[u8],
 ) -> Bytes {
-    let size = PubWithReplyFrame::wire_size(subject.len(), reply_to.len(), payload.len());
+    let size = PubWithReplyFrame::wire_size(subject.len(), reply_to.len(), msg_id.len(), payload.len());
     let mut buf = vec![0u8; size];
-    PubWithReplyFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, reply_to, payload);
+    PubWithReplyFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, reply_to, msg_id, payload);
     Bytes::from(buf)
 }
 

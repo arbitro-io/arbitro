@@ -125,10 +125,11 @@ pub(crate) fn publish_with_reply_async(
     stream_id: u32,
     subject: &[u8],
     reply_to: &[u8],
+    msg_id: &[u8],
     payload: Bytes,
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
     let seq   = seq_alloc.next();
-    let frame = WriteFrame::Mono(encode_pub_with_reply_v2(seq, stream_id, subject, reply_to, &payload));
+    let frame = WriteFrame::Mono(encode_pub_with_reply_v2(seq, stream_id, subject, reply_to, msg_id, &payload));
     let rx    = pending.register(seq);
     let enqueue_result = enqueue(tx, frame);
     async move {
