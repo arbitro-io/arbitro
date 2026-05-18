@@ -38,6 +38,16 @@ pub struct ShardRouter {
     stores: Arc<[SharedStore]>,
     gates: Arc<[Arc<Gate>]>,
     names: Arc<NameRegistry>,
+    /// H5: drain thread join handles, one per shard. Kept inside a
+    /// `parking_lot::Mutex<Option<...>>` so `shutdown()` can take
+    /// ownership and join. Without this the OS thread is leaked on
+    /// server shutdown — fine in practice but breaks tests that
+    /// expect all sockets/files closed by the time `shutdown()`
+    /// returns.
+    drain_joins: Arc<parking_lot::Mutex<Vec<Option<std::thread::JoinHandle<()>>>>>,
+    /// Per-shard "running" flags, used by `shutdown` to flip drain
+    /// threads off so they exit their inner loop cleanly.
+    drain_running: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
     /// Per-shard idempotency dedup state. Each entry is a
     /// lazily-allocated tracker (`Option<...>` starts None, fills in
     /// on first idempotent publish for that shard). Shared between
@@ -70,6 +80,8 @@ impl ShardRouter {
         let mut gates = Vec::with_capacity(shard_count);
         let mut idempotency = Vec::with_capacity(shard_count);
         let mut has_idempotency = Vec::with_capacity(shard_count);
+        let mut drain_joins = Vec::with_capacity(shard_count);
+        let mut drain_running = Vec::with_capacity(shard_count);
         let names = Arc::new(NameRegistry::new());
 
         for id in 0..shard_count {
@@ -131,10 +143,14 @@ impl ShardRouter {
                 consumer_subjects: Vec::new(),
             };
 
-            std::thread::Builder::new()
+            // H5: keep the JoinHandle. shutdown() will flip `running`
+            // to false, release the gate, and join.
+            let join = std::thread::Builder::new()
                 .name(format!("drain-{id}"))
                 .spawn(move || drain_worker.run())
                 .expect("failed to spawn drain thread");
+            drain_joins.push(Some(join));
+            drain_running.push(Arc::clone(&running));
 
             // ── Command task — tokio::spawn, owns engine ────────────
             let cmd_worker = CommandWorker {
@@ -210,6 +226,8 @@ impl ShardRouter {
             stores: stores.into(),
             gates: gates.into(),
             names,
+            drain_joins: Arc::new(parking_lot::Mutex::new(drain_joins)),
+            drain_running: drain_running.into(),
             idempotency: idempotency.into(),
             has_idempotency: has_idempotency.into(),
             command_log: None,
@@ -303,6 +321,26 @@ impl ShardRouter {
     pub fn shutdown(&self) {
         for shard in self.shards.iter() {
             shard.send_shutdown();
+        }
+        // H5: flip every drain's `running` flag, release the gate so
+        // the thread unparks past `gate.acquire()`, and join. The
+        // command worker also sets running=false on its Shutdown arm
+        // (worker.rs::handle_or_shutdown), but it does so AFTER the
+        // shard channel drains. Flipping it here too is idempotent and
+        // guarantees a clean join even if the command task aborted.
+        for r in self.drain_running.iter() {
+            r.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        for g in self.gates.iter() {
+            g.release();
+        }
+        let mut joins = self.drain_joins.lock();
+        for slot in joins.iter_mut() {
+            if let Some(h) = slot.take() {
+                if let Err(e) = h.join() {
+                    tracing::warn!(?e, "drain thread join failed");
+                }
+            }
         }
     }
 }
