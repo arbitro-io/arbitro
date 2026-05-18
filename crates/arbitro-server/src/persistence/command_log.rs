@@ -70,7 +70,13 @@ impl CommandLog {
         buf.extend_from_slice(command);
 
         self.file.write_all(&buf)?;
+        // H17: cold-path durability. `File::flush()` is a no-op on a
+        // raw POSIX `File`; `sync_data()` issues the actual fdatasync
+        // (or its OS equivalent), so a CreateStream RepOk is no longer
+        // a promise the kernel can break. The cost is ~1 ms per record,
+        // which is fine for the cold metadata path.
         self.file.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 

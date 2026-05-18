@@ -144,8 +144,10 @@ version = "0.1.0"
 dependencies = [
  "arbitro-engine",
  "arbitro-proto",
+ "crc32fast",
  "memmap2",
  "tempfile",
+ "tracing",
  "zerocopy",
 ]
 

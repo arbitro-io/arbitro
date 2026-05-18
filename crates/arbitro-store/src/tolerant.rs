@@ -46,6 +46,17 @@ const MAGIC: u8 = 0xAF;
 /// [23..27]  stream_id u32
 /// [27]      flags u8
 const HEADER_SIZE: usize = 28;
+/// **B5 record CRC** — written immediately after `[subject || payload]`
+/// and covers `[header bytes 0..27 || subject || payload]`. Recovery
+/// re-computes and compares before adding the entry to the index; a
+/// mismatch stops the scan at that record (treat the remainder of the
+/// segment as truncated, same shape as a missing MAGIC byte).
+/// Without this every tear leaves the recovery path open to silently
+/// emit garbage `subj_len` / `payload_len` and panic the drain when
+/// it tries to slice the mmap. crc32fast is the same hasher
+/// `command_log.rs` uses, so the broker only depends on one CRC
+/// implementation.
+const RECORD_CRC_SIZE: usize = 4;
 
 impl TolerantStore {
     pub fn new(base_path: PathBuf) -> Self {
@@ -65,7 +76,17 @@ impl TolerantStore {
 
     fn rotate(&mut self) -> Result<(), StoreError> {
         if let Some(mmap) = self.active_mmap.take() {
-            let _ = mmap.flush();
+            // H18: surface msync failures instead of swallowing them.
+            // A silent flush failure means the durability story for
+            // the previous segment is a lie. Logging the error makes
+            // it visible to operators without breaking shutdown (we
+            // still try to seal and rotate).
+            if let Err(e) = mmap.flush() {
+                tracing::error!(
+                    error = %e,
+                    "tolerant store: mmap.flush failed during rotate — segment durability lost",
+                );
+            }
             // Drop mmap BEFORE seal_segment reopens the file (Windows file locking).
             drop(mmap);
             let path = segment::segment_path(&self.base_path, self.active_segment_id);
@@ -131,11 +152,45 @@ impl TolerantStore {
             let stream_id = u32::from_le_bytes([h[23], h[24], h[25], h[26]]);
             let flags = h[27];
 
+            // B5 defensive bounds check — clamp lengths against the
+            // remaining segment so a tear that left garbage starting
+            // with the MAGIC byte cannot drive a downstream OOB slice
+            // when the (now-meaningless) subj_len / payload_len
+            // exceed what's left.
+            let data_off = offset + HEADER_SIZE;
+            let body_end = match data_off
+                .checked_add(subj_len as usize)
+                .and_then(|s| s.checked_add(payload_len as usize))
+            {
+                Some(v) => v,
+                None => break,
+            };
+            let crc_end = match body_end.checked_add(RECORD_CRC_SIZE) {
+                Some(v) => v,
+                None => break,
+            };
+            if crc_end > mmap.len() {
+                break;
+            }
+
+            // B5: re-compute CRC32 over [header || subject || payload]
+            // and stop the scan on any mismatch. Treats a corrupt tail
+            // the same as a tear (lost-after-crash).
+            let expected_crc = u32::from_le_bytes([
+                mmap[body_end],
+                mmap[body_end + 1],
+                mmap[body_end + 2],
+                mmap[body_end + 3],
+            ]);
+            let actual_crc = crc32fast::hash(&mmap[offset..body_end]);
+            if expected_crc != actual_crc {
+                break;
+            }
+
             if first == 0 {
                 first = seq;
             }
             last = seq;
-            let data_off = offset + HEADER_SIZE;
             let subject_hash = wire_hash_32(&mmap[data_off..data_off + subj_len as usize]);
             self.index.push(LogMetadata {
                 seq,
@@ -149,7 +204,7 @@ impl TolerantStore {
                 flags,
             });
 
-            offset += HEADER_SIZE + (subj_len as usize) + (payload_len as usize);
+            offset = crc_end;
             self.next_seq = seq + 1;
             self.total_bytes += (subj_len as u64) + (payload_len as u64);
         }
@@ -176,7 +231,7 @@ impl TolerantStore {
     /// mmap bounds-check panic (no silent corruption).
     fn append_no_rotate(&mut self, entry: EntryRef<'_>, timestamp: u64) -> u64 {
         let entry_total = (entry.subject.len() + entry.payload.len()) as u64;
-        let total_needed = (HEADER_SIZE as u64) + entry_total;
+        let total_needed = (HEADER_SIZE as u64) + entry_total + RECORD_CRC_SIZE as u64;
 
         let seq = self.next_seq;
         let mmap = self.active_mmap.as_mut().expect("active mmap initialised");
@@ -197,6 +252,14 @@ impl TolerantStore {
         mmap[data_off..data_off + entry.subject.len()].copy_from_slice(entry.subject);
         mmap[data_off + entry.subject.len()..data_off + entry.subject.len() + entry.payload.len()]
             .copy_from_slice(entry.payload);
+
+        // B5: CRC32 over [header || subject || payload] written
+        // immediately after the payload. Recovery verifies this before
+        // accepting the record.
+        let crc_off = data_off + entry.subject.len() + entry.payload.len();
+        let covered = &mmap[start..crc_off];
+        let crc = crc32fast::hash(covered);
+        mmap[crc_off..crc_off + RECORD_CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
 
         // Zero-allocation push (capacity guaranteed by init() +
         // reserve() in `append_batch` for batched callers).
@@ -237,7 +300,8 @@ impl Store for TolerantStore {
 
     fn append(&mut self, entry: EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError> {
         let entry_total = (entry.subject.len() + entry.payload.len()) as u64;
-        let total_needed = (HEADER_SIZE as u64) + entry_total;
+        // +RECORD_CRC_SIZE for the trailing CRC32 (B5).
+        let total_needed = (HEADER_SIZE as u64) + entry_total + RECORD_CRC_SIZE as u64;
 
         if (self.current_segment_offset as u64) + total_needed >= MAX_SEGMENT_BYTES {
             self.rotate()?;
@@ -317,7 +381,12 @@ impl Store for TolerantStore {
 
     fn shutdown(&mut self) -> Result<(), StoreError> {
         if let Some(mmap) = self.active_mmap.take() {
-            let _ = mmap.flush();
+            if let Err(e) = mmap.flush() {
+                tracing::error!(
+                    error = %e,
+                    "tolerant store: mmap.flush failed during shutdown — final segment durability lost",
+                );
+            }
             // Drop mmap BEFORE seal_segment reopens the file.
             // On Windows, mmap holds an exclusive file handle.
             drop(mmap);
@@ -371,7 +440,8 @@ impl Store for TolerantStore {
         let total_needed: u64 = entries.iter()
             .map(|e| (HEADER_SIZE as u64)
                 + (e.subject.len() as u64)
-                + (e.payload.len() as u64))
+                + (e.payload.len() as u64)
+                + RECORD_CRC_SIZE as u64) // B5
             .sum();
 
         if (self.current_segment_offset as u64) + total_needed < MAX_SEGMENT_BYTES {
@@ -869,6 +939,12 @@ mod tests {
             file.write_all(&header).unwrap();
             file.write_all(subj).unwrap();
             file.write_all(payload).unwrap();
+            // B5: trailing CRC32 over [header || subject || payload].
+            let mut h1 = crc32fast::Hasher::new();
+            h1.update(&header);
+            h1.update(subj);
+            h1.update(payload);
+            file.write_all(&h1.finalize().to_le_bytes()).unwrap();
 
             // Entry 2: subject="c", payload="dd", seq=2, ts=200
             let subj2 = b"c";
@@ -883,6 +959,11 @@ mod tests {
             file.write_all(&header).unwrap();
             file.write_all(subj2).unwrap();
             file.write_all(payload2).unwrap();
+            let mut h2 = crc32fast::Hasher::new();
+            h2.update(&header);
+            h2.update(subj2);
+            h2.update(payload2);
+            file.write_all(&h2.finalize().to_le_bytes()).unwrap();
 
             // Garbage bytes (no MAGIC prefix) simulating crash mid-write
             file.write_all(&[0x00, 0x01, 0x02, 0xFF, 0xFE]).unwrap();
@@ -916,6 +997,73 @@ mod tests {
             })
             .unwrap();
         assert!(found);
+    }
+
+    /// **B5 regression**: a record whose payload bytes were silently
+    /// flipped in the segment file must be rejected on recovery; the
+    /// CRC32 trailer is the only thing keeping the drain from slicing
+    /// the mmap with bad lengths.
+    #[test]
+    fn b5_corrupt_record_is_rejected_on_recovery() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store");
+        std::fs::create_dir_all(&store_path).unwrap();
+
+        // First write two valid entries via the store API.
+        {
+            let mut store = TolerantStore::new(store_path.clone());
+            store.init().unwrap();
+            store
+                .append(
+                    EntryRef { subject: b"good", payload: b"first", stream_id: 0, flags: 0 },
+                    1_000,
+                )
+                .unwrap();
+            store
+                .append(
+                    EntryRef { subject: b"good", payload: b"second", stream_id: 0, flags: 0 },
+                    2_000,
+                )
+                .unwrap();
+            store.shutdown().unwrap();
+        }
+
+        // Find the sealed segment file and corrupt one payload byte
+        // inside the SECOND record. The trailing CRC must catch it.
+        let seg_path = std::fs::read_dir(&store_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map_or(false, |x| x == "log"))
+            .expect("sealed segment");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&seg_path)
+                .unwrap();
+            // Each record = 28 hdr + 4 subj + N payload + 4 crc.
+            // First record body = 5 payload → first record total = 41 B.
+            // Second record body = 6 payload → starts at offset 41,
+            // header 28, subject 4 ("good"), payload starts at 41+32 = 73.
+            let payload_off = 41 + 28 + 4;
+            file.seek(SeekFrom::Start(payload_off as u64)).unwrap();
+            file.write_all(b"X").unwrap(); // flip first byte of payload
+        }
+
+        // Reopen: recovery must stop at the corrupt second entry and
+        // load only the first one. The drain index must therefore have
+        // exactly one entry; without the CRC check the drain would
+        // crash or hand a partial entry to subscribers.
+        let mut store = TolerantStore::new(store_path);
+        store.init().unwrap();
+        let info = store.info();
+        assert_eq!(
+            info.messages, 1,
+            "CRC failure on entry 2 should drop it from the recovered set",
+        );
     }
 
     #[test]
