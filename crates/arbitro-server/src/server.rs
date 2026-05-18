@@ -644,13 +644,25 @@ async fn metrics_loop(
                 acc.publish_no_match           += snap.publish_no_match;
                 acc.publish_queues_pushed      += snap.publish_queues_pushed;
                 acc.publish_fanout_notified    += snap.publish_fanout_notified;
+                // L11: catch up the previously-unaggregated fields so
+                // dashboards see the full set of engine counters.
+                acc.claim_batches              += snap.claim_batches;
                 acc.claim_entries_delivered    += snap.claim_entries_delivered;
+                acc.claim_skipped_consumer_paused += snap.claim_skipped_consumer_paused;
                 acc.claim_skipped_max_inflight += snap.claim_skipped_max_inflight;
                 acc.claim_skipped_subject_limit += snap.claim_skipped_subject_limit;
+                acc.claim_skipped_credit_conn  += snap.claim_skipped_credit_conn;
+                acc.claim_skipped_credit_subject += snap.claim_skipped_credit_subject;
+                acc.claim_empty_pop            += snap.claim_empty_pop;
                 acc.ack_accepted               += snap.ack_accepted;
                 acc.ack_not_found              += snap.ack_not_found;
                 acc.nack_accepted              += snap.nack_accepted;
+                acc.seed_entries               += snap.seed_entries;
+                acc.seed_queues_pushed         += snap.seed_queues_pushed;
+                acc.seed_no_match              += snap.seed_no_match;
                 acc.drain_pending_removed      += snap.drain_pending_removed;
+                acc.drain_connections          += snap.drain_connections;
+                acc.drain_consumers            += snap.drain_consumers;
             }
         }
 
