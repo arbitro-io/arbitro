@@ -232,8 +232,8 @@ pub(crate) fn encode_list_consumers_v2(
 // ─── Tokio-only frames (no legacy counterpart) ────────────────────────
 
 #[inline]
-pub(crate) fn encode_hello_v2(role: Role, caps: u16) -> Bytes {
-    let f = HelloFrame::new(role, caps);
+pub(crate) fn encode_hello_v2(role: Role) -> Bytes {
+    let f = HelloFrame::new(role);
     Bytes::copy_from_slice(f.as_bytes())
 }
 

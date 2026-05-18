@@ -31,7 +31,7 @@ pub use batch_pub_frame::{
     BATCH_PUB_BODY_FIXED, BATCH_PUB_ENTRY_HEADER_SIZE, BatchPubBody, BatchPubEntryHeader,
     BatchPubEntryView, BatchPubFrame, BatchPubIter,
 };
-pub use hello::{HELLO_FRAME_SIZE, HelloFrame, Role, cap};
+pub use hello::{HELLO_FRAME_SIZE, HelloFrame, Role};
 pub use pub_frame::{PUB_BODY_FIXED, PubBody, PubFrame};
 pub use pub_with_headers::{PUB_WITH_HEADERS_BODY_FIXED, PubWithHeadersBody, PubWithHeadersFrame};
 pub use pub_with_reply::{PUB_WITH_REPLY_BODY_FIXED, PubWithReplyBody, PubWithReplyFrame};

@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use arbitro_proto::v2::ingress::hello::{cap, Role};
+use arbitro_proto::v2::ingress::hello::Role;
 
 use crate::conn::heartbeat::heartbeat_task;
 use crate::conn::reconnect::Backoff;
@@ -106,7 +106,7 @@ pub(crate) async fn spawn_connection(
 async fn write_handshake(
     w: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<(), ClientError> {
-    let hello = encode_hello_v2(Role::Client, cap::REPLY | cap::BATCH_HEADERS);
+    let hello = encode_hello_v2(Role::Client);
     w.write_all(&hello).await?;
     Ok(())
 }

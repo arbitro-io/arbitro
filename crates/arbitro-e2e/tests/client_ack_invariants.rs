@@ -509,7 +509,7 @@ async fn t11_reconnect_resumes_unacked_tail() {
 #[tokio::test(flavor = "multi_thread")]
 async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
     use arbitro_proto::v2::ingress::ack_frame::AckFrame;
-    use arbitro_proto::v2::ingress::hello::{HelloFrame, Role, cap};
+    use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use zerocopy::IntoBytes;
@@ -553,7 +553,7 @@ async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
     // targeting the owner's consumer_id. Broker keys pending by
     // (conn_id, consumer_id, seq) — this ack lands in a foreign bucket.
     let mut rogue = TcpStream::connect(&server.addr).await.unwrap();
-    let hello = HelloFrame::new(Role::Client, cap::REPLY);
+    let hello = HelloFrame::new(Role::Client);
     rogue.write_all(hello.as_bytes()).await.unwrap();
     // ack seq=1 — clearly something the owner is holding, but routed
     // through the rogue conn.

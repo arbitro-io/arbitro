@@ -1,6 +1,6 @@
 //! Connection handshake — the only frame in v2 that does NOT start with
 //! the 16-byte `Header`. Sent as the very first 8 bytes of every TCP
-//! connection (in both directions: client→server and server→client).
+//! connection.
 //!
 //! Wire layout:
 //! ```text
@@ -9,7 +9,7 @@
 //!   0     magic    u32   = ARBITRO_MAGIC_V2 ("ARB2", 0x32425241 LE)
 //!   4     version  u8    = CURRENT_VERSION (2 today)
 //!   5     role     u8    = 0 client, 1 server
-//!   6     caps     u16   bitfield (capability flags)
+//!   6     _pad     u16   = 0 (reserved — see "Capabilities" below)
 //!                      ─────
 //!                      8 B
 //! ```
@@ -23,13 +23,23 @@
 //!   * v1 clients hitting a v2 broker
 //!   * port scanners sending garbage
 //!
-//! Once both sides exchange `HelloFrame`s and validate the magic, the
-//! rest of the connection is pure `Header`-prefixed v2 frames.
+//! Once the magic is validated the rest of the connection is pure
+//! `Header`-prefixed v2 frames.
 //!
-//! ### Capabilities
+//! ### Capabilities (M9 — pruned)
 //!
-//! `caps` is forward-compatible: unknown bits are ignored. Both sides
-//! send what they support, the effective set is the bitwise AND.
+//! Earlier versions had a `caps: u16` bitfield where the client
+//! announced features it supported (`HEADERS`, `REPLY`,
+//! `BATCH_HEADERS`, `COMPRESSED_PAYLOAD`). The server never read those
+//! bytes — they were wire bytes that lied.
+//!
+//! The honest pattern for a broker is **server-announced capabilities**
+//! (cf. NATS `INFO`, MQTT 5 `CONNACK`, Kafka `ApiVersionsResponse`):
+//! the server tells the client what it supports, the client adapts.
+//! Until arbitro has that reply frame, the slot stays `_pad` — clients
+//! must write `0`, server ignores. Any future feature negotiation will
+//! land in a dedicated `HelloAck`/`Welcome` frame, not by overloading
+//! these bits.
 
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -43,7 +53,9 @@ pub struct HelloFrame {
     pub magic:   U32,
     pub version: u8,
     pub role:    u8,
-    pub caps:    U16,
+    /// Reserved (M9 — was `caps: u16`, removed). Must be 0. Reserved
+    /// for a future `HelloAck` negotiation; see module docs.
+    pub _pad:    U16,
 }
 
 pub const HELLO_FRAME_SIZE: usize = core::mem::size_of::<HelloFrame>();
@@ -56,32 +68,15 @@ pub enum Role {
     Server = 1,
 }
 
-// TODO §5: only `cap::REPLY` is honoured by the broker today (it gates
-// PublishWithReply dispatch). The other bits are reserved markers so a
-// future release can wire the corresponding features without a HELLO
-// renegotiation — clients may set them today without harm.
-pub mod cap {
-    /// Reserved (TODO §5). PublishWithHeaders is unimplemented; the
-    /// dispatcher returns `Unimplemented` for that action.
-    pub const HEADERS:           u16 = 1 << 0;
-    pub const REPLY:             u16 = 1 << 1; // PublishWithReply supported
-    /// Reserved (TODO §5). PublishBatchWithHeaders is unimplemented.
-    pub const BATCH_HEADERS:     u16 = 1 << 2;
-    /// Reserved (TODO §5). Broker stores payloads verbatim;
-    /// `entry_flag::COMPRESSED` is also reserved.
-    pub const COMPRESSED_PAYLOAD:u16 = 1 << 3;
-    // bits 4..15 reserved
-}
-
 impl HelloFrame {
-    /// Build a Hello with the current protocol version and given role/caps.
+    /// Build a Hello with the current protocol version and given role.
     #[inline(always)]
-    pub fn new(role: Role, caps: u16) -> Self {
+    pub fn new(role: Role) -> Self {
         Self {
             magic:   U32::new(ARBITRO_MAGIC_V2),
             version: CURRENT_VERSION,
             role:    role as u8,
-            caps:    U16::new(caps),
+            _pad:    U16::new(0),
         }
     }
 
@@ -111,13 +106,13 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let h = HelloFrame::new(Role::Client, cap::HEADERS | cap::REPLY);
+        let h = HelloFrame::new(Role::Client);
         let bytes = h.as_bytes();
         assert_eq!(bytes.len(), 8);
         let parsed = HelloFrame::parse(bytes).expect("magic ok");
         assert_eq!(parsed.version, CURRENT_VERSION);
         assert_eq!(parsed.role, Role::Client as u8);
-        assert_eq!(parsed.caps.get(), 0b0000_0011);
+        assert_eq!(parsed._pad.get(), 0);
     }
 
     #[test]
@@ -129,7 +124,7 @@ mod tests {
 
     #[test]
     fn magic_bytes_readable() {
-        let h = HelloFrame::new(Role::Server, 0);
+        let h = HelloFrame::new(Role::Server);
         let bytes = h.as_bytes();
         assert_eq!(&bytes[0..4], b"ARB2");
     }
