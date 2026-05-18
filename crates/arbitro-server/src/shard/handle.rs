@@ -82,7 +82,6 @@ impl ShardHandle {
         let first_seq = self
             .store
             .lock()
-            .unwrap()
             .append_batch(&store_entries, now_ms)
             .map_err(|_| SendError::SHARD_DOWN)?;
 

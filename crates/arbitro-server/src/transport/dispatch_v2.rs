@@ -163,9 +163,15 @@ fn v2_publish(
         let hash = idempotency_hash(msg_id);
         let shared = server.idempotency_for(seq_stream);
         let mut guard = shared.lock().expect("idempotency mutex poisoned");
+        let was_none = guard.is_none();
         let tracker = guard.get_or_insert_with(
             crate::shard::idempotency::IdempotencyTracker::new,
         );
+        // F10: announce allocation so the command worker stops locking
+        // this Arc just to test Option::is_some() on every iteration.
+        if was_none {
+            server.mark_idempotency_allocated(seq_stream);
+        }
         if !tracker.record(seq_stream, hash, window_ms) {
             // Duplicate within window — reject. The original write
             // (whichever publish landed first) remains intact.
@@ -183,15 +189,15 @@ fn v2_publish(
         flags: 0,
     }];
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // F7: single relaxed atomic load instead of SystemTime::now() syscall.
+    let now_ms = server.now_ms();
 
+    // F2: drop block_in_place. The store mutex is uncontended in steady
+    // state (drain takes it once per cycle); append_batch is a mmap memcpy
+    // (sub-µs). The block_in_place wrapper costs more than the work it
+    // guards. parking_lot::Mutex gives a faster uncontested path.
     let shared_store = server.store_for(seq_stream);
-    let first_seq = match tokio::task::block_in_place(|| {
-        shared_store.lock().unwrap().append_batch(&entries, now_ms)
-    }) {
+    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -236,11 +242,14 @@ fn v2_publish_with_reply(
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
     };
 
-    // Encode reply_to into the payload prefix: [reply_len:u16 LE][reply_to][payload].
-    // The drain extracts this using the HAS_REPLY_TO flag.
+    // F5: Encode reply_to into the payload prefix using a `SmallVec` —
+    // most reply addresses + small payloads fit inline (no heap alloc).
+    // Format: [reply_len:u16 LE][reply_to][payload]. The drain extracts
+    // this using the HAS_REPLY_TO flag.
     let reply_to = f.reply_to();
     let payload = f.payload();
-    let mut combined_payload = Vec::with_capacity(2 + reply_to.len() + payload.len());
+    let mut combined_payload: smallvec::SmallVec<[u8; 256]> =
+        smallvec::SmallVec::with_capacity(2 + reply_to.len() + payload.len());
     combined_payload.extend_from_slice(&(reply_to.len() as u16).to_le_bytes());
     combined_payload.extend_from_slice(reply_to);
     combined_payload.extend_from_slice(payload);
@@ -252,15 +261,12 @@ fn v2_publish_with_reply(
         flags: arbitro_store::flags::HAS_REPLY_TO,
     }];
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // F7: SharedClock atomic load.
+    let now_ms = server.now_ms();
 
+    // F2: drop block_in_place; parking_lot::Mutex is uncontested fast.
     let shared_store = server.store_for(seq_stream);
-    let first_seq = match tokio::task::block_in_place(|| {
-        shared_store.lock().unwrap().append_batch(&entries, now_ms)
-    }) {
+    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -289,36 +295,32 @@ fn v2_publish_batch(
         None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
     };
 
-    // Collect entry views; subject/payload are zero-copy slices into `frame`.
-    let entry_views: Vec<_> = f.iter().collect();
-
     // ── Idempotency check (all-or-nothing) ────────────────────────────
     //
-    // We honour the same atomic batch semantics the store uses: if any
-    // entry in the batch carries a `msg_id` that's already in the
-    // dedup window, we reject the WHOLE batch and roll back any
-    // entries we'd already inserted into the tracker on this call.
-    // This matches what the user expects from `publishBatch` — either
-    // every entry lands, or none do.
+    // F6: stream-build EntryRef vec directly from `f.iter()` —
+    // dropping the materialised entry_views Vec on the non-idempotent
+    // fast path. The iterator (`BatchPubIter`) is `Copy`, so the
+    // idempotency branch can iterate twice without an extra alloc.
     //
-    // Fast-bail when the stream has no idempotency window or none of
-    // the entries carry a msg_id (the common case for batch publish
-    // on non-idempotent streams).
+    // Fast-bail when the stream has no idempotency window.
     let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
-    let any_msg_id = window_ms > 0 && entry_views.iter().any(|v| !v.msg_id().is_empty());
-    if any_msg_id {
+    if window_ms > 0 && f.iter().any(|v| !v.msg_id().is_empty()) {
         let shared = server.idempotency_for(seq_stream);
         let mut guard = shared.lock().expect("idempotency mutex poisoned");
+        let was_none = guard.is_none();
         let tracker = guard.get_or_insert_with(
             crate::shard::idempotency::IdempotencyTracker::new,
         );
+        if was_none {
+            server.mark_idempotency_allocated(seq_stream);
+        }
 
         // Track which (hash) keys we inserted on this call so we can
         // roll them back if a later entry collides. Entries with an
         // empty msg_id are skipped (per-entry opt-in dedup).
-        let mut inserted_hashes: Vec<u64> = Vec::with_capacity(entry_views.len());
+        let mut inserted_hashes: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
         let mut duplicate = false;
-        for v in entry_views.iter() {
+        for v in f.iter() {
             let id = v.msg_id();
             if id.is_empty() {
                 continue;
@@ -344,7 +346,9 @@ fn v2_publish_batch(
         drop(guard);
     }
 
-    let entries: Vec<arbitro_store::EntryRef<'_>> = entry_views
+    // Stream-build EntryRef vec — one allocation, no intermediate
+    // entry_views Vec. SmallVec inline storage absorbs small batches.
+    let entries: smallvec::SmallVec<[arbitro_store::EntryRef<'_>; 16]> = f
         .iter()
         .map(|v| arbitro_store::EntryRef {
             stream_id: seq_stream.raw(),
@@ -354,15 +358,12 @@ fn v2_publish_batch(
         })
         .collect();
 
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    // F7: SharedClock atomic load.
+    let now_ms = server.now_ms();
 
+    // F2: drop block_in_place.
     let shared_store = server.store_for(seq_stream);
-    let first_seq = match tokio::task::block_in_place(|| {
-        shared_store.lock().unwrap().append_batch(&entries, now_ms)
-    }) {
+    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -405,11 +406,13 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         None => return,
     };
     let shard = server.shard_for(seq_stream);
-    let entries: Vec<AckEntry> = f
-        .entries()
-        .iter()
-        .map(|e| AckEntry { stream_id: seq_stream, seq: e.seq.get() })
-        .collect();
+    // The shard handle requires `Vec<AckEntry>` for channel transport.
+    // Stream-build with capacity to avoid mid-fill reallocation.
+    let raw = f.entries();
+    let mut entries: Vec<AckEntry> = Vec::with_capacity(raw.len());
+    for e in raw {
+        entries.push(AckEntry { stream_id: seq_stream, seq: e.seq.get() });
+    }
     let _ = shard.ack(consumer_id, conn_id, entries).await;
 }
 
@@ -847,7 +850,21 @@ async fn v2_delete_consumer(
     };
     let consumer_id = ConsumerId(f.body.consumer_id.get());
 
-    for i in 0..server.shard_count() {
+    // F14: route directly to the owning shard when we know it.
+    // Fall back to fanning out if the consumer→stream mapping is unknown
+    // (recovery edge cases, manual control-plane calls).
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
+        .names()
+        .consumer_stream(consumer_id)
+    {
+        Some(stream) => {
+            let idx = stream.raw() as usize % server.shard_count();
+            smallvec::smallvec![idx]
+        }
+        None => (0..server.shard_count()).collect(),
+    };
+
+    for i in candidate_shards {
         if let Ok(_) = server.shard(i).delete_consumer(consumer_id).await {
             // Mirror the cascade that `v2_delete_stream` does for streams:
             // drop the wire-name → id mapping (plus the consumer's reverse
@@ -889,12 +906,15 @@ async fn v2_consumer_stats(
     };
     let consumer_id = ConsumerId(f.body.consumer_id.get());
 
-    let mut total = 0u64;
-    for i in 0..server.shard_count() {
-        if let Ok(count) = server.shard(i).consumer_pending(consumer_id).await {
-            total += count;
+    // F14: route directly to the owning shard via NameRegistry — the
+    // consumer lives on exactly one shard, no need to fan out queries.
+    let total = match server.names().consumer_stream(consumer_id) {
+        Some(stream) => {
+            let shard = server.shard_for(stream);
+            shard.consumer_pending(consumer_id).await.unwrap_or(0)
         }
-    }
+        None => 0,
+    };
     send_rep_ok_v2(registry, conn_id, req_seq, total);
 }
 

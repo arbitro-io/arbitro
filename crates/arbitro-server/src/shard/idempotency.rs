@@ -135,7 +135,10 @@ impl IdempotencyTracker {
             Entry::Vacant(slot) => {
                 slot.insert(());
                 // Schedule removal. Round window up to whole seconds
-                // (wheel resolution is 1s).
+                // (wheel resolution is 1s). NameRegistry already
+                // clamped the window at create time (F39), but we
+                // still apply `.min()` here defensively in case a
+                // caller wires the tracker without the registry.
                 let clamped_ms = window_ms.min(MAX_WINDOW_MS);
                 let ticks = clamped_ms.div_ceil(TICK_MS as u32);
                 self.wheel.insert(

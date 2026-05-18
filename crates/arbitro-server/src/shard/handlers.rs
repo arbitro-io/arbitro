@@ -77,10 +77,13 @@ impl CommandWorker {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let stream_ids: Vec<_> =
-            self.accum_streams.keys().copied().collect();
+        // F27: reuse the persistent scratch vec on every flush.
+        self.flush_stream_ids.clear();
+        self.flush_stream_ids.extend(self.accum_streams.keys().copied());
+        let stream_ids = std::mem::take(&mut self.flush_stream_ids);
 
-        for stream_id in stream_ids {
+        for stream_id in &stream_ids {
+            let stream_id = *stream_id;
             let accum =
                 self.accum_streams.get_mut(&stream_id).unwrap();
             if accum.store_entries.is_empty() {
@@ -102,7 +105,7 @@ impl CommandWorker {
                 })
                 .collect();
 
-            match self.store.lock().unwrap().append_batch(&refs, now_ms) {
+            match self.store.lock().append_batch(&refs, now_ms) {
                 Ok(first_seq) => {
                     let mut seq_offset = 0u64;
                     for caller in &callers {
@@ -121,7 +124,7 @@ impl CommandWorker {
                     if let Some(ret) = self.stream_retention.get(&stream_id) {
                         let need_check = (ret.max_msgs > 0) || (ret.max_bytes > 0);
                         if need_check {
-                            let mut store = self.store.lock().unwrap();
+                            let mut store = self.store.lock();
                             let info = store.info();
                             let excess_msgs = if ret.max_msgs > 0 {
                                 info.messages.saturating_sub(ret.max_msgs)
@@ -161,6 +164,10 @@ impl CommandWorker {
         self.accum_deadline = None;
         self.accum_total = 0;
         self.accum_bytes = 0;
+        // Return the scratch vec so the next flush can reuse its
+        // allocation. Keep capacity, drop content.
+        self.flush_stream_ids = stream_ids;
+        self.flush_stream_ids.clear();
     }
 
     // ── Hot path — ack / nack ───────────────────────────────────────────
@@ -201,8 +208,8 @@ impl CommandWorker {
         // Now sync the shared atomics so drain sees freed capacity.
         if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
             let queue_id = consumer.queue_id;
-            for _ in 0..accepted {
-                self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+            if accepted > 0 {
+                self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, accepted);
             }
         }
         // Subject inflight decremented by apply_delta_and_sync below.
@@ -261,8 +268,8 @@ impl CommandWorker {
             // Decrement atomic inflight counters.
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
-                for _ in 0..requeued {
-                    self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+                if requeued > 0 {
+                    self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
                 }
             }
 
@@ -299,8 +306,8 @@ impl CommandWorker {
             // Decrement atomic inflight counters (nack releases inflight too).
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
-                for _ in 0..requeued {
-                    self.counters.dec_inflight(cmd.consumer_id.0, queue_id.0);
+                if requeued > 0 {
+                    self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
                 }
             }
 
@@ -695,7 +702,7 @@ impl CommandWorker {
         &mut self,
         cmd: StoreInfoCmd,
     ) {
-        let info = self.store.lock().unwrap().info();
+        let info = self.store.lock().info();
         let _ = cmd.reply.send(StoreInfoReply {
             messages: info.messages,
             bytes: info.bytes,
@@ -708,7 +715,7 @@ impl CommandWorker {
         &mut self,
         cmd: PurgeStreamCmd,
     ) {
-        let deleted = self.store.lock().unwrap().purge();
+        let deleted = self.store.lock().purge();
         // After a full purge the store's first_seq equals next_seq — no
         // entries exist. The drain cursor may be behind next_seq; leave it
         // where it is. New publishes will fire the gate and the drain will
@@ -720,7 +727,7 @@ impl CommandWorker {
         &mut self,
         cmd: DrainSubjectCmd,
     ) {
-        let deleted = self.store.lock().unwrap().drain(&cmd.subject);
+        let deleted = self.store.lock().drain(&cmd.subject);
         let _ = cmd.reply.send(deleted);
     }
 
@@ -748,7 +755,7 @@ impl CommandWorker {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.lock();
         let info = store.info();
 
         if info.messages == 0 {

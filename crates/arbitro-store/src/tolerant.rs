@@ -296,6 +296,14 @@ impl Store for TolerantStore {
             dropped += 1;
         }
 
+        // F25: subtract bytes from the dropped prefix in O(idx) instead
+        // of re-walking the survivors. Eviction no longer pauses publish
+        // for ms-scale on large stores.
+        let dropped_bytes: u64 = self.index[..idx]
+            .iter()
+            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
+            .sum();
+
         self.index.drain(0..idx);
         if dropped > 0 {
             for m in &mut self.index {
@@ -303,11 +311,7 @@ impl Store for TolerantStore {
             }
         }
         self.first_seq = target;
-        self.total_bytes = self
-            .index
-            .iter()
-            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
-            .sum();
+        self.total_bytes = self.total_bytes.saturating_sub(dropped_bytes);
         idx as u64
     }
 

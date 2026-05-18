@@ -142,7 +142,7 @@ impl DrainWorker {
 
         // ── Store init ───────────────────────────────────────────────────
         {
-            let mut store_guard = self.store.lock().unwrap();
+            let mut store_guard = self.store.lock();
             if let Err(e) = store_guard.init() {
                 tracing::error!(error = ?e, "store init failed");
             }
@@ -195,7 +195,7 @@ impl DrainWorker {
                 // ONLY during the for_each walk (Phase 1). TCP delivery
                 // and bookkeeping (Phase 2+3) run lock-free.
                 let read_result = {
-                    let store_guard = self.store.lock().unwrap();
+                    let store_guard = self.store.lock();
                     super::drain::drain_read(
                         &self.counters,
                         &snap,
@@ -354,6 +354,17 @@ pub struct CommandWorker {
     /// fast-bails via `NameRegistry::stream_idempotency_window_ms`
     /// before touching this Arc.
     pub(super) idempotency_tracker: crate::shard::idempotency::SharedIdempotency,
+    /// F10 — cached "has idempotency tracker been allocated" flag.
+    /// Used in `tokio::select!` predicates to avoid locking the shared
+    /// `Arc<Mutex<Option<IdempotencyTracker>>>` on every iteration just
+    /// to call `Option::is_some()`. Flipped to `true` the first time the
+    /// publish hot path allocates the tracker; never goes back to false
+    /// in steady state (the tracker only drops when the shard shuts down).
+    pub(super) has_idempotency: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// F27 — reusable buffer for accumulator flush. Avoids one Vec
+    /// allocation per `flush_accumulator()` call (200/s at the default
+    /// 5 ms interval per shard).
+    pub(super) flush_stream_ids: Vec<StreamId>,
 }
 
 impl CommandWorker {
@@ -412,7 +423,7 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.lock().expect("idempotency mutex poisoned").is_some() => {
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed) => {
                         // Both timers run at the same 1-second cadence;
                         // one tokio::sleep drives both. Wheel tick is a
                         // no-op when wheel is None. Idempotency tick
@@ -451,7 +462,7 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.idempotency_tracker.lock().expect("idempotency mutex poisoned").is_some() => {
+                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed) => {
                         // Both timers run at the same 1-second cadence;
                         // one tokio::sleep drives both. Wheel tick is a
                         // no-op when wheel is None. Idempotency tick
@@ -659,7 +670,7 @@ impl CommandWorker {
     fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
         if matches!(cmd, ShardCommand::Shutdown) {
             self.flush_accumulator();
-            if let Err(e) = self.store.lock().unwrap().shutdown() {
+            if let Err(e) = self.store.lock().shutdown() {
                 tracing::error!(error = ?e, "store shutdown failed");
             }
             self.running

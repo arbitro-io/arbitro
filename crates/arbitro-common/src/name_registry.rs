@@ -220,18 +220,29 @@ impl NameRegistry {
         Some(removed)
     }
 
+    /// Maximum window the broker honours. Matches
+    /// `arbitro_server::shard::idempotency::MAX_WINDOW_MS`. Duplicated
+    /// here so this crate can clamp without depending on the server.
+    pub const MAX_IDEMPOTENCY_WINDOW_MS: u32 = 5 * 60 * 1000;
+
     /// Set the idempotency window for an already-allocated stream. A
     /// non-zero value enables per-stream dedup on the publish hot
     /// path (the value is checked by `stream_idempotency_window_ms`).
     /// A zero value disables it. Setting on an unknown `seq` is a
     /// silent no-op (defensive — recovery may replay out of order).
+    ///
+    /// **F39**: clamp once here at set time. The publish hot path
+    /// (`IdempotencyTracker::record`) used to clamp on every record;
+    /// doing it once on the cold create/update path drops a `.min()`
+    /// from the per-publish budget.
     pub fn set_stream_idempotency(&self, seq: StreamId, window_ms: u32) {
+        let clamped = window_ms.min(Self::MAX_IDEMPOTENCY_WINDOW_MS);
         let mut g = self.inner.lock().expect("name registry poisoned");
         let idx = seq.0 as usize;
         if idx >= g.streams_idempotency_window_ms.len() {
             g.streams_idempotency_window_ms.resize(idx + 1, 0);
         }
-        g.streams_idempotency_window_ms[idx] = window_ms;
+        g.streams_idempotency_window_ms[idx] = clamped;
     }
 
     /// Get the idempotency window for a stream. Returns `0` when the

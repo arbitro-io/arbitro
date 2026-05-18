@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::match_table::MatchTable;
 use arbitro_engine_v2::command::DeliveredEntry;
@@ -274,31 +274,37 @@ pub fn find_writer<'a>(
 
 // ── SnapshotSwap ───────────────────────────────────────────────────────────
 
-/// Atomic snapshot swap. `RwLock<Arc<T>>` held for ~5ns (pointer swap only).
+/// Lock-free atomic snapshot swap backed by `arc_swap::ArcSwap` (F20).
 ///
-/// Drain: `load()` → Arc clone (~3ns), read-only access for entire cycle.
-/// Command: `store()` → swap Arc pointer (~5ns), old Arc drops when refcount=0.
+/// Drain: `load()` → ~1–2 ns lock-free Arc load.
+/// Command: `store()` → atomic pointer swap, old Arc drops when refcount = 0.
+///
+/// Replaces the previous `RwLock<Arc<T>>` pattern, which paid a read-lock
+/// acquire on every drain cycle (~5 ns); at 100k+ cycles/s the savings
+/// add up — and the API is unchanged for callers (`.load() -> Arc<T>`,
+/// `.store(val)`).
 pub struct SnapshotSwap<T> {
-    inner: RwLock<Arc<T>>,
+    inner: arc_swap::ArcSwap<T>,
 }
 
 impl<T> SnapshotSwap<T> {
     pub fn new(val: T) -> Self {
         Self {
-            inner: RwLock::new(Arc::new(val)),
+            inner: arc_swap::ArcSwap::from_pointee(val),
         }
     }
 
-    /// Load the current snapshot. Returns an Arc — caller owns a reference.
-    /// RwLock read held for ~3ns (Arc clone only).
+    /// Load the current snapshot — lock-free, ~1–2 ns.
     #[inline]
     pub fn load(&self) -> Arc<T> {
-        self.inner.read().unwrap().clone()
+        // `load_full` returns an owned `Arc<T>`, matching the prior
+        // signature `RwLock::read().clone()`.
+        self.inner.load_full()
     }
 
-    /// Replace the snapshot. RwLock write held for ~5ns (pointer swap only).
+    /// Replace the snapshot — single atomic pointer swap.
     pub fn store(&self, val: T) {
-        *self.inner.write().unwrap() = Arc::new(val);
+        self.inner.store(Arc::new(val));
     }
 }
 

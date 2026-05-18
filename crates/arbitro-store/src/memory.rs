@@ -441,6 +441,14 @@ impl Store for MemoryStore {
 
         let removed = cut as u64;
 
+        // F24: compute dropped bytes from the cut prefix in O(cut)
+        // instead of O(remaining). On 1M-entry stores this turns a
+        // multi-ms stall under the publish lock into a sub-ms hit.
+        let dropped_bytes: u64 = self.index[..cut]
+            .iter()
+            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
+            .sum();
+
         // Determine how many whole sealed segments are fully dropped
         // (all their entries have seq < first_seq).
         let remaining_start_seg = if cut < self.index.len() {
@@ -466,12 +474,8 @@ impl Store for MemoryStore {
         self.index.drain(0..cut);
         self.first_seq = first_seq;
 
-        // Recalculate total bytes.
-        self.total_bytes = self
-            .index
-            .iter()
-            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
-            .sum();
+        // Incremental update — no full re-walk.
+        self.total_bytes = self.total_bytes.saturating_sub(dropped_bytes);
 
         removed
     }

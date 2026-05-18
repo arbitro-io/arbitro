@@ -21,6 +21,9 @@ tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile    = "3.10"
 tokio-uring = "0.5"
+parking_lot  = "0.12"
+smallvec     = "1.13"
+arc-swap     = "1.7"
 
 [profile.release]
 opt-level = 3

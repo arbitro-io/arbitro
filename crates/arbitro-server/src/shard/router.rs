@@ -16,6 +16,7 @@ use arbitro_store::MemoryStore;
 use tokio::sync::mpsc;
 
 use crate::common::{Gate, NameRegistry};
+use arbitro_common::SharedClock;
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::drain_events::DrainEventRing;
@@ -25,7 +26,10 @@ use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
 use crate::transport::ConnectionRegistry;
 
 /// Shared store handle — publish writes, drain reads.
-pub type SharedStore = Arc<std::sync::Mutex<Box<dyn arbitro_store::Store>>>;
+/// Shared store handle — publish writes, drain reads.
+/// **F2**: `parking_lot::Mutex` for faster uncontested path; no
+/// `block_in_place` wrapper needed (append is a sub-µs mmap memcpy).
+pub type SharedStore = Arc<parking_lot::Mutex<Box<dyn arbitro_store::Store>>>;
 
 /// Routes commands to the correct shard worker by stream_id.
 #[derive(Clone)]
@@ -40,10 +44,19 @@ pub struct ShardRouter {
     /// the dispatch publish path (membership check + record) and the
     /// shard worker's tick loop (expiration sweep).
     idempotency: Arc<[crate::shard::idempotency::SharedIdempotency]>,
+    /// Per-shard "tracker allocated" flag (F10) — flipped to `true` the
+    /// first time the publish hot path lazily allocates the idempotency
+    /// tracker for that shard. The command worker reads this with a
+    /// single relaxed atomic load in its `tokio::select!` predicate
+    /// instead of locking the shared `Arc<Mutex<Option<...>>>`.
+    has_idempotency: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
     /// Optional persistent command log — set when `data_dir` is configured.
     /// Used by dispatch to record metadata mutations (create/delete stream/consumer)
     /// so they survive server restarts.
     command_log: Option<SharedCommandLog>,
+    /// Shared monotonic millisecond clock (F7). Replaces per-publish
+    /// `SystemTime::now()` syscalls with a single relaxed atomic load.
+    clock: SharedClock,
 }
 
 impl ShardRouter {
@@ -56,6 +69,7 @@ impl ShardRouter {
         let mut stores = Vec::with_capacity(shard_count);
         let mut gates = Vec::with_capacity(shard_count);
         let mut idempotency = Vec::with_capacity(shard_count);
+        let mut has_idempotency = Vec::with_capacity(shard_count);
         let names = Arc::new(NameRegistry::new());
 
         for id in 0..shard_count {
@@ -72,7 +86,7 @@ impl ShardRouter {
                 }
                 None => Box::new(MemoryStore::new()),
             };
-            let shared_store: SharedStore = Arc::new(std::sync::Mutex::new(store));
+            let shared_store: SharedStore = Arc::new(parking_lot::Mutex::new(store));
 
             // Shared atomics — zero Mutex, zero contention.
             let counters = Arc::new(SharedCounters::new());
@@ -88,6 +102,7 @@ impl ShardRouter {
             // command worker (tick loop) and dispatch_v2 (publish
             // check + record) hold clones of this Arc.
             let shard_idempotency = super::idempotency::new_shared_idempotency();
+            let shard_has_idempotency = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Notification ring: drain → command (deliveries + dead connections).
             // SPSC Ring — drain is the sole producer, command task is the sole consumer.
@@ -151,6 +166,8 @@ impl ShardRouter {
                 wheel_buf: Vec::new(),
                 next_wheel_tick: None,
                 idempotency_tracker: Arc::clone(&shard_idempotency),
+                has_idempotency: Arc::clone(&shard_has_idempotency),
+                flush_stream_ids: Vec::new(),
             };
 
             tokio::spawn(cmd_worker.run());
@@ -158,6 +175,7 @@ impl ShardRouter {
             stores.push(Arc::clone(&shared_store));
             gates.push(Arc::clone(&gate));
             idempotency.push(Arc::clone(&shard_idempotency));
+            has_idempotency.push(Arc::clone(&shard_has_idempotency));
 
             handles.push(ShardHandle::new(
                 id as u32,
@@ -168,14 +186,48 @@ impl ShardRouter {
             ));
         }
 
+        // Spawn the SharedClock updater task — refreshes the cached
+        // millisecond timestamp at ~1000 Hz. Hot paths read with one
+        // relaxed atomic load (~1 ns) instead of paying the
+        // `SystemTime::now()` syscall (~25–50 ns on Linux, more on
+        // Windows). See `arbitro_common::clock`.
+        let clock = SharedClock::new();
+        {
+            let clk = clock.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(
+                    std::time::Duration::from_millis(1),
+                );
+                loop {
+                    interval.tick().await;
+                    clk.refresh();
+                }
+            });
+        }
+
         Self {
             shards: handles.into(),
             stores: stores.into(),
             gates: gates.into(),
             names,
             idempotency: idempotency.into(),
+            has_idempotency: has_idempotency.into(),
             command_log: None,
+            clock,
         }
+    }
+
+    /// Cached "now" in milliseconds since the UNIX epoch. Hot path —
+    /// one relaxed atomic load. See `arbitro_common::SharedClock`.
+    #[inline(always)]
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
+    /// Clone the shared clock — used by callers that want their own handle.
+    #[inline]
+    pub fn clock(&self) -> SharedClock {
+        self.clock.clone()
     }
 
     /// Wire the persistent command log. Called by `ArbitroServer::set_command_log`
@@ -219,6 +271,17 @@ impl ShardRouter {
     ) -> &super::idempotency::SharedIdempotency {
         let idx = stream_id.raw() as usize % self.idempotency.len();
         &self.idempotency[idx]
+    }
+
+    /// Per-shard "tracker allocated" flag — flip to `true` after the
+    /// publish hot path lazily allocates the idempotency tracker so
+    /// the command worker's `select!` predicate can stop locking the
+    /// Arc just to call `Option::is_some()` (F10).
+    #[inline]
+    pub fn mark_idempotency_allocated(&self, stream_id: StreamId) {
+        let idx = stream_id.raw() as usize % self.has_idempotency.len();
+        self.has_idempotency[idx]
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
