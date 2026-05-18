@@ -919,7 +919,9 @@ impl CommandWorker {
         }
 
         self.snapshot.store(DrainSnapshot {
-            bindings: snap_bindings,
+            // F19: wrap once into an Arc<[T]> so the drain thread sees
+            // an immutable cheaply-cloneable slice instead of a Vec.
+            bindings: Arc::from(snap_bindings.into_boxed_slice()),
             writers_by_conn,
             match_tables,
             stream_max_age_ms,

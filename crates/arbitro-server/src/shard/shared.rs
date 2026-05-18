@@ -242,7 +242,13 @@ impl SharedCounters {
 /// is a direct `bindings[match_entry.binding_idx]` Vec access.
 pub struct DrainSnapshot {
     /// Active bindings — iterated by drain for delivery.
-    pub bindings: Vec<ActiveBinding>,
+    /// F19: `Arc<[T]>` instead of `Vec<T>`. Snapshot rebuild builds a
+    /// fresh boxed slice and wraps it in `Arc`, so cloning the
+    /// `DrainSnapshot` into a new tokio task or reading from the drain
+    /// thread doesn't pay a Vec-clone per swap. Deref to `&[T]` keeps
+    /// every drain call site (`&snap.bindings`, `snap.bindings[idx]`)
+    /// unchanged.
+    pub bindings: Arc<[ActiveBinding]>,
     /// Per-connection writer index. One entry per connection (dedup'd
     /// from bindings — multiple consumers share a writer).
     /// HashMap+foldhash: connection_id is unbounded-monotonic, so direct
@@ -269,7 +275,7 @@ pub struct WriterIndexEntry {
 impl DrainSnapshot {
     pub fn empty() -> Self {
         Self {
-            bindings: Vec::new(),
+            bindings: Arc::from(Vec::<ActiveBinding>::new().into_boxed_slice()),
             writers_by_conn: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::new(),
             stream_max_age_ms: Vec::new(),

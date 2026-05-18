@@ -556,9 +556,15 @@ async fn v2_subscribe(
         )
         .await;
 
+    // M19: differentiate "shard returned `Ok(false)` (no such
+    // consumer/binding)" from a transport-level SendError. The shard
+    // reply is a `bool`; the only legitimate way to see `Ok(false)` is
+    // an unknown consumer at this layer (everything else is reported as
+    // a separate command outcome).
     match reply {
-        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
-        _        => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Ok(true)  => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
+        Ok(false) => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
+        Err(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -787,10 +793,20 @@ async fn v2_list_streams(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    // M20: a shard that errors silently dropped its streams from the
+    // listing — operators saw a half-populated reply and never knew. We
+    // now fail loud (InternalError) if any shard reports an error, so
+    // partial views never reach the client. Trade-off: a single
+    // crashed shard kills the whole `list_streams` reply, but that's
+    // strictly safer than fabricating an incomplete list.
     let mut all_streams: Vec<(u32, Vec<u8>)> = Vec::new();
     for i in 0..server.shard_count() {
-        if let Ok(reply) = server.shard(i).list_streams().await {
-            all_streams.extend(reply.streams);
+        match server.shard(i).list_streams().await {
+            Ok(reply) => all_streams.extend(reply.streams),
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                return;
+            }
         }
     }
 
@@ -1111,10 +1127,18 @@ async fn v2_list_consumers(
         Some(server.names().stream_seq(wire_filter).map(|s| s.raw()).unwrap_or(u32::MAX))
     };
 
+    // M20: fail loud on any shard error rather than returning a partial
+    // listing. Same trade-off as `v2_list_streams` — one crashed shard
+    // takes the whole reply, but the alternative is silently lying to
+    // the operator about what consumers exist.
     let mut all_consumers: Vec<(u32, u32, u32, bool)> = Vec::new();
     for i in 0..server.shard_count() {
-        if let Ok(reply) = server.shard(i).list_consumers().await {
-            all_consumers.extend(reply.consumers);
+        match server.shard(i).list_consumers().await {
+            Ok(reply) => all_consumers.extend(reply.consumers),
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                return;
+            }
         }
     }
 

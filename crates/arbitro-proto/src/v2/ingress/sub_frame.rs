@@ -22,6 +22,12 @@ pub struct SubBody {
     pub conn_id:       U32,
     pub consumer_id:   U32,
     pub filter_len:    U16,
+    /// M18: reserved 16 bits for future SubFrame options (qos, durable,
+    /// retain-pickup, etc). The current `dispatch_v2::v2_subscribe`
+    /// ignores every bit — kept on the wire to lock in the field
+    /// position so a future release can wire flags without a
+    /// renegotiation. Treat as 0 in tests and producers; clients that
+    /// happen to set bits will see no behaviour change.
     pub options_flags: U16,
 }
 pub const SUB_BODY_FIXED: usize = core::mem::size_of::<SubBody>();

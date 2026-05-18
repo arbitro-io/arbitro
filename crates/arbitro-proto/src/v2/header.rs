@@ -98,17 +98,36 @@ impl Header {
 }
 
 // ── Transport flags (offset 2) ───────────────────────────────────────────
+//
+// TODO §5: every bit other than ACK_REQ is reserved for forward-compatible
+// extensions. The broker IGNORES DUP / PRIORITY_HIGH today — they are
+// kept to lock in the bit positions so a future feature can claim them
+// without renegotiating the wire layout. The header tests reference these
+// constants; do not delete them without renumbering reserved bits first.
 pub mod flag {
     pub const ACK_REQ:        u8 = 1 << 0;
+    /// Reserved (TODO §5). Set by clients that detect retransmission;
+    /// the broker does NOT use this bit for deduplication today.
     pub const DUP:            u8 = 1 << 1;
+    /// Reserved (TODO §5). No priority queue exists yet — the broker
+    /// treats high-priority publishes identically to normal ones.
     pub const PRIORITY_HIGH:  u8 = 1 << 2;
     // bits 3..7 reserved
 }
 
 // ── Per-message flags (offset 3, formerly `version`) ─────────────────────
+//
+// TODO §5: the broker honours none of these bits today. They are kept as
+// reserved markers so a future release can wire them up without breaking
+// existing clients that already happen to set them.
 pub mod entry_flag {
+    /// Reserved (TODO §5). No retain semantics implemented.
     pub const RETAIN:           u8 = 1 << 0;
+    /// Reserved (TODO §5). Broker never decompresses on the read path —
+    /// payloads are stored exactly as received.
     pub const COMPRESSED:       u8 = 1 << 1;
+    /// Reserved (TODO §5). Broker has only one backpressure policy
+    /// today (drop on per-conn mpsc full); this bit is not consulted.
     pub const NO_BACKPRESSURE:  u8 = 1 << 2;
     // bits 3..7 reserved
 }

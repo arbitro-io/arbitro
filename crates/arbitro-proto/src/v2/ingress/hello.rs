@@ -56,11 +56,20 @@ pub enum Role {
     Server = 1,
 }
 
+// TODO §5: only `cap::REPLY` is honoured by the broker today (it gates
+// PublishWithReply dispatch). The other bits are reserved markers so a
+// future release can wire the corresponding features without a HELLO
+// renegotiation — clients may set them today without harm.
 pub mod cap {
-    pub const HEADERS:           u16 = 1 << 0; // PublishWithHeaders supported
+    /// Reserved (TODO §5). PublishWithHeaders is unimplemented; the
+    /// dispatcher returns `Unimplemented` for that action.
+    pub const HEADERS:           u16 = 1 << 0;
     pub const REPLY:             u16 = 1 << 1; // PublishWithReply supported
-    pub const BATCH_HEADERS:     u16 = 1 << 2; // PublishBatchWithHeaders supported
-    pub const COMPRESSED_PAYLOAD:u16 = 1 << 3; // entry_flag::COMPRESSED honored
+    /// Reserved (TODO §5). PublishBatchWithHeaders is unimplemented.
+    pub const BATCH_HEADERS:     u16 = 1 << 2;
+    /// Reserved (TODO §5). Broker stores payloads verbatim;
+    /// `entry_flag::COMPRESSED` is also reserved.
+    pub const COMPRESSED_PAYLOAD:u16 = 1 << 3;
     // bits 4..15 reserved
 }
 
