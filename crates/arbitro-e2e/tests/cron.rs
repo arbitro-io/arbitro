@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arbitro_client_tokio::Client;
+use arbitro_client_tokio::{ClientConfig, ReconnectPolicy};
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 1. Basic cron — register, receive fire, verify
@@ -92,4 +92,73 @@ async fn cron_10_workers_single_delivery() {
         h.stop().await.unwrap();
     }
     server.shutdown().await;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. Reconnect — server dies, restarts on same port, crons resume firing
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cron_survives_server_restart() {
+    // Bind a port we'll reuse across restarts.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+
+    // Phase 1: start server, register cron, verify it fires.
+    let mut server = TestServerBuilder::new().spawn_on(&addr).await;
+
+    let fire_count = Arc::new(AtomicU64::new(0));
+    let fc = fire_count.clone();
+
+    let client = arbitro_client_tokio::Client::connect(ClientConfig {
+        addr: addr.clone(),
+        reconnect: ReconnectPolicy {
+            base: Duration::from_millis(100),
+            cap: Duration::from_millis(500),
+            max_attempts: Some(30),
+        },
+        ..ClientConfig::default()
+    })
+    .await
+    .expect("initial connect");
+
+    let _cron = client
+        .cron(b"reconnect-test")
+        .every(b"* * * * * *")
+        .run(move |_ctx| {
+            let fc = fc.clone();
+            async move {
+                fc.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+        .await
+        .expect("create cron");
+
+    // Let it fire at least once.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before_restart = fire_count.load(Ordering::Relaxed);
+    assert!(before_restart >= 1, "expected ≥1 fires before restart, got {before_restart}");
+
+    // Phase 2: kill server.
+    server.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 3: restart server on same port.
+    let mut server2 = TestServerBuilder::new().spawn_on(&addr).await;
+
+    // Wait for client to reconnect + re-register cron + fires to resume.
+    // Reconnect + handshake + CreateCron round-trip can take 1-2s.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let after_restart = fire_count.load(Ordering::Relaxed);
+    let new_fires = after_restart - before_restart;
+    assert!(
+        new_fires >= 1,
+        "expected ≥1 new fires after server restart, got {new_fires} \
+         (total: {after_restart}, before: {before_restart}). \
+         Cron did not resume after reconnect."
+    );
+
+    server2.shutdown().await;
 }

@@ -47,13 +47,17 @@ impl TestServerBuilder {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         drop(listener);
+        self.spawn_on(&addr).await
+    }
 
+    /// Spawn a server on a specific address (for reconnect tests).
+    pub async fn spawn_on(self, addr: &str) -> TestServer {
         let (tx, rx) = watch::channel(false);
         let mut config = Config::default()
-            .listen_addr(&addr)
+            .listen_addr(addr)
             .shard_count(self.shard_count)
             .shutdown_timeout(self.shutdown_timeout);
-            
+
         if let Some(ref dir) = self.data_dir {
             config = config.data_dir(dir);
         }
@@ -74,7 +78,7 @@ impl TestServerBuilder {
         });
 
         TestServer {
-            addr,
+            addr: addr.to_string(),
             shutdown_tx: tx,
             handle: Some(handle),
         }
