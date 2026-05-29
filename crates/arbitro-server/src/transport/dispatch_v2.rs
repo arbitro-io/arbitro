@@ -41,6 +41,7 @@ use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::CreateConsumerFrame;
 use arbitro_proto::v2::manager::stream_mgmt::CreateStreamFrame;
 use bytes::{Bytes, BytesMut};
+use serde_json;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
@@ -59,6 +60,7 @@ pub async fn dispatch_frame_v2(
     frame: Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
 ) -> Result<(), ()> {
     if frame.len() < HEADER_SIZE {
         return Err(());
@@ -119,8 +121,15 @@ pub async fn dispatch_frame_v2(
         Action::PauseConsumer  => v2_pause_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::ResumeConsumer => v2_resume_consumer(conn_id, req_seq, &frame, server, registry).await,
 
+        // ── Cron scheduling ─────────────────────────────────────────
+        Action::CreateCron     => v2_create_cron(conn_id, req_seq, &frame, registry, cron_registry),
+        Action::DeleteCron     => v2_delete_cron(conn_id, req_seq, &frame, registry, cron_registry),
+        Action::ListCrons      => v2_list_crons(conn_id, req_seq, registry, cron_registry),
+        Action::CronAck        => v2_cron_ack(&frame, cron_registry),
+        Action::CronFire       => { /* server→client only; ignore if received */ }
+
         // ── System ──────────────────────────────────────────────────
-        Action::Disconnect     => v2_disconnect(conn_id, server, registry).await,
+        Action::Disconnect     => { v2_disconnect(conn_id, server, registry, cron_registry).await; }
         Action::Ping           => v2_ping(conn_id, registry),
         // M17: count Pongs so the keepalive path is observable. The
         // counter lives on the connection registry — it's stable across
@@ -1370,6 +1379,7 @@ pub(crate) async fn v2_disconnect(
     conn_id: u64,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
 ) {
     let shards = server.shard_count();
     let cid = ConnectionId(conn_id);
@@ -1389,6 +1399,9 @@ pub(crate) async fn v2_disconnect(
         let _ = h.await;
     }
 
+    // Remove this connection from all cron worker pools.
+    cron_registry.remove_connection(conn_id);
+
     tracing::debug!(target = "dispatch", conn = conn_id, "v2_disconnect: drains complete");
     registry.remove(conn_id);
 }
@@ -1397,4 +1410,80 @@ fn v2_ping(conn_id: u64, registry: &ConnectionRegistry) {
     // Reply with a Pong header (no body). Header = 12B, fits inline.
     let header = Header::new(Action::Pong.as_u16(), 0, 0);
     registry.send_inline(conn_id, header.as_bytes());
+}
+
+// ── Cron ──────────────────────────────────────────────────────────────────
+
+fn v2_create_cron(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+) {
+    let body_bytes = &frame[HEADER_SIZE..];
+    let body = match arbitro_proto::wire::cron::decode_create_cron(body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
+    };
+    match cron_registry.create(
+        Bytes::copy_from_slice(body.name.as_bytes()),
+        &body.every,
+        body.tz,
+        body.timeout_ms,
+        body.overlap,
+        conn_id,
+    ) {
+        Ok(()) => send_rep_ok_v2(registry, conn_id, req_seq, 0),
+        Err(msg) => {
+            tracing::warn!(conn_id, name = %body.name, error = %msg, "create_cron failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
+}
+
+fn v2_delete_cron(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+) {
+    let name = &frame[HEADER_SIZE..];
+    if cron_registry.delete(name) {
+        send_rep_ok_v2(registry, conn_id, req_seq, 0);
+    } else {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+    }
+}
+
+fn v2_list_crons(
+    conn_id: u64,
+    req_seq: u64,
+    registry: &ConnectionRegistry,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+) {
+    let infos = cron_registry.list();
+    let json = serde_json::to_vec(&infos).unwrap_or_default();
+    // Send as RepOk with JSON body in ref_seq position (0) + raw JSON
+    // appended. The client reads the body after the standard RepOk header.
+    let total = HEADER_SIZE + json.len();
+    let mut buf = BytesMut::with_capacity(total);
+    let header = Header::new(Action::ListCrons.as_u16(), json.len() as u32, req_seq);
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&json);
+    registry.send_bytes(conn_id, buf.freeze());
+}
+
+fn v2_cron_ack(
+    frame: &Bytes,
+    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+) {
+    let body = &frame[HEADER_SIZE..];
+    if let Some(view) = arbitro_proto::wire::cron::decode_cron_ack(body) {
+        cron_registry.ack(view.name, view.ok);
+    }
 }

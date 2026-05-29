@@ -71,9 +71,21 @@ pub enum Action {
     // dispatcher. Reserved; do not reuse the slots.
     Disconnect    = 0x0605,
 
-    // L1: 0x07xx (Stats / StatsReply) deleted — metrics travel via
-    // the per-shard `Metrics` command in arbitro-server, never as a
-    // wire frame. Reserved; do not reuse the family yet.
+    // 0x07xx — Cron scheduling
+    /// Register a cron job. JSON body: name, cron_expr, tz (optional).
+    /// Reply: RepOk on success.
+    CreateCron    = 0x0701,
+    /// Remove a cron job by name. Body: name bytes.
+    /// Reply: RepOk.
+    DeleteCron    = 0x0702,
+    /// List active cron jobs. No body.
+    /// Reply: RepOk with JSON array of cron definitions.
+    ListCrons     = 0x0703,
+    /// Broker→client: a cron job fired. Body: name + fire_time + fire_count.
+    CronFire      = 0x0704,
+    /// Client→broker: acknowledges cron fire execution.
+    /// Body: name + status (0=ok, 1=error).
+    CronAck       = 0x0705,
 }
 
 impl Action {
@@ -123,7 +135,12 @@ impl Action {
             0x0602 => Some(Self::Pong),
             // 0x0603, 0x0604 reserved (deleted Connect/Connected) — L1.
             0x0605 => Some(Self::Disconnect),
-            // 0x0701, 0x0702 reserved (deleted Stats/StatsReply) — L1.
+
+            0x0701 => Some(Self::CreateCron),
+            0x0702 => Some(Self::DeleteCron),
+            0x0703 => Some(Self::ListCrons),
+            0x0704 => Some(Self::CronFire),
+            0x0705 => Some(Self::CronAck),
 
             _ => None,
         }

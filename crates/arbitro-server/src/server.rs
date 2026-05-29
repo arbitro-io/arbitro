@@ -197,6 +197,16 @@ impl ArbitroServer {
             }))
         };
 
+        // Cron scheduler task — evaluates cron expressions every second
+        // and fires jobs to registered worker connections.
+        let cron_registry = std::sync::Arc::new(crate::cron::CronRegistry::new());
+        let cron_reg_clone = std::sync::Arc::clone(&cron_registry);
+        let cron_connections = self.registry.clone();
+        let cron_shutdown = shutdown_rx.clone();
+        let _cron_handle = tokio::spawn(async move {
+            crate::cron::cron_loop(cron_reg_clone, cron_connections, cron_shutdown).await;
+        });
+
         // H14: minimal HTTP /health endpoint. Enabled when
         // ARBITRO_HEALTH_LISTEN is set (e.g. "0.0.0.0:9090"); off by
         // default. Replies "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
@@ -300,8 +310,9 @@ impl ArbitroServer {
                                 let srv = accept_server.clone();
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
+                                let cron = cron_registry.clone();
                                 tokio::spawn(async move {
-                                    read_loop(conn_id, reader, srv, reg, sd, auth, max_frame_size, max_ops_per_sec).await;
+                                    read_loop(conn_id, reader, srv, reg, sd, auth, max_frame_size, max_ops_per_sec, cron).await;
                                 });
                             }
                             Err(e) => {
@@ -437,6 +448,7 @@ async fn read_loop(
     auth_token: Option<Arc<str>>,
     max_frame_size: usize,
     max_ops_per_sec: u32,
+    cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -546,7 +558,7 @@ async fn read_loop(
                 }
                 let frame = acc.split_to(total).freeze();
                 registry.touch(conn_id);
-                if dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry).await.is_err() {
+                if dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry, &cron_registry).await.is_err() {
                     tracing::warn!(conn_id, "malformed frame, dropping connection");
                     break 'outer;
                 }

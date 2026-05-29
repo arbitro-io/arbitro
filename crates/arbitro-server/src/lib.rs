@@ -24,6 +24,7 @@
 
 pub mod common;
 pub mod config;
+pub mod cron;
 pub mod lifecycle_trace;
 pub mod persistence;
 pub mod server;
