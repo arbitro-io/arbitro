@@ -14,7 +14,7 @@ pub struct SegmentMetadata {
 }
 
 pub fn segment_path(base: &Path, first_seq: u64) -> PathBuf {
-    base.join(format!("{:020}.log", first_seq))
+    base.join(format!("{first_seq:020}.log"))
 }
 
 pub fn create_active_segment(path: &Path) -> std::io::Result<MmapMut> {

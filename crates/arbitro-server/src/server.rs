@@ -344,7 +344,7 @@ impl ArbitroServer {
                 tokio::spawn(async move {
                     while sigusr1.recv().await.is_some() {
                         let pid = std::process::id();
-                        let path = format!("/tmp/arbitro-dump-{}.json", pid);
+                        let path = format!("/tmp/arbitro-dump-{pid}.json");
                         let dump = build_diagnostic_dump(&server_dump, &registry_dump).await;
                         match std::fs::write(&path, &dump) {
                             Ok(()) => tracing::info!(path = %path, "SIGUSR1 diagnostic dump written"),
