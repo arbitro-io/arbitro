@@ -19,17 +19,8 @@ pub enum ErrorCode {
     StreamNotFound      = 0x0201,
     StreamAlreadyExists = 0x0202,
     StreamFull          = 0x0203,
-    /// **Reserved — TODO §5.2.** Wire this when a CreateStream `filter`
-    /// would overlap an existing stream's filter (currently H1's
-    /// validators reject only single-stream subject pathologies, not
-    /// cross-stream overlap). Returned by a future `v2_create_stream`
-    /// branch in `dispatch_v2.rs`.
-    StreamFilterOverlap = 0x0204,
-    /// **Reserved — TODO §5.2.** Wire this on Subscribe / Publish to a
-    /// subject that does not match any registered stream's `filter`.
-    /// Currently such publishes silently drop into a "no_match" counter
-    /// and clients receive a RepOk.
-    SubjectNotFound     = 0x0205,
+    // 0x0204 reserved (deleted StreamFilterOverlap) — §5.2.
+    // 0x0205 reserved (deleted SubjectNotFound) — §5.2.
     /// Publish carried a `msg_id` that the broker has already seen for
     /// this stream within `idempotency_window_ms`. The message was not
     /// stored. Safe for the client to treat as a successful publish
@@ -39,32 +30,16 @@ pub enum ErrorCode {
     // 0x03xx — Consumer
     ConsumerNotFound       = 0x0301,
     ConsumerAlreadyExists  = 0x0302,
-    /// **Reserved — TODO §5.2.** Wire this when a new consumer's
-    /// `subject` filter overlaps an existing consumer's filter on the
-    /// same stream in a way that would violate exclusive/queue
-    /// semantics. Currently the catalog accepts the overlap and lets
-    /// match-table dedup handle it (see F32).
-    ConsumerFilterOverlap  = 0x0303,
+    // 0x0303 reserved (deleted ConsumerFilterOverlap) — §5.2.
+    /// The CreateConsumer request carries mutually incompatible fields
+    /// (e.g. `AckPolicy::None` + `max_inflight`, or `Fanout` + non-empty
+    /// `group`). The consumer was NOT created.
+    InvalidConsumerConfig  = 0x0304,
 
     // 0x04xx — Delivery
-    /// **Reserved — TODO §5.2.** Wire this when an Ack frame carries a
-    /// `seq` outside the consumer's in-flight high-water mark.
-    /// Currently such acks silently no-op via `ack_not_found`. Wiring
-    /// this lets the client detect a bookkeeping desync (e.g. after a
-    /// rewind race) early.
-    InvalidSequence     = 0x0401,
-    /// **Reserved — TODO §5.2.** Wire this on the publish reply path
-    /// when a consumer hit its `max_inflight` cap and the message is
-    /// being held (not dropped). Today the broker increments
-    /// `claim_skipped_max_inflight` and waits silently; clients have no
-    /// signal that they are throttled.
-    MaxInflightReached  = 0x0402,
-    /// **Reserved — TODO §5.2.** Wire this when the timing wheel fires
-    /// an ack-timeout and rolls the entry back. The client could use
-    /// this asynchronous signal to react (e.g. nack-and-retry) instead
-    /// of waiting for its own deadline. Today the wheel triggers an
-    /// internal nack with no client-visible event.
-    AckTimeout          = 0x0403,
+    // 0x0401 reserved (deleted InvalidSequence) — §5.2.
+    // 0x0402 reserved (deleted MaxInflightReached) — §5.2.
+    // 0x0403 reserved (deleted AckTimeout) — §5.2.
 
     // 0x05xx — System
     ServerShuttingDown  = 0x0501,
@@ -91,17 +66,15 @@ impl ErrorCode {
             0x0201 => Some(Self::StreamNotFound),
             0x0202 => Some(Self::StreamAlreadyExists),
             0x0203 => Some(Self::StreamFull),
-            0x0204 => Some(Self::StreamFilterOverlap),
-            0x0205 => Some(Self::SubjectNotFound),
+            // 0x0204, 0x0205 reserved (deleted §5.2).
             0x0206 => Some(Self::IdempotencyDuplicate),
 
             0x0301 => Some(Self::ConsumerNotFound),
             0x0302 => Some(Self::ConsumerAlreadyExists),
-            0x0303 => Some(Self::ConsumerFilterOverlap),
+            // 0x0303 reserved (deleted §5.2).
+            0x0304 => Some(Self::InvalidConsumerConfig),
 
-            0x0401 => Some(Self::InvalidSequence),
-            0x0402 => Some(Self::MaxInflightReached),
-            0x0403 => Some(Self::AckTimeout),
+            // 0x0401..=0x0403 reserved (deleted §5.2).
 
             0x0501 => Some(Self::ServerShuttingDown),
             0x0502 => Some(Self::InternalError),

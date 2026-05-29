@@ -427,15 +427,15 @@ async fn queue_group_distributes_messages() {
     let resp = client.create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // Two consumers with the SAME default group → same queue → round-robin
+    // Two consumers with the SAME group + deliver_mode=1 (Queue) → round-robin
     let resp = client
-        .create_consumer(stream_id, b"worker1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"worker1", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"worker2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"worker2", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -700,7 +700,7 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let cli_a = server.connect().await;
     let resp = cli_a
-        .create_consumer(stream_id, b"qoa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"qoa", b"qovlp-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid_a = TestServer::parse_id(&resp);
@@ -708,7 +708,7 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let cli_b = server.connect().await;
     let resp = cli_b
-        .create_consumer(stream_id, b"qob", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"qob", b"qovlp-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
@@ -821,18 +821,18 @@ async fn queue_group_multi_client() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // Two separate connections, each with its own consumer, same default group
+    // Two separate connections, each with its own consumer, same queue group
     let client1 = server.connect().await;
     let client2 = server.connect().await;
 
     let resp = client1
-        .create_consumer(stream_id, b"qw1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"qw1", b"qtasks-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client2
-        .create_consumer(stream_id, b"qw2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"qw2", b"qtasks-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -956,25 +956,25 @@ async fn queue_group_three_clients_100_msgs() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // 3 consumers on separate connections, same default group
+    // 3 consumers on separate connections, same queue group
     let cli0 = server.connect().await;
     let cli1 = server.connect().await;
     let cli2 = server.connect().await;
 
     let resp = cli0
-        .create_consumer(stream_id, b"q3w0", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"q3w0", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid0 = TestServer::parse_id(&resp);
 
     let resp = cli1
-        .create_consumer(stream_id, b"q3w1", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"q3w1", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = cli2
-        .create_consumer(stream_id, b"q3w2", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(stream_id, b"q3w2", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);

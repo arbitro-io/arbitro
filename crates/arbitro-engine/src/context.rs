@@ -12,6 +12,8 @@
 //! `InFlightCounters` (subject/consumer/queue credits), `EngineMetrics`
 //! (atomic counters for cross-thread observability).
 
+use std::sync::Arc;
+
 use crate::catalog::Catalog;
 use crate::inflight::InFlightCounters;
 use crate::metrics::EngineMetrics;
@@ -30,7 +32,10 @@ pub struct EngineContext {
 
     /// Atomic broker counters — the **only** permitted form of hot-path
     /// observability (`performance.md` §15).
-    pub metrics: EngineMetrics,
+    ///
+    /// Wrapped in `Arc` so the protocol layer can snapshot without routing
+    /// through the shard command channel (F9).
+    pub metrics: Arc<EngineMetrics>,
 }
 
 impl EngineContext {
@@ -39,7 +44,7 @@ impl EngineContext {
         Self {
             catalog: Catalog::new(),
             inflight: InFlightCounters::new(),
-            metrics: EngineMetrics::new(),
+            metrics: Arc::new(EngineMetrics::new()),
         }
     }
 }

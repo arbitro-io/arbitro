@@ -76,6 +76,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             // avoids a heap alloc per ack batch.
             let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+            let mut matched = 0u64;
             for bid in binding_ids {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
@@ -90,9 +91,14 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                                 .push((consumer_id.raw(), pending.subject_hash));
                             ctx.inflight
                                 .dec_pending(consumer_id.raw(), queue_raw);
+                            matched += 1;
                         }
                     }
                 }
+            }
+            let not_found = entries.len() as u64 - matched;
+            if not_found > 0 {
+                m.ack_not_found.fetch_add(not_found, Ordering::Relaxed);
             }
         }
 
@@ -107,6 +113,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             // F3+F4: SmallVec for binding ids.
             let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+            let mut matched = 0u64;
             for bid in binding_ids {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
@@ -121,9 +128,14 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                                 .push((consumer_id.raw(), pending.subject_hash));
                             ctx.inflight
                                 .dec_pending(consumer_id.raw(), queue_raw);
+                            matched += 1;
                         }
                     }
                 }
+            }
+            let not_found = entries.len() as u64 - matched;
+            if not_found > 0 {
+                m.nack_not_found.fetch_add(not_found, Ordering::Relaxed);
             }
         }
 

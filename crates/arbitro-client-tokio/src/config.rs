@@ -16,6 +16,9 @@ pub struct ClientConfig {
     pub keep_alive: KeepAlive,
     /// Bound for the writer mpsc (back-pressure threshold).
     pub write_queue_capacity: usize,
+    /// TLS configuration. `None` → plain TCP. Requires the `tls` feature.
+    #[cfg(feature = "tls")]
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for ClientConfig {
@@ -27,8 +30,24 @@ impl Default for ClientConfig {
             reconnect:            ReconnectPolicy::default(),
             keep_alive:           KeepAlive::default(),
             write_queue_capacity: 4096,
+            #[cfg(feature = "tls")]
+            tls:                  None,
         }
     }
+}
+
+/// TLS configuration for the client connection.
+///
+/// When provided, the client wraps the underlying TCP stream with a
+/// TLS layer using `tokio-rustls`. The server name is used for SNI
+/// and certificate verification.
+#[cfg(feature = "tls")]
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// Server name for SNI + cert verification (e.g. "broker.example.com").
+    pub server_name: String,
+    /// Accept invalid/self-signed certs. **Dangerous** — only for dev.
+    pub danger_accept_invalid_certs: bool,
 }
 
 /// Decorrelated-jitter backoff policy (AWS algorithm):

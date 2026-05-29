@@ -144,11 +144,13 @@ struct Inner {
     streams_name_by_wire: HashMap<u32, Vec<u8>, foldhash::fast::FixedState>,
     next_stream: u32,
 
-    /// Consumers are keyed by name because the wire never carries a
-    /// pre-computed consumer id — the server allocates one and the client
-    /// echoes it back. Re-creates with the same name return the same id.
-    /// Sparse key (arbitrary bytes) → foldhash.
-    consumers_by_name: HashMap<Vec<u8>, ConsumerId, foldhash::fast::FixedState>,
+    /// Consumers are keyed by `(stream_id, name)` because the wire never
+    /// carries a pre-computed consumer id — the server allocates one and
+    /// the client echoes it back. Re-creates with the same (stream, name)
+    /// pair return the same id. Namespacing by stream prevents two
+    /// consumers with identical names on different streams from aliasing
+    /// to the same ConsumerId (GAP-6).
+    consumers_by_name: HashMap<(StreamId, Vec<u8>), ConsumerId, foldhash::fast::FixedState>,
     /// Per-consumer queue mapping. Populated at create time so that
     /// `dispatch_subscribe` can recover the same queue id without parsing
     /// the (group-less) Subscribe wire body — guarantees that the binding
@@ -428,12 +430,14 @@ impl NameRegistry {
 
     // ── Consumers ──────────────────────────────────────────────────────────
 
-    /// Resolve `name` → `ConsumerId`, allocating a fresh sequential id the
-    /// first time the name is seen. The `created` flag is `true` only on
-    /// first allocation.
-    pub fn get_or_create_consumer(&self, name: &[u8]) -> (ConsumerId, bool) {
+    /// Resolve `(stream, name)` → `ConsumerId`, allocating a fresh
+    /// sequential id the first time the pair is seen. The `created` flag
+    /// is `true` only on first allocation. GAP-6: namespacing by stream
+    /// prevents cross-stream aliasing.
+    pub fn get_or_create_consumer(&self, stream: StreamId, name: &[u8]) -> (ConsumerId, bool) {
         self.with_inner_swap(|g| {
-            if let Some(&id) = g.consumers_by_name.get(name) {
+            let key = (stream, name.to_vec());
+            if let Some(&id) = g.consumers_by_name.get(&key) {
                 return (id, false);
             }
             // B1: same admission check as `get_or_create_stream`.
@@ -444,7 +448,7 @@ impl NameRegistry {
             }
             let id = ConsumerId(g.next_consumer);
             g.next_consumer += 1;
-            g.consumers_by_name.insert(name.to_vec(), id);
+            g.consumers_by_name.insert(key, id);
             // Reserve a slot in `consumer_stream` so future
             // `set_consumer_stream` writes can land directly. Until the
             // caller binds a stream, the slot stays UNSET.
@@ -456,23 +460,26 @@ impl NameRegistry {
         })
     }
 
-    /// Lookup only — returns `None` if the name has never been registered.
-    pub fn consumer_id(&self, name: &[u8]) -> Option<ConsumerId> {
+    /// Lookup only — returns `None` if the (stream, name) pair has never
+    /// been registered.
+    pub fn consumer_id(&self, stream: StreamId, name: &[u8]) -> Option<ConsumerId> {
+        let key = (stream, name.to_vec());
         self.inner
             .lock()
             .expect("name registry poisoned")
             .consumers_by_name
-            .get(name)
+            .get(&key)
             .copied()
     }
 
-    /// Drop a consumer mapping by NAME. Removes the wire-name→id mapping
-    /// and every reverse index keyed by that id, so a subsequent
-    /// `consumer_id(name)`, `consumer_queue(id)`, `consumer_stream(id)` or
-    /// `consumer_deliver_policy(id)` all return `None`.
-    pub fn remove_consumer(&self, name: &[u8]) -> Option<ConsumerId> {
+    /// Drop a consumer mapping by (stream, name). Removes the composite
+    /// key→id mapping and every reverse index keyed by that id, so a
+    /// subsequent `consumer_id`, `consumer_queue`, `consumer_stream` or
+    /// `consumer_deliver_policy` all return `None`.
+    pub fn remove_consumer(&self, stream: StreamId, name: &[u8]) -> Option<ConsumerId> {
         self.with_inner_swap(|g| {
-            let removed = g.consumers_by_name.remove(name)?;
+            let key = (stream, name.to_vec());
+            let removed = g.consumers_by_name.remove(&key)?;
             g.consumer_queue.remove(&removed);
             if let Some(slot) = g.consumer_stream.get_mut(removed.0 as usize) {
                 *slot = CONSUMER_STREAM_UNSET;
@@ -504,13 +511,14 @@ impl NameRegistry {
             .collect()
     }
 
-    /// Drop a consumer mapping by ID.
+    /// Drop a consumer mapping by ID (reverse lookup).
     pub fn remove_consumer_by_id(&self, id: ConsumerId) -> Option<Vec<u8>> {
         self.with_inner_swap(|g| {
-            let name = g.consumers_by_name
+            let key = g.consumers_by_name
                 .iter()
-                .find_map(|(n, &v)| if v == id { Some(n.clone()) } else { None })?;
-            g.consumers_by_name.remove(&name);
+                .find_map(|(k, &v)| if v == id { Some(k.clone()) } else { None })?;
+            let name = key.1.clone();
+            g.consumers_by_name.remove(&key);
             g.consumer_queue.remove(&id);
             if let Some(slot) = g.consumer_stream.get_mut(id.0 as usize) {
                 *slot = CONSUMER_STREAM_UNSET;
@@ -690,29 +698,34 @@ mod tests {
     #[test]
     fn consumer_queue_round_trips() {
         let r = NameRegistry::new();
-        let (c, _) = r.get_or_create_consumer(b"alice");
-        let q = r.get_or_create_queue(StreamId(0), b"workers");
+        let s = StreamId(0);
+        let (c, _) = r.get_or_create_consumer(s, b"alice");
+        let q = r.get_or_create_queue(s, b"workers");
         r.set_consumer_queue(c, q);
         assert_eq!(r.consumer_queue(c), Some(q));
         // Removing the consumer also drops the queue association.
-        r.remove_consumer(b"alice");
+        r.remove_consumer(s, b"alice");
         assert_eq!(r.consumer_queue(c), None);
     }
 
     #[test]
-    fn consumers_are_sequential_by_name() {
+    fn consumers_are_sequential_by_stream_name() {
         let r = NameRegistry::new();
-        assert_eq!(r.get_or_create_consumer(b"alice"), (ConsumerId(1), true));
-        assert_eq!(r.get_or_create_consumer(b"bob"), (ConsumerId(2), true));
-        assert_eq!(r.get_or_create_consumer(b"alice"), (ConsumerId(1), false));
-        assert_eq!(r.consumer_id(b"alice"), Some(ConsumerId(1)));
+        let s = StreamId(0);
+        assert_eq!(r.get_or_create_consumer(s, b"alice"), (ConsumerId(1), true));
+        assert_eq!(r.get_or_create_consumer(s, b"bob"), (ConsumerId(2), true));
+        assert_eq!(r.get_or_create_consumer(s, b"alice"), (ConsumerId(1), false));
+        assert_eq!(r.consumer_id(s, b"alice"), Some(ConsumerId(1)));
+        // GAP-6: same name on a different stream → different ConsumerId.
+        let s2 = StreamId(1);
+        assert_eq!(r.get_or_create_consumer(s2, b"alice"), (ConsumerId(3), true));
     }
 
     #[test]
     fn consumer_stream_lookup_is_lock_free_round_trip() {
         let r = NameRegistry::new();
-        let (c, _) = r.get_or_create_consumer(b"alice");
         let s = StreamId(7);
+        let (c, _) = r.get_or_create_consumer(s, b"alice");
         r.set_consumer_stream(c, s);
         assert_eq!(r.consumer_stream(c), Some(s));
         assert_eq!(r.consumer_stream(ConsumerId(999)), None);
@@ -721,10 +734,10 @@ mod tests {
     #[test]
     fn consumers_for_stream_via_dense_index() {
         let r = NameRegistry::new();
-        let (c1, _) = r.get_or_create_consumer(b"alice");
-        let (c2, _) = r.get_or_create_consumer(b"bob");
-        let (c3, _) = r.get_or_create_consumer(b"carol");
         let s = StreamId(3);
+        let (c1, _) = r.get_or_create_consumer(s, b"alice");
+        let (c2, _) = r.get_or_create_consumer(StreamId(4), b"bob");
+        let (c3, _) = r.get_or_create_consumer(s, b"carol");
         r.set_consumer_stream(c1, s);
         r.set_consumer_stream(c2, StreamId(4));
         r.set_consumer_stream(c3, s);

@@ -348,10 +348,15 @@ impl CommandWorker {
 
         let stream_ok =
             self.engine.create_stream(cmd.stream_config).is_ok();
-        let consumer_ok = self
-            .engine
-            .create_consumer(cmd.consumer_config)
-            .is_ok();
+        // Subscribe's ensure-consumer is best-effort — if the consumer
+        // already exists (from a prior CreateConsumer), just proceed
+        // regardless of config differences. ConfigMismatch only matters
+        // for explicit CreateConsumer requests.
+        let consumer_ok = match self.engine.create_consumer(cmd.consumer_config) {
+            Ok(_) => true,
+            Err(e) if e.code() == arbitro_engine_v2::error::ErrorCode::ConsumerConfigMismatch => true,
+            Err(_) => false,
+        };
         let sub_ok = self
             .engine
             .create_subscription(cmd.subscription_config)
@@ -384,6 +389,8 @@ impl CommandWorker {
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
                 if let Some(write_tx) = self.registry.get_write_tx(connection_id.0) {
+                    let write_failed = self.registry.get_write_failed(connection_id.0)
+                        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
                     self.bindings.push(ActiveBinding {
                         binding_id,
                         connection_id,
@@ -394,6 +401,7 @@ impl CommandWorker {
                         fire_and_forget,
                         ack_wait_ms,
                         write_tx,
+                        write_failed,
                     });
                 }
 
@@ -535,15 +543,27 @@ impl CommandWorker {
         cmd: CreateConsumerCmd,
     ) {
         let stream_id = cmd.config.stream_id;
-        let ok = self.engine.create_consumer(cmd.config).is_ok();
-        if ok {
-            for (pattern, limit) in &cmd.max_subject_inflights {
-                let _ = self.engine.set_max_subject_inflight(
-                    stream_id, pattern, *limit,
-                );
+        match self.engine.create_consumer(cmd.config) {
+            Ok(true) => {
+                // Newly created — apply subject limits.
+                for (pattern, limit) in &cmd.max_subject_inflights {
+                    let _ = self.engine.set_max_subject_inflight(
+                        stream_id, pattern, *limit,
+                    );
+                }
+                let _ = cmd.reply.send(1); // created
+            }
+            Ok(false) => {
+                // Already existed, same config — idempotent.
+                let _ = cmd.reply.send(0);
+            }
+            Err(e) if e.code() == arbitro_engine_v2::error::ErrorCode::ConsumerConfigMismatch => {
+                let _ = cmd.reply.send(2); // config mismatch
+            }
+            Err(_) => {
+                let _ = cmd.reply.send(2); // other error → treat as rejection
             }
         }
-        let _ = cmd.reply.send(ok);
     }
 
     pub(in crate::shard) fn handle_delete_consumer(
@@ -645,6 +665,8 @@ impl CommandWorker {
                 .unwrap_or(0);
 
             if let Some(write_tx) = self.registry.get_write_tx(cmd.connection_id.0) {
+                let write_failed = self.registry.get_write_failed(cmd.connection_id.0)
+                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
                 self.bindings.push(ActiveBinding {
                     binding_id,
                     connection_id: cmd.connection_id,
@@ -655,6 +677,7 @@ impl CommandWorker {
                     fire_and_forget,
                     ack_wait_ms,
                     write_tx,
+                    write_failed,
                 });
             }
 
@@ -821,14 +844,29 @@ impl CommandWorker {
         let cap_end = start.saturating_add(Self::EVICT_WALK_CAP);
         let end = cap_end.min(info.last_seq.saturating_add(1));
 
+        // F16 oldest_ts cache: pre-resolve streams whose cached oldest
+        // timestamp is already past the cutoff — they have no expired
+        // entries and can be skipped entirely.
+        let mut resolved = vec![false; max_stream_idx + 1];
+        for (sid, r) in &self.stream_retention {
+            let idx = sid.raw() as usize;
+            if idx < resolved.len() && r.max_age_ms > 0 {
+                if let Some(&cached_ts) = self.stream_oldest_ts.get(sid) {
+                    if cached_ts >= cutoff_ts[idx] {
+                        resolved[idx] = true; // skip: all entries are fresh
+                    }
+                }
+            }
+        }
+
         // Single pass: find the minimum first-valid seq across all streams.
         // For streams with max_age: first entry with timestamp >= cutoff.
         // For streams without max_age (cutoff_ts == 0): their first entry
         // is always valid and constrains truncation.
         let mut min_valid_seq: u64 = 0;
-        // Track which streams we've already resolved (found first valid entry).
-        let mut resolved = vec![false; max_stream_idx + 1];
 
+        // Collect oldest_ts updates in a local vec to avoid borrow conflict.
+        let mut ts_updates: Vec<(u32, u64)> = Vec::new();
         let _ = store.for_each(start, end, &mut |entry| {
             let sid = entry.stream_id as usize;
             if sid >= resolved.len() {
@@ -850,14 +888,20 @@ impl CommandWorker {
                     min_valid_seq = entry.seq;
                 }
             } else if entry.timestamp >= stream_cutoff {
-                // First non-expired entry for this stream.
+                // First non-expired entry for this stream — cache its ts.
                 resolved[sid] = true;
+                ts_updates.push((sid as u32, entry.timestamp));
                 if min_valid_seq == 0 || entry.seq < min_valid_seq {
                     min_valid_seq = entry.seq;
                 }
             }
             // else: entry is expired for this stream, keep scanning.
         });
+
+        // F16: apply oldest_ts cache updates collected during the walk.
+        for (sid_raw, ts) in ts_updates {
+            self.stream_oldest_ts.insert(StreamId::new(sid_raw), ts);
+        }
 
         // Truncate if we found a valid boundary past current first_seq.
         if min_valid_seq > info.first_seq {
@@ -868,6 +912,9 @@ impl CommandWorker {
                     new_first_seq = min_valid_seq,
                     "evict_expired: truncated aged entries"
                 );
+                // Invalidate oldest_ts cache for streams that had entries
+                // truncated — next eviction will re-scan and re-cache.
+                self.stream_oldest_ts.clear();
             }
             // Restart at the new front next time.
             self.evict_resume_seq = 0;

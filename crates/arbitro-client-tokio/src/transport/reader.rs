@@ -13,8 +13,7 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::AsyncReadExt;
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use zerocopy::FromBytes;
 
@@ -37,8 +36,8 @@ fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
-pub(crate) async fn reader_task(
-    mut r:  OwnedReadHalf,
+pub(crate) async fn reader_task<R: AsyncRead + Unpin>(
+    mut r:  R,
     inner:  Arc<Inner>,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {

@@ -291,6 +291,79 @@ async fn batch_with_internal_duplicate_is_rejected() {
     server.shutdown().await;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Cross-restart contract
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// T9. The idempotency dedup state is in-memory only. After a server
+/// restart, previously-recorded msg_ids are lost — re-publishing the
+/// same msg_id must succeed. This documents the explicit contract:
+/// **dedup does NOT survive restarts** (no disk persistence for the
+/// dedup window). Clients that need cross-restart exactly-once must
+/// implement their own producer-side dedup above the wire protocol.
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_restart_dedup_state_is_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    // ── First boot: publish with a msg_id, confirm dedup rejects it ──
+    {
+        let mut server = TestServerBuilder::new()
+            .data_dir(dir_str)
+            .spawn()
+            .await;
+        let client = server.connect().await;
+
+        let resp = client
+            .create_stream(b"persistent", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap();
+        let stream_id = TestServer::parse_id(&resp);
+
+        client
+            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1"))
+            .await
+            .expect("first publish must succeed");
+
+        // Within the same session, the duplicate must be rejected.
+        let err = client
+            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1-dup"))
+            .await
+            .expect_err("duplicate within same session");
+        assert!(is_duplicate(&err));
+
+        server.shutdown().await;
+    }
+
+    // ── Second boot: same data_dir (metadata restored) ───────────────
+    {
+        let mut server = TestServerBuilder::new()
+            .data_dir(dir_str)
+            .spawn()
+            .await;
+        let client = server.connect().await;
+
+        // The stream should exist (metadata restored from command log).
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        assert_eq!(TestServer::stream_count(&resp), 1, "stream must survive restart");
+
+        let stream_id = TestServer::find_stream_id(&resp, b"persistent")
+            .expect("must find stream by name after restart");
+
+        // The same msg_id that was rejected in the first session must
+        // now be ACCEPTED — dedup state is ephemeral.
+        client
+            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v2"))
+            .await
+            .expect(
+                "cross-restart dedup state must be empty; the broker \
+                 does NOT persist the idempotency window to disk"
+            );
+
+        server.shutdown().await;
+    }
+}
+
 /// On a stream with dedup enabled, mixing entries WITH and WITHOUT
 /// msg_id is allowed. The empty-id entries are never deduped; the
 /// id-bearing ones are. A duplicate in only the id-bearing entries

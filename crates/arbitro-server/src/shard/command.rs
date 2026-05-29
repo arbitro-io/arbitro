@@ -4,7 +4,7 @@
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
-use arbitro_engine_v2::{ConsumerStateSnapshot, MetricsSnapshot};
+use arbitro_engine_v2::ConsumerStateSnapshot;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
@@ -55,7 +55,6 @@ pub enum ShardCommand {
     ListStreams(ListStreamsCmd),
     ListConsumers(ListConsumersCmd),
     StoreInfo(StoreInfoCmd),
-    Metrics(MetricsCmd),
     ConsumerStates(ConsumerStatesCmd),
     ConsumerPending(ConsumerPendingCmd),
 
@@ -164,11 +163,15 @@ pub struct DeleteStreamCmd {
 
 // ── Consumer management ─────────────────────────────────────────────────────
 
+/// CreateConsumer reply codes:
+/// - `0` = consumer already existed (same config — idempotent)
+/// - `1` = newly created
+/// - `2` = consumer already exists with different config (GAP-3)
 pub struct CreateConsumerCmd {
     pub config: ConsumerConfig,
     /// Per-subject inflight limits: (pattern, limit). Applied after consumer creation.
     pub max_subject_inflights: Vec<(Vec<u8>, u32)>,
-    pub reply: oneshot::Sender<bool>,
+    pub reply: oneshot::Sender<u8>,
 }
 
 pub struct DeleteConsumerCmd {
@@ -204,13 +207,6 @@ pub struct StoreInfoCmd {
 pub struct StoreInfoReply {
     pub messages: u64,
     pub bytes: u64,
-}
-
-/// Snapshot the shard's engine-level atomic counters. Cheap — just
-/// `Relaxed` loads on the same struct; no roundtrip cost beyond the
-/// channel hop.
-pub struct MetricsCmd {
-    pub reply: oneshot::Sender<MetricsSnapshot>,
 }
 
 /// Snapshot every consumer's live state on this shard (id, stream, queue,

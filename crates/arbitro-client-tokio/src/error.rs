@@ -51,6 +51,11 @@ pub enum ClientError {
     /// `DeliverPolicy::ByStartSeq` without a non-zero `start_seq`, etc.
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    /// TLS handshake or configuration error (only with `tls` feature).
+    #[cfg(feature = "tls")]
+    #[error("tls: {0}")]
+    Tls(String),
 }
 
 impl From<ProtoError> for ClientError {

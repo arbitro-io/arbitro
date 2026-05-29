@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arbitro_kit::route::MpscAsyncConsumer;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -21,6 +21,57 @@ use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
 
+/// Connect a raw `TcpStream` and optionally wrap it with TLS.
+///
+/// Returns `(read_half, write_half)` as boxed trait objects so the
+/// caller doesn't need separate generic paths for plain / TLS.
+async fn dial(
+    inner: &Inner,
+) -> Result<
+    (
+        Box<dyn AsyncRead + Unpin + Send>,
+        Box<dyn AsyncWrite + Unpin + Send>,
+    ),
+    ClientError,
+> {
+    let tcp = TcpStream::connect(&inner.cfg.addr).await?;
+
+    #[cfg(feature = "tls")]
+    {
+        if let Some(ref tls_cfg) = inner.cfg.tls {
+            use tokio_rustls::TlsConnector;
+
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let mut config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            if tls_cfg.danger_accept_invalid_certs {
+                config
+                    .dangerous()
+                    .set_certificate_verifier(Arc::new(danger::NoCertVerifier));
+            }
+
+            let connector = TlsConnector::from(Arc::new(config));
+            let domain = rustls::pki_types::ServerName::try_from(
+                tls_cfg.server_name.clone(),
+            )
+            .map_err(|_| ClientError::Tls("invalid server name".into()))?;
+
+            let tls_stream = connector.connect(domain, tcp).await
+                .map_err(|e| ClientError::Tls(e.to_string()))?;
+
+            let (r, w) = tokio::io::split(tls_stream);
+            return Ok((Box::new(r), Box::new(w)));
+        }
+    }
+
+    // Plain TCP — split into owned halves.
+    let (r, w) = tcp.into_split();
+    Ok((Box::new(r), Box::new(w)))
+}
+
 /// Spawn the background connection loop.
 ///
 /// Establishes the first TCP connection + handshake before returning so
@@ -31,17 +82,16 @@ pub(crate) async fn spawn_connection(
     inner:    Arc<Inner>,
 ) -> Result<(), ClientError> {
     // Initial connection — fast failure path.
-    let first = TcpStream::connect(&inner.cfg.addr).await?;
-    let (read_h, mut write_h) = first.into_split();
-    write_handshake(&mut write_h).await?;
+    let (r, mut w) = dial(&inner).await?;
+    write_handshake(&mut w).await?;
     // Replay any subscriptions (none on first connect — future-proofs reconnect).
     replay_subscriptions(&inner);
 
     let cancel = inner.cancel.clone();
     tokio::spawn(async move {
         let mut consumer = consumer;
-        let mut wh = Some(write_h);
-        let mut rh = Some(read_h);
+        let mut wh: Option<Box<dyn AsyncWrite + Unpin + Send>> = Some(w);
+        let mut rh: Option<Box<dyn AsyncRead  + Unpin + Send>> = Some(r);
         let mut back = Backoff::new(&inner.cfg.reconnect);
 
         loop {
@@ -77,9 +127,8 @@ pub(crate) async fn spawn_connection(
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(delay) => {}
                 }
-                match TcpStream::connect(&inner.cfg.addr).await {
-                    Ok(s) => {
-                        let (r, mut w) = s.into_split();
+                match dial(&inner).await {
+                    Ok((r, mut w)) => {
                         if let Err(e) = write_handshake(&mut w).await {
                             warn!(?e, "handshake write failed");
                             continue;
@@ -103,8 +152,8 @@ pub(crate) async fn spawn_connection(
 }
 
 /// Write the v2 Hello handshake frame.
-async fn write_handshake(
-    w: &mut tokio::net::tcp::OwnedWriteHalf,
+async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
 ) -> Result<(), ClientError> {
     let hello = encode_hello_v2(Role::Client);
     w.write_all(&hello).await?;
@@ -131,13 +180,17 @@ fn replay_subscriptions(inner: &Inner) {
 
 /// Run writer + reader + heartbeat concurrently under a child token.
 /// Returns when the first of the three finishes (error or clean exit).
-async fn run_session(
+async fn run_session<W, R>(
     consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    w:        tokio::net::tcp::OwnedWriteHalf,
-    r:        tokio::net::tcp::OwnedReadHalf,
+    w:        W,
+    r:        R,
     inner:    Arc<Inner>,
     cancel:   CancellationToken,
-) -> Result<(), ClientError> {
+) -> Result<(), ClientError>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead  + Unpin + Send + 'static,
+{
     let cfg_ka = inner.cfg.keep_alive.clone();
 
     let inner_r  = Arc::clone(&inner);
@@ -162,6 +215,54 @@ async fn run_session(
         r = heartbeat_task(inner_hb, cfg_ka, cancel_hb) => {
             cancel.cancel();
             r
+        }
+    }
+}
+
+// ── TLS: danger_accept_invalid_certs verifier ─────────────────────────
+#[cfg(feature = "tls")]
+mod danger {
+    /// Certificate verifier that accepts **any** server certificate.
+    ///
+    /// Only enabled when `TlsConfig::danger_accept_invalid_certs` is `true`
+    /// — intended for development / testing with self-signed certs.
+    #[derive(Debug)]
+    pub(super) struct NoCertVerifier;
+
+    impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 }

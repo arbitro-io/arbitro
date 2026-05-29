@@ -21,14 +21,12 @@ use arbitro_proto::v2::header::{Header, HEADER_SIZE as HEADER_SIZE_V2};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, HELLO_FRAME_SIZE};
 use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
 
-const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024; // 64 MB
-
 use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
-use crate::transport::registry::{BoxedReader, BoxedWriter};
+use crate::transport::registry::{ConnReader, ConnWriter};
 use crate::transport::ConnectionRegistry;
 use crate::transport::dispatch_v2;
 
@@ -247,6 +245,8 @@ impl ArbitroServer {
         let auth_token_shared: Option<Arc<str>> = self.config.auth_token
             .as_deref()
             .map(Arc::from);
+        let max_frame_size = self.config.max_frame_size;
+        let max_ops_per_sec = self.config.max_ops_per_sec;
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -262,8 +262,8 @@ impl ArbitroServer {
 
                                 let _ = stream.set_nodelay(true);
 
-                                // Split into reader/writer — boxed for TLS/plain uniformity.
-                                let (reader, writer): (BoxedReader, BoxedWriter);
+                                // F36: split into reader/writer — monomorphic enum.
+                                let (reader, writer): (ConnReader, ConnWriter);
 
                                 #[cfg(feature = "tls")]
                                 {
@@ -271,8 +271,8 @@ impl ArbitroServer {
                                         match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
                                                 let (r, w) = tokio::io::split(tls_stream);
-                                                reader = Box::new(r);
-                                                writer = Box::new(w);
+                                                reader = ConnReader::Tls(r);
+                                                writer = ConnWriter::Tls(w);
                                             }
                                             Err(e) => {
                                                 tracing::debug!(%addr, error = %e, "TLS handshake failed");
@@ -281,16 +281,16 @@ impl ArbitroServer {
                                         }
                                     } else {
                                         let (r, w) = stream.into_split();
-                                        reader = Box::new(r);
-                                        writer = Box::new(w);
+                                        reader = ConnReader::Plain(r);
+                                        writer = ConnWriter::Plain(w);
                                     }
                                 }
 
                                 #[cfg(not(feature = "tls"))]
                                 {
                                     let (r, w) = stream.into_split();
-                                    reader = Box::new(r);
-                                    writer = Box::new(w);
+                                    reader = ConnReader::Plain(r);
+                                    writer = ConnWriter::Plain(w);
                                 }
 
                                 let conn_id = accept_registry.register(writer);
@@ -301,7 +301,7 @@ impl ArbitroServer {
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
                                 tokio::spawn(async move {
-                                    read_loop(conn_id, reader, srv, reg, sd, auth).await;
+                                    read_loop(conn_id, reader, srv, reg, sd, auth, max_frame_size, max_ops_per_sec).await;
                                 });
                             }
                             Err(e) => {
@@ -430,16 +430,24 @@ impl ArbitroServer {
 /// 4. Drain `Header`-prefixed v2 frames from the accumulator forever.
 async fn read_loop(
     conn_id: u64,
-    mut reader: BoxedReader,
+    mut reader: ConnReader,
     server: ShardRouter,
     registry: ConnectionRegistry,
     mut shutdown: watch::Receiver<bool>,
     auth_token: Option<Arc<str>>,
+    max_frame_size: usize,
+    max_ops_per_sec: u32,
 ) {
     use tokio::io::AsyncReadExt;
 
     const INITIAL_CAP: usize = 64 * 1024;
     let mut acc = BytesMut::with_capacity(INITIAL_CAP);
+
+    // Per-connection rate limiter — simple token bucket.
+    // tokens_remaining is refilled every second. When 0, the loop sleeps
+    // until the next refill window. 0 = unlimited (no limiter).
+    let mut tokens_remaining: u32 = max_ops_per_sec;
+    let mut window_start = tokio::time::Instant::now();
 
     // Per-connection HELLO state. Connection is closed if the first 4
     // bytes are not the v2 magic.
@@ -527,8 +535,8 @@ async fn read_loop(
                     acc[4], acc[5], acc[6], acc[7],
                 ]) as usize;
                 
-                if msg_len > MAX_FRAME_SIZE {
-                    tracing::warn!(conn_id, msg_len, "frame exceeds MAX_FRAME_SIZE, dropping connection");
+                if msg_len > max_frame_size {
+                    tracing::warn!(conn_id, msg_len, max_frame_size, "frame exceeds max_frame_size, dropping connection");
                     break 'outer;
                 }
                 
@@ -541,6 +549,20 @@ async fn read_loop(
                 if dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry).await.is_err() {
                     tracing::warn!(conn_id, "malformed frame, dropping connection");
                     break 'outer;
+                }
+
+                // Rate limit: if max_ops_per_sec > 0, consume a token.
+                if max_ops_per_sec > 0 {
+                    if tokens_remaining == 0 {
+                        // Wait until the current 1-second window expires.
+                        let elapsed = window_start.elapsed();
+                        if elapsed < std::time::Duration::from_secs(1) {
+                            tokio::time::sleep(std::time::Duration::from_secs(1) - elapsed).await;
+                        }
+                        window_start = tokio::time::Instant::now();
+                        tokens_remaining = max_ops_per_sec;
+                    }
+                    tokens_remaining -= 1;
                 }
             }
         }
@@ -582,7 +604,7 @@ async fn read_loop(
 
 fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
     let frame = RepErrFrame::new(0, 0, ErrorCode::ServerShuttingDown.as_u16());
-    registry.send_parts(conn_id, &[frame.as_bytes()]);
+    registry.send_inline(conn_id, frame.as_bytes());
 }
 
 /// Send a single RepError frame with the given error code. Used by the
@@ -591,7 +613,7 @@ fn send_shutdown_frame(registry: &ConnectionRegistry, conn_id: u64) {
 /// server-side shutdown. H2.
 fn send_error_frame(registry: &ConnectionRegistry, conn_id: u64, code: ErrorCode) {
     let frame = RepErrFrame::new(0, 0, code.as_u16());
-    registry.send_parts(conn_id, &[frame.as_bytes()]);
+    registry.send_inline(conn_id, frame.as_bytes());
 }
 
 /// M1: per-data-dir marker recording the `shard_count` the broker
@@ -691,7 +713,7 @@ async fn keepalive_loop(
 /// are eventually evicted by the idle-timeout sweep.
 fn send_ping(registry: &ConnectionRegistry, conn_id: u64) {
     let header = Header::new(Action::Ping.as_u16(), 0, 0);
-    registry.send_parts(conn_id, &[header.as_bytes()]);
+    registry.send_inline(conn_id, header.as_bytes());
 }
 
 /// Walk every shard, enumerate streams and consumers, and log a single
@@ -825,32 +847,32 @@ async fn metrics_loop(
         // Aggregate across all shards.
         let mut acc = MetricsSnapshot::default();
         for i in 0..server.shard_count() {
-            if let Ok(snap) = server.shard(i).metrics().await {
-                acc.publish_entries_accepted   += snap.publish_entries_accepted;
-                acc.publish_duplicates_skipped += snap.publish_duplicates_skipped;
-                acc.publish_no_match           += snap.publish_no_match;
-                acc.publish_queues_pushed      += snap.publish_queues_pushed;
-                acc.publish_fanout_notified    += snap.publish_fanout_notified;
-                // L11: catch up the previously-unaggregated fields so
-                // dashboards see the full set of engine counters.
-                acc.claim_batches              += snap.claim_batches;
-                acc.claim_entries_delivered    += snap.claim_entries_delivered;
-                acc.claim_skipped_consumer_paused += snap.claim_skipped_consumer_paused;
-                acc.claim_skipped_max_inflight += snap.claim_skipped_max_inflight;
-                acc.claim_skipped_subject_limit += snap.claim_skipped_subject_limit;
-                acc.claim_skipped_credit_conn  += snap.claim_skipped_credit_conn;
-                acc.claim_skipped_credit_subject += snap.claim_skipped_credit_subject;
-                acc.claim_empty_pop            += snap.claim_empty_pop;
-                acc.ack_accepted               += snap.ack_accepted;
-                acc.ack_not_found              += snap.ack_not_found;
-                acc.nack_accepted              += snap.nack_accepted;
-                acc.seed_entries               += snap.seed_entries;
-                acc.seed_queues_pushed         += snap.seed_queues_pushed;
-                acc.seed_no_match              += snap.seed_no_match;
-                acc.drain_pending_removed      += snap.drain_pending_removed;
-                acc.drain_connections          += snap.drain_connections;
-                acc.drain_consumers            += snap.drain_consumers;
-            }
+            let snap = server.shard(i).metrics();
+            acc.publish_entries_accepted   += snap.publish_entries_accepted;
+            acc.publish_duplicates_skipped += snap.publish_duplicates_skipped;
+            acc.publish_no_match           += snap.publish_no_match;
+            acc.publish_queues_pushed      += snap.publish_queues_pushed;
+            acc.publish_fanout_notified    += snap.publish_fanout_notified;
+            // L11: catch up the previously-unaggregated fields so
+            // dashboards see the full set of engine counters.
+            acc.claim_batches              += snap.claim_batches;
+            acc.claim_entries_delivered    += snap.claim_entries_delivered;
+            acc.claim_skipped_consumer_paused += snap.claim_skipped_consumer_paused;
+            acc.claim_skipped_max_inflight += snap.claim_skipped_max_inflight;
+            acc.claim_skipped_subject_limit += snap.claim_skipped_subject_limit;
+            acc.claim_skipped_credit_conn  += snap.claim_skipped_credit_conn;
+            acc.claim_skipped_credit_subject += snap.claim_skipped_credit_subject;
+            acc.claim_empty_pop            += snap.claim_empty_pop;
+            acc.ack_accepted               += snap.ack_accepted;
+            acc.ack_not_found              += snap.ack_not_found;
+            acc.nack_accepted              += snap.nack_accepted;
+            acc.nack_not_found             += snap.nack_not_found;
+            acc.seed_entries               += snap.seed_entries;
+            acc.seed_queues_pushed         += snap.seed_queues_pushed;
+            acc.seed_no_match              += snap.seed_no_match;
+            acc.drain_pending_removed      += snap.drain_pending_removed;
+            acc.drain_connections          += snap.drain_connections;
+            acc.drain_consumers            += snap.drain_consumers;
         }
 
         // Counts of active entities and current saturation gauges.
@@ -1044,11 +1066,14 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
     let mut total_ack_pending = 0u64;
     for i in 0..server.shard_count() {
         let shard = server.shard(i);
-        if let Ok(snap) = shard.metrics().await {
+        {
+            let snap = shard.metrics();
             let _ = writeln!(out, "arbitro_publish_total{{shard=\"{i}\"}} {}", snap.publish_entries_accepted);
             let _ = writeln!(out, "arbitro_deliver_total{{shard=\"{i}\"}} {}", snap.claim_entries_delivered);
             let _ = writeln!(out, "arbitro_ack_total{{shard=\"{i}\"}} {}", snap.ack_accepted);
+            let _ = writeln!(out, "arbitro_ack_not_found_total{{shard=\"{i}\"}} {}", snap.ack_not_found);
             let _ = writeln!(out, "arbitro_nack_total{{shard=\"{i}\"}} {}", snap.nack_accepted);
+            let _ = writeln!(out, "arbitro_nack_not_found_total{{shard=\"{i}\"}} {}", snap.nack_not_found);
         }
         if let Ok(r) = shard.list_streams().await {
             total_streams += r.streams.len();
@@ -1110,12 +1135,13 @@ async fn build_diagnostic_dump(
     use arbitro_engine_v2::MetricsSnapshot;
     let mut acc = MetricsSnapshot::default();
     for i in 0..server.shard_count() {
-        if let Ok(snap) = server.shard(i).metrics().await {
-            acc.publish_entries_accepted += snap.publish_entries_accepted;
-            acc.claim_entries_delivered += snap.claim_entries_delivered;
-            acc.ack_accepted += snap.ack_accepted;
-            acc.nack_accepted += snap.nack_accepted;
-        }
+        let snap = server.shard(i).metrics();
+        acc.publish_entries_accepted += snap.publish_entries_accepted;
+        acc.claim_entries_delivered += snap.claim_entries_delivered;
+        acc.ack_accepted += snap.ack_accepted;
+        acc.ack_not_found += snap.ack_not_found;
+        acc.nack_accepted += snap.nack_accepted;
+        acc.nack_not_found += snap.nack_not_found;
     }
     let drops = server.silent_drops().snapshot();
     let mut streams = 0usize;
@@ -1155,7 +1181,8 @@ async fn build_diagnostic_dump(
          \"stream_messages\":{tm},\"stream_bytes\":{tb},\
          \"publish_entries_accepted\":{pub_in},\
          \"claim_entries_delivered\":{dl},\
-         \"ack_accepted\":{ak},\"nack_accepted\":{nk},\
+         \"ack_accepted\":{ak},\"ack_not_found\":{anf},\
+         \"nack_accepted\":{nk},\"nack_not_found\":{nnf},\
          \"silent_drops\":{{\"conn_write\":{cw},\"notify_ring\":{nr},\"drain_evt\":{de}}},\
          \"per_stream\":[{ps}]}}",
         pid = std::process::id(),
@@ -1171,7 +1198,9 @@ async fn build_diagnostic_dump(
         pub_in = acc.publish_entries_accepted,
         dl = acc.claim_entries_delivered,
         ak = acc.ack_accepted,
+        anf = acc.ack_not_found,
         nk = acc.nack_accepted,
+        nnf = acc.nack_not_found,
         cw = drops.conn_write,
         nr = drops.notify_ring,
         de = drops.drain_evt,

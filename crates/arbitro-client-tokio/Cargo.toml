@@ -6,6 +6,10 @@ license.workspace = true
 
 description = "Pure-tokio Arbitro client built on arbitro-kit primitives (Mpsc, OneShotAsync, Pipe, Hub) with reconnect state machine + heartbeat watchdog."
 
+[features]
+default = []
+tls = ["tokio-rustls", "rustls", "webpki-roots"]
+
 [dependencies]
 arbitro-proto      = { path = "../arbitro-proto" }
 arbitro-engine-v2  = { workspace = true }
@@ -17,6 +21,11 @@ bytes         = { workspace = true }
 zerocopy      = { workspace = true }
 fastrand      = "2"
 thiserror     = "1"
+
+# TLS (optional — enable with `features = ["tls"]`)
+tokio-rustls  = { version = "0.26", optional = true }
+rustls        = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots  = { version = "0.26", optional = true }
 
 [dev-dependencies]
 tokio          = { workspace = true }

@@ -69,6 +69,9 @@ pub struct ActiveBinding {
     /// Sender to the per-connection async writer task. `try_send` is
     /// non-blocking — no `block_in_place`, no write lock, no runtime handle.
     pub(super) write_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    /// **M8**: writer feedback — `true` when the writer task has hit an
+    /// I/O error. Shared with the writer task via Arc.
+    pub(super) write_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ── Accumulator private types ────────────────────────────────────────────────
@@ -389,6 +392,11 @@ pub struct CommandWorker {
     /// it left off. Reset back to `0` when the walk completes or the
     /// store is rotated.
     pub(super) evict_resume_seq: u64,
+    /// F16 — per-stream oldest known timestamp cache. If a stream's
+    /// cached oldest_ts >= the cutoff, the eviction walk skips it
+    /// entirely (no entries can be expired). Invalidated on truncation
+    /// and when streams are deleted.
+    pub(super) stream_oldest_ts: HashMap<StreamId, u64, foldhash::fast::FixedState>,
 }
 
 impl CommandWorker {
@@ -793,9 +801,6 @@ impl CommandWorker {
             ShardCommand::ListStreams(cmd) => self.handle_list_streams(cmd),
             ShardCommand::ListConsumers(cmd) => self.handle_list_consumers(cmd),
             ShardCommand::StoreInfo(cmd) => self.handle_store_info(cmd),
-            ShardCommand::Metrics(cmd) => {
-                let _ = cmd.reply.send(self.engine.metrics_snapshot());
-            }
             ShardCommand::ConsumerStates(cmd) => {
                 let _ = cmd.reply.send(self.engine.consumer_states_snapshot());
             }
@@ -869,6 +874,7 @@ impl CommandWorker {
                 fire_and_forget: b.fire_and_forget,
                 ack_wait_ms: b.ack_wait_ms,
                 write_tx: b.write_tx.clone(),
+                write_failed: std::sync::Arc::clone(&b.write_failed),
             })
             .collect();
 
@@ -888,6 +894,7 @@ impl CommandWorker {
             writers_by_conn.entry(b.connection_id.0).or_insert_with(|| {
                 crate::shard::shared::WriterIndexEntry {
                     write_tx: b.write_tx.clone(),
+                    write_failed: std::sync::Arc::clone(&b.write_failed),
                 }
             });
         }

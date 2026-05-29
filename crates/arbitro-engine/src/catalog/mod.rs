@@ -132,9 +132,9 @@ pub struct Recipient {
 
 /// The catalog: entity lifecycle, match tables, bindings, demand tracking.
 pub struct Catalog {
-    // Entity storage — direct HashMap, no graph indirection.
-    streams: HashMap<StreamId, StreamInfo, foldhash::fast::FixedState>,
-    consumers: HashMap<ConsumerId, ConsumerInfo, foldhash::fast::FixedState>,
+    // Entity storage — Vec<Option<..>> for dense monotonic IDs (O(1) index).
+    streams: Vec<Option<StreamInfo>>,
+    consumers: Vec<Option<ConsumerInfo>>,
     subscriptions: HashMap<SubscriptionId, SubscriptionInfo, foldhash::fast::FixedState>,
 
     // Bindings with 3 secondary indices.
@@ -157,8 +157,8 @@ pub struct Catalog {
 impl Catalog {
     pub fn new() -> Self {
         Self {
-            streams: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            consumers: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            streams: Vec::with_capacity(16),
+            consumers: Vec::with_capacity(16),
             subscriptions: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             bindings: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             by_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
@@ -168,6 +168,22 @@ impl Catalog {
             connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::with_capacity(16),
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_stream_slot(&mut self, id: StreamId) {
+        let idx = id.0 as usize;
+        if idx >= self.streams.len() {
+            self.streams.resize_with(idx + 4, || None);
+        }
+    }
+
+    #[inline(always)]
+    fn ensure_consumer_slot(&mut self, id: ConsumerId) {
+        let idx = id.0 as usize;
+        if idx >= self.consumers.len() {
+            self.consumers.resize_with(idx + 4, || None);
         }
     }
 
@@ -215,11 +231,11 @@ impl Catalog {
 
     /// Create or ensure a stream exists. Idempotent.
     pub fn ensure_stream(&mut self, config: StreamConfig) -> EngineResult<()> {
-        if self.streams.contains_key(&config.id) {
+        self.ensure_stream_slot(config.id);
+        if self.streams[config.id.0 as usize].is_some() {
             return Ok(());
         }
-        self.streams
-            .insert(config.id, StreamInfo { name: config.name });
+        self.streams[config.id.0 as usize] = Some(StreamInfo { name: config.name });
         self.ensure_match_table_slot(config.id);
         let slot = &mut self.match_tables[config.id.0 as usize];
         if slot.is_none() {
@@ -231,8 +247,9 @@ impl Catalog {
     /// Remove a stream. Does NOT cascade bindings — caller must retire
     /// bindings first via `retire_bindings_for_stream`.
     pub fn remove_stream_entity(&mut self, id: StreamId) -> EngineResult<()> {
-        if self.streams.remove(&id).is_none() {
-            return Err(EngineError::stream_not_found());
+        match self.streams.get_mut(id.0 as usize).and_then(|s| s.take()) {
+            Some(_) => {}
+            None => return Err(EngineError::stream_not_found()),
         }
         if let Some(slot) = self.match_tables.get_mut(id.0 as usize) {
             *slot = None;
@@ -243,39 +260,56 @@ impl Catalog {
     /// Stream exists?
     #[inline]
     pub fn stream_exists(&self, id: StreamId) -> bool {
-        self.streams.contains_key(&id)
+        self.streams
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .is_some()
     }
 
     // ── Consumer ────────────────────────────────────────────────────────
 
-    /// Create or ensure a consumer exists. Idempotent.
-    pub fn ensure_consumer(&mut self, config: ConsumerConfig) -> EngineResult<()> {
-        if !self.streams.contains_key(&config.stream_id) {
+    /// Create or ensure a consumer exists.
+    ///
+    /// GAP-3 fix: if the consumer already exists, compare the mutable
+    /// config fields (`max_inflight`, `ack_policy`, `ack_wait_ms`). A
+    /// mismatch returns `ConsumerConfigMismatch` so the caller knows
+    /// the create was NOT idempotent — delete + recreate is required.
+    /// Same-config re-creation still returns `Ok(())` (idempotent).
+    pub fn ensure_consumer(&mut self, config: ConsumerConfig) -> EngineResult<bool> {
+        if !self.stream_exists(config.stream_id) {
             return Err(EngineError::stream_not_found());
         }
-        if self.consumers.contains_key(&config.id) {
-            return Ok(());
+        self.ensure_consumer_slot(config.id);
+        if let Some(existing) = &self.consumers[config.id.0 as usize] {
+            // Same-config re-creation is idempotent.
+            if existing.max_inflight == config.max_inflight
+                && existing.ack_policy == config.ack_policy
+                && existing.ack_wait_ms == config.ack_wait_ms
+                && existing.stream_id == config.stream_id
+                && existing.queue_id == config.queue_id
+            {
+                return Ok(false); // already existed, same config
+            }
+            return Err(EngineError::consumer_config_mismatch());
         }
-        self.consumers.insert(
-            config.id,
-            ConsumerInfo {
-                stream_id: config.stream_id,
-                queue_id: config.queue_id,
-                max_inflight: config.max_inflight,
-                paused: false,
-                ack_policy: config.ack_policy,
-                durable: config.durable,
-                ack_wait_ms: config.ack_wait_ms,
-            },
-        );
-        Ok(())
+        self.consumers[config.id.0 as usize] = Some(ConsumerInfo {
+            stream_id: config.stream_id,
+            queue_id: config.queue_id,
+            max_inflight: config.max_inflight,
+            paused: false,
+            ack_policy: config.ack_policy,
+            durable: config.durable,
+            ack_wait_ms: config.ack_wait_ms,
+        });
+        Ok(true) // newly created
     }
 
     /// Remove a consumer entity. Does NOT cascade — caller retires
     /// bindings and subscriptions first.
     pub fn remove_consumer_entity(&mut self, id: ConsumerId) -> EngineResult<()> {
         self.consumers
-            .remove(&id)
+            .get_mut(id.0 as usize)
+            .and_then(|s| s.take())
             .ok_or_else(EngineError::consumer_not_found)?;
         Ok(())
     }
@@ -283,21 +317,22 @@ impl Catalog {
     /// Get consumer info.
     #[inline]
     pub fn consumer(&self, id: ConsumerId) -> Option<&ConsumerInfo> {
-        self.consumers.get(&id)
+        self.consumers.get(id.0 as usize).and_then(|s| s.as_ref())
     }
 
     /// Is the consumer paused?
     #[inline]
     pub fn is_paused(&self, id: ConsumerId) -> bool {
         self.consumers
-            .get(&id)
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
             .map(|c| c.paused)
             .unwrap_or(false)
     }
 
     /// Pause a consumer.
     pub fn pause_consumer(&mut self, id: ConsumerId) -> bool {
-        if let Some(info) = self.consumers.get_mut(&id) {
+        if let Some(info) = self.consumers.get_mut(id.0 as usize).and_then(|s| s.as_mut()) {
             info.paused = true;
             true
         } else {
@@ -307,7 +342,7 @@ impl Catalog {
 
     /// Resume a consumer.
     pub fn resume_consumer(&mut self, id: ConsumerId) -> bool {
-        if let Some(info) = self.consumers.get_mut(&id) {
+        if let Some(info) = self.consumers.get_mut(id.0 as usize).and_then(|s| s.as_mut()) {
             info.paused = false;
             true
         } else {
@@ -319,12 +354,13 @@ impl Catalog {
 
     /// Create or ensure a subscription exists. Updates match table.
     pub fn ensure_subscription(&mut self, config: SubscriptionConfig) -> EngineResult<()> {
-        if !self.streams.contains_key(&config.stream_id) {
+        if !self.stream_exists(config.stream_id) {
             return Err(EngineError::stream_not_found());
         }
         let consumer = self
             .consumers
-            .get(&config.consumer_id)
+            .get(config.consumer_id.0 as usize)
+            .and_then(|s| s.as_ref())
             .ok_or_else(EngineError::consumer_not_found)?;
         let queue_id = consumer.queue_id;
 
@@ -430,7 +466,8 @@ impl Catalog {
             .ok_or_else(EngineError::subscription_not_found)?;
         let consumer = self
             .consumers
-            .get(&sub.consumer_id)
+            .get(sub.consumer_id.0 as usize)
+            .and_then(|s| s.as_ref())
             .ok_or_else(EngineError::consumer_not_found)?;
 
         let binding_id = BindingId(self.next_binding_id);
@@ -601,7 +638,7 @@ impl Catalog {
         pattern: &[u8],
         max_inflight: u32,
     ) -> EngineResult<()> {
-        if !self.streams.contains_key(&stream_id) {
+        if !self.stream_exists(stream_id) {
             return Err(EngineError::stream_not_found());
         }
         self.ensure_match_table_slot(stream_id);
@@ -634,19 +671,30 @@ impl Catalog {
 
     /// All stream IDs.
     pub fn stream_ids(&self) -> Vec<StreamId> {
-        self.streams.keys().copied().collect()
+        self.streams
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.as_ref().map(|_| StreamId(i as u32)))
+            .collect()
     }
 
     /// All consumer IDs.
     pub fn consumer_ids(&self) -> Vec<ConsumerId> {
-        self.consumers.keys().copied().collect()
+        self.consumers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.as_ref().map(|_| ConsumerId(i as u32)))
+            .collect()
     }
 
     /// List all streams with names.
     pub fn list_streams(&self) -> Vec<(StreamId, Vec<u8>)> {
         self.streams
             .iter()
-            .map(|(id, info)| (*id, info.name.clone()))
+            .enumerate()
+            .filter_map(|(i, opt)| {
+                opt.as_ref().map(|info| (StreamId(i as u32), info.name.clone()))
+            })
             .collect()
     }
 
@@ -654,7 +702,11 @@ impl Catalog {
     pub fn list_consumers(&self) -> Vec<(ConsumerId, StreamId, QueueId, bool)> {
         self.consumers
             .iter()
-            .map(|(id, info)| (*id, info.stream_id, info.queue_id, info.paused))
+            .enumerate()
+            .filter_map(|(i, opt)| {
+                opt.as_ref()
+                    .map(|info| (ConsumerId(i as u32), info.stream_id, info.queue_id, info.paused))
+            })
             .collect()
     }
 
@@ -667,8 +719,15 @@ impl Catalog {
     pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
         self.consumers
             .iter()
-            .filter_map(|(cid, info)| {
-                if info.stream_id == stream_id { Some(*cid) } else { None }
+            .enumerate()
+            .filter_map(|(i, opt)| {
+                opt.as_ref().and_then(|info| {
+                    if info.stream_id == stream_id {
+                        Some(ConsumerId(i as u32))
+                    } else {
+                        None
+                    }
+                })
             })
             .collect()
     }

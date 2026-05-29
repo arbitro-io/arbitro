@@ -11,8 +11,9 @@ pub enum Action {
     Publish                  = 0x0101,
     PublishBatch             = 0x0103,
     PublishWithReply         = 0x0104, // + reply_to (RPC)
-    PublishWithHeaders       = 0x0105, // + headers (tracing/metadata)
-    PublishBatchWithHeaders  = 0x0106, // batch where every entry has headers
+    // 0x0105, 0x0106 reserved (deleted PublishWithHeaders /
+    // PublishBatchWithHeaders) — §5.1: frame defs existed but no
+    // dispatcher was ever wired. Reserved; do not reuse the slots.
 
     // 0x00xx — Handshake / control (pre-Header). Hello is *not* a v2 frame:
     // its on-wire representation is a 8B HelloFrame starting with the v2
@@ -87,8 +88,7 @@ impl Action {
             // 0x0102 reserved (deleted PublishAccumulate) — TODO §5.1.
             0x0103 => Some(Self::PublishBatch),
             0x0104 => Some(Self::PublishWithReply),
-            0x0105 => Some(Self::PublishWithHeaders),
-            0x0106 => Some(Self::PublishBatchWithHeaders),
+            // 0x0105, 0x0106 reserved (deleted §5.1).
 
             0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
@@ -142,8 +142,6 @@ impl Action {
             Self::Publish
                 | Self::PublishBatch
                 | Self::PublishWithReply
-                | Self::PublishWithHeaders
-                | Self::PublishBatchWithHeaders
                 | Self::Ack
                 | Self::Nack
                 | Self::BatchAck
@@ -159,8 +157,6 @@ impl Action {
             Self::Publish
                 | Self::PublishBatch
                 | Self::PublishWithReply
-                | Self::PublishWithHeaders
-                | Self::PublishBatchWithHeaders
                 | Self::Subscribe
         )
     }
@@ -173,8 +169,6 @@ impl Action {
             Self::Publish
                 | Self::PublishBatch
                 | Self::PublishWithReply
-                | Self::PublishWithHeaders
-                | Self::PublishBatchWithHeaders
         )
     }
 }

@@ -55,6 +55,8 @@ pub enum ErrorCode {
     ConfigIoError = 400,
     /// Config command invalid.
     ConfigInvalid = 401,
+    /// Consumer already exists with different config.
+    ConsumerConfigMismatch = 402,
 }
 
 /// The primary error type for all engine operations.
@@ -178,6 +180,13 @@ impl EngineError {
 
     pub fn edge_not_found(name: &'static str) -> Self {
         EngineError::Plugin { code: ErrorCode::EdgeNotFound, plugin: name }
+    }
+
+    pub fn consumer_config_mismatch() -> Self {
+        EngineError::Config {
+            code: ErrorCode::ConsumerConfigMismatch,
+            detail: "consumer already exists with different config".to_string(),
+        }
     }
 }
 

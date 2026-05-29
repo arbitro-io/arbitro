@@ -284,6 +284,57 @@ async fn double_shutdown_is_idempotent() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// T10. Shutdown mid-publish — metadata remains consistent
+//
+// Trigger shutdown while publish_batch is still in progress.
+// Verify: (a) the server doesn't panic, (b) metadata (stream definition)
+// survives the restart regardless of whether the in-flight messages made it.
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_mid_publish_metadata_survives() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().into_owned();
+
+    let mut server = TestServerBuilder::new().data_dir(&path).spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"sd_mid", b">", 0, 0, 0, 1, 1, 0, 0, 0)
+        .await
+        .unwrap();
+    let sid = TestServer::parse_id(&resp);
+
+    // Fire a batch of publishes WITHOUT waiting for acks — they are
+    // still in-flight when we signal shutdown.
+    let entries: Vec<BatchEntry<'_>> = (0..200u32)
+        .map(|_| BatchEntry::new(b"sd_mid.ev", Bytes::copy_from_slice(b"payload")))
+        .collect();
+    // Non-blocking publish (fire-and-forget, no sync wait).
+    client.publish_batch(sid, &entries).expect("enqueue batch");
+
+    // Immediately trigger shutdown — the batch may or may not have been
+    // fully processed by the engine at this point.
+    server.shutdown().await;
+
+    // Restart: metadata must be intact regardless of message state.
+    let mut server2 = TestServerBuilder::new().data_dir(&path).spawn().await;
+    let client2 = server2.connect().await;
+
+    let resp2 = client2.list_streams(0, 1000).await.unwrap();
+    assert_eq!(
+        TestServer::stream_count(&resp2),
+        1,
+        "stream metadata must survive shutdown-mid-publish"
+    );
+
+    // The stream name must match.
+    let names = TestServer::stream_names(&resp2);
+    assert_eq!(names[0], b"sd_mid");
+    server2.shutdown().await;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // 4. Shutdown under load
 // ══════════════════════════════════════════════════════════════════════════════
 

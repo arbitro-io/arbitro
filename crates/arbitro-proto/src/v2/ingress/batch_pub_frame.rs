@@ -24,9 +24,8 @@
 //!
 //! ### Why no reply / headers
 //!
-//! Plain batch only. For batches with headers use `Action::PublishBatchWithHeaders`
-//! (a separate frame type with a wider per-entry header). Reply-batches
-//! are not supported on purpose — RPC semantics don't compose with batching.
+//! Plain batch only. Reply-batches are not supported on purpose — RPC
+//! semantics don't compose with batching.
 
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};

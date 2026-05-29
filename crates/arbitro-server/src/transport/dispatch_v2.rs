@@ -15,7 +15,7 @@
 //!   * `AckSync`/`BatchAckSync` — collapsed into fire-and-forget Ack/BatchAck.
 //!   * `PublishAccumulate` — accumulator path is v1-only for now.
 //!   * `PublishWithReply` — now implemented (request/reply RPC).
-//!   * `PublishWithHeaders` — not implemented.
+//!   * `PublishWithHeaders` / `PublishBatchWithHeaders` — deleted §5.1.
 //!
 //! ## Notable wire-shape compromises
 //!
@@ -129,9 +129,9 @@ pub async fn dispatch_frame_v2(
         Action::Pong           => { registry.touch(conn_id); }
 
         // L1 / L2: AckSync / BatchAckSync, PublishAccumulate,
-        // PublishWithHeaders, PublishBatchWithHeaders, FanoutBatch — all
-        // have wire codes but no dispatcher. Reply `Unimplemented` so the
-        // client gets a stable, distinct error instead of UnknownAction.
+        // FanoutBatch — have wire codes but no dispatcher. Reply
+        // `Unimplemented` so the client gets a stable, distinct error
+        // instead of UnknownAction.
         _ => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::Unimplemented);
             return Err(());
@@ -975,6 +975,24 @@ async fn v2_create_consumer(
         _ => AckPolicy::Explicit,
     };
 
+    // GAP-2: AckPolicy::None ignores max_inflight — fire-and-forget
+    // bindings never increment inflight counters, so any limit is dead
+    // weight. Force unlimited so operators aren't misled by a config
+    // that has no effect.
+    let effective_max_inflight: u16 = if ack_policy == AckPolicy::None {
+        0 // 0 → u32::MAX (unlimited) at ConsumerConfig construction below
+    } else {
+        body.max_inflight
+    };
+
+    // GAP-5: Fanout mode ignores the group field — the group drives
+    // queue-dedup semantics in the drain (QueueId != 0 triggers
+    // round-robin). For Fanout consumers we assign QueueId(0) directly
+    // instead of going through get_or_create_queue, because that
+    // allocator starts at 1 and any non-zero id activates queue-mode
+    // dedup in the drain worker.
+    let is_fanout = body.deliver_mode == 0;
+
     // B6: subject limits are only honored under Explicit ack. The wire
     // body always carries the Vec, but we silently drop it for None-ack
     // consumers (legacy contract — predates serde migration).
@@ -987,7 +1005,7 @@ async fn v2_create_consumer(
         Vec::new()
     };
 
-    let (seq_consumer, _created) = server.names().get_or_create_consumer(name);
+    let (seq_consumer, _created) = server.names().get_or_create_consumer(seq_stream, name);
     // B1: registry refused — consumer slot pool exhausted.
     if seq_consumer.raw() == u32::MAX {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
@@ -995,7 +1013,11 @@ async fn v2_create_consumer(
     }
     let shard = server.shard_for(seq_stream);
 
-    let queue_id = server.names().get_or_create_queue(seq_stream, group);
+    let queue_id = if is_fanout {
+        QueueId(0)
+    } else {
+        server.names().get_or_create_queue(seq_stream, group)
+    };
     server.names().set_consumer_queue(seq_consumer, queue_id);
     server.names().set_consumer_stream(seq_consumer, seq_stream);
     server.names().set_consumer_deliver_policy(
@@ -1012,10 +1034,10 @@ async fn v2_create_consumer(
                 stream_id: seq_stream,
                 durable: true,
                 ack_policy,
-                max_inflight: if body.max_inflight == 0 {
+                max_inflight: if effective_max_inflight == 0 {
                     u32::MAX
                 } else {
-                    body.max_inflight as u32
+                    effective_max_inflight as u32
                 },
                 ack_wait_ms: body.ack_wait_ms,
             },
@@ -1023,7 +1045,7 @@ async fn v2_create_consumer(
         )
         .await
     {
-        Ok(true) => {
+        Ok(1) => {
             // F37: a new consumer must show up in list_consumers reply.
             server.invalidate_list_cache();
             // Metadata log keeps the legacy zerocopy
@@ -1046,7 +1068,7 @@ async fn v2_create_consumer(
                 CreateConsumerFrame::encode_into(
                     &mut wire, 0, wire_stream,
                     name, group, subject_filter,
-                    body.max_inflight, body.ack_policy, body.deliver_policy,
+                    effective_max_inflight, body.ack_policy, body.deliver_policy,
                     body.deliver_mode, body.ack_wait_ms, body.start_seq,
                     &limit_refs,
                 );
@@ -1057,8 +1079,16 @@ async fn v2_create_consumer(
             }
             send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64)
         }
-        Ok(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists),
-        Err(_)   => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Ok(0) => {
+            // Already existed with same config — idempotent, return id.
+            send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64)
+        }
+        Ok(2) => {
+            // GAP-3: consumer exists with different config.
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig)
+        }
+        Ok(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -1235,7 +1265,14 @@ async fn v2_get_consumer(
         Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
     };
     let name = body.name.as_slice();
-    match server.names().consumer_id(name) {
+    // GAP-6: consumers are namespaced by stream — translate the wire
+    // stream_id to the sequential engine id before lookup.
+    let wire_stream = body.stream_id;
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+    };
+    match server.names().consumer_id(seq_stream, name) {
         Some(id) => send_rep_ok_v2(registry, conn_id, req_seq, id.0 as u64),
         None     => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
     }
@@ -1357,7 +1394,7 @@ pub(crate) async fn v2_disconnect(
 }
 
 fn v2_ping(conn_id: u64, registry: &ConnectionRegistry) {
-    // Reply with a Pong header (no body).
+    // Reply with a Pong header (no body). Header = 12B, fits inline.
     let header = Header::new(Action::Pong.as_u16(), 0, 0);
-    registry.send_parts(conn_id, &[header.as_bytes()]);
+    registry.send_inline(conn_id, header.as_bytes());
 }

@@ -449,3 +449,62 @@ async fn delete_recreate_subscription_delivers() {
     assert!(msg_b.is_some(), "second subscription must produce a message");
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T6. Malformed CreateConsumer (invalid name) must NOT leak a consumer slot.
+//
+// The dispatch validation rejects names with invalid characters before
+// allocating a slot in NameRegistry. This test verifies that after
+// multiple rejected requests, valid consumer creation still works and
+// the namespace isn't polluted with ghost entries.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_create_consumer_does_not_leak_slot() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let stream_id = create_stream(&client, b"orders").await;
+
+    // Attempt several invalid consumer names. Each should fail without
+    // allocating a slot in the internal registry.
+    let invalid_names: &[&[u8]] = &[
+        b"",                       // empty
+        b"has space",              // space char
+        b"dot.name",              // dot char
+        b"slash/name",            // slash char
+    ];
+
+    for &bad_name in invalid_names {
+        let result = client
+            .create_consumer(stream_id, bad_name, b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .await;
+        assert!(
+            result.is_err(),
+            "create_consumer with invalid name {:?} must fail",
+            bad_name
+        );
+    }
+
+    // After all the rejected attempts, listing consumers must show zero.
+    let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
+    assert_eq!(
+        TestServer::consumer_count(&resp),
+        0,
+        "malformed CreateConsumer must not leak phantom entries into \
+         the consumer list"
+    );
+
+    // And creating a VALID consumer must succeed — proving the slot
+    // pool wasn't corrupted by the rejected attempts.
+    let valid_id = create_consumer(&client, stream_id, b"worker").await;
+    assert!(valid_id > 0, "valid consumer id must be allocated");
+
+    let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
+    assert_eq!(
+        TestServer::consumer_count(&resp),
+        1,
+        "exactly one valid consumer must exist after the malformed attempts"
+    );
+    server.shutdown().await;
+}

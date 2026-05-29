@@ -180,10 +180,14 @@ impl ArbitroEngine {
     }
 
     /// Create or ensure a consumer exists.
+    ///
+    /// Returns `Ok(true)` if a new consumer was created, `Ok(false)` if
+    /// the consumer already existed with the same config (idempotent),
+    /// or `Err(ConsumerConfigMismatch)` if it existed with different config.
     pub fn create_consumer(
         &mut self,
         config: catalog::ConsumerConfig,
-    ) -> error::EngineResult<()> {
+    ) -> error::EngineResult<bool> {
         self.ctx.catalog.ensure_consumer(config)
     }
 
@@ -328,6 +332,13 @@ impl ArbitroEngine {
     #[inline]
     pub fn metrics_snapshot(&self) -> metrics::MetricsSnapshot {
         self.ctx.metrics.snapshot()
+    }
+
+    /// Shared handle to the atomic metrics — callers can snapshot without
+    /// routing through the shard command channel (F9).
+    #[inline]
+    pub fn metrics_arc(&self) -> std::sync::Arc<EngineMetrics> {
+        std::sync::Arc::clone(&self.ctx.metrics)
     }
 
     // ── Internal access (for server integration) ────────────────────────

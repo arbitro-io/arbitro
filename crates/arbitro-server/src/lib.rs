@@ -45,7 +45,7 @@ pub mod command_log {
     pub use crate::persistence::command_log::*;
 }
 
-pub use config::Config;
+pub use config::{Config, FsyncPolicy};
 pub use server::ArbitroServer;
 pub use shard::router::ShardRouter;
 /// Back-compat alias — old name for `ShardRouter`.

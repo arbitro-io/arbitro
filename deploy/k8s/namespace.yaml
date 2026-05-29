@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: arbitro
+  labels:
+    app.kubernetes.io/name: arbitro
+    app.kubernetes.io/part-of: arbitro-io

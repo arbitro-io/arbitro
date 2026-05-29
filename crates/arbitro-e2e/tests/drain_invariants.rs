@@ -1289,3 +1289,125 @@ async fn t13_single_shard_saturation_no_silent_drops() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// T15. evict_expired must NOT stall publish.
+//
+// The eviction walk is bounded by EVICT_WALK_CAP (10K entries) per call.
+// This test creates a stream with max_age=1s, fills it with messages,
+// waits for expiry, then publishes a new message and asserts the publish
+// completes within a tight deadline. If eviction blocked the entire
+// shard worker unbounded, publish_sync would time out.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn evict_expired_does_not_stall_publish() {
+    let mut server = TestServerBuilder::new()
+        .shard_count(1) // force all traffic onto one shard for maximum contention
+        .spawn()
+        .await;
+    let client = server.connect().await;
+
+    // max_age_secs = 1 → entries expire after 1 second.
+    let resp = client
+        .create_stream(b"evict_test", b">", 0, 0, /*max_age_secs*/ 1, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    // Fill the stream with a burst of messages that will expire quickly.
+    let batch: Vec<arbitro_client_tokio::BatchEntry<'_>> = (0..500)
+        .map(|_| arbitro_client_tokio::BatchEntry::new(b"evict_test.fill", Bytes::from_static(b"x")))
+        .collect();
+    client.publish_batch_sync(stream_id, &batch).await.expect("fill batch");
+
+    // Wait for all entries to expire (max_age = 1s).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Now publish a fresh message. The shard may be running eviction
+    // during this call — it must complete within 2 seconds regardless.
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.publish_sync(stream_id, b"evict_test.fresh", Bytes::from_static(b"alive")),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {} // publish completed within deadline — pass
+        Ok(Err(e)) => panic!("publish_sync errored (eviction may have broken state): {e:?}"),
+        Err(_) => panic!(
+            "publish_sync timed out after 2s — evict_expired likely stalled the shard worker"
+        ),
+    }
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 16. Partial-write recovery — connection drops mid-delivery, unacked
+//     messages redeliver after ack_wait timeout.
+//
+// T16 (gated on M8 writer feedback): when the subscriber's TCP
+// connection drops after receiving messages but before acking them,
+// those messages must be redelivered to the same (or replacement)
+// consumer once the ack-wait timeout fires. The writer feedback loop
+// ensures the drain detects the dead connection fast, but the
+// recovery mechanism is the ack-timeout wheel.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_write_recovery_redelivers_unacked() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let stream_id = create_stream(&client, b"pw_recover", b">").await;
+
+    // ack_wait_ms = 500ms — short enough for the test to be fast.
+    let consumer_id = create_consumer(
+        &client, stream_id, b"pw_sub", b"", b"", 10, 1, 0, 500, 0,
+    )
+    .await;
+
+    // Publish 5 messages before subscribing.
+    for i in 0u32..5 {
+        client
+            .publish_sync(
+                stream_id,
+                b"pw_recover.ev",
+                Bytes::copy_from_slice(format!("msg-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    // First subscriber — receives but does NOT ack.
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let batch = drain_n(&mut handle, 5, Duration::from_secs(3)).await;
+    assert_eq!(batch.len(), 5, "first subscriber must receive all 5 messages");
+
+    // Simulate connection failure: drop the subscription handle and close
+    // the client without acking. This triggers the writer feedback (M8)
+    // detecting the dead connection.
+    drop(handle);
+    drop(client);
+
+    // Wait for ack-timeout to fire (500ms + buffer for wheel granularity).
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    // Reconnect and re-subscribe the SAME consumer. Messages should be
+    // redelivered because they were never acked.
+    let client2 = server.connect().await;
+    let mut handle2 = client2.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    let redelivered = drain_n(&mut handle2, 5, Duration::from_secs(5)).await;
+    assert!(
+        !redelivered.is_empty(),
+        "after connection drop + ack-wait timeout, unacked messages must \
+         be redelivered; got 0 messages on re-subscribe"
+    );
+
+    // Ack redelivered messages to clean up.
+    for m in redelivered {
+        m.ack();
+    }
+    server.shutdown().await;
+}

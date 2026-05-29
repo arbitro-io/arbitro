@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
-use arbitro_engine_v2::{ConsumerStateSnapshot, MetricsSnapshot};
+use arbitro_engine_v2::{ConsumerStateSnapshot, EngineMetrics, MetricsSnapshot};
 use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
@@ -29,6 +29,8 @@ pub struct ShardHandle {
     gate: Arc<Gate>,
     /// Connection registry — publish replies directly to the client.
     registry: ConnectionRegistry,
+    /// Shared metrics — read directly via atomic loads (F9), no shard round-trip.
+    metrics: Arc<EngineMetrics>,
 }
 
 impl ShardHandle {
@@ -38,6 +40,7 @@ impl ShardHandle {
         store: SharedStore,
         gate: Arc<Gate>,
         registry: ConnectionRegistry,
+        metrics: Arc<EngineMetrics>,
     ) -> Self {
         Self {
             shard_id,
@@ -45,6 +48,7 @@ impl ShardHandle {
             store,
             gate,
             registry,
+            metrics,
         }
     }
 
@@ -250,11 +254,15 @@ impl ShardHandle {
 
     // ── Consumer management ─────────────────────────────────────────────
 
+    /// Create or ensure a consumer. Returns:
+    /// - `Ok(1)` = newly created
+    /// - `Ok(0)` = already existed with same config (idempotent)
+    /// - `Ok(2)` = consumer exists with different config (GAP-3)
     pub async fn create_consumer(
         &self,
         config: ConsumerConfig,
         max_subject_inflights: Vec<(Vec<u8>, u32)>,
-    ) -> Result<bool, SendError> {
+    ) -> Result<u8, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::CreateConsumer(CreateConsumerCmd {
             config,
@@ -362,11 +370,11 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    /// Snapshot this shard's engine metrics. Cheap (atomic loads).
-    pub async fn metrics(&self) -> Result<MetricsSnapshot, SendError> {
-        let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::Metrics(MetricsCmd { reply: tx })).await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    /// Snapshot this shard's engine metrics. Sync — reads Arc<EngineMetrics>
+    /// directly via Relaxed loads, no shard command round-trip (F9).
+    #[inline]
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Snapshot per-consumer live state (pending ACKs, paused flag, etc.).

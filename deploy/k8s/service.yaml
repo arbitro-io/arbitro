@@ -1,24 +1,17 @@
-# ClusterIP service for in-cluster clients. For external exposure put
-# this behind a LoadBalancer / Ingress / NodePort as appropriate for
-# the cloud — arbitro speaks raw TCP, so an L4 LB is the cleanest
-# fronting option.
 apiVersion: v1
 kind: Service
 metadata:
-  name: arbitro
+  name: arbitro-server
+  namespace: arbitro
   labels:
-    app.kubernetes.io/name: arbitro
+    app.kubernetes.io/name: arbitro-server
+    app.kubernetes.io/part-of: arbitro-io
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: arbitro
+    app.kubernetes.io/name: arbitro-server
   ports:
     - name: broker
       port: 9898
-      targetPort: 9898
+      targetPort: broker
       protocol: TCP
-  # Keep an endpoint addressable while a pod is terminating so we
-  # don't drop in-flight publishes during a rolling update. Combined
-  # with `preStopHook` + `ARBITRO_SHUTDOWN_TIMEOUT`, this gives the
-  # broker the full grace window to drain.
-  publishNotReadyAddresses: false

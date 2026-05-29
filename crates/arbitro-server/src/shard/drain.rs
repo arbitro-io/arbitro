@@ -313,6 +313,14 @@ pub(in crate::shard) fn drain_deliver(
                 flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
                 return false;
             };
+            // M8: writer feedback — if the writer task has signalled an
+            // I/O error, skip this connection immediately. Frames sent
+            // to a dead writer's channel would pile up until the session
+            // is reaped, wasting memory and CPU.
+            if writer.write_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
+                return false;
+            }
             crate::lifecycle_trace!(
                 "29_frame_built",
                 frame.connection_id.0,

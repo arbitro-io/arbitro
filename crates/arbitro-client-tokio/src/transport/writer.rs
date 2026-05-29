@@ -1,9 +1,8 @@
-//! Single-writer transport task — owns `OwnedWriteHalf`, drains the
+//! Single-writer transport task — generic over `AsyncWrite`, drains the
 //! kit Mpsc consumer with `recv_async` + `try_recv`.
 
 use arbitro_kit::route::MpscAsyncConsumer;
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ClientError;
@@ -59,9 +58,9 @@ mod tests {
     }
 }
 
-pub(crate) async fn writer_task(
+pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    mut w: OwnedWriteHalf,
+    mut w: W,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
     loop {

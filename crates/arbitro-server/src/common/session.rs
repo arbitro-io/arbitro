@@ -6,7 +6,8 @@
 //! non-blocking `try_send` — backpressure drops the frame if the per-conn
 //! queue is full, preventing deadlocks in the shared tokio runtime.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -24,6 +25,17 @@ pub struct Session {
     /// so `touch()` doesn't need to take the registry mutex; readers
     /// (idle sweep + keepalive sweep) load with Relaxed.
     pub last_activity: AtomicU64,
+    /// **M8**: writer feedback — set to `true` by the writer task when
+    /// `write_all` hits an I/O error. The drain path reads this with
+    /// `Relaxed` to detect dead connections before wasting frames into
+    /// the channel. Shared via `Arc` so the writer task can outlive the
+    /// session map entry during shutdown races.
+    pub write_failed: Arc<AtomicBool>,
+    /// **M8**: total frames successfully written to the socket. The
+    /// writer task increments after each `write_all` success. Used for
+    /// observability and back-pressure detection (compare with frames
+    /// enqueued via `try_send`).
+    pub frames_written: Arc<AtomicU64>,
 }
 
 /// Atomic connection ID generator.

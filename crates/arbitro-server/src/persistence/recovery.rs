@@ -109,13 +109,17 @@ impl ReplayApplier {
                     let consumer_id = config.id;
                     let shard = self.server.shard_for(stream_id);
                     match shard.create_consumer(config, max_subject_inflights).await {
-                        Ok(true) => {
+                        Ok(1) => {
                             consumers_recovered += 1;
                             tracing::debug!(?consumer_id, "replayed CreateConsumer");
                         }
-                        Ok(false) => tracing::debug!(
+                        Ok(0) => tracing::debug!(
                             ?consumer_id,
                             "CreateConsumer already exists (idempotent)"
+                        ),
+                        Ok(code) => tracing::warn!(
+                            ?consumer_id, code,
+                            "replay CreateConsumer rejected (config mismatch?)"
                         ),
                         Err(e) => {
                             tracing::error!(?consumer_id, error = %e, "replay CreateConsumer failed")
@@ -239,14 +243,20 @@ impl MetadataApplier for ReplayApplier {
                 let (stream_id, _) = self.server.names().get_or_create_stream(wire_stream);
 
                 let consumer_name = cv.name();
-                let (consumer_id, _) = self.server.names().get_or_create_consumer(consumer_name);
+                let (consumer_id, _) = self.server.names().get_or_create_consumer(stream_id, consumer_name);
 
-                // Same content-addressed queue allocation as live dispatch:
-                // `(seq_stream, group) → small QueueId`. Replay must hit
-                // the same id allocator so the post-restart queue topology
-                // matches the pre-restart one for any group sharing.
+                // GAP-5 (mirrored from live dispatch): Fanout consumers
+                // (deliver_mode == 0) use QueueId(0) directly — the
+                // drain worker skips queue-dedup for id 0, giving every
+                // consumer its own copy. Queue consumers go through the
+                // content-addressed allocator so members of the same
+                // group share a single QueueId.
                 let group = cv.group();
-                let queue_id = self.server.names().get_or_create_queue(stream_id, group);
+                let queue_id = if cv.deliver_mode() == 0 {
+                    QueueId(0)
+                } else {
+                    self.server.names().get_or_create_queue(stream_id, group)
+                };
                 self.server
                     .names()
                     .set_consumer_queue(consumer_id, queue_id);

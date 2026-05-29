@@ -2,9 +2,8 @@
 //!
 //! This is the **base** publish action (`Action::Publish`). For frames
 //! that need a reply subject, use `Action::PublishWithReply` /
-//! `PubWithReplyFrame`. For frames with headers, use
-//! `Action::PublishWithHeaders` / `PubWithHeadersFrame`. There is no
-//! discriminator byte inside the body — the action *is* the discriminator.
+//! `PubWithReplyFrame`. There is no discriminator byte inside the
+//! body — the action *is* the discriminator.
 //!
 //! Wire layout:
 //! ```text

@@ -156,13 +156,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --workspace --no-run
 
+  # ── Security audit ─────────────────────────────────────────────────────
+  audit:
+    name: cargo audit + deny
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - name: Install cargo-audit & cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+      - name: cargo audit
+        run: cargo audit
+      - name: cargo deny
+        run: cargo deny check
+
   # ── Docker image build (musl static + scratch) ────────────────────────
   # PRs only verify the build succeeds (no push). Pushes to master/main
   # additionally publish to GHCR with `latest` + commit-SHA tags.
   docker:
     name: docker image
     runs-on: ubuntu-latest
-    needs: [unit-tests]      # gate on the cheap suite first
+    needs: [unit-tests, e2e-integration, e2e-persistence]
     permissions:
       contents: read
       packages: write        # push to ghcr.io

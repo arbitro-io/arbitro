@@ -66,7 +66,7 @@ arbitro-engine   # single-threaded oracle (catalog + matcher + inflight)
 arbitro-common   # Gate, NameRegistry, IdPool
 arbitro-store    # journal trait + Memory / Tolerant backends
 arbitro-server   # shard orchestration + transport + persistence
-arbitro-client   # client SDK
+arbitro-client   # Rust client SDK (tokio, optional TLS)
 arbitro-e2e      # integration tests + benchmarks
 ```
 
@@ -127,6 +127,9 @@ docker compose up -d   # default port: 9898
 | `ARBITRO_CHANNEL_CAPACITY` | `4096` | Per-shard command channel capacity. |
 | `ARBITRO_MAX_FEED_PER_CYCLE` | `256` | Max store entries fed into the drain per cycle. |
 | `ARBITRO_DRAIN_BATCH_SIZE` | `256` | Entries per `RepBatch` frame emitted by the drain. |
+| `ARBITRO_MAX_FRAME_SIZE` | `67108864` | Max frame body bytes (64 MiB). Rejects oversized frames. |
+| `ARBITRO_MAX_OPS_PER_SEC` | `0` | Max frames/sec per connection (`0` = unlimited). |
+| `ARBITRO_FSYNC_POLICY` | `every` | Metadata fsync policy: `every` (default) or `none`. |
 
 ## Observability
 
@@ -246,11 +249,21 @@ client.publish_batch(b"ORDERS", &[
 - [x] Disk persistence (TolerantStore)
 - [x] Crash-safe journaling (Magic Byte 0xAF)
 - [x] Per-entry `consumer_id` routing (broadcast collapse)
-- [ ] Subject scavenging (TTL-based inactive-slot cleanup)
-- [ ] Multi-language clients (TypeScript, Go)
+- [x] TypeScript client (`@arbitro/client`)
+- [x] Client TLS (`tokio-rustls`, behind `tls` feature flag)
 
-### Phase 3 — Observability & Scale (planned)
-- [ ] Prometheus-native metrics
+### Phase 3 — Observability & Operability (done)
+- [x] Prometheus-native `/metrics` endpoint
+- [x] `/health` HTTP endpoint + k8s probes
+- [x] `arbitroctl` CLI
+- [x] `cargo audit` / `cargo deny` in CI
+- [x] Docker image gated on e2e tests
+- [x] Configurable rate-limit, fsync policy, MAX_FRAME_SIZE
+- [x] `--version` / `--help` flags + config validation at startup
+- [x] Protocol hardening (AckPolicy::None limits, stale config, namespaced consumers)
+
+### Phase 4 — Scale (planned)
+- [ ] Subject scavenging (TTL-based inactive-slot cleanup)
 - [ ] Clustering (Raft) for stream state replication
 - [ ] Adaptive subject prioritization
 - [ ] Cross-shard subject aggregation for global limits

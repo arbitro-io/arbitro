@@ -276,6 +276,10 @@ pub struct DrainSnapshot {
 #[derive(Clone)]
 pub struct WriterIndexEntry {
     pub write_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    /// **M8**: writer feedback — `true` when the writer task has hit an
+    /// I/O error. Drain checks this before `try_send` to skip dead
+    /// connections without wasting frames into the channel.
+    pub write_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DrainSnapshot {

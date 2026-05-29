@@ -1,37 +1,27 @@
-# Minimal single-replica deployment skeleton for the arbitro broker.
-#
-# Arbitro is not yet clustered (Phase 3 roadmap), so this manifest
-# intentionally pins replicas=1 and uses a Recreate strategy — running
-# two replicas of an unclustered broker would split clients across
-# divergent state. When clustering lands, switch to RollingUpdate +
-# the cluster's quorum primitive.
-#
-# Image: replace `arbitro:latest` with a tagged immutable digest in
-# production (cosign + SLSA provenance are on the roadmap, see
-# TODO §7 operability).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: arbitro
+  name: arbitro-server
+  namespace: arbitro
   labels:
-    app.kubernetes.io/name: arbitro
+    app.kubernetes.io/name: arbitro-server
+    app.kubernetes.io/part-of: arbitro-io
 spec:
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: arbitro
+      app.kubernetes.io/name: arbitro-server
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: arbitro
+        app.kubernetes.io/name: arbitro-server
+        app.kubernetes.io/part-of: arbitro-io
     spec:
-      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
       containers:
-        - name: arbitro
-          image: arbitro:latest
-          imagePullPolicy: IfNotPresent
+        - name: arbitro-server
+          image: ghcr.io/arbitro-io/arbitro-server:latest
           ports:
             - name: broker
               containerPort: 9898
@@ -39,42 +29,31 @@ spec:
           envFrom:
             - configMapRef:
                 name: arbitro-config
-          # Uncomment to wire ARBITRO_AUTH_TOKEN from a Secret:
-          # env:
-          #   - name: ARBITRO_AUTH_TOKEN
-          #     valueFrom:
-          #       secretKeyRef:
-          #         name: arbitro-auth
-          #         key: token
           resources:
             requests:
-              cpu: "500m"
-              memory: "512Mi"
+              memory: "256Mi"
+              cpu: "250m"
             limits:
-              cpu: "2"
-              memory: "2Gi"
-          # No HTTP healthcheck endpoint yet (TODO §7 operability — a
-          # /healthz HTTP endpoint is on the roadmap). For now we
-          # rely on TCP readiness: pod is Ready as soon as the listen
-          # socket binds.
+              memory: "1Gi"
+              cpu: "1000m"
           readinessProbe:
             tcpSocket:
-              port: broker
-            initialDelaySeconds: 1
+              port: 9898
+            initialDelaySeconds: 3
             periodSeconds: 5
-            timeoutSeconds: 1
           livenessProbe:
             tcpSocket:
-              port: broker
-            initialDelaySeconds: 10
+              port: 9898
+            initialDelaySeconds: 5
             periodSeconds: 10
-            timeoutSeconds: 3
-          # Volume mount for the persistent journal. Wire a PVC and
-          # uncomment ARBITRO_DATA_DIR in the ConfigMap to enable.
-          # volumeMounts:
-          #   - name: data
-          #     mountPath: /var/lib/arbitro
-      # volumes:
-      #   - name: data
-      #     persistentVolumeClaim:
-      #       claimName: arbitro-data
+          securityContext:
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: arbitro-data

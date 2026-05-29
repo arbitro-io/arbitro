@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: arbitro-data
+  namespace: arbitro
+  labels:
+    app.kubernetes.io/name: arbitro-server
+    app.kubernetes.io/part-of: arbitro-io
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # storageClassName: <your-storage-class>
+  # Uncomment and set the storageClassName appropriate for your cluster.
+  # Examples: gp3 (AWS EBS), premium-rwo (GKE), managed-csi (AKS)

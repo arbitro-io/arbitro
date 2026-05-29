@@ -7,8 +7,8 @@
 //! (connection too slow); the tokio reactor is never starved.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
@@ -38,10 +38,72 @@ fn now_ms(clock: &Option<SharedClock>) -> u64 {
     }
 }
 
-/// Trait-object writer — works for both plain TCP and TLS.
-pub type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-/// Trait-object reader — works for both plain TCP and TLS.
-pub type BoxedReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+/// **F36**: monomorphic writer enum — eliminates vtable indirection.
+/// Each variant holds the concrete type, so `write_all` inlines to a
+/// direct method call instead of an indirect function pointer.
+pub enum ConnWriter {
+    Plain(tokio::net::tcp::OwnedWriteHalf),
+    #[cfg(feature = "tls")]
+    Tls(tokio::io::WriteHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl tokio::io::AsyncWrite for ConnWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ConnWriter::Plain(w) => std::pin::Pin::new(w).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            ConnWriter::Tls(w) => std::pin::Pin::new(w).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnWriter::Plain(w) => std::pin::Pin::new(w).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            ConnWriter::Tls(w) => std::pin::Pin::new(w).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnWriter::Plain(w) => std::pin::Pin::new(w).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            ConnWriter::Tls(w) => std::pin::Pin::new(w).poll_shutdown(cx),
+        }
+    }
+}
+
+/// **F36**: monomorphic reader enum — eliminates vtable indirection.
+pub enum ConnReader {
+    Plain(tokio::net::tcp::OwnedReadHalf),
+    #[cfg(feature = "tls")]
+    Tls(tokio::io::ReadHalf<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl tokio::io::AsyncRead for ConnReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ConnReader::Plain(r) => std::pin::Pin::new(r).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            ConnReader::Tls(r) => std::pin::Pin::new(r).poll_read(cx, buf),
+        }
+    }
+}
+
 
 /// TCP transport. Clone-friendly — backed by Arc.
 #[derive(Clone)]
@@ -111,7 +173,7 @@ impl ConnectionRegistry {
     /// and drains the per-connection frame queue. Returns the `conn_id`.
     ///
     /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
-    pub fn register(&self, writer: BoxedWriter) -> u64 {
+    pub fn register(&self, writer: ConnWriter) -> u64 {
         let conn_id = self.inner.conn_id_gen.next();
         // H13: honour the configured per-connection capacity. Fallback
         // is the historical default if the field is unset (zero).
@@ -121,13 +183,24 @@ impl ConnectionRegistry {
             self.inner.write_buffer_cap
         };
         let (tx, rx) = mpsc::channel::<Bytes>(cap);
+        // M8: shared feedback atomics — writer task signals failures and
+        // counts successful writes so the drain path skips dead connections.
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let frames_written = Arc::new(AtomicU64::new(0));
         // H6: writer task removes the session from the registry on
         // write error so a half-dead peer cannot pile up forever.
         let inner = Arc::clone(&self.inner);
         // M15: supervise the writer task — panics here would silently
         // strand the connection's mpsc receiver. Watcher logs and exits
         // when the child resolves (normal or panic).
-        let writer_handle = tokio::spawn(conn_writer_task(rx, writer, conn_id, inner));
+        let writer_handle = tokio::spawn(conn_writer_task(
+            rx,
+            writer,
+            conn_id,
+            inner,
+            Arc::clone(&write_failed),
+            Arc::clone(&frames_written),
+        ));
         let cid_for_log = conn_id;
         tokio::spawn(async move {
             match writer_handle.await {
@@ -144,6 +217,8 @@ impl ConnectionRegistry {
         let session = Session {
             write_tx: tx,
             last_activity: std::sync::atomic::AtomicU64::new(now_ms(&clock)),
+            write_failed,
+            frames_written,
         };
         self.inner.sessions.lock().insert(conn_id, session);
         conn_id
@@ -173,6 +248,13 @@ impl ConnectionRegistry {
     pub fn get_write_tx(&self, conn_id: u64) -> Option<mpsc::Sender<Bytes>> {
         let sessions = self.inner.sessions.lock();
         sessions.get(&conn_id).map(|s| s.write_tx.clone())
+    }
+
+    /// **M8**: clone the writer-feedback flag for a connection so the drain
+    /// snapshot can check it inline without taking the registry lock.
+    pub fn get_write_failed(&self, conn_id: u64) -> Option<Arc<AtomicBool>> {
+        let sessions = self.inner.sessions.lock();
+        sessions.get(&conn_id).map(|s| Arc::clone(&s.write_failed))
     }
 
     /// Number of active sessions.
@@ -209,6 +291,30 @@ impl ConnectionRegistry {
         sessions.keys().copied().collect()
     }
 
+    /// **M8**: check whether the writer task for `conn_id` is still healthy.
+    /// Returns `false` if the writer has signalled an I/O error or if the
+    /// connection doesn't exist. Drain uses this to skip dead connections
+    /// before wasting frames into the channel.
+    #[inline]
+    pub fn is_conn_healthy(&self, conn_id: u64) -> bool {
+        let sessions = self.inner.sessions.lock();
+        match sessions.get(&conn_id) {
+            Some(s) => !s.write_failed.load(Relaxed),
+            None => false,
+        }
+    }
+
+    /// **M8**: number of frames successfully written to the socket for
+    /// `conn_id`. Returns 0 if the connection doesn't exist.
+    #[inline]
+    pub fn frames_written(&self, conn_id: u64) -> u64 {
+        let sessions = self.inner.sessions.lock();
+        match sessions.get(&conn_id) {
+            Some(s) => s.frames_written.load(Relaxed),
+            None => 0,
+        }
+    }
+
     /// Enqueue frame parts as a single `Bytes`. Non-blocking — drops if full.
     #[inline]
     pub fn send_parts(&self, conn_id: u64, parts: &[&[u8]]) -> bool {
@@ -218,6 +324,15 @@ impl ConnectionRegistry {
             buf.extend_from_slice(part);
         }
         self.enqueue(conn_id, buf.freeze())
+    }
+
+    /// F34: Enqueue a small zerocopy frame without BytesMut allocation.
+    /// `Bytes::copy_from_slice` uses an inline representation for buffers
+    /// ≤ ~31 bytes (RepOkFrame = 24B, Header = 12B), avoiding the heap
+    /// entirely on the publish-reply hot path.
+    #[inline]
+    pub fn send_inline(&self, conn_id: u64, data: &[u8]) -> bool {
+        self.enqueue(conn_id, Bytes::copy_from_slice(data))
     }
 
     /// Enqueue an already-built `Bytes`. Non-blocking — drops if full.
@@ -256,19 +371,26 @@ impl ConnectionRegistry {
 /// noticed the EOF.
 async fn conn_writer_task(
     mut rx: mpsc::Receiver<Bytes>,
-    mut w: BoxedWriter,
+    mut w: ConnWriter,
     conn_id: u64,
     inner: Arc<Inner>,
+    write_failed: Arc<AtomicBool>,
+    frames_written: Arc<AtomicU64>,
 ) {
-    let mut write_err = false;
+    let mut err = false;
     while let Some(frame) = rx.recv().await {
         if w.write_all(&frame).await.is_err() {
-            write_err = true;
+            // M8: signal the drain path that this connection is dead.
+            write_failed.store(true, Relaxed);
+            err = true;
             break;
         }
+        // M8: bump written count so observers can compare enqueued vs.
+        // written for back-pressure and delivery-confirmation.
+        frames_written.fetch_add(1, Relaxed);
     }
     let _ = w.shutdown().await;
-    if write_err {
+    if err {
         inner.sessions.lock().remove(&conn_id);
     }
 }

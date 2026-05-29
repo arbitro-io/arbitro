@@ -8,6 +8,7 @@
 //! **Zero Mutex between drain and commands.** Shared state is atomics +
 //! ArcSwap snapshots.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbitro_engine_v2::types::StreamId;
@@ -170,6 +171,7 @@ impl ShardRouter {
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
             let engine = ArbitroEngine::new();
+            let shard_metrics = engine.metrics_arc();
             let gate = Arc::new(Gate::new());
 
             let store: Box<dyn arbitro_store::Store> = match &config.data_dir {
@@ -271,6 +273,7 @@ impl ShardRouter {
                 pending_consumer_remove: Vec::new(),
                 last_wheel_tick: None,
                 evict_resume_seq: 0,
+                stream_oldest_ts: HashMap::default(),
             };
 
             // M15: supervise the command-worker task — if it panics
@@ -304,6 +307,7 @@ impl ShardRouter {
                 Arc::clone(&shared_store),
                 Arc::clone(&gate),
                 registry.clone(),
+                shard_metrics,
             ));
         }
 

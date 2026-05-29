@@ -25,6 +25,8 @@ use arbitro_proto::lifecycle::LifeCycle;
 use arbitro_proto::metadata::{MetadataApplier, MetadataCommandView};
 use tracing::{info, warn};
 
+use crate::config::FsyncPolicy;
+
 /// Append-only command log with length-prefix framing.
 ///
 /// Thread safety: the server ensures only one thread writes metadata
@@ -32,11 +34,17 @@ use tracing::{info, warn};
 pub struct CommandLog {
     path: PathBuf,
     file: File,
+    fsync_policy: FsyncPolicy,
 }
 
 impl CommandLog {
     /// Open or create a command log at the given path.
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::open_with_policy(path, FsyncPolicy::Every)
+    }
+
+    /// Open with a specific fsync policy.
+    pub fn open_with_policy(path: impl Into<PathBuf>, fsync_policy: FsyncPolicy) -> std::io::Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -48,7 +56,7 @@ impl CommandLog {
             .read(true)
             .open(&path)?;
 
-        Ok(Self { path, file })
+        Ok(Self { path, file, fsync_policy })
     }
 
     /// Append a raw metadata command to the log.
@@ -76,7 +84,9 @@ impl CommandLog {
         // a promise the kernel can break. The cost is ~1 ms per record,
         // which is fine for the cold metadata path.
         self.file.flush()?;
-        self.file.sync_data()?;
+        if self.fsync_policy == FsyncPolicy::Every {
+            self.file.sync_data()?;
+        }
         Ok(())
     }
 

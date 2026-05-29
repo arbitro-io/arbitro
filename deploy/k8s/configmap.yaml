@@ -1,30 +1,15 @@
-# Arbitro broker configuration. Mounted into the deployment as
-# environment variables — same names as the README env table. Any
-# variable left unset falls back to the defaults baked into
-# `arbitro_server::config::Config::from_env`.
-#
-# Override per environment by patching this ConfigMap (or building
-# kustomize/helm on top of it). The deployment will only pick up
-# changes after a pod rollout.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: arbitro-config
+  namespace: arbitro
   labels:
-    app.kubernetes.io/name: arbitro
+    app.kubernetes.io/name: arbitro-server
+    app.kubernetes.io/part-of: arbitro-io
 data:
   ARBITRO_LISTEN: "0.0.0.0:9898"
+  ARBITRO_SHARDS: "4"
   ARBITRO_MAX_CONNECTIONS: "10000"
-  ARBITRO_WRITE_BUFFER_CAP: "8192"
-  ARBITRO_IDLE_TIMEOUT: "300"
-  ARBITRO_KEEPALIVE_INTERVAL: "30"
+  ARBITRO_DATA_DIR: "/data"
   ARBITRO_METRICS_INTERVAL: "5"
-  ARBITRO_SHUTDOWN_TIMEOUT: "10"
-  ARBITRO_CHANNEL_CAPACITY: "4096"
-  ARBITRO_MAX_FEED_PER_CYCLE: "256"
-  ARBITRO_DRAIN_BATCH_SIZE: "256"
-  # Persistence — uncomment to enable disk-backed journal. The path
-  # must point to a writable PVC mounted into the pod.
-  # ARBITRO_DATA_DIR: "/var/lib/arbitro"
-  # Auth — recommend wiring this via a Secret, not the ConfigMap.
-  # See `auth-secret-example.yaml` (commented in deployment.yaml).
+  ARBITRO_IDLE_TIMEOUT: "300"

@@ -325,13 +325,14 @@ async fn test_queue_same_connection() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
 
+    // deliver_mode=1 (Queue) + shared group → round-robin.
     let resp = client
-        .create_consumer(sid, b"qsc-w1", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"qsc-w1", b"qsc-group", b"", 100, 1, 0, 1, 0, 0)
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"qsc-w2", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"qsc-w2", b"qsc-group", b"", 100, 1, 0, 1, 0, 0)
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);

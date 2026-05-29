@@ -41,10 +41,11 @@ pub struct EngineMetrics {
     pub claim_empty_pop:               AtomicU64,
 
     // ── Ack / Nack ────────────────────────────
-    pub ack_accepted:  AtomicU64,
-    pub ack_not_found: AtomicU64,
-    pub nack_accepted: AtomicU64,
-    _pad2: [u8; 40],
+    pub ack_accepted:   AtomicU64,
+    pub ack_not_found:  AtomicU64,
+    pub nack_accepted:  AtomicU64,
+    pub nack_not_found: AtomicU64,
+    _pad2: [u8; 32],
 
     // ── Seed / Replay ─────────────────────────
     pub seed_entries:       AtomicU64,
@@ -82,10 +83,11 @@ impl EngineMetrics {
             claim_skipped_credit_subject:  AtomicU64::new(0),
             claim_empty_pop:               AtomicU64::new(0),
 
-            ack_accepted:  AtomicU64::new(0),
-            ack_not_found: AtomicU64::new(0),
-            nack_accepted: AtomicU64::new(0),
-            _pad2: [0; 40],
+            ack_accepted:   AtomicU64::new(0),
+            ack_not_found:  AtomicU64::new(0),
+            nack_accepted:  AtomicU64::new(0),
+            nack_not_found: AtomicU64::new(0),
+            _pad2: [0; 32],
 
             seed_entries:       AtomicU64::new(0),
             seed_queues_pushed: AtomicU64::new(0),
@@ -119,9 +121,10 @@ impl EngineMetrics {
             claim_skipped_credit_subject:  l(&self.claim_skipped_credit_subject),
             claim_empty_pop:               l(&self.claim_empty_pop),
 
-            ack_accepted:  l(&self.ack_accepted),
-            ack_not_found: l(&self.ack_not_found),
-            nack_accepted: l(&self.nack_accepted),
+            ack_accepted:   l(&self.ack_accepted),
+            ack_not_found:  l(&self.ack_not_found),
+            nack_accepted:  l(&self.nack_accepted),
+            nack_not_found: l(&self.nack_not_found),
 
             seed_entries:       l(&self.seed_entries),
             seed_queues_pushed: l(&self.seed_queues_pushed),
@@ -157,9 +160,10 @@ pub struct MetricsSnapshot {
     pub claim_skipped_credit_subject:  u64,
     pub claim_empty_pop:               u64,
 
-    pub ack_accepted:  u64,
-    pub ack_not_found: u64,
-    pub nack_accepted: u64,
+    pub ack_accepted:   u64,
+    pub ack_not_found:  u64,
+    pub nack_accepted:  u64,
+    pub nack_not_found: u64,
 
     pub seed_entries:       u64,
     pub seed_queues_pushed: u64,

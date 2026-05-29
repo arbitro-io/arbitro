@@ -41,6 +41,26 @@ pub struct Config {
     pub tls_key: Option<String>,
     /// Auth token — if set, clients must send this in Hello frame (None = no auth).
     pub auth_token: Option<String>,
+    /// Maximum frame body size in bytes (default: 64 MiB).
+    /// Frames larger than this are rejected and the connection is dropped.
+    pub max_frame_size: usize,
+    /// Maximum frames per second per connection (0 = unlimited, default: 0).
+    /// When set, connections that exceed this rate are throttled — the
+    /// read loop sleeps until the next token is available.
+    pub max_ops_per_sec: u32,
+    /// Fsync policy for the metadata command log.
+    /// - "every" (default): fdatasync after every metadata write (safest)
+    /// - "none": no fsync (fastest, risk of metadata loss on crash)
+    pub fsync_policy: FsyncPolicy,
+}
+
+/// Fsync policy for metadata persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsyncPolicy {
+    /// fdatasync after every metadata write (default, safest).
+    Every,
+    /// No fsync — OS buffers may lose data on crash.
+    None,
 }
 
 impl Config {
@@ -64,6 +84,32 @@ impl Config {
             tls_cert: std::env::var("ARBITRO_TLS_CERT").ok(),
             tls_key: std::env::var("ARBITRO_TLS_KEY").ok(),
             auth_token: std::env::var("ARBITRO_AUTH_TOKEN").ok(),
+            max_frame_size: env_parse("ARBITRO_MAX_FRAME_SIZE", 64 * 1024 * 1024),
+            max_ops_per_sec: env_parse("ARBITRO_MAX_OPS_PER_SEC", 0),
+            fsync_policy: match std::env::var("ARBITRO_FSYNC_POLICY").as_deref() {
+                Ok("none") => FsyncPolicy::None,
+                _ => FsyncPolicy::Every,
+            },
+        }
+    }
+
+    /// Validate configuration invariants. Panics on invalid combinations
+    /// so the server fails loudly at startup rather than misbehaving at
+    /// runtime.
+    pub fn validate(&self) {
+        assert!(self.shard_count > 0, "ARBITRO_SHARDS must be > 0");
+        assert!(self.channel_capacity > 0, "ARBITRO_CHANNEL_CAPACITY must be > 0");
+        assert!(self.max_connections > 0, "ARBITRO_MAX_CONNECTIONS must be > 0");
+        assert!(self.write_buffer_cap > 0, "ARBITRO_WRITE_BUFFER_CAP must be > 0");
+        assert!(self.max_frame_size > 0, "ARBITRO_MAX_FRAME_SIZE must be > 0");
+        assert!(
+            self.max_frame_size <= 256 * 1024 * 1024,
+            "ARBITRO_MAX_FRAME_SIZE must be <= 256 MiB"
+        );
+        assert!(self.max_feed_per_cycle > 0, "ARBITRO_MAX_FEED_PER_CYCLE must be > 0");
+        assert!(self.drain_batch_size > 0, "ARBITRO_DRAIN_BATCH_SIZE must be > 0");
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            panic!("ARBITRO_TLS_CERT and ARBITRO_TLS_KEY must both be set or both unset");
         }
     }
 
@@ -121,6 +167,21 @@ impl Config {
         self.data_dir = Some(dir.into());
         self
     }
+
+    pub fn max_frame_size(mut self, size: usize) -> Self {
+        self.max_frame_size = size;
+        self
+    }
+
+    pub fn max_ops_per_sec(mut self, ops: u32) -> Self {
+        self.max_ops_per_sec = ops;
+        self
+    }
+
+    pub fn fsync_policy(mut self, policy: FsyncPolicy) -> Self {
+        self.fsync_policy = policy;
+        self
+    }
 }
 
 impl Default for Config {
@@ -141,6 +202,9 @@ impl Default for Config {
             tls_cert: None,
             tls_key: None,
             auth_token: None,
+            max_frame_size: 64 * 1024 * 1024,
+            max_ops_per_sec: 0,
+            fsync_policy: FsyncPolicy::Every,
         }
     }
 }
