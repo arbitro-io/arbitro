@@ -23,6 +23,7 @@
 # Docs and agent notes — not consumed by the build.
 **/*.md
 **/.agent/
+**/.claude/
 
 # Editor / OS / Node noise.
 **/node_modules/

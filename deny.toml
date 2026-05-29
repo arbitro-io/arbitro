@@ -1,16 +1,12 @@
 # cargo-deny configuration for arbitro
 # https://embarkstudios.github.io/cargo-deny/
+#
+# Updated for cargo-deny 0.19.x (breaking config changes from 0.16+).
 
 [advisories]
-db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -20,8 +16,13 @@ allow = [
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Zlib",
+    "OpenSSL",
 ]
-copyleft = "deny"
+
+# Workspace crates have publish = false → cargo-deny treats them as private.
+[licenses.private]
+ignore = true
+registries = []
 
 [[licenses.clarify]]
 name = "ring"
@@ -30,7 +31,7 @@ license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"

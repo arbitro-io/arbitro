@@ -16,14 +16,17 @@ FROM rust:1.88-slim AS builder
 # but doesn't ship to the runtime image.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends musl-tools && \
-    rm -rf /var/lib/apt/lists/* && \
-    rustup target add x86_64-unknown-linux-musl
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY arbitro/ ./arbitro/
 COPY arbitro-kit/ ./arbitro-kit/
 
 WORKDIR /build/arbitro
+# rust-toolchain.toml may re-sync the toolchain on first cargo invocation,
+# so install the musl target AFTER the COPY to guarantee it matches the
+# active toolchain.
+RUN rustup target add x86_64-unknown-linux-musl
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/arbitro/target \
     cargo build --release --target x86_64-unknown-linux-musl -p arbitro-server && \
