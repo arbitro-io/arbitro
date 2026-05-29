@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
 use crate::action::Action;
-use crate::wire::envelope::{Envelope, ENVELOPE_SIZE};
+use crate::v2::header::{Header, HEADER_SIZE};
 
 // ── CreateCron ──────────────────────────────────────────────────────────────
 
@@ -29,10 +29,10 @@ pub struct CreateCronBody {
 }
 
 /// Encode a CreateCron frame (Envelope + JSON body).
-pub fn encode_create_cron(seq: u32, body: &CreateCronBody) -> Bytes {
+pub fn encode_create_cron(seq: u64, body: &CreateCronBody) -> Bytes {
     let json = serde_json::to_vec(body).expect("CreateCronBody is always serializable");
-    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE + json.len());
-    let env = Envelope::new(Action::CreateCron, 0, json.len() as u32, seq);
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + json.len());
+    let env = Header::new(Action::CreateCron.as_u16(), json.len() as u32, seq);
     buf.put_slice(env.as_bytes());
     buf.put_slice(&json);
     buf.freeze()
@@ -46,9 +46,9 @@ pub fn decode_create_cron(body: &[u8]) -> Result<CreateCronBody, serde_json::Err
 // ── DeleteCron ──────────────────────────────────────────────────────────────
 
 /// Encode a DeleteCron frame. Body = cron name bytes (no JSON needed).
-pub fn encode_delete_cron(seq: u32, name: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE + name.len());
-    let env = Envelope::new(Action::DeleteCron, 0, name.len() as u32, seq);
+pub fn encode_delete_cron(seq: u64, name: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + name.len());
+    let env = Header::new(Action::DeleteCron.as_u16(), name.len() as u32, seq);
     buf.put_slice(env.as_bytes());
     buf.put_slice(name);
     buf.freeze()
@@ -57,9 +57,9 @@ pub fn encode_delete_cron(seq: u32, name: &[u8]) -> Bytes {
 // ── ListCrons ───────────────────────────────────────────────────────────────
 
 /// Encode a ListCrons request frame. No body.
-pub fn encode_list_crons(seq: u32) -> Bytes {
-    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE);
-    let env = Envelope::new(Action::ListCrons, 0, 0, seq);
+pub fn encode_list_crons(seq: u64) -> Bytes {
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE);
+    let env = Header::new(Action::ListCrons.as_u16(), 0, seq);
     buf.put_slice(env.as_bytes());
     buf.freeze()
 }
@@ -84,10 +84,10 @@ pub struct CronInfo {
 pub const CRON_FIRE_FIXED: usize = 2 + 8 + 8; // 18 bytes
 
 /// Encode a CronFire frame.
-pub fn encode_cron_fire(seq: u32, name: &[u8], fire_time_ms: u64, fire_count: u64) -> Bytes {
+pub fn encode_cron_fire(seq: u64, name: &[u8], fire_time_ms: u64, fire_count: u64) -> Bytes {
     let body_len = CRON_FIRE_FIXED + name.len();
-    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE + body_len);
-    let env = Envelope::new(Action::CronFire, 0, body_len as u32, seq);
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + body_len);
+    let env = Header::new(Action::CronFire.as_u16(), body_len as u32, seq);
     buf.put_slice(env.as_bytes());
     buf.put_u16_le(name.len() as u16);
     buf.put_u64_le(fire_time_ms);
@@ -125,10 +125,10 @@ pub fn decode_cron_fire(body: &[u8]) -> Option<CronFireView<'_>> {
 pub const CRON_ACK_FIXED: usize = 2 + 1; // 3 bytes
 
 /// Encode a CronAck frame.
-pub fn encode_cron_ack(seq: u32, name: &[u8], ok: bool) -> Bytes {
+pub fn encode_cron_ack(seq: u64, name: &[u8], ok: bool) -> Bytes {
     let body_len = CRON_ACK_FIXED + name.len();
-    let mut buf = BytesMut::with_capacity(ENVELOPE_SIZE + body_len);
-    let env = Envelope::new(Action::CronAck, 0, body_len as u32, seq);
+    let mut buf = BytesMut::with_capacity(HEADER_SIZE + body_len);
+    let env = Header::new(Action::CronAck.as_u16(), body_len as u32, seq);
     buf.put_slice(env.as_bytes());
     buf.put_u16_le(name.len() as u16);
     buf.put_u8(if ok { 0 } else { 1 });

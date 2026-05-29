@@ -167,7 +167,7 @@ impl<'a> CronBuilder<'a> {
 
         // Send CreateCron to broker and await reply
         let seq = self.client.inner.seq_alloc.next();
-        let frame = encode_create_cron(seq as u32, &body);
+        let frame = encode_create_cron(seq, &body);
 
         let rx = self.client.inner.pending.register(seq);
         crate::publish::enqueue(self.client.producer(), crate::transport::frame::WriteFrame::Mono(frame))?;
@@ -206,7 +206,7 @@ impl CronHandle {
     /// Unregister this cron job from the broker and remove the local handler.
     pub async fn stop(&self) -> Result<(), ClientError> {
         let seq = self.inner.seq_alloc.next();
-        let frame = encode_delete_cron(seq as u32, &self.name);
+        let frame = encode_delete_cron(seq, &self.name);
 
         let rx = self.inner.pending.register(seq);
         {
@@ -258,7 +258,7 @@ pub(crate) async fn dispatch_cron_fire(frame: Bytes, inner: &Inner) {
 }
 
 fn send_cron_ack(inner: &Inner, name: &[u8], ok: bool) {
-    let seq = inner.seq_alloc.next() as u32;
+    let seq = inner.seq_alloc.next();
     let frame = encode_cron_ack(seq, name, ok);
     let wf = crate::transport::frame::WriteFrame::Mono(frame);
     if let Ok(mut admin) = inner.admin_producer.lock() {
@@ -272,7 +272,7 @@ fn send_cron_ack(inner: &Inner, name: &[u8], ok: bool) {
 pub(crate) fn replay_crons(inner: &Inner) {
     let configs = inner.cron_state.all_configs();
     for (_name, body) in configs {
-        let seq = inner.seq_alloc.next() as u32;
+        let seq = inner.seq_alloc.next();
         let frame = encode_create_cron(seq, &body);
         let wf = crate::transport::frame::WriteFrame::Mono(frame);
         if let Ok(mut admin) = inner.admin_producer.lock() {

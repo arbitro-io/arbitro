@@ -174,6 +174,7 @@ impl CronRegistry {
         conn_id: u64,
     ) -> Result<(), String> {
         let cron = Cron::new(every)
+            .with_seconds_optional()
             .parse()
             .map_err(|e| format!("invalid cron expression: {e}"))?;
 
