@@ -95,6 +95,7 @@ impl Client {
             nack_tx,
             last_pong_ns:   AtomicU64::new(Inner::now_ns()),
             metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
+            cron_state:     crate::cron::CronState::new(),
         });
 
         // Spawn the ack-batcher and nack-batcher — both live for the Client lifetime.
@@ -124,7 +125,7 @@ impl Client {
     }
 
     #[inline]
-    fn producer(&self) -> &WriteProducer {
+    pub(crate) fn producer(&self) -> &WriteProducer {
         self.producer.as_ref().expect("producer missing")
     }
 
@@ -542,5 +543,26 @@ impl Client {
     #[inline]
     pub fn metrics_snapshot(&self) -> crate::metrics::ClientMetricsSnapshot {
         self.inner.metrics.snapshot()
+    }
+
+    // ── Cron scheduling ────────────────────────────────────────────────
+
+    /// Start building a cron job registration.
+    ///
+    /// ```rust,no_run
+    /// # use arbitro_client_tokio::Client;
+    /// # async fn example(client: &Client) {
+    /// let cron = client.cron(b"billing")
+    ///     .every(b"0 0 1 * *")
+    ///     .run(|ctx| async move {
+    ///         println!("fire #{}", ctx.fire_count);
+    ///     })
+    ///     .await
+    ///     .unwrap();
+    /// cron.stop().await.unwrap();
+    /// # }
+    /// ```
+    pub fn cron<'a>(&'a self, name: &[u8]) -> crate::cron::CronBuilder<'a> {
+        crate::cron::CronBuilder::new(self, name)
     }
 }

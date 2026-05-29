@@ -53,6 +53,8 @@ pub(crate) struct Inner {
     /// Atomic client counters — shared with hot-path tasks for cheap
     /// `fetch_add(Relaxed)` observability. See [`crate::metrics`].
     pub(crate) metrics:        Arc<ClientMetrics>,
+    /// Active cron job handlers — keyed by name, used by dispatch + reconnect.
+    pub(crate) cron_state:     crate::cron::CronState,
 }
 
 impl Inner {

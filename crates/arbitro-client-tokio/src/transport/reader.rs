@@ -142,6 +142,12 @@ async fn dispatch(inner: &Inner, frame: Bytes) {
         return;
     }
 
+    // ── Cron fire ──────────────────────────────────────────────────
+    if action == Action::CronFire.as_u16() {
+        crate::cron::dispatch_cron_fire(frame, inner).await;
+        return;
+    }
+
     // All other actions are silently dropped (system frames, etc.)
     let _ = action;
 }

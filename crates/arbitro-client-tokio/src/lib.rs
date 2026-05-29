@@ -36,6 +36,7 @@
 pub mod client;
 pub mod config;
 pub mod consumer_builder;
+pub mod cron;
 pub mod error;
 pub mod metrics;
 
@@ -77,6 +78,7 @@ pub use arbitro_proto::v2::manager::SubjectLimit;
 /// at call sites — it's an explicit no-broker-round-trip cost when
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
+pub use cron::{CronBuilder, CronHandle, CronContext};
 
 /// Consumer-config enums lifted from `arbitro-proto` so callers don't
 /// have to depend on the proto crate directly to set `ack_policy`,
