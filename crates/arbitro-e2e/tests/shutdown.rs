@@ -203,7 +203,7 @@ async fn sigterm_raw_signal_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_string_lossy().into_owned();
 
-    let mut server = TestServerBuilder::new().data_dir(&path).spawn().await;
+    let server = TestServerBuilder::new().data_dir(&path).spawn().await;
     let client = server.connect().await;
 
     let resp = client
@@ -220,6 +220,7 @@ async fn sigterm_raw_signal_isolated() {
     // Send the actual OS SIGTERM — server's signal handler will catch it.
     signal::kill(Pid::this(), Signal::SIGTERM).expect("kill(SIGTERM)");
     tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(server);
 
     let mut server2 = TestServerBuilder::new().data_dir(&path).spawn().await;
     let client2 = server2.connect().await;

@@ -171,6 +171,7 @@ jobs:
         with:
           repository: arbitro-io/arbitro-kit
           path: arbitro-kit
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit & cargo-deny
         run: cargo install cargo-audit cargo-deny --locked
       - name: cargo audit
