@@ -27,34 +27,11 @@ One rule isolates an unbounded number of subjects. A saturated `orders.freemium.
 ## Key Features
 
 - **Massive Subject Partitioning** — millions of unique subjects, one rule.
-- **Ultra-High Throughput** — 14.2M+ msg/s ingest, 4.3M+ msg/s replay drain.
-- **Predictable Latency** — sub-microsecond internal dispatch, zero GC pauses.
+- **Ultra-High Throughput** — zero-copy hot path, zero GC pauses.
 - **Crash-Safe Persistence** — Magic Byte (0xAF) validation survives `SIGKILL`.
 - **Reactive Model** — callback + pull subscription modes.
 - **Shard-Parallel Architecture** — split-phase drain (store read + lock-free delivery) + command threads per shard. Publish never blocks on drain.
 - **Ack Timeout & Nack Delay** — per-consumer timing wheel auto-nacks stale deliveries and supports delayed requeue.
-
-## Performance (E2E Throughput)
-
-Arbitro is built for **Hardware Sympathy**. Benchmarks represent the full end-to-end cycle (TCP + Protocol + Engine) on a single server instance (WSL, 64B payload, Memory backend).
-
-| Mode | Throughput (1K → 1M msgs) | Latency / unit |
-|------|----------------------------|----------------|
-| **Publish (ingest)** | 6.3M — 14.2M msg/s | ~70 ns |
-| **Cycle fire-and-forget** | 6.5M — 15.1M msg/s | ~66 ns |
-| **Cycle explicit ack** | 2.1M — 2.52M msg/s | ~390 ns |
-| **VIP subject isolation** | Independent of noise | 31 ns (L3) — 84 µs (net) |
-
-## Endurance & Stability (1-minute sustained)
-
-| Scenario | Throughput | CPU | RSS | Stability |
-|----------|-----------|-----|-----|-----------|
-| Memory hot-path | ~2.8M msg/s | ~10.8% | ~2.99 GB | O(1) hybrid index |
-| Disk persistence | ~35.4k msg/s | ~3.2% | ~120 MB | Crash-safe (0xAF) |
-| Chaos resilience | 10 s stress | Isolated PIDs | Stable | 100% recovery proof |
-
-> [!IMPORTANT]
-> **Performance Consistency**: Introducing *Dynamic Subject Isolation* resulted in **0% regression** in global throughput.
 
 ## Architecture Overview
 
@@ -227,7 +204,7 @@ while let Some(msg) = sub.next().await {
 // Single fire-and-forget
 client.publish(b"ORDERS", b"orders.freemium.u1", payload).await?;
 
-// High-density batch (14.2M msg/s)
+// High-density batch
 client.publish_batch(b"ORDERS", &[
     (b"orders.premium.u1", &payload),
     (b"orders.premium.u2", &payload),
