@@ -10,7 +10,7 @@
 #
 # CI runs that step automatically (.github/workflows/ci.yml). Without it,
 # the local context can grow to >4 GB by sweeping in `target/` artifacts.
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 
 # musl toolchain for static linking. ~30 MB extra in the builder layer
 # but doesn't ship to the runtime image.
