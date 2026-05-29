@@ -235,7 +235,7 @@ pub struct BatchAckEntryIter<'a> {
     remaining: usize,
 }
 
-impl<'a> Iterator for BatchAckEntryIter<'a> {
+impl Iterator for BatchAckEntryIter<'_> {
     type Item = (u64, u32);
 
     #[inline(always)]

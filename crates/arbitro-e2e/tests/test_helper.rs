@@ -4,7 +4,8 @@ use bytes::Bytes;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Builder para configurar una instancia de TestServer.
+/// Builder for configuring a TestServer instance.
+#[allow(dead_code)]
 pub struct TestServerBuilder {
     data_dir: Option<String>,
     shard_count: usize,
@@ -17,6 +18,7 @@ impl Default for TestServerBuilder {
     }
 }
 
+#[allow(dead_code)]
 impl TestServerBuilder {
     pub fn new() -> Self {
         Self {
@@ -58,7 +60,7 @@ impl TestServerBuilder {
 
         let mut server = ArbitroServer::new(config);
 
-        // Si hay data_dir, activamos la persistencia del log de comandos.
+        // Enable command-log persistence when data_dir is set.
         if let Some(ref data_dir) = self.data_dir {
             if !data_dir.is_empty() {
                 let path = std::path::Path::new(data_dir).join("metadata.log");
@@ -79,15 +81,17 @@ impl TestServerBuilder {
     }
 }
 
-/// Instancia de servidor en ejecución para tests.
+/// Running server instance for tests.
+#[allow(dead_code)]
 pub struct TestServer {
     pub addr: String,
     shutdown_tx: watch::Sender<bool>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 impl TestServer {
-    /// Conexión determinista con reintentos.
+    /// Connect with deterministic retries.
     pub async fn connect(&self) -> Client {
         Self::connect_to(&self.addr).await
     }
@@ -107,7 +111,7 @@ impl TestServer {
         panic!("Failed to connect to {}", addr);
     }
 
-    /// Apagado determinista.
+    /// Deterministic shutdown.
     pub async fn shutdown(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = self.shutdown_tx.send(true);
@@ -115,7 +119,7 @@ impl TestServer {
         }
     }
 
-    /// Helper rápido para parsear IDs de respuesta.
+    /// Quick helper to parse response IDs.
     pub fn parse_id(resp: &Bytes) -> u32 {
         u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
     }

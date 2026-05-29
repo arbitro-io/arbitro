@@ -125,7 +125,7 @@ pub enum PayloadRef<'a> {
     Owned(Bytes),
 }
 
-impl<'a> PayloadRef<'a> {
+impl PayloadRef<'_> {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         match self {

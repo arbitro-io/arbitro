@@ -470,7 +470,7 @@ pub struct MatchResult<'a> {
     pub catch_all: &'a [MatchEntry],
 }
 
-impl<'a> MatchResult<'a> {
+impl MatchResult<'_> {
     /// Total number of matched consumers.
     #[inline]
     pub fn count(&self) -> usize {
