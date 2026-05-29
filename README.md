@@ -211,6 +211,36 @@ client.publish_batch(b"ORDERS", &[
 ]).await?;
 ```
 
+## Cron Scheduling
+
+Register distributed cron jobs directly on the broker. Multiple workers can register the same name — only one receives each fire (queue semantics). Crons survive reconnects automatically.
+
+```rust
+let cron = client.cron(b"billing-monthly")
+    .every(b"0 0 1 * *")
+    .tz(b"America/New_York")
+    .run(|ctx| async move {
+        process_billing(ctx.fire_count).await;
+    })
+    .await?;
+
+// Later:
+cron.stop().await?;
+```
+
+```typescript
+const cron = await client.cron("billing-monthly")
+    .every("0 0 1 * *")
+    .tz("America/New_York")
+    .run(async (ctx) => {
+        await processBilling(ctx.fireCount);
+    });
+
+cron.stop();
+```
+
+Cron jobs live in memory — if the broker restarts, clients re-register automatically on reconnect.
+
 ## Roadmap
 
 ### Phase 1 — Core Engine (done)
@@ -239,7 +269,15 @@ client.publish_batch(b"ORDERS", &[
 - [x] `--version` / `--help` flags + config validation at startup
 - [x] Protocol hardening (AckPolicy::None limits, stale config, namespaced consumers)
 
-### Phase 4 — Scale (planned)
+### Phase 4 — Scheduling (done)
+- [x] In-memory cron scheduler (server-side, no persistence)
+- [x] Queue semantics — multiple workers, single delivery per fire
+- [x] Automatic re-registration on reconnect
+- [x] Overlap guard + handler timeout + failover on disconnect
+- [x] Rust client: `client.cron(name).every("...").run(handler)`
+- [x] TypeScript client: `client.cron(name).every("...").run(handler)`
+
+### Phase 5 — Scale (planned)
 - [ ] Subject scavenging (TTL-based inactive-slot cleanup)
 - [ ] Clustering (Raft) for stream state replication
 - [ ] Adaptive subject prioritization
