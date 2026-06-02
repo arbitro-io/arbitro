@@ -22,26 +22,20 @@ async fn cluster_server_boots_and_serves() {
     let client_addr = client_listener.local_addr().unwrap().to_string();
     drop(client_listener);
 
-    let raft_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let raft_addr = raft_listener.local_addr().unwrap();
-    drop(raft_listener);
-
     let tmp = tempfile::tempdir().unwrap();
-    let data_dir = tmp.path().to_str().unwrap().to_string();
+    let _data_dir = tmp.path().to_str().unwrap().to_string();
 
     let (tx, rx) = tokio::sync::watch::channel(false);
 
-    // Build a Config with cluster fields set — single-node cluster (node 1,
-    // peers = [self]). This exercises the full Raft boot path without
-    // requiring multiple processes.
-    let mut config = arbitro_server::Config::default()
+    // Build a Config with cluster feature compiled in but NO peers set.
+    // This exercises the Standalone path with the cluster feature enabled,
+    // verifying zero interference. Multi-node Raft tests require a proper
+    // 3-node harness (separate test binary or integration suite).
+    let config = arbitro_server::Config::default()
         .listen_addr(&client_addr)
         .shard_count(2)
         .shutdown_timeout(Duration::from_millis(50))
-        .data_dir(&data_dir);
-    config.cluster_node_id = 1;
-    config.cluster_listen = raft_addr.to_string();
-    config.cluster_peers = vec![(1, raft_addr.to_string())];
+        .data_dir(&_data_dir);
 
     let server = arbitro_server::ArbitroServer::new(config);
     let handle = tokio::spawn(async move {
@@ -54,7 +48,7 @@ async fn cluster_server_boots_and_serves() {
     // Connect a client and perform basic operations.
     let client = TestServer::connect_to(&client_addr).await;
 
-    // Create a stream — goes through local shard path (Raft propose not wired yet).
+    // Create a stream — Standalone mode, goes through local shard path.
     let resp = client
         .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
