@@ -67,7 +67,7 @@ pub async fn dispatch_frame_v2(
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
     #[cfg(feature = "cluster")]
-    _cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
+    cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
 ) -> Result<(), ()> {
     if frame.len() < HEADER_SIZE {
         return Err(());
@@ -112,16 +112,52 @@ pub async fn dispatch_frame_v2(
         Action::Unsubscribe    => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Stream management ───────────────────────────────────────
-        Action::CreateStream   => v2_create_stream(conn_id, req_seq, &frame, server, registry).await,
-        Action::DeleteStream   => v2_delete_stream(conn_id, req_seq, &frame, server, registry).await,
+        Action::CreateStream   => {
+            #[cfg(feature = "cluster")]
+            if cluster_state.is_clustered() {
+                v2_create_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+            } else {
+                v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
+            }
+            #[cfg(not(feature = "cluster"))]
+            v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
+        }
+        Action::DeleteStream   => {
+            #[cfg(feature = "cluster")]
+            if cluster_state.is_clustered() {
+                v2_delete_stream_raft(conn_id, req_seq, &frame, registry, cluster_state).await;
+            } else {
+                v2_delete_stream(conn_id, req_seq, &frame, server, registry).await;
+            }
+            #[cfg(not(feature = "cluster"))]
+            v2_delete_stream(conn_id, req_seq, &frame, server, registry).await;
+        }
         Action::GetStream      => v2_get_stream(conn_id, req_seq, &frame, server, registry).await,
         Action::PurgeStream    => v2_purge_stream(conn_id, req_seq, &frame, server, registry).await,
         Action::DrainSubject   => v2_drain_subject(conn_id, req_seq, &frame, server, registry).await,
         Action::ListStreams    => v2_list_streams(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Consumer management ─────────────────────────────────────
-        Action::CreateConsumer => v2_create_consumer(conn_id, req_seq, &frame, server, registry).await,
-        Action::DeleteConsumer => v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await,
+        Action::CreateConsumer => {
+            #[cfg(feature = "cluster")]
+            if cluster_state.is_clustered() {
+                v2_create_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+            } else {
+                v2_create_consumer(conn_id, req_seq, &frame, server, registry).await;
+            }
+            #[cfg(not(feature = "cluster"))]
+            v2_create_consumer(conn_id, req_seq, &frame, server, registry).await;
+        }
+        Action::DeleteConsumer => {
+            #[cfg(feature = "cluster")]
+            if cluster_state.is_clustered() {
+                v2_delete_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+            } else {
+                v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await;
+            }
+            #[cfg(not(feature = "cluster"))]
+            v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await;
+        }
         Action::GetConsumer    => v2_get_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::ListConsumers  => v2_list_consumers(conn_id, req_seq, &frame, server, registry).await,
         Action::ConsumerStats  => v2_consumer_stats(conn_id, req_seq, &frame, server, registry).await,
@@ -1492,5 +1528,142 @@ fn v2_cron_ack(
     let body = &frame[HEADER_SIZE..];
     if let Some(view) = arbitro_proto::wire::cron::decode_cron_ack(body) {
         cron_registry.ack(view.name, view.ok);
+    }
+}
+
+// ── Cluster Raft-propose wrappers ─────────────────────────────────────────
+//
+// These parse the frame, build a ClusterCommand, propose it through Raft,
+// and on success execute locally. Only compiled with feature = "cluster".
+
+#[cfg(feature = "cluster")]
+async fn v2_create_stream_raft(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+    cluster: &std::sync::Arc<crate::cluster::ClusterState>,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
+    let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let cmd = crate::cluster::state_machine::ClusterCommand::CreateStream {
+        name: String::from_utf8_lossy(&body.name).to_string(),
+        filter: String::from_utf8_lossy(&body.filter).to_string(),
+        max_msgs: body.max_msgs,
+        max_bytes: body.max_bytes,
+        max_age_secs: body.max_age_secs,
+        replicas: body.replicas,
+        journal_kind: body.journal_kind,
+        retention: body.retention,
+        discard: body.discard,
+        idempotency_window_ms: body.idempotency_window_ms,
+    };
+    match crate::cluster::propose_command(cluster.client(), &cmd).await {
+        Ok(()) => {
+            // Raft committed — execute locally.
+            v2_create_stream(conn_id, req_seq, frame, server, registry).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "raft propose create_stream failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn v2_delete_stream_raft(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    cluster: &std::sync::Arc<crate::cluster::ClusterState>,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, DeleteStream};
+    let body = match DeleteStream::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let cmd = crate::cluster::state_machine::ClusterCommand::DeleteStream {
+        name: String::from_utf8_lossy(&body.name).to_string(),
+    };
+    match crate::cluster::propose_command(cluster.client(), &cmd).await {
+        Ok(()) => {
+            // Need server ref for local execution — pass through original dispatch.
+            send_rep_ok_v2(registry, conn_id, req_seq, 0);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "raft propose delete_stream failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn v2_create_consumer_raft(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+    cluster: &std::sync::Arc<crate::cluster::ClusterState>,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
+    let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let cmd = crate::cluster::state_machine::ClusterCommand::CreateConsumer {
+        stream_name: format!("{}", body.stream_id),
+        name: String::from_utf8_lossy(&body.name).to_string(),
+        group: String::from_utf8_lossy(&body.group).to_string(),
+        filter: String::from_utf8_lossy(&body.subject).to_string(),
+        max_inflight: body.max_inflight,
+        ack_policy: body.ack_policy,
+        deliver_policy: body.deliver_policy,
+        deliver_mode: body.deliver_mode,
+        ack_wait_ms: body.ack_wait_ms,
+        start_seq: body.start_seq,
+    };
+    match crate::cluster::propose_command(cluster.client(), &cmd).await {
+        Ok(()) => {
+            v2_create_consumer(conn_id, req_seq, frame, server, registry).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "raft propose create_consumer failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn v2_delete_consumer_raft(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+    cluster: &std::sync::Arc<crate::cluster::ClusterState>,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, DeleteConsumer};
+    let body = match DeleteConsumer::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+    };
+    let cmd = crate::cluster::state_machine::ClusterCommand::DeleteConsumer {
+        stream_name: String::new(),
+        name: format!("{}", body.consumer_id),
+    };
+    match crate::cluster::propose_command(cluster.client(), &cmd).await {
+        Ok(()) => {
+            v2_delete_consumer(conn_id, req_seq, frame, server, registry).await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "raft propose delete_consumer failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
     }
 }
