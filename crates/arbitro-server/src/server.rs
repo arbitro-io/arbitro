@@ -214,7 +214,12 @@ impl ArbitroServer {
         #[cfg(feature = "cluster")]
         {
             if !self.config.cluster_peers.is_empty() {
-                use crate::cluster::{storage::FileRaftStorage, transport::TcpRaftTransport};
+                use crate::cluster::{
+                    storage::{FileRaftStorage, SharedRaftStorage},
+                    transport::TcpRaftTransport,
+                    state_machine::ArbitroStateMachine,
+                    apply_loop,
+                };
                 use arbitro_raft::*;
 
                 tracing::info!(
@@ -260,7 +265,11 @@ impl ArbitroServer {
                     panic!("invalid raft config: {e}");
                 }
 
-                let storage = FileRaftStorage::new(&raft_dir);
+                // Shared storage: the Arc<FileRaftStorage> is shared between
+                // the RaftNode (via SharedRaftStorage wrapper) and the apply
+                // loop that reads committed entries.
+                let storage_inner = std::sync::Arc::new(FileRaftStorage::new(&raft_dir));
+                let storage_for_raft = SharedRaftStorage(storage_inner.clone());
 
                 let peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> =
                     self.config.cluster_peers
@@ -274,7 +283,7 @@ impl ArbitroServer {
                     .await
                     .expect("failed to create raft transport");
 
-                let raft_node = RaftNode::new(node_config, storage, transport)
+                let raft_node = RaftNode::new(node_config, storage_for_raft, transport)
                     .expect("failed to create raft node");
                 let mut raft = ArbitroRaft::new(raft_node);
                 let client_handle = raft.client_handle();
@@ -294,6 +303,17 @@ impl ArbitroServer {
                             tracing::info!("raft node shutting down");
                         }
                     }
+                });
+
+                // State machine with ShardRouter wired in.
+                let mut sm = ArbitroStateMachine::new();
+                sm.set_router(std::sync::Arc::new(self.server.clone()));
+                let sm = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+
+                // Apply loop: polls storage for new entries and applies them.
+                let apply_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    apply_loop::apply_loop(storage_inner, sm, apply_shutdown).await;
                 });
 
                 tracing::info!(node_id = node_id.0, "raft node started");

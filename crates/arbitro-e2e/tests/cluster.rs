@@ -182,9 +182,9 @@ async fn three_node_cluster_replicates_stream() {
     }
 
     // ── Step 7: List streams on each node via fresh connections ──────
-    // list_streams goes through the local shard path (not Raft), so it
-    // should always work. Use fresh connections since the previous ones
-    // may have their server-side read loops stuck on Raft propose.
+    // Wait for the apply loop to propagate committed entries to followers.
+    // The apply loop polls every 100ms; give 2s for Raft replication + apply.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     drop(clients);
     for (i, addr) in client_addrs.iter().enumerate() {
         let fresh_client = TestServer::connect_to(addr).await;

@@ -6,6 +6,7 @@
 //! consistency. Message publish does NOT go through Raft — it uses the local
 //! shard path for maximum throughput (Kafka-style async replication).
 
+pub mod apply_loop;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;

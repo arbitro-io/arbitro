@@ -125,7 +125,7 @@ pub async fn dispatch_frame_v2(
         Action::DeleteStream   => {
             #[cfg(feature = "cluster")]
             if cluster_state.is_clustered() {
-                v2_delete_stream_raft(conn_id, req_seq, &frame, registry, cluster_state).await;
+                v2_delete_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
             } else {
                 v2_delete_stream(conn_id, req_seq, &frame, server, registry).await;
             }
@@ -1562,13 +1562,20 @@ async fn v2_create_stream_raft(
         discard: body.discard,
         idempotency_window_ms: body.idempotency_window_ms,
     };
-    match crate::cluster::propose_command(cluster.client(), &cmd).await {
-        Ok(()) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::cluster::propose_command(cluster.client(), &cmd),
+    ).await {
+        Ok(Ok(())) => {
             // Raft committed — execute locally.
             v2_create_stream(conn_id, req_seq, frame, server, registry).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "raft propose create_stream failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+        Err(_) => {
+            tracing::warn!("raft propose create_stream timed out (node may not be leader)");
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
     }
@@ -1579,6 +1586,7 @@ async fn v2_delete_stream_raft(
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
+    server: &ShardRouter,
     registry: &ConnectionRegistry,
     cluster: &std::sync::Arc<crate::cluster::ClusterState>,
 ) {
@@ -1590,13 +1598,20 @@ async fn v2_delete_stream_raft(
     let cmd = crate::cluster::state_machine::ClusterCommand::DeleteStream {
         name: String::from_utf8_lossy(&body.name).to_string(),
     };
-    match crate::cluster::propose_command(cluster.client(), &cmd).await {
-        Ok(()) => {
-            // Need server ref for local execution — pass through original dispatch.
-            send_rep_ok_v2(registry, conn_id, req_seq, 0);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::cluster::propose_command(cluster.client(), &cmd),
+    ).await {
+        Ok(Ok(())) => {
+            // Raft committed — execute locally via the standard path.
+            v2_delete_stream(conn_id, req_seq, frame, server, registry).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "raft propose delete_stream failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+        Err(_) => {
+            tracing::warn!("raft propose delete_stream timed out (node may not be leader)");
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
     }
@@ -1628,12 +1643,19 @@ async fn v2_create_consumer_raft(
         ack_wait_ms: body.ack_wait_ms,
         start_seq: body.start_seq,
     };
-    match crate::cluster::propose_command(cluster.client(), &cmd).await {
-        Ok(()) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::cluster::propose_command(cluster.client(), &cmd),
+    ).await {
+        Ok(Ok(())) => {
             v2_create_consumer(conn_id, req_seq, frame, server, registry).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "raft propose create_consumer failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+        Err(_) => {
+            tracing::warn!("raft propose create_consumer timed out (node may not be leader)");
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
     }
@@ -1657,12 +1679,19 @@ async fn v2_delete_consumer_raft(
         stream_name: String::new(),
         name: format!("{}", body.consumer_id),
     };
-    match crate::cluster::propose_command(cluster.client(), &cmd).await {
-        Ok(()) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::cluster::propose_command(cluster.client(), &cmd),
+    ).await {
+        Ok(Ok(())) => {
             v2_delete_consumer(conn_id, req_seq, frame, server, registry).await;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "raft propose delete_consumer failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+        Err(_) => {
+            tracing::warn!("raft propose delete_consumer timed out (node may not be leader)");
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
     }

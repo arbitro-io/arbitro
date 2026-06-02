@@ -76,6 +76,52 @@ impl FileRaftStorage {
     }
 }
 
+/// Arc-wrapped storage that can be shared between the RaftNode (which takes
+/// ownership of its `S: RaftStorage`) and the apply loop (which needs to
+/// read committed entries).  Delegates every method to the inner
+/// `FileRaftStorage`.
+pub struct SharedRaftStorage(pub std::sync::Arc<FileRaftStorage>);
+
+impl RaftStorage for SharedRaftStorage {
+    fn load_hard_state(&self) -> Result<HardState, RaftError> {
+        self.0.load_hard_state()
+    }
+    fn save_hard_state(&self, state: &HardState) -> Result<(), RaftError> {
+        self.0.save_hard_state(state)
+    }
+    fn append_entries(&self, entries: &[LogEntry<'_>]) -> Result<(), RaftError> {
+        self.0.append_entries(entries)
+    }
+    fn entry_at<'a>(
+        &self,
+        index: LogIndex,
+        payload_buf: &'a mut [u8],
+    ) -> Result<Option<LogEntry<'a>>, RaftError> {
+        self.0.entry_at(index, payload_buf)
+    }
+    fn last_log_position(&self) -> Result<(LogIndex, Term), RaftError> {
+        self.0.last_log_position()
+    }
+    fn truncate_suffix(&self, from: LogIndex) -> Result<(), RaftError> {
+        self.0.truncate_suffix(from)
+    }
+    fn save_snapshot(&self, meta: &SnapshotMeta, snapshot: &[u8]) -> Result<(), RaftError> {
+        self.0.save_snapshot(meta, snapshot)
+    }
+    fn load_snapshot(&self) -> Result<Option<(SnapshotMeta, Vec<u8>)>, RaftError> {
+        self.0.load_snapshot()
+    }
+    fn read_entries<'a>(
+        &self,
+        from: LogIndex,
+        to: LogIndex,
+        out: &mut Vec<LogEntry<'a>>,
+        payload_buf: &'a mut [u8],
+    ) -> Result<usize, RaftError> {
+        self.0.read_entries(from, to, out, payload_buf)
+    }
+}
+
 impl RaftStorage for FileRaftStorage {
     fn load_hard_state(&self) -> Result<HardState, RaftError> {
         if !self.hard_state_path.exists() {
