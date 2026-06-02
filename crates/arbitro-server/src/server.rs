@@ -211,25 +211,85 @@ impl ArbitroServer {
         #[cfg(feature = "cluster")]
         {
             if !self.config.cluster_peers.is_empty() {
+                use crate::cluster::{storage::FileRaftStorage, transport::TcpRaftTransport};
+                use arbitro_raft::*;
+
                 tracing::info!(
                     node_id = self.config.cluster_node_id,
                     peers = ?self.config.cluster_peers,
                     listen = %self.config.cluster_listen,
                     "cluster mode: initializing Raft node"
                 );
-                // TODO: full Raft boot sequence:
-                //   1. Create FileRaftStorage from data_dir/raft/
-                //   2. Create ArbitroStateMachine
-                //   3. Create TcpRaftTransport (async) bound to cluster_listen
-                //   4. Build NodeConfig with peer list
-                //   5. Construct RaftNode, wrap in ArbitroRaft
-                //   6. Obtain ClientHandle, spawn ArbitroRaft::run()
-                //   7. Store Arc<ClusterState::Clustered { client, peer_id }>
-                //
-                // For now the server continues in standalone mode — metadata
-                // operations go through the local shard path. The Raft
-                // propose path will be wired in the next iteration once
-                // the full boot sequence is validated.
+
+                let data_dir = self.config.data_dir.clone()
+                    .unwrap_or_else(|| "/tmp/arbitro-raft".into());
+                let raft_dir = std::path::PathBuf::from(&data_dir).join("raft");
+                std::fs::create_dir_all(&raft_dir).expect("failed to create raft data dir");
+
+                let node_id = PeerId(self.config.cluster_node_id);
+                let peers: Vec<PeerId> = self.config.cluster_peers
+                    .iter()
+                    .map(|(id, _)| PeerId(*id))
+                    .collect();
+                let bootstrap_peers: Vec<BootstrapPeer> = self.config.cluster_peers
+                    .iter()
+                    .map(|(id, addr)| BootstrapPeer {
+                        id: PeerId(*id),
+                        addr: addr.parse().expect("invalid peer addr"),
+                    })
+                    .collect();
+
+                let node_config = NodeConfig {
+                    cluster_id: ClusterId(1),
+                    node_id,
+                    peers,
+                    bootstrap_peers,
+                    timing: TimingConfig::default(),
+                    limits: LimitsConfig::default(),
+                };
+
+                if let Err(e) = validate_node_config(&node_config) {
+                    tracing::error!(error = %e, "invalid raft config");
+                    panic!("invalid raft config: {e}");
+                }
+
+                let storage = FileRaftStorage::new(&raft_dir);
+
+                let peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> =
+                    self.config.cluster_peers
+                        .iter()
+                        .map(|(id, addr)| (PeerId(*id), addr.parse().expect("invalid peer addr")))
+                        .collect();
+                let bind_addr: std::net::SocketAddr = self.config.cluster_listen
+                    .parse()
+                    .expect("invalid cluster_listen addr");
+                let transport = TcpRaftTransport::new(bind_addr, peer_addrs)
+                    .await
+                    .expect("failed to create raft transport");
+
+                let raft_node = RaftNode::new(node_config, storage, transport)
+                    .expect("failed to create raft node");
+                let mut raft = ArbitroRaft::new(raft_node);
+                let _client_handle = raft.client_handle();
+
+                let raft_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        result = raft.run() => {
+                            if let Err(e) = result {
+                                tracing::error!(error = %e, "raft node stopped");
+                            }
+                        }
+                        _ = async {
+                            let mut rx = raft_shutdown;
+                            let _ = rx.changed().await;
+                        } => {
+                            tracing::info!("raft node shutting down");
+                        }
+                    }
+                });
+
+                tracing::info!(node_id = node_id.0, "raft node started");
             }
         }
 
