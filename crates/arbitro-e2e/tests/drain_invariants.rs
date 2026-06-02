@@ -1411,3 +1411,115 @@ async fn partial_write_recovery_redelivers_unacked() {
     }
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Triple fanout — 2x Explicit (different groups) + 1x None, all receive all
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn triple_fanout_two_explicit_one_none_all_receive() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"triple", b">").await;
+
+    // Consumer A: Explicit, group "workers"
+    let a_id = create_consumer(
+        &client, stream_id, b"worker-a", b"workers", b"",
+        100, 1, 0, 30_000, 0,
+    ).await;
+    // Consumer B: Explicit, group "auditors" (different group → fanout)
+    let b_id = create_consumer(
+        &client, stream_id, b"auditor-b", b"auditors", b"",
+        100, 1, 0, 30_000, 0,
+    ).await;
+    // Consumer C: None, group "tap" (fire-and-forget metrics)
+    let c_id = create_consumer(
+        &client, stream_id, b"tap-c", b"tap", b"",
+        100, 0, 0, 0, 0,
+    ).await;
+
+    let mut sub_a = client.subscribe(stream_id, a_id, b"").await.unwrap();
+    let mut sub_b = client.subscribe(stream_id, b_id, b"").await.unwrap();
+    let mut sub_c = client.subscribe(stream_id, c_id, b"").await.unwrap();
+
+    const N: usize = 15;
+    for i in 0..N {
+        client.publish_sync(
+            stream_id, b"triple.ev",
+            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+        ).await.unwrap();
+    }
+
+    let c_msgs = drain_n(&mut sub_c, N, Duration::from_secs(5)).await;
+    assert_eq!(c_msgs.len(), N, "None consumer must get all {N} (got {})", c_msgs.len());
+
+    let a_msgs = drain_n(&mut sub_a, N, Duration::from_secs(5)).await;
+    let a_count = a_msgs.len();
+    for m in a_msgs { m.ack(); }
+    assert_eq!(a_count, N, "Explicit-A must get all {N} (got {a_count})");
+
+    let b_msgs = drain_n(&mut sub_b, N, Duration::from_secs(5)).await;
+    let b_count = b_msgs.len();
+    for m in b_msgs { m.ack(); }
+    assert_eq!(b_count, N, "Explicit-B must get all {N} (got {b_count})");
+
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mixed AckPolicy — Explicit + None on the same Fanout stream
+//
+// One consumer acks (processing pipeline), the other is fire-and-forget
+// (metrics tap). Both MUST receive every message independently.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_ack_explicit_and_none_both_receive_all() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"mixed", b">").await;
+
+    // Consumer A: Explicit ack (processing)
+    let explicit_id = create_consumer(
+        &client, stream_id, b"processor", b"proc-group", b"",
+        100, 1, /* Explicit */ 0, 30_000, 0,
+    ).await;
+
+    // Consumer B: None (fire-and-forget metrics tap)
+    let none_id = create_consumer(
+        &client, stream_id, b"metrics-tap", b"tap-group", b"",
+        100, 0, /* None */ 0, 0, 0,
+    ).await;
+
+    let mut sub_explicit = client.subscribe(stream_id, explicit_id, b"").await.unwrap();
+    let mut sub_none = client.subscribe(stream_id, none_id, b"").await.unwrap();
+
+    const N: usize = 20;
+    for i in 0..N {
+        client.publish_sync(
+            stream_id, b"mixed.event",
+            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+        ).await.unwrap();
+    }
+
+    // Fire-and-forget consumer drains without acking.
+    let none_msgs = drain_n(&mut sub_none, N, Duration::from_secs(5)).await;
+    assert_eq!(
+        none_msgs.len(), N,
+        "AckPolicy::None consumer must receive all {N} messages (got {})",
+        none_msgs.len()
+    );
+
+    // Explicit consumer drains and acks each message.
+    let explicit_msgs = drain_n(&mut sub_explicit, N, Duration::from_secs(5)).await;
+    let explicit_count = explicit_msgs.len();
+    for m in explicit_msgs {
+        m.ack();
+    }
+    assert_eq!(
+        explicit_count, N,
+        "AckPolicy::Explicit consumer must also receive all {N} messages (got {explicit_count})",
+    );
+
+    server.shutdown().await;
+}
