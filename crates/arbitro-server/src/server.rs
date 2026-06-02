@@ -209,6 +209,9 @@ impl ArbitroServer {
 
         // ── Cluster: Raft boot (when feature = "cluster") ─────────────
         #[cfg(feature = "cluster")]
+        let mut cluster_state: std::sync::Arc<crate::cluster::ClusterState> =
+            std::sync::Arc::new(crate::cluster::ClusterState::Standalone);
+        #[cfg(feature = "cluster")]
         {
             if !self.config.cluster_peers.is_empty() {
                 use crate::cluster::{storage::FileRaftStorage, transport::TcpRaftTransport};
@@ -270,7 +273,7 @@ impl ArbitroServer {
                 let raft_node = RaftNode::new(node_config, storage, transport)
                     .expect("failed to create raft node");
                 let mut raft = ArbitroRaft::new(raft_node);
-                let _client_handle = raft.client_handle();
+                let client_handle = raft.client_handle();
 
                 let raft_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
@@ -290,6 +293,12 @@ impl ArbitroServer {
                 });
 
                 tracing::info!(node_id = node_id.0, "raft node started");
+                cluster_state = std::sync::Arc::new(
+                    crate::cluster::ClusterState::Clustered {
+                        client: std::sync::Arc::new(client_handle),
+                        peer_id: node_id,
+                    }
+                );
             }
         }
 
@@ -397,8 +406,15 @@ impl ArbitroServer {
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
                                 let cron = cron_registry.clone();
+                                #[cfg(feature = "cluster")]
+                                let cluster = cluster_state.clone();
                                 tokio::spawn(async move {
-                                    read_loop(conn_id, reader, srv, reg, sd, auth, max_frame_size, max_ops_per_sec, cron).await;
+                                    read_loop(
+                                        conn_id, reader, srv, reg, sd, auth,
+                                        max_frame_size, max_ops_per_sec, cron,
+                                        #[cfg(feature = "cluster")]
+                                        cluster,
+                                    ).await;
                                 });
                             }
                             Err(e) => {
@@ -535,6 +551,8 @@ async fn read_loop(
     max_frame_size: usize,
     max_ops_per_sec: u32,
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
+    #[cfg(feature = "cluster")]
+    cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -644,7 +662,11 @@ async fn read_loop(
                 }
                 let frame = acc.split_to(total).freeze();
                 registry.touch(conn_id);
-                if dispatch_v2::dispatch_frame_v2(conn_id, frame, &server, &registry, &cron_registry).await.is_err() {
+                if dispatch_v2::dispatch_frame_v2(
+                    conn_id, frame, &server, &registry, &cron_registry,
+                    #[cfg(feature = "cluster")]
+                    &cluster_state,
+                ).await.is_err() {
                     tracing::warn!(conn_id, "malformed frame, dropping connection");
                     break 'outer;
                 }

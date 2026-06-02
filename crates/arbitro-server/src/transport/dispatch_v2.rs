@@ -66,6 +66,8 @@ pub async fn dispatch_frame_v2(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+    #[cfg(feature = "cluster")]
+    _cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
 ) -> Result<(), ()> {
     if frame.len() < HEADER_SIZE {
         return Err(());
