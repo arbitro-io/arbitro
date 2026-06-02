@@ -247,7 +247,11 @@ impl ArbitroServer {
                     node_id,
                     peers,
                     bootstrap_peers,
-                    timing: TimingConfig::default(),
+                    timing: TimingConfig {
+                        heartbeat_ms: 50,
+                        election_min_ms: 150,
+                        election_max_ms: 1000,
+                    },
                     limits: LimitsConfig::default(),
                 };
 

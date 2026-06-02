@@ -136,8 +136,9 @@ async fn three_node_cluster_replicates_stream() {
     }
 
     // ── Step 4: Wait for Raft election ───────────────────────────────
-    // Raft default election timeout is ~1-3s. Give 5 seconds to be safe.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Election timeout range is 150ms-1000ms with randomized jitter.
+    // Give 8 seconds for multiple rounds to converge.
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     // ── Step 5: Connect to each node, verify connectivity ────────────
     // All 3 servers must accept TCP connections without panic.
