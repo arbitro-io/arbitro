@@ -107,6 +107,9 @@ docker compose up -d   # default port: 9898
 | `ARBITRO_MAX_FRAME_SIZE` | `67108864` | Max frame body bytes (64 MiB). Rejects oversized frames. |
 | `ARBITRO_MAX_OPS_PER_SEC` | `0` | Max frames/sec per connection (`0` = unlimited). |
 | `ARBITRO_FSYNC_POLICY` | `every` | Metadata fsync policy: `every` (default) or `none`. |
+| `ARBITRO_CLUSTER_PEERS` | _unset_ | Comma-separated peer list: `1@host:port,2@host:port,3@host:port`. Enables Raft clustering (requires `cluster` feature). |
+| `ARBITRO_CLUSTER_NODE_ID` | `1` | This node's peer ID in the cluster. |
+| `ARBITRO_CLUSTER_LISTEN` | `0.0.0.0:9900` | TCP address for Raft inter-node traffic. |
 
 ## Observability
 
@@ -277,11 +280,21 @@ Cron jobs live in memory — if the broker restarts, clients re-register automat
 - [x] Rust client: `client.cron(name).every("...").run(handler)`
 - [x] TypeScript client: `client.cron(name).every("...").run(handler)`
 
-### Phase 5 — Scale (planned)
+### Phase 5 — Clustering (done)
+- [x] Raft consensus for metadata replication (`arbitro-raft`)
+- [x] Leader election over TCP (pre-vote + check-quorum)
+- [x] Metadata commands (CreateStream/DeleteStream/CreateConsumer/DeleteConsumer) proposed through Raft
+- [x] Publish/Ack/Subscribe remain local-only (zero Raft overhead on hot path)
+- [x] `ARBITRO_CLUSTER_PEERS` env var for cluster boot
+- [x] Behind `cluster` feature flag — zero cost when off
+
+### Phase 6 — Scale (planned)
 - [ ] Subject scavenging (TTL-based inactive-slot cleanup)
-- [ ] Clustering (Raft) for stream state replication
+- [ ] Follower metadata apply loop (committed Raft entries → local engine)
+- [ ] Async message replication (Kafka ISR-style, per-stream configurable)
 - [ ] Adaptive subject prioritization
 - [ ] Cross-shard subject aggregation for global limits
+- [ ] Membership changes (add/remove nodes at runtime)
 
 ## Next Session Context
 
