@@ -52,6 +52,15 @@ pub struct Config {
     /// - "every" (default): fdatasync after every metadata write (safest)
     /// - "none": no fsync (fastest, risk of metadata loss on crash)
     pub fsync_policy: FsyncPolicy,
+    /// Cluster peer addresses (comma-separated). When set with the `cluster`
+    /// feature enabled, the broker boots in Clustered mode. Format:
+    /// `"1@127.0.0.1:9900,2@127.0.0.1:9901,3@127.0.0.1:9902"`
+    /// where the number before `@` is the peer ID.
+    pub cluster_peers: Vec<(u64, String)>,
+    /// This node's peer ID in the cluster (default: 1).
+    pub cluster_node_id: u64,
+    /// Address this node listens on for Raft traffic (default: "0.0.0.0:9900").
+    pub cluster_listen: String,
 }
 
 /// Fsync policy for metadata persistence.
@@ -90,6 +99,9 @@ impl Config {
                 Ok("none") => FsyncPolicy::None,
                 _ => FsyncPolicy::Every,
             },
+            cluster_peers: parse_cluster_peers(),
+            cluster_node_id: env_parse("ARBITRO_CLUSTER_NODE_ID", 1),
+            cluster_listen: env_or("ARBITRO_CLUSTER_LISTEN", "0.0.0.0:9900"),
         }
     }
 
@@ -205,6 +217,9 @@ impl Default for Config {
             max_frame_size: 64 * 1024 * 1024,
             max_ops_per_sec: 0,
             fsync_policy: FsyncPolicy::Every,
+            cluster_peers: Vec::new(),
+            cluster_node_id: 1,
+            cluster_listen: "0.0.0.0:9900".into(),
         }
     }
 }
@@ -218,4 +233,20 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse `ARBITRO_CLUSTER_PEERS` env var.
+/// Format: `"1@127.0.0.1:9900,2@127.0.0.1:9901,3@127.0.0.1:9902"`
+fn parse_cluster_peers() -> Vec<(u64, String)> {
+    let Ok(raw) = std::env::var("ARBITRO_CLUSTER_PEERS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            let (id_str, addr) = entry.split_once('@')?;
+            let id: u64 = id_str.parse().ok()?;
+            Some((id, addr.to_string()))
+        })
+        .collect()
 }

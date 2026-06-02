@@ -207,6 +207,32 @@ impl ArbitroServer {
             crate::cron::cron_loop(cron_reg_clone, cron_connections, cron_shutdown).await;
         });
 
+        // ── Cluster: Raft boot (when feature = "cluster") ─────────────
+        #[cfg(feature = "cluster")]
+        {
+            if !self.config.cluster_peers.is_empty() {
+                tracing::info!(
+                    node_id = self.config.cluster_node_id,
+                    peers = ?self.config.cluster_peers,
+                    listen = %self.config.cluster_listen,
+                    "cluster mode: initializing Raft node"
+                );
+                // TODO: full Raft boot sequence:
+                //   1. Create FileRaftStorage from data_dir/raft/
+                //   2. Create ArbitroStateMachine
+                //   3. Create TcpRaftTransport (async) bound to cluster_listen
+                //   4. Build NodeConfig with peer list
+                //   5. Construct RaftNode, wrap in ArbitroRaft
+                //   6. Obtain ClientHandle, spawn ArbitroRaft::run()
+                //   7. Store Arc<ClusterState::Clustered { client, peer_id }>
+                //
+                // For now the server continues in standalone mode — metadata
+                // operations go through the local shard path. The Raft
+                // propose path will be wired in the next iteration once
+                // the full boot sequence is validated.
+            }
+        }
+
         // H14: minimal HTTP /health endpoint. Enabled when
         // ARBITRO_HEALTH_LISTEN is set (e.g. "0.0.0.0:9090"); off by
         // default. Replies "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"

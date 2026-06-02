@@ -27,6 +27,7 @@ default = []
 lifecycle_trace = []
 # TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:thiserror"]
+cluster = ["dep:arbitro-raft"]
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
@@ -54,6 +55,8 @@ chrono            = { version = "0.4", default-features = false, features = ["cl
 tokio-rustls      = { version = "0.26", optional = true }
 rustls-pemfile    = { version = "2", optional = true }
 thiserror         = { version = "1", optional = true }
+# Cluster (optional)
+arbitro-raft      = { path = "../../../arbitro-raft", optional = true }
 
 [dev-dependencies]
 # (intentionally empty — benches now use only workspace deps)

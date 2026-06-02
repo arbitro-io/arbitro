@@ -23,6 +23,8 @@
 //!   accept loop.
 
 pub mod common;
+#[cfg(feature = "cluster")]
+pub mod cluster;
 pub mod config;
 pub mod cron;
 pub mod lifecycle_trace;

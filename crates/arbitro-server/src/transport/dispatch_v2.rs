@@ -45,6 +45,11 @@ use serde_json;
 use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
+// Used by metadata match arms once the Raft propose path is wired.
+#[cfg(feature = "cluster")]
+#[allow(unused_imports)]
+use crate::cluster::ClusterState;
+
 use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::router::ShardRouter;
 use crate::transport::ConnectionRegistry;
