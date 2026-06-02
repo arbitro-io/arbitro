@@ -1,37 +1,35 @@
-//! TCP-based Raft transport with length-prefixed framing.
+//! TCP-based Raft transport using the arbitro-raft wire format.
+//!
+//! Frames use the 32-byte `RaftFrameHeader` defined in arbitro-raft's
+//! `protocol::codec::wire`. The `body_len` field at offset 16 gives the
+//! body size; total frame = 32 + body_len.
+//!
+//! `send_vectored` uses true `write_vectored` with `IoSlice` to avoid
+//! copying payload buffers — matching the zero-copy design of the bench
+//! transport in `arbitro-raft/benches/tcp_raft_bench.rs`.
 
 use std::collections::HashMap;
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arbitro_raft::{PeerId, RaftError, RaftTransport};
+use arbitro_raft::{PeerId, RaftError, RaftTransport, RAFT_FRAME_HEADER_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-/// TCP transport for Raft inter-node communication.
-///
-/// Frames are length-prefixed: 4 bytes little-endian length followed by the
-/// payload. Connections to peers are established lazily and cached for reuse.
-/// Incoming frames from the listener task are funnelled through an MPSC channel
-/// so that `recv_frame` / `recv_frame_timeout` are cheap polling operations.
+/// Offset of `body_len: U32` inside `RaftFrameHeader`.
+const BODY_LEN_OFFSET: usize = 16;
+
 pub struct TcpRaftTransport {
     peers: HashMap<PeerId, SocketAddr>,
-    connections: Arc<Mutex<HashMap<PeerId, TcpStream>>>,
+    connections: Arc<Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<TcpStream>>>>>,
     incoming_rx: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    /// Kept alive so the accept-loop senders are not orphaned.
     _incoming_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 impl TcpRaftTransport {
-    /// Create a new TCP transport.
-    ///
-    /// `bind_addr` is the local address to listen on for incoming Raft frames.
-    /// `peers` maps each peer's ID to its TCP address.
-    ///
-    /// The listener task is spawned immediately and runs for the lifetime of
-    /// the transport.
     pub async fn new(
         bind_addr: SocketAddr,
         peers: HashMap<PeerId, SocketAddr>,
@@ -55,89 +53,79 @@ impl TcpRaftTransport {
         })
     }
 
-    /// Background task: accept connections and read length-prefixed frames.
     async fn accept_loop(listener: TcpListener, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
         loop {
-            let Ok((stream, _addr)) = listener.accept().await else {
-                break;
-            };
+            let Ok((stream, _)) = listener.accept().await else { break };
             let frame_tx = tx.clone();
             tokio::spawn(async move {
-                Self::read_frames(stream, frame_tx).await;
+                Self::read_raft_frames(stream, frame_tx).await;
             });
         }
     }
 
-    /// Read length-prefixed frames from a single TCP connection.
-    async fn read_frames(mut stream: TcpStream, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    /// Read Raft-framed messages from a TCP stream.
+    ///
+    /// Protocol: [32-byte RaftFrameHeader][body of body_len bytes]
+    /// body_len is at offset 16 in the header (U32 LE).
+    async fn read_raft_frames(mut stream: TcpStream, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        let mut buf = Vec::with_capacity(65536);
         loop {
-            // Read 4-byte LE length prefix.
-            let len = match stream.read_u32_le().await {
-                Ok(n) => n as usize,
-                Err(_) => break,
-            };
-            if len == 0 {
-                continue;
+            // Ensure we have at least the 32-byte header.
+            while buf.len() < RAFT_FRAME_HEADER_SIZE {
+                let mut tmp = [0u8; 4096];
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
             }
 
-            let mut buf = vec![0u8; len];
-            if stream.read_exact(&mut buf).await.is_err() {
-                break;
+            // Extract body_len from offset 16.
+            let body_len = u32::from_le_bytes(
+                buf[BODY_LEN_OFFSET..BODY_LEN_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let total = RAFT_FRAME_HEADER_SIZE + body_len;
+
+            // Read until we have the full frame.
+            while buf.len() < total {
+                let mut tmp = [0u8; 4096];
+                let n = match stream.read(&mut tmp).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&tmp[..n]);
             }
 
-            if tx.send(buf).await.is_err() {
-                break;
+            // Extract frame and send.
+            let frame = buf[..total].to_vec();
+            buf.drain(..total);
+            if tx.send(frame).await.is_err() {
+                return;
             }
         }
     }
 
     /// Get or create a cached TCP connection to a peer.
-    async fn get_connection(&self, peer: PeerId) -> Result<(), RaftError> {
+    async fn get_stream(&self, peer: PeerId) -> Result<Arc<tokio::sync::Mutex<TcpStream>>, RaftError> {
         let mut conns = self.connections.lock().await;
-        if conns.contains_key(&peer) {
-            return Ok(());
+        if let Some(s) = conns.get(&peer) {
+            return Ok(s.clone());
         }
-        let addr = self
-            .peers
-            .get(&peer)
+        let addr = self.peers.get(&peer)
             .ok_or_else(|| RaftError::PeerUnknown(peer))?;
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| RaftError::Transport(format!("connect to peer {}: {e}", peer.0)))?;
-        conns.insert(peer, stream);
-        Ok(())
+        let s = Arc::new(tokio::sync::Mutex::new(stream));
+        conns.insert(peer, s.clone());
+        Ok(s)
     }
 
-    /// Write a length-prefixed frame to a peer, reconnecting on failure.
-    async fn write_frame(&self, peer: PeerId, data: &[u8]) -> Result<(), RaftError> {
-        // Ensure connection exists.
-        self.get_connection(peer).await?;
-
-        let mut conns = self.connections.lock().await;
-        let stream = conns
-            .get_mut(&peer)
-            .ok_or_else(|| RaftError::PeerUnknown(peer))?;
-
-        let len = data.len() as u32;
-        let result = async {
-            stream.write_all(&len.to_le_bytes()).await?;
-            stream.write_all(data).await?;
-            stream.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Drop the broken connection so the next call reconnects.
-                conns.remove(&peer);
-                Err(RaftError::Transport(format!(
-                    "write to peer {}: {e}",
-                    peer.0
-                )))
-            }
-        }
+    /// Remove a broken connection so the next call reconnects.
+    async fn drop_connection(&self, peer: PeerId) {
+        self.connections.lock().await.remove(&peer);
     }
 }
 
@@ -147,12 +135,52 @@ impl RaftTransport for TcpRaftTransport {
         peer: PeerId,
         slices: &[&[u8]],
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
-        // Concatenate slices into a single buffer and send as one frame.
-        let mut frame = Vec::new();
-        for s in slices {
-            frame.extend_from_slice(s);
+        let connections = self.connections.clone();
+        let peers = self.peers.clone();
+
+        // SAFETY: RaftNode guarantees the slices live until this future completes.
+        let slices_static = unsafe {
+            std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices)
+        };
+
+        async move {
+            let addr = *peers.get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+
+            let stream = {
+                let mut conns = connections.lock().await;
+                if let Some(s) = conns.get(&peer) {
+                    s.clone()
+                } else {
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = Arc::new(tokio::sync::Mutex::new(s));
+                    conns.insert(peer, s.clone());
+                    s
+                }
+            };
+
+            let mut s = stream.lock().await;
+
+            // True vectored write — one writev syscall for all iovecs.
+            let mut io_bufs: Vec<IoSlice<'_>> =
+                slices_static.iter().map(|s| IoSlice::new(s)).collect();
+            let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
+            while !bufs.is_empty() {
+                let n = s.write_vectored(bufs)
+                    .await
+                    .map_err(|e| {
+                        // Don't hold the lock while removing — just flag for cleanup.
+                        RaftError::Transport(format!("write to peer {}: {e}", peer.0))
+                    })?;
+                if n == 0 {
+                    return Err(RaftError::Transport("write_vectored returned 0".into()));
+                }
+                IoSlice::advance_slices(&mut bufs, n);
+            }
+            Ok(())
         }
-        async move { self.write_frame(peer, &frame).await }
     }
 
     fn send_frame_owned(
@@ -160,7 +188,32 @@ impl RaftTransport for TcpRaftTransport {
         peer: PeerId,
         frame: bytes::Bytes,
     ) -> impl std::future::Future<Output = Result<(), RaftError>> + Send {
-        async move { self.write_frame(peer, &frame).await }
+        let connections = self.connections.clone();
+        let peers = self.peers.clone();
+        async move {
+            let addr = *peers.get(&peer)
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+
+            let stream = {
+                let mut conns = connections.lock().await;
+                if let Some(s) = conns.get(&peer) {
+                    s.clone()
+                } else {
+                    let s = TcpStream::connect(addr)
+                        .await
+                        .map_err(|e| RaftError::Transport(e.to_string()))?;
+                    let s = Arc::new(tokio::sync::Mutex::new(s));
+                    conns.insert(peer, s.clone());
+                    s
+                }
+            };
+
+            let mut s = stream.lock().await;
+            s.write_all(&frame)
+                .await
+                .map_err(|e| RaftError::Transport(format!("write to peer {}: {e}", peer.0)))?;
+            Ok(())
+        }
     }
 
     fn recv_frame(
@@ -169,15 +222,12 @@ impl RaftTransport for TcpRaftTransport {
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
         async move {
             let mut rx = self.incoming_rx.lock().await;
-            let frame = rx
-                .recv()
-                .await
+            let frame = rx.recv().await
                 .ok_or_else(|| RaftError::Transport("incoming channel closed".into()))?;
             let len = frame.len();
             if out.len() < len {
                 return Err(RaftError::Transport(format!(
-                    "recv buffer too small: need {len}, have {}",
-                    out.len()
+                    "recv buffer too small: need {len}, have {}", out.len()
                 )));
             }
             out[..len].copy_from_slice(&frame);
@@ -197,8 +247,7 @@ impl RaftTransport for TcpRaftTransport {
                     let len = frame.len();
                     if out.len() < len {
                         return Err(RaftError::Transport(format!(
-                            "recv buffer too small: need {len}, have {}",
-                            out.len()
+                            "recv buffer too small: need {len}, have {}", out.len()
                         )));
                     }
                     out[..len].copy_from_slice(&frame);
