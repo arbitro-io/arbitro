@@ -280,14 +280,15 @@ Cron jobs live in memory — if the broker restarts, clients re-register automat
 - [x] Rust client: `client.cron(name).every("...").run(handler)`
 - [x] TypeScript client: `client.cron(name).every("...").run(handler)`
 
-### Phase 5 — Clustering (in progress)
+### Phase 5 — Clustering (done)
 - [x] Raft consensus integration (`arbitro-raft`, behind `cluster` feature flag)
 - [x] Leader election over TCP (pre-vote + check-quorum)
 - [x] Metadata commands proposed through Raft on leader node
+- [x] Follower apply loop — committed entries replicated to local engine
+- [x] Metadata visible on all nodes after Raft commit (verified: 3 nodes × 1 stream)
 - [x] Publish/Ack/Subscribe remain local-only (zero Raft overhead on hot path)
+- [x] Follower propose timeout (2s) — returns error instead of hanging
 - [x] `ARBITRO_CLUSTER_PEERS` env var for cluster boot
-- [ ] Follower apply loop (committed entries → local engine)
-- [ ] Metadata visible on all nodes after Raft commit
 
 ### Phase 6 — Scale (planned)
 - [ ] Subject scavenging (TTL-based inactive-slot cleanup)
