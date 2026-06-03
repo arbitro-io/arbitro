@@ -248,7 +248,7 @@ impl ArbitroServer {
                                 }
                             }
                         }
-                        if journal.len() > 0 {
+                        if !journal.is_empty() {
                             tracing::info!(
                                 pending = journal.len(),
                                 "delayed journal: pending entries recovered"

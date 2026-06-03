@@ -155,11 +155,15 @@ pub struct CronRegistry {
     inner: Mutex<HashMap<Bytes, CronSlot>>,
 }
 
+impl Default for CronRegistry {
+    fn default() -> Self {
+        Self { inner: Mutex::new(HashMap::new()) }
+    }
+}
+
 impl CronRegistry {
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a cron job. If the name already exists, just add the
