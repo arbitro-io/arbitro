@@ -66,3 +66,8 @@ harness = false
 name    = "memory_growth"
 harness = false
 
+[[bench]]
+name    = "chaos_cluster"
+harness = false
+required-features = ["cluster"]
+
