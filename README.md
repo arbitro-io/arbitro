@@ -244,6 +244,19 @@ cron.stop();
 
 Cron jobs live in memory — if the broker restarts, clients re-register automatically on reconnect.
 
+## Delayed Publish
+
+Schedule message delivery for the future. Messages are persisted immediately — if the broker restarts, delayed messages survive and deliver on time.
+
+```rust
+// Deliver this message 5 seconds from now
+client.publish_delayed(stream_id, b"orders.reminder", payload, 5000).await?;
+```
+
+```typescript
+await client.publishDelayed("ORDERS", "orders.reminder", payload, 5000);
+```
+
 ## Roadmap
 
 ### Phase 1 — Core Engine (done)
@@ -287,12 +300,19 @@ Cron jobs live in memory — if the broker restarts, clients re-register automat
 - [x] Follower apply loop — committed entries replicated to local engine
 - [x] Metadata visible on all nodes after Raft commit (verified: 3 nodes × 1 stream)
 - [x] Publish/Ack/Subscribe remain local-only (zero Raft overhead on hot path)
-- [x] Follower propose timeout (2s) — returns error instead of hanging
+- [x] Follower propose timeout (500ms) — returns error instead of hanging
 - [x] `ARBITRO_CLUSTER_PEERS` env var for cluster boot
 
-### Phase 6 — Scale (planned)
-- [ ] Subject scavenging (TTL-based inactive-slot cleanup)
-- [ ] Follower metadata apply loop (committed Raft entries → local engine)
+### Phase 6 — Durability & Delivery (done)
+- [x] Delayed publish — separate journal + min-heap + maturation task + restart recovery
+- [x] Dead letter queue — max_nack per consumer, auto-ack on exceed
+- [x] TTL / subject scavenging — `purge_before(timestamp_ms)` on store trait
+- [x] Stream quotas enforcement — max_msgs/max_bytes reject with StreamFull
+- [x] Consumer cursor persistence — ack saves position, subscribe resumes from last ack
+- [x] Rust client: `publish_delayed(stream_id, subject, payload, delay_ms)`
+- [x] TypeScript client: `publishDelayed(streamName, subject, data, delayMs)`
+
+### Phase 7 — Scale (planned)
 - [ ] Async message replication (Kafka ISR-style, per-stream configurable)
 - [ ] Adaptive subject prioritization
 - [ ] Cross-shard subject aggregation for global limits
