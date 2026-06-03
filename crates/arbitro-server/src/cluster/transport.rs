@@ -107,26 +107,6 @@ impl TcpRaftTransport {
         }
     }
 
-    /// Get or create a cached TCP connection to a peer.
-    async fn get_stream(&self, peer: PeerId) -> Result<Arc<tokio::sync::Mutex<TcpStream>>, RaftError> {
-        let mut conns = self.connections.lock().await;
-        if let Some(s) = conns.get(&peer) {
-            return Ok(s.clone());
-        }
-        let addr = self.peers.get(&peer)
-            .ok_or_else(|| RaftError::PeerUnknown(peer))?;
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| RaftError::Transport(format!("connect to peer {}: {e}", peer.0)))?;
-        let s = Arc::new(tokio::sync::Mutex::new(stream));
-        conns.insert(peer, s.clone());
-        Ok(s)
-    }
-
-    /// Remove a broken connection so the next call reconnects.
-    async fn drop_connection(&self, peer: PeerId) {
-        self.connections.lock().await.remove(&peer);
-    }
 }
 
 impl RaftTransport for TcpRaftTransport {
