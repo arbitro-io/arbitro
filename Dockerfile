@@ -21,6 +21,7 @@ RUN apt-get update && \
 WORKDIR /build
 COPY arbitro/ ./arbitro/
 COPY arbitro-kit/ ./arbitro-kit/
+COPY arbitro-raft/ ./arbitro-raft/
 
 WORKDIR /build/arbitro
 # rust-toolchain.toml may re-sync the toolchain on first cargo invocation,
