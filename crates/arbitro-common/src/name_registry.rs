@@ -88,6 +88,17 @@ impl Default for NameRegistry {
     }
 }
 
+/// Per-stream quota limits for the publish hot-path pre-check.
+/// Indexed by `StreamId.0`. A `max_msgs == 0` or `max_bytes == 0`
+/// means no limit for that dimension.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamQuota {
+    pub max_msgs: u64,
+    pub max_bytes: u64,
+    /// Discard policy: 0 = Old (FIFO eviction), 1 = New (reject publish).
+    pub discard: u8,
+}
+
 /// Hot-path lookups. Lives behind `ArcSwap` — readers do a single
 /// pointer-bump load.
 #[derive(Debug, Default)]
@@ -106,6 +117,8 @@ struct HotSnapshot {
     /// recover the stream id (v2 ack body has no stream_id field).
     /// Indexed by `ConsumerId.0`; gaps stay as `u32::MAX` (sentinel).
     consumer_stream: Vec<u32>,
+    /// Per-stream quota limits. Indexed by `StreamId.0`.
+    stream_quotas: Vec<StreamQuota>,
 }
 
 impl HotSnapshot {
@@ -116,11 +129,13 @@ impl HotSnapshot {
         let streams_seq_to_wire = inner.streams_seq_to_wire.clone();
         let streams_idempotency_window_ms = inner.streams_idempotency_window_ms.clone();
         let consumer_stream = inner.consumer_stream.clone();
+        let stream_quotas = inner.stream_quotas.clone();
         Self {
             streams_by_wire,
             streams_seq_to_wire,
             streams_idempotency_window_ms,
             consumer_stream,
+            stream_quotas,
         }
     }
 }
@@ -142,6 +157,9 @@ struct Inner {
     /// `name` field. Authoritative copy; cold path — never read by the
     /// publish hot path.
     streams_name_by_wire: HashMap<u32, Vec<u8>, foldhash::fast::FixedState>,
+    /// Per-stream quota limits. Indexed by `StreamId.0`. Authoritative copy;
+    /// mirrored to `HotSnapshot.stream_quotas`.
+    stream_quotas: Vec<StreamQuota>,
     next_stream: u32,
 
     /// Consumers are keyed by `(stream_id, name)` because the wire never
@@ -164,6 +182,9 @@ struct Inner {
     /// Per-consumer deliver policy (0=All, 1=New, 2=ByStartSeq) + start_seq.
     /// Set at CreateConsumer time, consumed at Subscribe time for cursor positioning.
     consumer_deliver: HashMap<ConsumerId, (u8, u64), foldhash::fast::FixedState>,
+    /// Per-consumer cursor: last acked sequence number. Updated on each
+    /// ack so reconnecting consumers can resume from where they left off.
+    consumer_cursors: HashMap<ConsumerId, u64, foldhash::fast::FixedState>,
     /// Consumer ids start at 1 so `0` can keep its conventional "unset /
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
@@ -197,6 +218,7 @@ impl Inner {
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
             ),
+            stream_quotas: Vec::with_capacity(PREALLOC),
             next_stream: 0,
             consumers_by_name: HashMap::with_capacity_and_hasher(
                 PREALLOC,
@@ -212,6 +234,10 @@ impl Inner {
                 foldhash::fast::FixedState::default(),
             ),
             next_consumer: 1,
+            consumer_cursors: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
             queues_by_key: HashMap::with_capacity_and_hasher(
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
@@ -428,6 +454,44 @@ impl NameRegistry {
             .unwrap_or(0)
     }
 
+    // ── Stream quotas ──────────────────────────────────────────────────────
+
+    /// Set the quota limits for an already-allocated stream. Called at
+    /// `CreateStream` time. Values of `0` mean unlimited for that
+    /// dimension.
+    pub fn set_stream_quota(
+        &self,
+        seq: StreamId,
+        max_msgs: u64,
+        max_bytes: u64,
+        discard: u8,
+    ) {
+        self.with_inner_swap(|g| {
+            let idx = seq.0 as usize;
+            if idx >= g.stream_quotas.len() {
+                g.stream_quotas.resize(idx + 1, StreamQuota::default());
+            }
+            g.stream_quotas[idx] = StreamQuota {
+                max_msgs,
+                max_bytes,
+                discard,
+            };
+        });
+    }
+
+    /// Look up the quota for a stream. Returns `None` if the stream
+    /// doesn't exist or has no quota.
+    ///
+    /// **Hot path**: lock-free `ArcSwap` load + indexed `Vec` access.
+    #[inline]
+    pub fn stream_quota(&self, seq: StreamId) -> Option<StreamQuota> {
+        self.hot
+            .load()
+            .stream_quotas
+            .get(seq.0 as usize)
+            .copied()
+    }
+
     // ── Consumers ──────────────────────────────────────────────────────────
 
     /// Resolve `(stream, name)` → `ConsumerId`, allocating a fresh
@@ -485,6 +549,7 @@ impl NameRegistry {
                 *slot = CONSUMER_STREAM_UNSET;
             }
             g.consumer_deliver.remove(&removed);
+            g.consumer_cursors.remove(&removed);
             Some(removed)
         })
     }
@@ -524,6 +589,7 @@ impl NameRegistry {
                 *slot = CONSUMER_STREAM_UNSET;
             }
             g.consumer_deliver.remove(&id);
+            g.consumer_cursors.remove(&id);
             Some(name)
         })
     }
@@ -613,6 +679,30 @@ impl NameRegistry {
             .lock()
             .expect("name registry poisoned")
             .consumer_deliver
+            .get(&consumer)
+            .copied()
+    }
+
+    // ── Consumer cursor persistence ───────────────────────────────────────
+
+    /// Update the persisted cursor for a consumer. Called on each ack
+    /// with the highest acked sequence number. The cursor is used on
+    /// reconnect to resume delivery from where the consumer left off.
+    pub fn set_consumer_cursor(&self, consumer: ConsumerId, last_acked_seq: u64) {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_cursors
+            .insert(consumer, last_acked_seq);
+    }
+
+    /// Look up the last acked sequence for a consumer. Returns `None`
+    /// if the consumer has never acked or has been removed.
+    pub fn consumer_cursor(&self, consumer: ConsumerId) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_cursors
             .get(&consumer)
             .copied()
     }

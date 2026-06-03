@@ -75,6 +75,7 @@ impl ShardHandle {
                 subject: &e.subject,
                 payload: &e.payload,
                 flags: 0,
+                deliver_at_ms: 0,
             })
             .collect();
 

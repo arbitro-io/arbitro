@@ -217,6 +217,7 @@ cold_body! {
         pub ack_wait_ms:    u32,
         pub start_seq:      u64,
         pub subject_limits: Vec<SubjectLimit>,
+        pub max_nack:       Option<u32>,
     },
 
     // ── Subscribe ────────────────────────────────────────────────────

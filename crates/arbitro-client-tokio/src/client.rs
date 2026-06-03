@@ -235,6 +235,27 @@ impl Client {
         )
     }
 
+    /// Publish a message with a delivery delay.
+    ///
+    /// The broker parks the message in its delayed journal and delivers it
+    /// to consumers after `delay_ms` milliseconds. Returns the broker's
+    /// confirmation (RepOk). The `ref_seq` in the reply is 0 because the
+    /// message doesn't receive a store sequence until maturation.
+    pub fn publish_delayed(
+        &self,
+        stream_id: u32,
+        subject:   &[u8],
+        payload:   Bytes,
+        delay_ms:  u64,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        crate::publish::publish_delayed_async(
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id, subject, payload, delay_ms,
+        )
+    }
+
     /// Publish a message with a reply-to subject (request/reply RPC pattern).
     ///
     /// The broker stores the entry with the `reply_to` metadata. Consumers

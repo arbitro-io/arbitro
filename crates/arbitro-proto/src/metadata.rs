@@ -25,6 +25,8 @@ pub const CMD_CREATE_STREAM: u8 = 0x01;
 pub const CMD_DELETE_STREAM: u8 = 0x02;
 pub const CMD_CREATE_CONSUMER: u8 = 0x03;
 pub const CMD_DELETE_CONSUMER: u8 = 0x04;
+/// Consumer cursor update: `[4 consumer_id LE][8 last_acked_seq LE]`.
+pub const CMD_CURSOR_UPDATE: u8 = 0x05;
 
 /// Zero-copy view over a metadata command buffer.
 ///
@@ -112,6 +114,16 @@ pub fn build_create_consumer(wire_body: &[u8]) -> Vec<u8> {
 #[inline]
 pub fn build_delete_consumer(wire_body: &[u8]) -> Vec<u8> {
     build_command(CMD_DELETE_CONSUMER, wire_body)
+}
+
+/// Build a cursor update metadata command.
+/// Body layout: `[4 consumer_id LE][8 last_acked_seq LE]`.
+#[inline]
+pub fn build_cursor_update(consumer_id: u32, last_acked_seq: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&consumer_id.to_le_bytes());
+    body.extend_from_slice(&last_acked_seq.to_le_bytes());
+    build_command(CMD_CURSOR_UPDATE, &body)
 }
 
 // ── Trait — compatible with StateMachine::apply(&[u8]) ─────────────────────

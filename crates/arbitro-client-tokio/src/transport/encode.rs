@@ -100,6 +100,21 @@ pub(crate) fn encode_pub_with_reply_v2(
     Bytes::from(buf)
 }
 
+/// Build a v2 PUB-DELAYED frame in one contiguous `Bytes`.
+pub(crate) fn encode_pub_delayed_v2(
+    seq: u64,
+    stream_id: u32,
+    subject: &[u8],
+    payload: &[u8],
+    delay_ms: u64,
+) -> Bytes {
+    use arbitro_proto::v2::ingress::pub_delayed_frame::PubDelayedFrame;
+    let size = PubDelayedFrame::wire_size(subject.len(), 0, payload.len());
+    let mut buf = vec![0u8; size];
+    PubDelayedFrame::encode_into(&mut buf, seq, stream_id, 0, 0, subject, &[], payload, delay_ms);
+    Bytes::from(buf)
+}
+
 // ─── v2 manager encoders ──────────────────────────────────────────────
 
 /// CreateStream request frame.
@@ -197,6 +212,7 @@ pub(crate) fn encode_create_consumer_v2(
         ack_wait_ms,
         start_seq,
         subject_limits: owned_limits,
+        max_nack: None,
     }
     .encode(seq)
 }

@@ -36,6 +36,7 @@ use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
 use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
+use arbitro_proto::v2::ingress::pub_delayed_frame::PubDelayedFrame;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
 use arbitro_proto::v2::manager::consumer_mgmt::CreateConsumerFrame;
@@ -66,6 +67,7 @@ pub async fn dispatch_frame_v2(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+    delayed_journal: &Option<crate::delayed::SharedDelayedJournal>,
     #[cfg(feature = "cluster")]
     cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
 ) -> Result<(), ()> {
@@ -164,6 +166,9 @@ pub async fn dispatch_frame_v2(
         Action::PauseConsumer  => v2_pause_consumer(conn_id, req_seq, &frame, server, registry).await,
         Action::ResumeConsumer => v2_resume_consumer(conn_id, req_seq, &frame, server, registry).await,
 
+        // ── Delayed publish ─────────────────────────────────────────
+        Action::PublishDelayed => v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal),
+
         // ── Cron scheduling ─────────────────────────────────────────
         Action::CreateCron     => v2_create_cron(conn_id, req_seq, &frame, registry, cron_registry),
         Action::DeleteCron     => v2_delete_cron(conn_id, req_seq, &frame, registry, cron_registry),
@@ -251,11 +256,31 @@ fn v2_publish(
         drop(t);
     }
 
+    // ── Stream quota pre-check (DiscardPolicy::New) ────────────────────
+    // If the stream has DiscardPolicy::New (discard == 1) and the store
+    // would exceed max_msgs or max_bytes, reject BEFORE appending.
+    if let Some(quota) = server.names().stream_quota(seq_stream) {
+        if quota.discard == 1 {
+            let shared_store = server.store_for(seq_stream);
+            let info = shared_store.lock().info();
+            if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+            let entry_bytes = (f.subject().len() + f.payload().len()) as u64;
+            if quota.max_bytes > 0 && info.bytes + entry_bytes > quota.max_bytes {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+        }
+    }
+
     let entries = [arbitro_store::EntryRef {
         stream_id: seq_stream.raw(),
         subject: f.subject(),
         payload: f.payload(),
         flags: 0,
+        deliver_at_ms: 0,
     }];
 
     // F7: single relaxed atomic load instead of SystemTime::now() syscall.
@@ -350,6 +375,7 @@ fn v2_publish_with_reply(
         subject: f.subject(),
         payload: &combined_payload,
         flags: arbitro_store::flags::HAS_REPLY_TO,
+        deliver_at_ms: 0,
     }];
 
     // F7: SharedClock atomic load.
@@ -454,6 +480,7 @@ fn v2_publish_batch(
             subject: v.subject(),
             payload: v.payload(),
             flags: 0,
+            deliver_at_ms: 0,
         })
         .collect();
 
@@ -472,6 +499,79 @@ fn v2_publish_batch(
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
     server.gate_for(seq_stream).release();
+}
+
+fn v2_publish_delayed(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+    delayed_journal: &Option<crate::delayed::SharedDelayedJournal>,
+) {
+    let f = match PubDelayedFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+    };
+    if let Err(code) = f.validate() {
+        send_error_v2(registry, conn_id, req_seq, code);
+        return;
+    }
+    let wire_stream = f.body.stream_id.get();
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+    };
+
+    let delay_ms = f.delay_ms();
+
+    // If delay_ms == 0, treat as a normal publish (bypass the journal).
+    if delay_ms == 0 {
+        let entries = [arbitro_store::EntryRef {
+            stream_id: seq_stream.raw(),
+            subject: f.subject(),
+            payload: f.payload(),
+            flags: 0,
+            deliver_at_ms: 0,
+        }];
+        let now_ms = server.now_ms();
+        let shared_store = server.store_for(seq_stream);
+        let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
+            Ok(seq) => seq,
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+        };
+        send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
+        server.gate_for(seq_stream).release();
+        return;
+    }
+
+    // Delayed path — park in the delayed journal.
+    let journal = match delayed_journal {
+        Some(j) => j,
+        None => {
+            // No data_dir configured — delayed publish requires persistence.
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
+    };
+
+    let now_ms = server.now_ms();
+    let deliver_at_ms = now_ms + delay_ms;
+
+    let mut j = journal.lock();
+    match j.append(deliver_at_ms, seq_stream.raw(), f.subject(), f.payload(), 0) {
+        Ok(()) => {
+            // Reply with RepOk (ref_seq = 0 since there's no store sequence yet).
+            send_rep_ok_v2(registry, conn_id, req_seq, 0);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "delayed journal append failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
 }
 
 async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
@@ -626,6 +726,7 @@ async fn v2_subscribe(
                 ack_policy: AckPolicy::Explicit,
                 max_inflight: u32::MAX,
                 ack_wait_ms: 0,
+                max_nack: 0,
             },
             SubscriptionConfig {
                 // body.subscription_id == 0 means "legacy default": use
@@ -766,6 +867,15 @@ async fn v2_create_stream(
             // legacy default = no dedup; any non-zero value activates
             // the dedup window on `v2_publish` / `v2_publish_batch`.
             server.names().set_stream_idempotency(seq_stream, idempotency_window_ms);
+
+            // Store stream quota limits so the publish hot path can
+            // pre-check and reject with StreamFull for DiscardPolicy::New.
+            server.names().set_stream_quota(
+                seq_stream,
+                max_msgs,
+                max_bytes,
+                body.discard,
+            );
 
             // F37: invalidate the list_streams / list_consumers TTL
             // cache so the next list-RPC reflects this new stream.
@@ -1092,6 +1202,7 @@ async fn v2_create_consumer(
                     effective_max_inflight as u32
                 },
                 ack_wait_ms: body.ack_wait_ms,
+                max_nack: body.max_nack.unwrap_or(5),
             },
             subject_limits,
         )

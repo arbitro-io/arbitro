@@ -577,7 +577,7 @@ mod tests {
     use crate::store::{EntryRef, Store};
 
     fn make_entry<'a>(subject: &'a [u8], payload: &'a [u8]) -> EntryRef<'a> {
-        EntryRef { stream_id: 0, subject, payload, flags: 0 }
+        EntryRef { stream_id: 0, subject, payload, flags: 0, deliver_at_ms: 0 }
     }
 
     #[test]
@@ -1017,13 +1017,13 @@ mod tests {
             store.init().unwrap();
             store
                 .append(
-                    EntryRef { subject: b"good", payload: b"first", stream_id: 0, flags: 0 },
+                    EntryRef { subject: b"good", payload: b"first", stream_id: 0, flags: 0, deliver_at_ms: 0 },
                     1_000,
                 )
                 .unwrap();
             store
                 .append(
-                    EntryRef { subject: b"good", payload: b"second", stream_id: 0, flags: 0 },
+                    EntryRef { subject: b"good", payload: b"second", stream_id: 0, flags: 0, deliver_at_ms: 0 },
                     2_000,
                 )
                 .unwrap();

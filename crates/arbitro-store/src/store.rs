@@ -38,6 +38,10 @@ pub struct EntryRef<'a> {
     pub subject: &'a [u8],
     pub payload: &'a [u8],
     pub flags: u8,
+    /// Millisecond-epoch timestamp at which this entry should be delivered.
+    /// `0` means immediate (default — no delay). A non-zero value signals
+    /// the server to park the entry in the delayed journal until maturation.
+    pub deliver_at_ms: u64,
 }
 
 /// Store stats.
@@ -109,6 +113,33 @@ pub trait Store: Send + Sync {
 
     /// Delete all messages matching a subject pattern. Returns deleted count.
     fn drain(&mut self, subject: &[u8]) -> u64;
+
+    /// Delete all messages with timestamp older than `timestamp_ms`.
+    /// Walks from `first_seq` forward and truncates all entries whose
+    /// `timestamp < timestamp_ms`. Returns number of deleted messages.
+    ///
+    /// Default implementation uses `for_each` + `truncate_front`.
+    fn purge_before(&mut self, timestamp_ms: u64) -> u64 {
+        let info = self.info();
+        if info.messages == 0 {
+            return 0;
+        }
+        // Walk from first_seq to find the first entry >= timestamp_ms.
+        let mut first_valid_seq: Option<u64> = None;
+        let _ = self.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+            if first_valid_seq.is_none() && entry.timestamp >= timestamp_ms {
+                first_valid_seq = Some(entry.seq);
+            }
+        });
+        match first_valid_seq {
+            Some(seq) if seq > info.first_seq => self.truncate_front(seq),
+            None => {
+                // All entries are older than timestamp_ms — purge everything.
+                self.purge()
+            }
+            _ => 0,
+        }
+    }
 
     /// Current stats.
     fn info(&self) -> StoreInfo;

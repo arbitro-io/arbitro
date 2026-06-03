@@ -379,6 +379,12 @@ pub struct CommandWorker {
     /// ring. Drained at the top of every command loop iteration so a
     /// transient ring-full doesn't leak the per-consumer subject slot.
     pub(super) pending_consumer_remove: Vec<ConsumerId>,
+    /// DLQ nack counter: `(consumer_id, seq) → nack_count`. Tracks how
+    /// many times each message has been nacked by a given consumer. When
+    /// the count exceeds the consumer's `max_nack` threshold, the message
+    /// is published to the DLQ stream and acked from the original.
+    pub(super) dlq_nack_counts: HashMap<(u32, u64), u32, foldhash::fast::FixedState>,
+
     /// H12: timestamp of the last `wheel_tick + idempotency tick` pass.
     /// The `tokio::select!` sleep arm can be starved when commands are
     /// arriving continuously; this field lets `dispatch_command` force

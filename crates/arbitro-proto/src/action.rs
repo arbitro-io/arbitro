@@ -71,6 +71,12 @@ pub enum Action {
     // dispatcher. Reserved; do not reuse the slots.
     Disconnect    = 0x0605,
 
+    // 0x08xx — Delayed publish
+    /// Publish with a delivery delay. Body = normal PubFrame body + u64
+    /// delay_ms appended. The broker parks the message in a delayed
+    /// journal and delivers it after `delay_ms` milliseconds.
+    PublishDelayed = 0x0801,
+
     // 0x07xx — Cron scheduling
     /// Register a cron job. JSON body: name, cron_expr, tz (optional).
     /// Reply: RepOk on success.
@@ -136,6 +142,8 @@ impl Action {
             // 0x0603, 0x0604 reserved (deleted Connect/Connected) — L1.
             0x0605 => Some(Self::Disconnect),
 
+            0x0801 => Some(Self::PublishDelayed),
+
             0x0701 => Some(Self::CreateCron),
             0x0702 => Some(Self::DeleteCron),
             0x0703 => Some(Self::ListCrons),
@@ -174,6 +182,7 @@ impl Action {
             Self::Publish
                 | Self::PublishBatch
                 | Self::PublishWithReply
+                | Self::PublishDelayed
                 | Self::Subscribe
         )
     }
@@ -186,6 +195,7 @@ impl Action {
             Self::Publish
                 | Self::PublishBatch
                 | Self::PublishWithReply
+                | Self::PublishDelayed
         )
     }
 }

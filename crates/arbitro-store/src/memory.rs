@@ -516,6 +516,7 @@ impl Store for MemoryStore {
                         subject: entry.subject,
                         payload: entry.payload,
                         flags: meta.flags,
+                        deliver_at_ms: 0,
                     },
                     ts,
                 );
@@ -569,6 +570,7 @@ mod tests {
                     payload: b"{}",
                     stream_id: 0,
                     flags: 0,
+                    deliver_at_ms: 0,
                 },
                 1000,
             )
@@ -585,9 +587,9 @@ mod tests {
     fn append_batch() {
         let mut s = MemoryStore::new();
         let entries = [
-            EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0 },
-            EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0 },
-            EntryRef { subject: b"c", payload: b"3", stream_id: 0, flags: 0 },
+            EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+            EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+            EntryRef { subject: b"c", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 },
         ];
         let first = s.append_batch(&entries, 100).unwrap();
         assert_eq!(first, 1);
@@ -602,7 +604,7 @@ mod tests {
         let mut s = MemoryStore::new();
         for i in 0..5 {
             s.append(
-                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 },
+                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0, deliver_at_ms: 0 },
                 0,
             )
             .unwrap();
@@ -625,7 +627,7 @@ mod tests {
         let mut s = MemoryStore::new();
         for i in 0..10 {
             s.append(
-                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0 },
+                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0, deliver_at_ms: 0 },
                 0,
             )
             .unwrap();
@@ -637,7 +639,7 @@ mod tests {
 
         let seq = s
             .append(
-                EntryRef { subject: b"y", payload: b"new", stream_id: 0, flags: 0 },
+                EntryRef { subject: b"y", payload: b"new", stream_id: 0, flags: 0, deliver_at_ms: 0 },
                 0,
             )
             .unwrap();
@@ -647,10 +649,10 @@ mod tests {
     #[test]
     fn drain_by_subject() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.created", payload: b"3", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"payments.done", payload: b"4", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"orders.created", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"payments.done", payload: b"4", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
 
         let drained = s.drain(b"orders.created");
         assert_eq!(drained, 2);
@@ -665,9 +667,9 @@ mod tests {
     #[test]
     fn drain_with_wildcard() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"payments.done", payload: b"3", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"payments.done", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
 
         let drained = s.drain(b"orders.>");
         assert_eq!(drained, 2);
@@ -680,16 +682,16 @@ mod tests {
     #[test]
     fn info_tracks_bytes() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"ab", payload: b"cd", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"ab", payload: b"cd", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
         assert_eq!(s.info().bytes, 4);
-        s.append(EntryRef { subject: b"ef", payload: b"ghij", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"ef", payload: b"ghij", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
         assert_eq!(s.info().bytes, 10);
     }
 
     #[test]
     fn empty_batch_returns_next_seq() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"x", payload: b"y", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"x", payload: b"y", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
         let seq = s.append_batch(&[], 0).unwrap();
         assert_eq!(seq, 2);
     }
@@ -697,8 +699,8 @@ mod tests {
     #[test]
     fn for_each_borrows_without_clone() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
 
         let mut seen = 0;
         s.for_each(1, 3, &mut |e| {
@@ -712,7 +714,7 @@ mod tests {
     #[test]
     fn get_borrows_without_clone() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"hello", payload: b"world", stream_id: 0, flags: 0 }, 42).unwrap();
+        s.append(EntryRef { subject: b"hello", payload: b"world", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 42).unwrap();
 
         let mut captured_ts = 0;
         let found = s
@@ -734,7 +736,7 @@ mod tests {
         let payload = vec![0u8; 1024];
         for _ in 0..6 {
             s.append(
-                EntryRef { subject: b"x", payload: &payload, stream_id: 0, flags: 0 },
+                EntryRef { subject: b"x", payload: &payload, stream_id: 0, flags: 0, deliver_at_ms: 0 },
                 0,
             )
             .unwrap();

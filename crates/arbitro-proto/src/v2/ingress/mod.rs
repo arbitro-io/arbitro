@@ -14,6 +14,7 @@ pub mod ack_frame;
 pub mod batch_pub_frame;
 pub mod hello;
 pub mod nack_frame;
+pub mod pub_delayed_frame;
 pub mod pub_frame;
 // pub_with_headers deleted — §5.1 (frame without dispatcher).
 pub mod pub_with_reply;
@@ -32,5 +33,6 @@ pub use batch_pub_frame::{
     BatchPubEntryView, BatchPubFrame, BatchPubIter,
 };
 pub use hello::{HELLO_FRAME_SIZE, HelloFrame, Role};
+pub use pub_delayed_frame::{PUB_DELAYED_BODY_FIXED, PubDelayedBody, PubDelayedFrame};
 pub use pub_frame::{PUB_BODY_FIXED, PubBody, PubFrame};
 pub use pub_with_reply::{PUB_WITH_REPLY_BODY_FIXED, PubWithReplyBody, PubWithReplyFrame};

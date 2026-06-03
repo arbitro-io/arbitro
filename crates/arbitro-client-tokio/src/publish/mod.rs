@@ -112,6 +112,32 @@ pub(crate) fn publish_sync_async(
     }
 }
 
+/// Delayed publish — parks the message in the broker's delayed journal.
+/// The message will be delivered to consumers after `delay_ms` milliseconds.
+/// Returns a future that resolves once the broker confirms receipt.
+pub(crate) fn publish_delayed_async(
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    subject: &[u8],
+    payload: Bytes,
+    delay_ms: u64,
+) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+    let seq   = seq_alloc.next();
+    let frame = WriteFrame::Mono(
+        crate::transport::encode::encode_pub_delayed_v2(seq, stream_id, subject, &payload, delay_ms)
+    );
+    let rx    = pending.register(seq);
+    let enqueue_result = enqueue(tx, frame);
+    async move {
+        enqueue_result?;
+        rx.recv_async().await
+            .map_err(|_| ClientError::ChannelClosed)
+            .and_then(|r| r)
+    }
+}
+
 /// Publish with a reply-to subject (request/reply pattern).
 ///
 /// The broker stores the entry with the reply_to subject and delivers it

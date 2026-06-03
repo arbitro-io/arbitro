@@ -274,6 +274,9 @@ impl ShardRouter {
                 last_wheel_tick: None,
                 evict_resume_seq: 0,
                 stream_oldest_ts: HashMap::default(),
+                dlq_nack_counts: std::collections::HashMap::with_hasher(
+                    foldhash::fast::FixedState::default(),
+                ),
             };
 
             // M15: supervise the command-worker task — if it panics

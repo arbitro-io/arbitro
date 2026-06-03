@@ -259,6 +259,7 @@ impl ArbitroStateMachine {
                     effective_max_inflight as u32
                 },
                 ack_wait_ms,
+                max_nack: 0,
             },
             Vec::new(), // no subject limits on replicated path
         ))

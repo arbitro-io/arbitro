@@ -207,6 +207,73 @@ impl ArbitroServer {
             crate::cron::cron_loop(cron_reg_clone, cron_connections, cron_shutdown).await;
         });
 
+        // Delayed publish journal — append-only file + min-heap maturation.
+        let delayed_journal: Option<crate::delayed::SharedDelayedJournal> =
+            if let Some(dir) = self.config.data_dir.as_deref() {
+                let data_path = std::path::Path::new(dir);
+                let mut journal = crate::delayed::DelayedJournal::new(data_path);
+                // Recovery: scan existing journal, rebuild heap, catch-up matured.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                match journal.recover(now_ms) {
+                    Ok(catch_up) => {
+                        if !catch_up.is_empty() {
+                            tracing::info!(
+                                count = catch_up.len(),
+                                "delayed journal: catching up matured entries from previous run"
+                            );
+                            for entry in catch_up {
+                                let seq_stream = arbitro_engine_v2::types::StreamId(entry.stream_id);
+                                let store_entry = arbitro_store::EntryRef {
+                                    stream_id: entry.stream_id,
+                                    subject: &entry.subject,
+                                    payload: &entry.payload,
+                                    flags: entry.flags,
+                                    deliver_at_ms: 0,
+                                };
+                                let shared_store = self.server.store_for(seq_stream);
+                                match shared_store.lock().append(store_entry, now_ms) {
+                                    Ok(_) => {
+                                        self.server.gate_for(seq_stream).release();
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            stream_id = entry.stream_id,
+                                            error = ?e,
+                                            "delayed catch-up: failed to append to main store"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if journal.len() > 0 {
+                            tracing::info!(
+                                pending = journal.len(),
+                                "delayed journal: pending entries recovered"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "delayed journal recovery failed");
+                    }
+                }
+                let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
+                // Spawn maturation task.
+                let mat_journal = std::sync::Arc::clone(&shared);
+                let mat_server = self.server.clone();
+                let mat_shutdown = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    crate::delayed::delayed_maturation_loop(
+                        mat_journal, mat_server, mat_shutdown,
+                    ).await;
+                });
+                Some(shared)
+            } else {
+                None
+            };
+
         // ── Cluster: Raft boot (when feature = "cluster") ─────────────
         #[cfg(feature = "cluster")]
         let mut cluster_state: std::sync::Arc<crate::cluster::ClusterState> =
@@ -430,12 +497,14 @@ impl ArbitroServer {
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
                                 let cron = cron_registry.clone();
+                                let delayed = delayed_journal.clone();
                                 #[cfg(feature = "cluster")]
                                 let cluster = cluster_state.clone();
                                 tokio::spawn(async move {
                                     read_loop(
                                         conn_id, reader, srv, reg, sd, auth,
                                         max_frame_size, max_ops_per_sec, cron,
+                                        delayed,
                                         #[cfg(feature = "cluster")]
                                         cluster,
                                     ).await;
@@ -575,6 +644,7 @@ async fn read_loop(
     max_frame_size: usize,
     max_ops_per_sec: u32,
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
+    delayed_journal: Option<crate::delayed::SharedDelayedJournal>,
     #[cfg(feature = "cluster")]
     cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
 ) {
@@ -688,6 +758,7 @@ async fn read_loop(
                 registry.touch(conn_id);
                 if dispatch_v2::dispatch_frame_v2(
                     conn_id, frame, &server, &registry, &cron_registry,
+                    &delayed_journal,
                     #[cfg(feature = "cluster")]
                     &cluster_state,
                 ).await.is_err() {

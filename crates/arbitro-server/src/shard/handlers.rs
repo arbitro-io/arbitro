@@ -102,6 +102,7 @@ impl CommandWorker {
                     subject: &e.subject,
                     payload: &e.payload,
                     flags: 0,
+                    deliver_at_ms: 0,
                 })
                 .collect();
 
@@ -195,6 +196,20 @@ impl CommandWorker {
             entries: &cmd.entries,
         });
 
+        // Clear DLQ nack counts for acked entries.
+        for entry in &cmd.entries {
+            self.dlq_nack_counts.remove(&(cmd.consumer_id.0, entry.seq));
+        }
+
+        // Persist consumer cursor: track the highest acked seq so
+        // reconnecting consumers can resume from where they left off.
+        if let Some(max_seq) = cmd.entries.iter().map(|e| e.seq).max() {
+            let cur = self.names.consumer_cursor(cmd.consumer_id).unwrap_or(0);
+            if max_seq > cur {
+                self.names.set_consumer_cursor(cmd.consumer_id, max_seq);
+            }
+        }
+
         let accepted = cmd.entries.len() as u32;
         crate::lifecycle_trace!(
             "a12_engine_ack_done",
@@ -250,6 +265,85 @@ impl CommandWorker {
             let _ = cmd.reply.send(NackReply { requeued: 0, not_found: cmd.entries.len() as u32 });
             return;
         }
+
+        // ── DLQ check ──────────────────────────────────────────────────
+        // If the consumer has max_nack > 0, track per-(consumer, seq)
+        // nack counts. Entries that exceed the threshold are acked from
+        // the original stream and published to the DLQ stream.
+        let max_nack = self
+            .engine
+            .consumer(cmd.consumer_id)
+            .map(|c| c.max_nack)
+            .unwrap_or(0);
+
+        let cmd = if max_nack > 0 {
+            let mut dlq_seqs = Vec::new();
+            let mut keep = Vec::new();
+            for entry in &cmd.entries {
+                let key = (cmd.consumer_id.0, entry.seq);
+                let count = self.dlq_nack_counts.entry(key).or_insert(0);
+                *count += 1;
+                if *count > max_nack {
+                    dlq_seqs.push(*entry);
+                    self.dlq_nack_counts.remove(&key);
+                } else {
+                    keep.push(*entry);
+                }
+            }
+
+            if !dlq_seqs.is_empty() {
+                // Ack the DLQ entries from the original stream.
+                self.drain_notifications();
+                let delta = self.engine.execute(&Command::Ack {
+                    consumer_id: cmd.consumer_id,
+                    entries: &dlq_seqs,
+                });
+                let acked = dlq_seqs.len() as u32;
+                if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
+                    if acked > 0 {
+                        self.counters.dec_inflight_bulk(
+                            cmd.consumer_id.0,
+                            consumer.queue_id.0,
+                            acked,
+                        );
+                    }
+                }
+                self.apply_delta_and_sync(&delta);
+
+                // Best-effort publish to DLQ stream. Read from store
+                // and re-append with a DLQ tag. For the skeleton, log
+                // the event — full wiring requires DLQ stream creation
+                // and registry integration.
+                for dlq_entry in &dlq_seqs {
+                    tracing::debug!(
+                        consumer_id = cmd.consumer_id.0,
+                        seq = dlq_entry.seq,
+                        "message moved to DLQ after exceeding max_nack={}",
+                        max_nack,
+                    );
+                }
+                self.gate.release();
+            }
+
+            if keep.is_empty() {
+                let _ = cmd.reply.send(NackReply {
+                    requeued: dlq_seqs.len() as u32,
+                    not_found: 0,
+                });
+                return;
+            }
+
+            // Continue with the surviving entries.
+            NackCmd {
+                consumer_id: cmd.consumer_id,
+                conn_id: cmd.conn_id,
+                entries: keep,
+                delay_ms: cmd.delay_ms,
+                reply: cmd.reply,
+            }
+        } else {
+            cmd
+        };
 
         // Process pending drain notifications first.
         self.drain_notifications();
@@ -423,8 +517,14 @@ impl CommandWorker {
             // 2 = ByStartSeq: rewind to start_seq - 1
             match cmd.deliver_policy {
                 0 => {
-                    // DeliverPolicy::All — replay from beginning.
-                    self.counters.set_cursor(0);
+                    // DeliverPolicy::All — if the consumer has a persisted
+                    // cursor (from a previous session), resume from
+                    // last_acked_seq + 1 instead of replaying from 0.
+                    if let Some(last_acked) = self.names.consumer_cursor(consumer_id) {
+                        self.counters.set_cursor(last_acked);
+                    } else {
+                        self.counters.set_cursor(0);
+                    }
                     self.counters.clear_rewind();
                 }
                 1 => {

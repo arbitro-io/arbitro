@@ -10,7 +10,7 @@ use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_proto::metadata::{
     MetadataApplier, MetadataCommandView, CMD_CREATE_CONSUMER, CMD_CREATE_STREAM,
-    CMD_DELETE_CONSUMER, CMD_DELETE_STREAM,
+    CMD_DELETE_CONSUMER, CMD_DELETE_STREAM, CMD_CURSOR_UPDATE,
 };
 use arbitro_proto::wire::manager::CreateConsumerView;
 use arbitro_proto::wire::stream::CreateStreamView;
@@ -40,6 +40,10 @@ enum ReplayCommand {
     DeleteConsumer {
         stream_id: StreamId,
         consumer_id: ConsumerId,
+    },
+    CursorUpdate {
+        consumer_id: ConsumerId,
+        last_acked_seq: u64,
     },
 }
 
@@ -290,6 +294,7 @@ impl MetadataApplier for ReplayApplier {
                             cv.max_inflight() as u32
                         },
                         ack_wait_ms: cv.ack_wait_ms(),
+                        max_nack: 0,
                     },
                     max_subject_inflights,
                 });
@@ -318,6 +323,23 @@ impl MetadataApplier for ReplayApplier {
                     stream_id,
                     consumer_id,
                 });
+            }
+            CMD_CURSOR_UPDATE => {
+                // Body: [4 consumer_id LE][8 last_acked_seq LE]
+                let body = view.body();
+                if body.len() >= 12 {
+                    let consumer_id = ConsumerId(u32::from_le_bytes([
+                        body[0], body[1], body[2], body[3],
+                    ]));
+                    let last_acked_seq = u64::from_le_bytes([
+                        body[4], body[5], body[6], body[7],
+                        body[8], body[9], body[10], body[11],
+                    ]);
+                    self.commands.push(ReplayCommand::CursorUpdate {
+                        consumer_id,
+                        last_acked_seq,
+                    });
+                }
             }
             _ => {
                 tracing::warn!(
