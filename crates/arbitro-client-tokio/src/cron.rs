@@ -49,6 +49,12 @@ pub struct CronState {
     handlers: Mutex<HashMap<Bytes, CronEntry>>,
 }
 
+impl std::fmt::Debug for CronState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CronState").finish()
+    }
+}
+
 struct CronEntry {
     handler: CronHandler,
     config: CreateCronBody,
@@ -103,6 +109,7 @@ impl CronState {
 /// cron.stop().await.unwrap();
 /// # }
 /// ```
+#[derive(Debug)]
 pub struct CronBuilder<'a> {
     client: &'a crate::client::Client,
     name: Bytes,
@@ -210,7 +217,7 @@ impl CronHandle {
 
         let rx = self.inner.pending.register(seq);
         {
-            let mut admin = self.inner.admin_producer.lock().unwrap();
+            let admin = self.inner.admin_producer.lock().unwrap();
             let _ = admin.try_send(crate::transport::frame::WriteFrame::Mono(frame));
         }
         let _ = rx.recv_async().await;
@@ -261,7 +268,7 @@ fn send_cron_ack(inner: &Inner, name: &[u8], ok: bool) {
     let seq = inner.seq_alloc.next();
     let frame = encode_cron_ack(seq, name, ok);
     let wf = crate::transport::frame::WriteFrame::Mono(frame);
-    if let Ok(mut admin) = inner.admin_producer.lock() {
+    if let Ok(admin) = inner.admin_producer.lock() {
         let _ = admin.try_send(wf);
     }
 }
@@ -275,7 +282,7 @@ pub(crate) fn replay_crons(inner: &Inner) {
         let seq = inner.seq_alloc.next();
         let frame = encode_create_cron(seq, &body);
         let wf = crate::transport::frame::WriteFrame::Mono(frame);
-        if let Ok(mut admin) = inner.admin_producer.lock() {
+        if let Ok(admin) = inner.admin_producer.lock() {
             let _ = admin.try_send(wf);
         }
     }
