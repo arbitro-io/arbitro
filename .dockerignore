@@ -35,5 +35,4 @@
 # not part of the broker build.
 arbitro-ts/
 arbitro-go-server/
-arbitro-raft/
 arbitro-baseline/
