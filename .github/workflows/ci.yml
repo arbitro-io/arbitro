@@ -156,6 +156,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench --workspace --no-run
 
+  # ── Cluster feature build (verifies cluster code compiles) ────────────
+  cluster-build:
+    name: cluster build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}/arbitro
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: arbitro
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-kit
+          path: arbitro-kit
+      - uses: actions/checkout@v4
+        with:
+          repository: arbitro-io/arbitro-raft
+          path: arbitro-raft
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p arbitro-server --features cluster
+
   # ── Security audit ─────────────────────────────────────────────────────
   audit:
     name: cargo audit + deny
