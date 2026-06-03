@@ -1674,7 +1674,7 @@ async fn v2_create_stream_raft(
         idempotency_window_ms: body.idempotency_window_ms,
     };
     match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
     ).await {
         Ok(Ok(())) => {
@@ -1710,7 +1710,7 @@ async fn v2_delete_stream_raft(
         name: String::from_utf8_lossy(&body.name).to_string(),
     };
     match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
     ).await {
         Ok(Ok(())) => {
@@ -1755,7 +1755,7 @@ async fn v2_create_consumer_raft(
         start_seq: body.start_seq,
     };
     match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
     ).await {
         Ok(Ok(())) => {
@@ -1791,7 +1791,7 @@ async fn v2_delete_consumer_raft(
         name: format!("{}", body.consumer_id),
     };
     match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
     ).await {
         Ok(Ok(())) => {
