@@ -142,6 +142,20 @@ impl ReplayApplier {
                         }
                     }
                 }
+                ReplayCommand::CursorUpdate {
+                    consumer_id,
+                    last_acked_seq,
+                } => {
+                    // Restore the persisted cursor into NameRegistry.
+                    self.server
+                        .names()
+                        .set_consumer_cursor(consumer_id, last_acked_seq);
+                    tracing::debug!(
+                        ?consumer_id,
+                        last_acked_seq,
+                        "replayed CursorUpdate"
+                    );
+                }
             }
         }
 
