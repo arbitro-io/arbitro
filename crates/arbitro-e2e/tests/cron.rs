@@ -31,8 +31,8 @@ async fn cron_basic_fire() {
         .await
         .expect("create cron");
 
-    // Wait 3 seconds — should fire at least 2 times
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait 4 seconds — should fire at least 2 times (1s cron, 4s window)
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
     let fires = fire_count.load(Ordering::Relaxed);
     assert!(fires >= 2, "expected ≥2 fires, got {fires}");
@@ -125,7 +125,7 @@ async fn cron_survives_server_restart() {
 
     let _cron = client
         .cron(b"reconnect-test")
-        .every(b"* * * * * *")
+        .every(b"*/2 * * * * *")
         .run(move |_ctx| {
             let fc = fc.clone();
             async move {
@@ -135,8 +135,8 @@ async fn cron_survives_server_restart() {
         .await
         .expect("create cron");
 
-    // Let it fire at least once.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Let it fire at least once (every 2s, wait 5s for margin).
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let before_restart = fire_count.load(Ordering::Relaxed);
     assert!(before_restart >= 1, "expected ≥1 fires before restart, got {before_restart}");
 
@@ -149,7 +149,8 @@ async fn cron_survives_server_restart() {
 
     // Wait for client to reconnect + re-register cron + fires to resume.
     // Reconnect + handshake + CreateCron round-trip can take 1-2s.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Cron fires every 2s, so 8s gives 3-4 chances.
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     let after_restart = fire_count.load(Ordering::Relaxed);
     let new_fires = after_restart - before_restart;

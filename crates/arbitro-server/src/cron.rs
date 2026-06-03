@@ -92,8 +92,8 @@ impl CronSlot {
         match self.cron.find_next_occurrence(&now_chrono, false) {
             Ok(next) => {
                 let delta = next.signed_duration_since(now_chrono);
-                let dur_secs = delta.num_seconds().max(1) as u64;
-                self.next_fire = Some(Instant::now() + Duration::from_secs(dur_secs));
+                let dur_ms = delta.num_milliseconds().max(100) as u64;
+                self.next_fire = Some(Instant::now() + Duration::from_millis(dur_ms));
             }
             Err(_) => {
                 self.next_fire = None;
