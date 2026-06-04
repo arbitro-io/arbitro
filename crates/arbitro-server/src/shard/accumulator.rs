@@ -72,17 +72,15 @@ impl Bucket {
         }
     }
 
-    fn activate(
-        &mut self,
-        conn: ConnectionId,
-        stream: StreamId,
-        first_seq: u64,
-        is_fanout: bool,
-    ) {
+    fn activate(&mut self, conn: ConnectionId, stream: StreamId, first_seq: u64, is_fanout: bool) {
         self.body.clear();
         self.body.extend_from_slice(&[0u8; ENVELOPE_SIZE]);
         self.body.extend_from_slice(
-            RepBatchFixed { count: U16::new(0), _pad: U16::new(0) }.as_bytes(),
+            RepBatchFixed {
+                count: U16::new(0),
+                _pad: U16::new(0),
+            }
+            .as_bytes(),
         );
         self.count = 0;
         self.first_seq = first_seq;
@@ -173,7 +171,9 @@ pub struct Accumulator {
 }
 
 impl Default for Accumulator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Frame handed to the flush callback. Bytes already have the envelope
@@ -191,10 +191,7 @@ impl Accumulator {
         Self {
             buckets: Vec::with_capacity(16),
             active: Vec::with_capacity(16),
-            index: HashMap::with_capacity_and_hasher(
-                16,
-                foldhash::fast::FixedState::default(),
-            ),
+            index: HashMap::with_capacity_and_hasher(16, foldhash::fast::FixedState::default()),
             free_buckets: Vec::with_capacity(16),
         }
     }
@@ -233,7 +230,14 @@ impl Accumulator {
         payload: &[u8],
     ) {
         let idx = self.acquire_bucket(conn, stream, seq, /* is_fanout */ false);
-        self.buckets[idx].push_entry_bytes(consumer.0, seq, subject_hash, subject, reply_to, payload);
+        self.buckets[idx].push_entry_bytes(
+            consumer.0,
+            seq,
+            subject_hash,
+            subject,
+            reply_to,
+            payload,
+        );
     }
 
     /// Append a broadcast entry. Routes to the `FanoutBatch` bucket for
@@ -335,7 +339,9 @@ impl Accumulator {
     // ── Test helpers ─────────────────────────────────────────────────────
 
     #[cfg(test)]
-    pub(crate) fn active_count(&self) -> usize { self.active.len() }
+    pub(crate) fn active_count(&self) -> usize {
+        self.active.len()
+    }
 
     /// Count of entries in the per-consumer (`RepBatch`) bucket for
     /// `(conn, stream)`. `None` if no such bucket is active this cycle.
@@ -369,18 +375,31 @@ mod tests {
     const SUBJECT: &[u8] = b"demo.topic";
     const PAYLOAD: &[u8] = b"hello";
 
-    fn names() -> Arc<NameRegistry> { Arc::new(NameRegistry::default()) }
+    fn names() -> Arc<NameRegistry> {
+        Arc::new(NameRegistry::default())
+    }
 
     #[test]
     fn single_conn_many_entries_one_bucket() {
         let mut acc = Accumulator::new();
         acc.clear();
         for seq in 1..=10u64 {
-            acc.add(ConnectionId(100), StreamId(1), ConsumerId(0),
-                    seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
+            acc.add(
+                ConnectionId(100),
+                StreamId(1),
+                ConsumerId(0),
+                seq,
+                SUBJECT,
+                0xDEAD,
+                &[],
+                PAYLOAD,
+            );
         }
         assert_eq!(acc.active_count(), 1);
-        assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(10));
+        assert_eq!(
+            acc.bucket_count_for(ConnectionId(100), StreamId(1)),
+            Some(10)
+        );
     }
 
     #[test]
@@ -389,13 +408,24 @@ mod tests {
         acc.clear();
         for conn in 1u64..=4 {
             for seq in 1..=5u64 {
-                acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
+                acc.add(
+                    ConnectionId(conn),
+                    StreamId(1),
+                    ConsumerId(0),
+                    seq,
+                    SUBJECT,
+                    0xDEAD,
+                    &[],
+                    PAYLOAD,
+                );
             }
         }
         assert_eq!(acc.active_count(), 4);
         for conn in 1u64..=4 {
-            assert_eq!(acc.bucket_count_for(ConnectionId(conn), StreamId(1)), Some(5));
+            assert_eq!(
+                acc.bucket_count_for(ConnectionId(conn), StreamId(1)),
+                Some(5)
+            );
         }
     }
 
@@ -403,8 +433,26 @@ mod tests {
     fn same_conn_different_streams_distinct_buckets() {
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(0), 1, SUBJECT, 0xDEAD, &[], PAYLOAD);
-        acc.add(ConnectionId(100), StreamId(2), ConsumerId(0), 1, SUBJECT, 0xDEAD, &[], PAYLOAD);
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(0),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
+        acc.add(
+            ConnectionId(100),
+            StreamId(2),
+            ConsumerId(0),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
         assert_eq!(acc.active_count(), 2);
     }
 
@@ -414,8 +462,16 @@ mod tests {
         for _ in 0..3 {
             acc.clear();
             for conn in 1u64..=4 {
-                acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        1, SUBJECT, 0xDEAD, &[], PAYLOAD);
+                acc.add(
+                    ConnectionId(conn),
+                    StreamId(1),
+                    ConsumerId(0),
+                    1,
+                    SUBJECT,
+                    0xDEAD,
+                    &[],
+                    PAYLOAD,
+                );
             }
             assert_eq!(acc.active_count(), 4);
         }
@@ -429,8 +485,16 @@ mod tests {
         acc.clear();
         for conn in 1u64..=3 {
             for seq in 1..=4u64 {
-                acc.add(ConnectionId(conn), StreamId(1), ConsumerId(0),
-                        seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
+                acc.add(
+                    ConnectionId(conn),
+                    StreamId(1),
+                    ConsumerId(0),
+                    seq,
+                    SUBJECT,
+                    0xDEAD,
+                    &[],
+                    PAYLOAD,
+                );
             }
         }
 
@@ -449,8 +513,16 @@ mod tests {
     fn frame_bytes_contain_envelope_and_rep_batch_header() {
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(0),
-                42, SUBJECT, 0xBEEF, &[], PAYLOAD);
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(0),
+            42,
+            SUBJECT,
+            0xBEEF,
+            &[],
+            PAYLOAD,
+        );
 
         let mut seen = false;
         acc.for_each(&names(), |frame| {
@@ -472,10 +544,20 @@ mod tests {
     fn broadcast_collapse_shows_1_entry_per_broadcast_call() {
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add(ConnectionId(100), StreamId(1),
-                ConsumerId(0),            // broadcast (consumer_id=0 in RepBatch)
-                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
-        assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(1));
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(0), // broadcast (consumer_id=0 in RepBatch)
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
+        assert_eq!(
+            acc.bucket_count_for(ConnectionId(100), StreamId(1)),
+            Some(1)
+        );
     }
 
     // ── FanoutBatch (per-bucket action) ───────────────────────────────────
@@ -489,18 +571,47 @@ mod tests {
         acc.clear();
 
         // 2 ack-mode consumers on this conn
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
-                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(8),
-                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(7),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(8),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
 
         // 1 broadcast entry on the same conn (collapsed fire-and-forget)
-        acc.add_fanout(ConnectionId(100), StreamId(1),
-                       1, SUBJECT, 0xDEAD, &[], PAYLOAD);
+        acc.add_fanout(
+            ConnectionId(100),
+            StreamId(1),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
 
         assert_eq!(acc.active_count(), 2, "RepBatch + FanoutBatch buckets");
-        assert_eq!(acc.bucket_count_for(ConnectionId(100), StreamId(1)), Some(2));
-        assert_eq!(acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)), Some(1));
+        assert_eq!(
+            acc.bucket_count_for(ConnectionId(100), StreamId(1)),
+            Some(2)
+        );
+        assert_eq!(
+            acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)),
+            Some(1)
+        );
     }
 
     /// Multiple `add_fanout` calls with the same `(conn, stream)` collapse
@@ -510,10 +621,21 @@ mod tests {
         let mut acc = Accumulator::new();
         acc.clear();
         for seq in 1..=10u64 {
-            acc.add_fanout(ConnectionId(100), StreamId(1), seq, SUBJECT, 0xDEAD, &[], PAYLOAD);
+            acc.add_fanout(
+                ConnectionId(100),
+                StreamId(1),
+                seq,
+                SUBJECT,
+                0xDEAD,
+                &[],
+                PAYLOAD,
+            );
         }
         assert_eq!(acc.active_count(), 1);
-        assert_eq!(acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)), Some(10));
+        assert_eq!(
+            acc.fanout_bucket_count_for(ConnectionId(100), StreamId(1)),
+            Some(10)
+        );
     }
 
     /// Fanout bucket flushes with `Action::FanoutBatch` (`0x0207`) in
@@ -527,10 +649,25 @@ mod tests {
 
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add(ConnectionId(100), StreamId(1), ConsumerId(7),
-                1, SUBJECT, 0xDEAD, &[], PAYLOAD);
-        acc.add_fanout(ConnectionId(100), StreamId(1),
-                       2, SUBJECT, 0xBEEF, &[], PAYLOAD);
+        acc.add(
+            ConnectionId(100),
+            StreamId(1),
+            ConsumerId(7),
+            1,
+            SUBJECT,
+            0xDEAD,
+            &[],
+            PAYLOAD,
+        );
+        acc.add_fanout(
+            ConnectionId(100),
+            StreamId(1),
+            2,
+            SUBJECT,
+            0xBEEF,
+            &[],
+            PAYLOAD,
+        );
 
         let mut actions: Vec<u16> = Vec::new();
         acc.for_each(&names(), |frame| {
@@ -556,8 +693,15 @@ mod tests {
 
         let mut acc = Accumulator::new();
         acc.clear();
-        acc.add_fanout(ConnectionId(100), StreamId(1),
-                       42, SUBJECT, 0xBEEF, &[], PAYLOAD);
+        acc.add_fanout(
+            ConnectionId(100),
+            StreamId(1),
+            42,
+            SUBJECT,
+            0xBEEF,
+            &[],
+            PAYLOAD,
+        );
 
         let mut saw = false;
         acc.for_each(&names(), |frame| {

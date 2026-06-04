@@ -16,9 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::runtime::{Builder, Runtime};
 
 use arbitro_client_tokio::client::BatchEntry;
@@ -27,8 +25,8 @@ use arbitro_server::{ArbitroServer, Config};
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-const PAYLOAD_LEN:        usize = 64;
-const BATCH_MESSAGES:     usize = 100;
+const PAYLOAD_LEN: usize = 64;
+const BATCH_MESSAGES: usize = 100;
 const CONCURRENCY_LEVELS: &[usize] = &[1, 2, 4, 8, 16];
 
 fn portpicker() -> u16 {
@@ -89,9 +87,9 @@ fn build_runtime() -> Runtime {
 
 /// One-shot fixture: server + N pre-connected clients + the wire stream id.
 struct Fixture {
-    _addr:     String,
+    _addr: String,
     stream_id: u32,
-    clients:   Vec<Client>,
+    clients: Vec<Client>,
 }
 
 async fn fixture(conns: usize) -> Fixture {
@@ -104,7 +102,11 @@ async fn fixture(conns: usize) -> Fixture {
     for _ in 0..conns {
         clients.push(connect(&addr).await);
     }
-    Fixture { _addr: addr, stream_id, clients }
+    Fixture {
+        _addr: addr,
+        stream_id,
+        clients,
+    }
 }
 
 /// Spread `total` iterations across `clients.len()` tasks, each looping its
@@ -145,25 +147,21 @@ fn bench_publish_single(c: &mut Criterion) {
     for &conns in CONCURRENCY_LEVELS {
         let fix = Arc::new(rt.block_on(fixture(conns)));
         let stream_id = fix.stream_id;
-        group.bench_with_input(
-            BenchmarkId::from_parameter(conns),
-            &conns,
-            |b, &conns| {
+        group.bench_with_input(BenchmarkId::from_parameter(conns), &conns, |b, &conns| {
+            let fix = Arc::clone(&fix);
+            b.iter(|| {
                 let fix = Arc::clone(&fix);
-                b.iter(|| {
-                    let fix = Arc::clone(&fix);
-                    rt.block_on(async move {
-                        fanout(&fix.clients, conns, move |client, _| {
-                            let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
-                            async move {
-                                let _ = client.publish(stream_id, b"bench", payload);
-                            }
-                        })
-                        .await;
-                    });
+                rt.block_on(async move {
+                    fanout(&fix.clients, conns, move |client, _| {
+                        let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
+                        async move {
+                            let _ = client.publish(stream_id, b"bench", payload);
+                        }
+                    })
+                    .await;
                 });
-            },
-        );
+            });
+        });
     }
     group.finish();
 }
@@ -178,26 +176,22 @@ fn bench_publish_batch(c: &mut Criterion) {
     for &conns in CONCURRENCY_LEVELS {
         let fix = Arc::new(rt.block_on(fixture(conns)));
         let stream_id = fix.stream_id;
-        group.bench_with_input(
-            BenchmarkId::from_parameter(conns),
-            &conns,
-            |b, &conns| {
+        group.bench_with_input(BenchmarkId::from_parameter(conns), &conns, |b, &conns| {
+            let fix = Arc::clone(&fix);
+            b.iter(|| {
                 let fix = Arc::clone(&fix);
-                b.iter(|| {
-                    let fix = Arc::clone(&fix);
-                    rt.block_on(async move {
-                        fanout(&fix.clients, conns, move |client, _| async move {
-                            let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
-                            let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
-                                .map(|_| BatchEntry::new(b"bench", payload.clone()))
-                                .collect();
-                            let _ = client.publish_batch(stream_id, &entries);
-                        })
-                        .await;
-                    });
+                rt.block_on(async move {
+                    fanout(&fix.clients, conns, move |client, _| async move {
+                        let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
+                        let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
+                            .map(|_| BatchEntry::new(b"bench", payload.clone()))
+                            .collect();
+                        let _ = client.publish_batch(stream_id, &entries);
+                    })
+                    .await;
                 });
-            },
-        );
+            });
+        });
     }
     group.finish();
 }
@@ -212,25 +206,19 @@ fn bench_publish_single_sync(c: &mut Criterion) {
     for &conns in CONCURRENCY_LEVELS {
         let fix = Arc::new(rt.block_on(fixture(conns)));
         let stream_id = fix.stream_id;
-        group.bench_with_input(
-            BenchmarkId::from_parameter(conns),
-            &conns,
-            |b, &conns| {
+        group.bench_with_input(BenchmarkId::from_parameter(conns), &conns, |b, &conns| {
+            let fix = Arc::clone(&fix);
+            b.iter(|| {
                 let fix = Arc::clone(&fix);
-                b.iter(|| {
-                    let fix = Arc::clone(&fix);
-                    rt.block_on(async move {
-                        fanout(&fix.clients, conns, move |client, _| async move {
-                            let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
-                            let _ = client
-                                .publish_sync(stream_id, b"bench", payload)
-                                .await;
-                        })
-                        .await;
-                    });
+                rt.block_on(async move {
+                    fanout(&fix.clients, conns, move |client, _| async move {
+                        let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
+                        let _ = client.publish_sync(stream_id, b"bench", payload).await;
+                    })
+                    .await;
                 });
-            },
-        );
+            });
+        });
     }
     group.finish();
 }
@@ -245,28 +233,22 @@ fn bench_publish_batch_sync(c: &mut Criterion) {
     for &conns in CONCURRENCY_LEVELS {
         let fix = Arc::new(rt.block_on(fixture(conns)));
         let stream_id = fix.stream_id;
-        group.bench_with_input(
-            BenchmarkId::from_parameter(conns),
-            &conns,
-            |b, &conns| {
+        group.bench_with_input(BenchmarkId::from_parameter(conns), &conns, |b, &conns| {
+            let fix = Arc::clone(&fix);
+            b.iter(|| {
                 let fix = Arc::clone(&fix);
-                b.iter(|| {
-                    let fix = Arc::clone(&fix);
-                    rt.block_on(async move {
-                        fanout(&fix.clients, conns, move |client, _| async move {
-                            let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
-                            let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
-                                .map(|_| BatchEntry::new(b"bench", payload.clone()))
-                                .collect();
-                            let _ = client
-                                .publish_batch_sync(stream_id, &entries)
-                                .await;
-                        })
-                        .await;
-                    });
+                rt.block_on(async move {
+                    fanout(&fix.clients, conns, move |client, _| async move {
+                        let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
+                        let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
+                            .map(|_| BatchEntry::new(b"bench", payload.clone()))
+                            .collect();
+                        let _ = client.publish_batch_sync(stream_id, &entries).await;
+                    })
+                    .await;
                 });
-            },
-        );
+            });
+        });
     }
     group.finish();
 }

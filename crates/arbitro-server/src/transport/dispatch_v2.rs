@@ -27,15 +27,15 @@
 //!     `CreateConsumer` (v2). If the consumer was never created via v2 the
 //!     ack is silently dropped — fire-and-forget contract.
 
-use arbitro_engine_v2::AckEntry;
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, SubscriptionConfig};
 use arbitro_engine_v2::types::*;
+use arbitro_engine_v2::AckEntry;
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
-use arbitro_proto::v2::ingress::nack_frame::{NackFrame, BatchNackFrame};
 use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
+use arbitro_proto::v2::ingress::nack_frame::{BatchNackFrame, NackFrame};
 use arbitro_proto::v2::ingress::pub_delayed_frame::PubDelayedFrame;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
@@ -56,8 +56,7 @@ use crate::shard::router::ShardRouter;
 use crate::transport::ConnectionRegistry;
 
 use arbitro_proto::metadata::{
-    build_create_stream, build_delete_stream,
-    build_create_consumer, build_delete_consumer,
+    build_create_consumer, build_create_stream, build_delete_consumer, build_delete_stream,
 };
 
 /// Dispatch one v2 frame. `frame` covers `[Header(16) || body(msg_len)]`.
@@ -69,8 +68,7 @@ pub async fn dispatch_frame_v2(
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
     workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
     delayed_journal: &Option<crate::delayed::SharedDelayedJournal>,
-    #[cfg(feature = "cluster")]
-    cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
+    #[cfg(feature = "cluster")] cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
 ) -> Result<(), ()> {
     if frame.len() < HEADER_SIZE {
         return Err(());
@@ -82,7 +80,12 @@ pub async fn dispatch_frame_v2(
     let action = match Action::from_u16(header.action.get()) {
         Some(a) => a,
         None => {
-            send_error_v2(registry, conn_id, header.seq.get(), ErrorCode::UnknownAction);
+            send_error_v2(
+                registry,
+                conn_id,
+                header.seq.get(),
+                ErrorCode::UnknownAction,
+            );
             return Err(());
         }
     };
@@ -104,47 +107,59 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry, workflow_registry),
-        Action::PublishBatch     => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
-        Action::PublishWithReply => v2_publish_with_reply(conn_id, req_seq, &frame, server, registry),
-        Action::Ack            => v2_ack(conn_id, &frame, server).await,
-        Action::BatchAck       => v2_batch_ack(conn_id, &frame, server).await,
-        Action::Nack           => v2_nack(conn_id, &frame, server).await,
-        Action::BatchNack      => v2_batch_nack(conn_id, &frame, server).await,
-        Action::Subscribe      => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
-        Action::Unsubscribe    => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
+        Action::Publish => v2_publish(
+            conn_id,
+            req_seq,
+            &frame,
+            server,
+            registry,
+            workflow_registry,
+        ),
+        Action::PublishBatch => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
+        Action::PublishWithReply => {
+            v2_publish_with_reply(conn_id, req_seq, &frame, server, registry)
+        }
+        Action::Ack => v2_ack(conn_id, &frame, server).await,
+        Action::BatchAck => v2_batch_ack(conn_id, &frame, server).await,
+        Action::Nack => v2_nack(conn_id, &frame, server).await,
+        Action::BatchNack => v2_batch_nack(conn_id, &frame, server).await,
+        Action::Subscribe => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
+        Action::Unsubscribe => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Stream management ───────────────────────────────────────
-        Action::CreateStream   => {
+        Action::CreateStream => {
             #[cfg(feature = "cluster")]
             if cluster_state.is_clustered() {
-                v2_create_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+                v2_create_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state)
+                    .await;
             } else {
                 v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
             }
             #[cfg(not(feature = "cluster"))]
             v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
         }
-        Action::DeleteStream   => {
+        Action::DeleteStream => {
             #[cfg(feature = "cluster")]
             if cluster_state.is_clustered() {
-                v2_delete_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+                v2_delete_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state)
+                    .await;
             } else {
                 v2_delete_stream(conn_id, req_seq, &frame, server, registry).await;
             }
             #[cfg(not(feature = "cluster"))]
             v2_delete_stream(conn_id, req_seq, &frame, server, registry).await;
         }
-        Action::GetStream      => v2_get_stream(conn_id, req_seq, &frame, server, registry).await,
-        Action::PurgeStream    => v2_purge_stream(conn_id, req_seq, &frame, server, registry).await,
-        Action::DrainSubject   => v2_drain_subject(conn_id, req_seq, &frame, server, registry).await,
-        Action::ListStreams    => v2_list_streams(conn_id, req_seq, &frame, server, registry).await,
+        Action::GetStream => v2_get_stream(conn_id, req_seq, &frame, server, registry).await,
+        Action::PurgeStream => v2_purge_stream(conn_id, req_seq, &frame, server, registry).await,
+        Action::DrainSubject => v2_drain_subject(conn_id, req_seq, &frame, server, registry).await,
+        Action::ListStreams => v2_list_streams(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Consumer management ─────────────────────────────────────
         Action::CreateConsumer => {
             #[cfg(feature = "cluster")]
             if cluster_state.is_clustered() {
-                v2_create_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+                v2_create_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state)
+                    .await;
             } else {
                 v2_create_consumer(conn_id, req_seq, &frame, server, registry).await;
             }
@@ -154,47 +169,70 @@ pub async fn dispatch_frame_v2(
         Action::DeleteConsumer => {
             #[cfg(feature = "cluster")]
             if cluster_state.is_clustered() {
-                v2_delete_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state).await;
+                v2_delete_consumer_raft(conn_id, req_seq, &frame, server, registry, cluster_state)
+                    .await;
             } else {
                 v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await;
             }
             #[cfg(not(feature = "cluster"))]
             v2_delete_consumer(conn_id, req_seq, &frame, server, registry).await;
         }
-        Action::GetConsumer    => v2_get_consumer(conn_id, req_seq, &frame, server, registry).await,
-        Action::ListConsumers  => v2_list_consumers(conn_id, req_seq, &frame, server, registry).await,
-        Action::ConsumerStats  => v2_consumer_stats(conn_id, req_seq, &frame, server, registry).await,
-        Action::PauseConsumer  => v2_pause_consumer(conn_id, req_seq, &frame, server, registry).await,
-        Action::ResumeConsumer => v2_resume_consumer(conn_id, req_seq, &frame, server, registry).await,
+        Action::GetConsumer => v2_get_consumer(conn_id, req_seq, &frame, server, registry).await,
+        Action::ListConsumers => {
+            v2_list_consumers(conn_id, req_seq, &frame, server, registry).await
+        }
+        Action::ConsumerStats => {
+            v2_consumer_stats(conn_id, req_seq, &frame, server, registry).await
+        }
+        Action::PauseConsumer => {
+            v2_pause_consumer(conn_id, req_seq, &frame, server, registry).await
+        }
+        Action::ResumeConsumer => {
+            v2_resume_consumer(conn_id, req_seq, &frame, server, registry).await
+        }
 
         // ── Delayed publish ─────────────────────────────────────────
-        Action::PublishDelayed => v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal),
+        Action::PublishDelayed => {
+            v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal)
+        }
 
         // ── Cron scheduling ─────────────────────────────────────────
-        Action::CreateCron     => v2_create_cron(conn_id, req_seq, &frame, registry, cron_registry),
-        Action::DeleteCron     => v2_delete_cron(conn_id, req_seq, &frame, registry, cron_registry),
-        Action::ListCrons      => v2_list_crons(conn_id, req_seq, registry, cron_registry),
-        Action::CronAck        => v2_cron_ack(&frame, cron_registry),
-        Action::CronFire       => { /* server→client only; ignore if received */ }
+        Action::CreateCron => v2_create_cron(conn_id, req_seq, &frame, registry, cron_registry),
+        Action::DeleteCron => v2_delete_cron(conn_id, req_seq, &frame, registry, cron_registry),
+        Action::ListCrons => v2_list_crons(conn_id, req_seq, registry, cron_registry),
+        Action::CronAck => v2_cron_ack(&frame, cron_registry),
+        Action::CronFire => { /* server→client only; ignore if received */ }
 
         // ── Workflow orchestration ──────────────────────────────────
-        Action::CreateWorkflow  => v2_create_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
-        Action::DeleteWorkflow  => v2_delete_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
-        Action::ListWorkflows   => v2_list_workflows(conn_id, req_seq, registry, workflow_registry),
-        Action::WorkflowResult  => v2_workflow_result(&frame, workflow_registry, registry),
-        Action::CancelWorkflow  => v2_cancel_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
-        Action::ListInstances   => v2_list_instances(conn_id, req_seq, &frame, registry, workflow_registry),
-        Action::WorkflowStep    => { /* server→client only; ignore if received */ }
-        Action::WorkflowError   => { /* server→client only; ignore if received */ }
+        Action::CreateWorkflow => {
+            v2_create_workflow(conn_id, req_seq, &frame, registry, workflow_registry)
+        }
+        Action::DeleteWorkflow => {
+            v2_delete_workflow(conn_id, req_seq, &frame, registry, workflow_registry)
+        }
+        Action::ListWorkflows => v2_list_workflows(conn_id, req_seq, registry, workflow_registry),
+        Action::WorkflowResult => v2_workflow_result(&frame, workflow_registry, registry),
+        Action::CancelWorkflow => {
+            v2_cancel_workflow(conn_id, req_seq, &frame, registry, workflow_registry)
+        }
+        Action::ListInstances => {
+            v2_list_instances(conn_id, req_seq, &frame, registry, workflow_registry)
+        }
+        Action::WorkflowStep => { /* server→client only; ignore if received */ }
+        Action::WorkflowError => { /* server→client only; ignore if received */ }
 
         // ── System ──────────────────────────────────────────────────
-        Action::Disconnect     => { v2_disconnect(conn_id, server, registry, cron_registry, workflow_registry).await; }
-        Action::Ping           => v2_ping(conn_id, registry),
+        Action::Disconnect => {
+            v2_disconnect(conn_id, server, registry, cron_registry, workflow_registry).await;
+        }
+        Action::Ping => v2_ping(conn_id, registry),
         // M17: count Pongs so the keepalive path is observable. The
         // counter lives on the connection registry — it's stable across
         // the lifetime of the conn and the read loop already touches
         // the registry on every frame.
-        Action::Pong           => { registry.touch(conn_id); }
+        Action::Pong => {
+            registry.touch(conn_id);
+        }
 
         // L1 / L2: AckSync / BatchAckSync, PublishAccumulate,
         // FanoutBatch — have wire codes but no dispatcher. Reply
@@ -216,12 +254,16 @@ fn v2_publish(
     frame: &Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
-    #[allow(unused_variables)]
-    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+    #[allow(unused_variables)] workflow_registry: &std::sync::Arc<
+        crate::workflow::WorkflowRegistry,
+    >,
 ) {
     let f = match PubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     // B4: bounds-check subject_len + msg_id_len against tail BEFORE
     // touching subject() / msg_id() / payload(). Without this a crafted
@@ -233,7 +275,10 @@ fn v2_publish(
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
 
     // ── Idempotency check (fast-bail) ─────────────────────────────────
@@ -347,7 +392,10 @@ fn v2_publish_with_reply(
 ) {
     let f = match PubWithReplyFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     if let Err(code) = f.validate() {
         send_error_v2(registry, conn_id, req_seq, code);
@@ -356,7 +404,10 @@ fn v2_publish_with_reply(
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
 
     // M10: idempotency for PublishWithReply — same pattern as v2_publish.
@@ -423,7 +474,10 @@ fn v2_publish_batch(
 ) {
     let f = match BatchPubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     // B3: walk the iterator once to count yielded entries; if fewer
     // than `count` come back, the frame's per-entry length fields are
@@ -441,7 +495,10 @@ fn v2_publish_batch(
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
 
     // ── Idempotency check (all-or-nothing) ────────────────────────────
@@ -464,8 +521,7 @@ fn v2_publish_batch(
         // (lives for the duration of this dispatch), so the rollback
         // doesn't need owned copies — except `forget` expects a slice,
         // which we still have.
-        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> =
-            smallvec::SmallVec::new();
+        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> = smallvec::SmallVec::new();
         let mut duplicate = false;
         for v in f.iter() {
             let id = v.msg_id();
@@ -530,7 +586,10 @@ fn v2_publish_delayed(
 ) {
     let f = match PubDelayedFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     if let Err(code) = f.validate() {
         send_error_v2(registry, conn_id, req_seq, code);
@@ -539,7 +598,10 @@ fn v2_publish_delayed(
     let wire_stream = f.body.stream_id.get();
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
 
     let delay_ms = f.delay_ms();
@@ -608,7 +670,10 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .ack(
             consumer_id,
             conn_id,
-            vec![AckEntry { stream_id: seq_stream, seq: f.body.ack_seq.get() }],
+            vec![AckEntry {
+                stream_id: seq_stream,
+                seq: f.body.ack_seq.get(),
+            }],
         )
         .await;
 }
@@ -631,7 +696,10 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let Some(raw) = f.try_entries() else { return };
     let mut entries: Vec<AckEntry> = Vec::with_capacity(raw.len());
     for e in raw {
-        entries.push(AckEntry { stream_id: seq_stream, seq: e.seq.get() });
+        entries.push(AckEntry {
+            stream_id: seq_stream,
+            seq: e.seq.get(),
+        });
     }
     let _ = shard.ack(consumer_id, conn_id, entries).await;
 }
@@ -652,7 +720,10 @@ async fn v2_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .nack(
             consumer_id,
             conn_id,
-            vec![AckEntry { stream_id: seq_stream, seq: f.body.nack_seq.get() }],
+            vec![AckEntry {
+                stream_id: seq_stream,
+                seq: f.body.nack_seq.get(),
+            }],
             0, // single nack frame has no delay field
         )
         .await;
@@ -675,7 +746,10 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let Some(raw) = f.try_entries() else { return };
     let entries: Vec<AckEntry> = raw
         .iter()
-        .map(|e| AckEntry { stream_id: seq_stream, seq: e.seq.get() })
+        .map(|e| AckEntry {
+            stream_id: seq_stream,
+            seq: e.seq.get(),
+        })
         .collect();
     // All entries in a batch share the same delay — take max.
     let delay_ms = raw.iter().map(|e| e.delay_ms.get()).max().unwrap_or(0);
@@ -692,15 +766,16 @@ async fn v2_subscribe(
     use arbitro_proto::v2::cold::{ColdBody, Subscribe as SubscribeCold};
     let body = match SubscribeCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     // H1: every filter validated. Empty `filters` = catch-all (legacy
     // single-empty-filter behaviour); each non-empty entry must parse
     // as a valid subject pattern.
     for f in &body.filters {
-        if !f.is_empty()
-            && arbitro_proto::validate::validate_subject(f).is_err()
-        {
+        if !f.is_empty() && arbitro_proto::validate::validate_subject(f).is_err() {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
             return;
         }
@@ -708,7 +783,10 @@ async fn v2_subscribe(
     let consumer_id = ConsumerId(body.consumer_id);
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
+            return;
+        }
     };
     let queue_id = server
         .names()
@@ -719,11 +797,7 @@ async fn v2_subscribe(
     // Drop empty filters (legacy "single empty-filter == catch-all"
     // contract). After filtering, an empty Vec also means catch-all —
     // the engine handles both forms identically.
-    let filters: Vec<Vec<u8>> = body
-        .filters
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .collect();
+    let filters: Vec<Vec<u8>> = body.filters.into_iter().filter(|f| !f.is_empty()).collect();
 
     // deliver_policy from consumer config (stored at CreateConsumer time).
     // Default: 0 = All (replay from beginning). The NameRegistry can hold
@@ -735,7 +809,10 @@ async fn v2_subscribe(
 
     let reply = shard
         .subscribe(
-            StreamConfig { id: seq_stream, name: vec![] },
+            StreamConfig {
+                id: seq_stream,
+                name: vec![],
+            },
             ConsumerConfig {
                 id: consumer_id,
                 queue_id,
@@ -784,9 +861,9 @@ async fn v2_subscribe(
     // is now active without an extra round-trip. Backward compatible
     // for clients that ignore `ref_seq`.
     match reply {
-        Ok(true)  => send_rep_ok_v2(registry, conn_id, req_seq, consumer_id.0 as u64),
+        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, consumer_id.0 as u64),
         Ok(false) => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
-        Err(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -800,17 +877,23 @@ async fn v2_unsubscribe(
     use arbitro_proto::v2::cold::{ColdBody, Unsubscribe};
     let body = match Unsubscribe::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
     };
     let consumer_id = ConsumerId(body.consumer_id);
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
+            return;
+        }
     };
     let shard = server.shard_for(seq_stream);
 
     match shard.unsubscribe(SubscriptionId(consumer_id.0)).await {
-        Ok(_)  => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
+        Ok(_) => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
         Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
@@ -827,7 +910,10 @@ async fn v2_create_stream(
     use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
     let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     // H1: validate name + filter at the dispatch boundary BEFORE
@@ -839,9 +925,7 @@ async fn v2_create_stream(
         return;
     }
     let filter = body.filter.as_slice();
-    if !filter.is_empty()
-        && arbitro_proto::validate::validate_subject(filter).is_err()
-    {
+    if !filter.is_empty() && arbitro_proto::validate::validate_subject(filter).is_err() {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
@@ -865,14 +949,17 @@ async fn v2_create_stream(
     }
     let shard = server.shard_for(seq_stream);
 
-    let max_msgs   = body.max_msgs;
-    let max_bytes  = body.max_bytes;
+    let max_msgs = body.max_msgs;
+    let max_bytes = body.max_bytes;
     let max_age_ms = body.max_age_secs.saturating_mul(1_000);
     let idempotency_window_ms = body.idempotency_window_ms;
 
     match shard
         .create_stream(
-            StreamConfig { id: seq_stream, name: name.to_vec() },
+            StreamConfig {
+                id: seq_stream,
+                name: name.to_vec(),
+            },
             max_msgs,
             max_bytes,
             max_age_ms,
@@ -885,16 +972,15 @@ async fn v2_create_stream(
             // u32 load (see `stream_idempotency_window_ms`). 0 is the
             // legacy default = no dedup; any non-zero value activates
             // the dedup window on `v2_publish` / `v2_publish_batch`.
-            server.names().set_stream_idempotency(seq_stream, idempotency_window_ms);
+            server
+                .names()
+                .set_stream_idempotency(seq_stream, idempotency_window_ms);
 
             // Store stream quota limits so the publish hot path can
             // pre-check and reject with StreamFull for DiscardPolicy::New.
-            server.names().set_stream_quota(
-                seq_stream,
-                max_msgs,
-                max_bytes,
-                body.discard,
-            );
+            server
+                .names()
+                .set_stream_quota(seq_stream, max_msgs, max_bytes, body.discard);
 
             // F37: invalidate the list_streams / list_consumers TTL
             // cache so the next list-RPC reflects this new stream.
@@ -911,9 +997,17 @@ async fn v2_create_stream(
                 let total = CreateStreamFrame::wire_size(name.len(), filter.len());
                 let mut wire = vec![0u8; total];
                 CreateStreamFrame::encode_into(
-                    &mut wire, 0, name, filter,
-                    max_msgs, max_bytes, body.max_age_secs,
-                    body.replicas, body.journal_kind, body.retention, body.discard,
+                    &mut wire,
+                    0,
+                    name,
+                    filter,
+                    max_msgs,
+                    max_bytes,
+                    body.max_age_secs,
+                    body.replicas,
+                    body.journal_kind,
+                    body.retention,
+                    body.discard,
                     idempotency_window_ms,
                 );
                 let cmd = build_create_stream(&wire[HEADER_SIZE..]);
@@ -923,8 +1017,8 @@ async fn v2_create_stream(
             }
             send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64)
         }
-        Ok(_)    => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists),
-        Err(_)   => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Ok(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -938,13 +1032,19 @@ async fn v2_delete_stream(
     use arbitro_proto::v2::cold::{ColdBody, DeleteStream};
     let body = match DeleteStream::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
     let shard = server.shard_for(seq_stream);
 
@@ -997,13 +1097,16 @@ async fn v2_get_stream(
     use arbitro_proto::v2::cold::{ColdBody, GetStream};
     let body = match GetStream::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     match server.names().stream_seq(wire_stream) {
         Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64),
-        None    => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
+        None => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
     }
 }
 
@@ -1017,18 +1120,24 @@ async fn v2_purge_stream(
     use arbitro_proto::v2::cold::{ColdBody, PurgeStream};
     let body = match PurgeStream::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None    => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
     let shard = server.shard_for(seq_stream);
     match shard.purge_stream(seq_stream).await {
         Ok(deleted) => send_rep_ok_v2(registry, conn_id, req_seq, deleted),
-        Err(_)      => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -1042,19 +1151,25 @@ async fn v2_drain_subject(
     use arbitro_proto::v2::cold::{ColdBody, DrainSubject};
     let body = match DrainSubject::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     let subject = body.subject;
     let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None    => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
     let shard = server.shard_for(seq_stream);
     match shard.drain_subject(seq_stream, subject).await {
         Ok(deleted) => send_rep_ok_v2(registry, conn_id, req_seq, deleted),
-        Err(_)      => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 
@@ -1100,7 +1215,10 @@ async fn v2_list_streams(
     buf.extend_from_slice(header.as_bytes());
     buf.extend_from_slice(&(all_streams.len() as u32).to_le_bytes());
     for (seq_id, name) in all_streams.iter() {
-        let wire_id = server.names().stream_wire(StreamId(*seq_id)).unwrap_or(*seq_id);
+        let wire_id = server
+            .names()
+            .stream_wire(StreamId(*seq_id))
+            .unwrap_or(*seq_id);
         buf.extend_from_slice(&wire_id.to_le_bytes());
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
         buf.extend_from_slice(name);
@@ -1120,12 +1238,18 @@ async fn v2_create_consumer(
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let wire_stream = body.stream_id;
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
     let name = body.name.as_slice();
     let group = body.group.as_slice();
@@ -1137,9 +1261,7 @@ async fn v2_create_consumer(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
-    if !group.is_empty()
-        && arbitro_proto::validate::validate_name(group).is_err()
-    {
+    if !group.is_empty() && arbitro_proto::validate::validate_name(group).is_err() {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
@@ -1201,11 +1323,9 @@ async fn v2_create_consumer(
     };
     server.names().set_consumer_queue(seq_consumer, queue_id);
     server.names().set_consumer_stream(seq_consumer, seq_stream);
-    server.names().set_consumer_deliver_policy(
-        seq_consumer,
-        body.deliver_policy,
-        body.start_seq,
-    );
+    server
+        .names()
+        .set_consumer_deliver_policy(seq_consumer, body.deliver_policy, body.start_seq);
 
     match shard
         .create_consumer(
@@ -1235,23 +1355,35 @@ async fn v2_create_consumer(
             // (CreateConsumerView) is unchanged. Rebuild from the
             // parsed cold body via the existing frame encoder.
             if let Some(log) = server.command_log() {
-                let limit_refs: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> =
-                    body.subject_limits.iter()
-                        .map(|s| arbitro_proto::v2::manager::SubjectLimit {
-                            pattern: s.pattern.as_slice(),
-                            limit: s.limit,
-                        })
-                        .collect();
+                let limit_refs: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> = body
+                    .subject_limits
+                    .iter()
+                    .map(|s| arbitro_proto::v2::manager::SubjectLimit {
+                        pattern: s.pattern.as_slice(),
+                        limit: s.limit,
+                    })
+                    .collect();
                 let tail_len = arbitro_proto::v2::manager::subject_limits_tail_len(&limit_refs);
                 let total = CreateConsumerFrame::wire_size(
-                    name.len(), group.len(), subject_filter.len(), tail_len,
+                    name.len(),
+                    group.len(),
+                    subject_filter.len(),
+                    tail_len,
                 );
                 let mut wire = vec![0u8; total];
                 CreateConsumerFrame::encode_into(
-                    &mut wire, 0, wire_stream,
-                    name, group, subject_filter,
-                    effective_max_inflight, body.ack_policy, body.deliver_policy,
-                    body.deliver_mode, body.ack_wait_ms, body.start_seq,
+                    &mut wire,
+                    0,
+                    wire_stream,
+                    name,
+                    group,
+                    subject_filter,
+                    effective_max_inflight,
+                    body.ack_policy,
+                    body.deliver_policy,
+                    body.deliver_mode,
+                    body.ack_wait_ms,
+                    body.start_seq,
                     &limit_refs,
                 );
                 let cmd = build_create_consumer(&wire[HEADER_SIZE..]);
@@ -1284,23 +1416,24 @@ async fn v2_delete_consumer(
     use arbitro_proto::v2::cold::{ColdBody, DeleteConsumer};
     let body = match DeleteConsumer::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let consumer_id = ConsumerId(body.consumer_id);
 
     // F14: route directly to the owning shard when we know it.
     // Fall back to fanning out if the consumer→stream mapping is unknown
     // (recovery edge cases, manual control-plane calls).
-    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
-        .names()
-        .consumer_stream(consumer_id)
-    {
-        Some(stream) => {
-            let idx = stream.raw() as usize % server.shard_count();
-            smallvec::smallvec![idx]
-        }
-        None => (0..server.shard_count()).collect(),
-    };
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> =
+        match server.names().consumer_stream(consumer_id) {
+            Some(stream) => {
+                let idx = stream.raw() as usize % server.shard_count();
+                smallvec::smallvec![idx]
+            }
+            None => (0..server.shard_count()).collect(),
+        };
 
     for i in candidate_shards {
         if let Ok(_) = server.shard(i).delete_consumer(consumer_id).await {
@@ -1348,19 +1481,20 @@ async fn v2_pause_consumer(
     use arbitro_proto::v2::cold::{ColdBody, PauseConsumer};
     let body = match PauseConsumer::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let consumer_id = ConsumerId(body.consumer_id);
-    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
-        .names()
-        .consumer_stream(consumer_id)
-    {
-        Some(stream) => {
-            let idx = stream.raw() as usize % server.shard_count();
-            smallvec::smallvec![idx]
-        }
-        None => (0..server.shard_count()).collect(),
-    };
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> =
+        match server.names().consumer_stream(consumer_id) {
+            Some(stream) => {
+                let idx = stream.raw() as usize % server.shard_count();
+                smallvec::smallvec![idx]
+            }
+            None => (0..server.shard_count()).collect(),
+        };
     for i in candidate_shards {
         if let Ok(true) = server.shard(i).pause_consumer(consumer_id).await {
             send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
@@ -1381,19 +1515,20 @@ async fn v2_resume_consumer(
     use arbitro_proto::v2::cold::{ColdBody, ResumeConsumer};
     let body = match ResumeConsumer::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let consumer_id = ConsumerId(body.consumer_id);
-    let candidate_shards: smallvec::SmallVec<[usize; 1]> = match server
-        .names()
-        .consumer_stream(consumer_id)
-    {
-        Some(stream) => {
-            let idx = stream.raw() as usize % server.shard_count();
-            smallvec::smallvec![idx]
-        }
-        None => (0..server.shard_count()).collect(),
-    };
+    let candidate_shards: smallvec::SmallVec<[usize; 1]> =
+        match server.names().consumer_stream(consumer_id) {
+            Some(stream) => {
+                let idx = stream.raw() as usize % server.shard_count();
+                smallvec::smallvec![idx]
+            }
+            None => (0..server.shard_count()).collect(),
+        };
     for i in candidate_shards {
         if let Ok(true) = server.shard(i).resume_consumer(consumer_id).await {
             send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
@@ -1418,7 +1553,10 @@ async fn v2_consumer_stats(
     use arbitro_proto::v2::cold::{ColdBody, ConsumerStats};
     let body = match ConsumerStats::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let consumer_id = ConsumerId(body.consumer_id);
 
@@ -1444,7 +1582,10 @@ async fn v2_get_consumer(
     use arbitro_proto::v2::cold::{ColdBody, GetConsumer};
     let body = match GetConsumer::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let name = body.name.as_slice();
     // GAP-6: consumers are namespaced by stream — translate the wire
@@ -1452,11 +1593,14 @@ async fn v2_get_consumer(
     let wire_stream = body.stream_id;
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
-        None => { send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound); return; }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
     };
     match server.names().consumer_id(seq_stream, name) {
         Some(id) => send_rep_ok_v2(registry, conn_id, req_seq, id.0 as u64),
-        None     => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
+        None => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
     }
 }
 
@@ -1470,7 +1614,10 @@ async fn v2_list_consumers(
     use arbitro_proto::v2::cold::{ColdBody, ListConsumers};
     let body = match ListConsumers::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     // Wire stream_id is the client-side hash; 0 = list all consumers.
     // Translate to the sequential engine id used inside the shard reply.
@@ -1478,9 +1625,15 @@ async fn v2_list_consumers(
     // None = no filter (return all); Some(seq) = filter by engine seq_id.
     // Unknown wire hash → Some(u32::MAX) which matches nothing → empty list.
     let seq_filter: Option<u32> = if wire_filter == 0 {
-        None  // no filter
+        None // no filter
     } else {
-        Some(server.names().stream_seq(wire_filter).map(|s| s.raw()).unwrap_or(u32::MAX))
+        Some(
+            server
+                .names()
+                .stream_seq(wire_filter)
+                .map(|s| s.raw())
+                .unwrap_or(u32::MAX),
+        )
     };
 
     // M20: fail loud on any shard error rather than returning a partial
@@ -1511,7 +1664,7 @@ async fn v2_list_consumers(
 
     // Apply stream filter when the client requested it.
     let filtered: Vec<(u32, u32, u32, bool)> = match seq_filter {
-        None      => all_consumers.as_ref().clone(),
+        None => all_consumers.as_ref().clone(),
         Some(seq) => all_consumers
             .iter()
             .copied()
@@ -1557,7 +1710,12 @@ pub(crate) async fn v2_disconnect(
 ) {
     let shards = server.shard_count();
     let cid = ConnectionId(conn_id);
-    tracing::debug!(target = "dispatch", conn = conn_id, shards, "v2_disconnect: draining all shards");
+    tracing::debug!(
+        target = "dispatch",
+        conn = conn_id,
+        shards,
+        "v2_disconnect: draining all shards"
+    );
 
     // Spawn each drain_connection onto the same runtime so they execute
     // concurrently. We must await all before removing the connection
@@ -1579,7 +1737,11 @@ pub(crate) async fn v2_disconnect(
     // Remove this connection from all workflow worker pools.
     workflow_registry.remove_connection(conn_id);
 
-    tracing::debug!(target = "dispatch", conn = conn_id, "v2_disconnect: drains complete");
+    tracing::debug!(
+        target = "dispatch",
+        conn = conn_id,
+        "v2_disconnect: drains complete"
+    );
     registry.remove(conn_id);
 }
 
@@ -1655,10 +1817,7 @@ fn v2_list_crons(
     registry.send_bytes(conn_id, buf.freeze());
 }
 
-fn v2_cron_ack(
-    frame: &Bytes,
-    cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
-) {
+fn v2_cron_ack(frame: &Bytes, cron_registry: &std::sync::Arc<crate::cron::CronRegistry>) {
     let body = &frame[HEADER_SIZE..];
     if let Some(view) = arbitro_proto::wire::cron::decode_cron_ack(body) {
         cron_registry.ack(view.name, view.ok);
@@ -1682,7 +1841,10 @@ async fn v2_create_stream_raft(
     use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
     let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let cmd = crate::cluster::state_machine::ClusterCommand::CreateStream {
         name: String::from_utf8_lossy(&body.name).to_string(),
@@ -1699,7 +1861,9 @@ async fn v2_create_stream_raft(
     match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => {
             // Raft committed — execute locally.
             v2_create_stream(conn_id, req_seq, frame, server, registry).await;
@@ -1727,7 +1891,10 @@ async fn v2_delete_stream_raft(
     use arbitro_proto::v2::cold::{ColdBody, DeleteStream};
     let body = match DeleteStream::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let cmd = crate::cluster::state_machine::ClusterCommand::DeleteStream {
         name: String::from_utf8_lossy(&body.name).to_string(),
@@ -1735,7 +1902,9 @@ async fn v2_delete_stream_raft(
     match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => {
             // Raft committed — execute locally via the standard path.
             v2_delete_stream(conn_id, req_seq, frame, server, registry).await;
@@ -1763,7 +1932,10 @@ async fn v2_create_consumer_raft(
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let cmd = crate::cluster::state_machine::ClusterCommand::CreateConsumer {
         stream_name: format!("{}", body.stream_id),
@@ -1780,7 +1952,9 @@ async fn v2_create_consumer_raft(
     match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => {
             v2_create_consumer(conn_id, req_seq, frame, server, registry).await;
         }
@@ -1807,7 +1981,10 @@ async fn v2_delete_consumer_raft(
     use arbitro_proto::v2::cold::{ColdBody, DeleteConsumer};
     let body = match DeleteConsumer::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
-        Err(_) => { send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError); return; }
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
     };
     let cmd = crate::cluster::state_machine::ClusterCommand::DeleteConsumer {
         stream_name: String::new(),
@@ -1816,7 +1993,9 @@ async fn v2_delete_consumer_raft(
     match tokio::time::timeout(
         std::time::Duration::from_millis(500),
         crate::cluster::propose_command(cluster.client(), &cmd),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(())) => {
             v2_delete_consumer(conn_id, req_seq, frame, server, registry).await;
         }

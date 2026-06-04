@@ -224,10 +224,11 @@ async fn producer(
             tick = Instant::now();
         }
 
-        let fut = client
-            .as_ref()
-            .unwrap()
-            .publish_sync(sid, subj.as_bytes(), Bytes::copy_from_slice(&payload));
+        let fut = client.as_ref().unwrap().publish_sync(
+            sid,
+            subj.as_bytes(),
+            Bytes::copy_from_slice(&payload),
+        );
         let result = tokio::time::timeout(PUBLISH_TIMEOUT, fut).await;
 
         match result {
@@ -462,7 +463,10 @@ async fn main() {
 
         // ── Chaos: kill leader at t=6 ────────────────────────────────
         if t == 6 {
-            println!("\n  [chaos] t=6s: killing leader (node {}) ...", nodes[leader_idx].node_id);
+            println!(
+                "\n  [chaos] t=6s: killing leader (node {}) ...",
+                nodes[leader_idx].node_id
+            );
             nodes[leader_idx].kill();
             // Signal producers to pause.
             cur_sid.store(0, Relaxed);

@@ -30,7 +30,7 @@ const _: () = assert!(REP_OK_BODY_SIZE == 8);
 #[repr(C)]
 pub struct RepOkFrame {
     pub header: Header,
-    pub body:   RepOkBody,
+    pub body: RepOkBody,
 }
 const _: () = assert!(core::mem::size_of::<RepOkFrame>() == HEADER_SIZE + REP_OK_BODY_SIZE);
 
@@ -40,8 +40,14 @@ impl RepOkFrame {
     #[inline(always)]
     pub fn new(seq: u64, ref_seq: u64) -> Self {
         Self {
-            header: Header::new(crate::action::Action::RepOk.as_u16(), REP_OK_BODY_SIZE as u32, seq),
-            body:   RepOkBody { ref_seq: U64::new(ref_seq) },
+            header: Header::new(
+                crate::action::Action::RepOk.as_u16(),
+                REP_OK_BODY_SIZE as u32,
+                seq,
+            ),
+            body: RepOkBody {
+                ref_seq: U64::new(ref_seq),
+            },
         }
     }
 }
@@ -49,9 +55,9 @@ impl RepOkFrame {
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct RepErrBody {
-    pub ref_seq:    U64,
+    pub ref_seq: U64,
     pub error_code: U16,
-    pub _pad:       [u8; 6],
+    pub _pad: [u8; 6],
 }
 pub const REP_ERR_BODY_SIZE: usize = core::mem::size_of::<RepErrBody>();
 const _: () = assert!(REP_ERR_BODY_SIZE == 16);
@@ -60,7 +66,7 @@ const _: () = assert!(REP_ERR_BODY_SIZE == 16);
 #[repr(C)]
 pub struct RepErrFrame {
     pub header: Header,
-    pub body:   RepErrBody,
+    pub body: RepErrBody,
 }
 const _: () = assert!(core::mem::size_of::<RepErrFrame>() == HEADER_SIZE + REP_ERR_BODY_SIZE);
 
@@ -70,11 +76,15 @@ impl RepErrFrame {
     #[inline(always)]
     pub fn new(seq: u64, ref_seq: u64, error_code: u16) -> Self {
         Self {
-            header: Header::new(crate::action::Action::RepError.as_u16(), REP_ERR_BODY_SIZE as u32, seq),
-            body:   RepErrBody {
-                ref_seq:    U64::new(ref_seq),
+            header: Header::new(
+                crate::action::Action::RepError.as_u16(),
+                REP_ERR_BODY_SIZE as u32,
+                seq,
+            ),
+            body: RepErrBody {
+                ref_seq: U64::new(ref_seq),
                 error_code: U16::new(error_code),
-                _pad:       [0; 6],
+                _pad: [0; 6],
             },
         }
     }

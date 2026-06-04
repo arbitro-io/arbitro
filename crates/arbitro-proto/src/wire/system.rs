@@ -63,11 +63,16 @@ pub struct PingView<'a> {
 
 impl<'a> PingView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn ping_id(&self) -> u64 {
-        PingAction::ref_from_bytes(&self.buf[..core::mem::size_of::<PingAction>()]).unwrap().ping_id.get()
+        PingAction::ref_from_bytes(&self.buf[..core::mem::size_of::<PingAction>()])
+            .unwrap()
+            .ping_id
+            .get()
     }
 }
 
@@ -77,7 +82,9 @@ pub struct ConnectView<'a> {
 
 impl<'a> ConnectView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &ConnectFixed {
@@ -85,10 +92,14 @@ impl<'a> ConnectView<'a> {
     }
 
     #[inline(always)]
-    pub fn proto_version(&self) -> u8 { self.fixed().proto_version }
+    pub fn proto_version(&self) -> u8 {
+        self.fixed().proto_version
+    }
 
     #[inline(always)]
-    pub fn flags(&self) -> u8 { self.fixed().flags }
+    pub fn flags(&self) -> u8 {
+        self.fixed().flags
+    }
 
     #[inline(always)]
     pub fn auth_token(&self) -> &'a [u8] {
@@ -103,18 +114,25 @@ pub struct ConnectedView<'a> {
 
 impl<'a> ConnectedView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
-
-    #[inline(always)]
-    fn inner(&self) -> &ConnectedAction {
-        ConnectedAction::ref_from_bytes(&self.buf[..core::mem::size_of::<ConnectedAction>()]).unwrap()
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
     }
 
     #[inline(always)]
-    pub fn conn_id(&self) -> u64 { self.inner().conn_id.get() }
+    fn inner(&self) -> &ConnectedAction {
+        ConnectedAction::ref_from_bytes(&self.buf[..core::mem::size_of::<ConnectedAction>()])
+            .unwrap()
+    }
 
     #[inline(always)]
-    pub fn proto_version(&self) -> u8 { self.inner().proto_version }
+    pub fn conn_id(&self) -> u64 {
+        self.inner().conn_id.get()
+    }
+
+    #[inline(always)]
+    pub fn proto_version(&self) -> u8 {
+        self.inner().proto_version
+    }
 }
 
 pub struct DisconnectView<'a> {
@@ -123,10 +141,15 @@ pub struct DisconnectView<'a> {
 
 impl<'a> DisconnectView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn reason_code(&self) -> u16 {
-        DisconnectAction::ref_from_bytes(&self.buf[..core::mem::size_of::<DisconnectAction>()]).unwrap().reason_code.get()
+        DisconnectAction::ref_from_bytes(&self.buf[..core::mem::size_of::<DisconnectAction>()])
+            .unwrap()
+            .reason_code
+            .get()
     }
 }

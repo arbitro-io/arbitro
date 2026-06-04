@@ -1,8 +1,8 @@
 //! Per-session lifecycle: dial, handshake, replay subscriptions, spawn
 //! writer + reader + heartbeat, run until any task drops, drain pending.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use arbitro_kit::route::MpscAsyncConsumer;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -54,12 +54,12 @@ async fn dial(
             }
 
             let connector = TlsConnector::from(Arc::new(config));
-            let domain = rustls::pki_types::ServerName::try_from(
-                tls_cfg.server_name.clone(),
-            )
-            .map_err(|_| ClientError::Tls("invalid server name".into()))?;
+            let domain = rustls::pki_types::ServerName::try_from(tls_cfg.server_name.clone())
+                .map_err(|_| ClientError::Tls("invalid server name".into()))?;
 
-            let tls_stream = connector.connect(domain, tcp).await
+            let tls_stream = connector
+                .connect(domain, tcp)
+                .await
                 .map_err(|e| ClientError::Tls(e.to_string()))?;
 
             let (r, w) = tokio::io::split(tls_stream);
@@ -79,7 +79,7 @@ async fn dial(
 /// happen silently in the background task.
 pub(crate) async fn spawn_connection(
     consumer: MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    inner:    Arc<Inner>,
+    inner: Arc<Inner>,
 ) -> Result<(), ClientError> {
     // Initial connection — fast failure path.
     let (r, mut w) = dial(&inner).await?;
@@ -95,7 +95,7 @@ pub(crate) async fn spawn_connection(
     tokio::spawn(async move {
         let mut consumer = consumer;
         let mut wh: Option<Box<dyn AsyncWrite + Unpin + Send>> = Some(w);
-        let mut rh: Option<Box<dyn AsyncRead  + Unpin + Send>> = Some(r);
+        let mut rh: Option<Box<dyn AsyncRead + Unpin + Send>> = Some(r);
         let mut back = Backoff::new(&inner.cfg.reconnect);
 
         loop {
@@ -104,10 +104,12 @@ pub(crate) async fn spawn_connection(
             let res = if let (Some(w), Some(r)) = (wh.take(), rh.take()) {
                 run_session(
                     &mut consumer,
-                    w, r,
+                    w,
+                    r,
                     Arc::clone(&inner),
                     session_cancel.clone(),
-                ).await
+                )
+                .await
             } else {
                 Err(ClientError::Disconnected)
             };
@@ -158,9 +160,7 @@ pub(crate) async fn spawn_connection(
 }
 
 /// Write the v2 Hello handshake frame.
-async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(
-    w: &mut W,
-) -> Result<(), ClientError> {
+async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(w: &mut W) -> Result<(), ClientError> {
     let hello = encode_hello_v2(Role::Client);
     w.write_all(&hello).await?;
     Ok(())
@@ -188,20 +188,20 @@ fn replay_subscriptions(inner: &Inner) {
 /// Returns when the first of the three finishes (error or clean exit).
 async fn run_session<W, R>(
     consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    w:        W,
-    r:        R,
-    inner:    Arc<Inner>,
-    cancel:   CancellationToken,
+    w: W,
+    r: R,
+    inner: Arc<Inner>,
+    cancel: CancellationToken,
 ) -> Result<(), ClientError>
 where
     W: AsyncWrite + Unpin + Send + 'static,
-    R: AsyncRead  + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
 {
     let cfg_ka = inner.cfg.keep_alive.clone();
 
-    let inner_r  = Arc::clone(&inner);
+    let inner_r = Arc::clone(&inner);
     let inner_hb = Arc::clone(&inner);
-    let cancel_r  = cancel.clone();
+    let cancel_r = cancel.clone();
     let cancel_hb = cancel.clone();
 
     let reader_h = tokio::spawn(reader_task(r, inner_r, cancel_r));

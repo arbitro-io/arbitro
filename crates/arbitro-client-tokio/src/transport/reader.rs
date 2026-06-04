@@ -8,8 +8,8 @@
 //! - `Pong`                           → update `last_pong_ns` heartbeat timestamp.
 //! - everything else                  → silently drop.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -37,8 +37,8 @@ fn now_ns() -> u64 {
 }
 
 pub(crate) async fn reader_task<R: AsyncRead + Unpin>(
-    mut r:  R,
-    inner:  Arc<Inner>,
+    mut r: R,
+    inner: Arc<Inner>,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
     let mut buf = BytesMut::with_capacity(READ_BUF_INITIAL);
@@ -98,9 +98,9 @@ async fn dispatch(inner: &Inner, frame: Bytes) {
         Ok(h) => h,
         Err(_) => return,
     };
-    let action  = h.action.get();
+    let action = h.action.get();
     let req_seq = h.seq.get();
-    let body    = frame.slice(HEADER_SIZE..);
+    let body = frame.slice(HEADER_SIZE..);
 
     // ── Reply paths ────────────────────────────────────────────────────
     if action == Action::RepOk.as_u16() {
@@ -109,10 +109,11 @@ async fn dispatch(inner: &Inner, frame: Bytes) {
     }
 
     if action == Action::RepError.as_u16() {
-        if let Ok(rep) = RepErrFrame::ref_from_bytes(
-            &frame[..core::mem::size_of::<RepErrFrame>()]
-        ) {
-            inner.pending.complete_err(req_seq, rep.body.error_code.get());
+        if let Ok(rep) = RepErrFrame::ref_from_bytes(&frame[..core::mem::size_of::<RepErrFrame>()])
+        {
+            inner
+                .pending
+                .complete_err(req_seq, rep.body.error_code.get());
         } else {
             inner.pending.complete_err(req_seq, 0);
         }
@@ -166,40 +167,35 @@ async fn dispatch(inner: &Inner, frame: Bytes) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::sync::atomic::AtomicU64;
+    use crate::config::ClientConfig;
+    use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions, Inner};
+    use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
     use arbitro_kit::route::MpscAsync;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
-    use crate::config::ClientConfig;
-    use crate::state::{
-        Inner,
-        pending::Pending,
-        seq::SeqAllocator,
-        subscriptions::Subscriptions,
-    };
-    use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP, MAX_WRITE_PRODUCERS};
 
     /// Build a minimal `Inner` for use in unit tests (no real connection).
     fn make_inner(cancel: CancellationToken) -> Arc<Inner> {
         let (mut producers, _consumer, _shutdown) =
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
         let admin = producers.remove(0);
-        let (ack_tx,  _ack_rx)  = tokio::sync::mpsc::channel(16);
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(16);
         Arc::new(Inner {
-            cfg:            ClientConfig::default(),
-            producer_pool:  Mutex::new(producers),
-            pending:        Arc::new(Pending::new()),
-            seq_alloc:      SeqAllocator::new(),
-            cancel:         cancel.clone(),
-            subscriptions:  Arc::new(Subscriptions::new()),
+            cfg: ClientConfig::default(),
+            producer_pool: Mutex::new(producers),
+            pending: Arc::new(Pending::new()),
+            seq_alloc: SeqAllocator::new(),
+            cancel: cancel.clone(),
+            subscriptions: Arc::new(Subscriptions::new()),
             admin_producer: Mutex::new(admin),
             ack_tx,
             nack_tx,
-            last_pong_ns:   AtomicU64::new(0),
-            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
-            cron_state:     crate::cron::CronState::new(),
+            last_pong_ns: AtomicU64::new(0),
+            metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+            cron_state: crate::cron::CronState::new(),
             workflow_state: crate::workflow::WorkflowState::new(),
         })
     }
@@ -224,7 +220,7 @@ mod tests {
         use std::time::Duration;
 
         let cancel = CancellationToken::new();
-        let inner  = make_inner(cancel.clone());
+        let inner = make_inner(cancel.clone());
 
         // Register a pending slot for seq=55.
         let rx = inner.pending.register(55);
@@ -235,10 +231,10 @@ mod tests {
 
         // Set up a loopback TCP pair.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr     = listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let accept_h = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let writer   = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let writer = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (r_half, _) = accept_h.await.unwrap().into_split();
         let (_, mut w_half) = writer.into_split();
 
@@ -252,10 +248,8 @@ mod tests {
         w_half.write_all(&frame[8..]).await.unwrap();
 
         // Pending must resolve exactly once.
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            rx.recv_async(),
-        ).await
+        let result = tokio::time::timeout(Duration::from_millis(500), rx.recv_async())
+            .await
             .expect("timed out waiting for RepOk")
             .expect("oneshot closed")
             .expect("wire error");

@@ -7,30 +7,30 @@ use crate::config::ReconnectPolicy;
 
 #[derive(Debug)]
 pub(crate) struct Backoff {
-    base:       Duration,
-    cap:        Duration,
-    max:        Option<u32>,
+    base: Duration,
+    cap: Duration,
+    max: Option<u32>,
     /// Previous delay; seeded with `base` so the first attempt yields
     /// something in `[base, base*3]`.
-    prev:       Duration,
+    prev: Duration,
     /// Number of attempts already taken (zero on first call to `next`).
-    attempts:   u32,
+    attempts: u32,
 }
 
 impl Backoff {
     pub fn new(p: &ReconnectPolicy) -> Self {
         Self {
-            base:     p.base,
-            cap:      p.cap,
-            max:      p.max_attempts,
-            prev:     p.base,
+            base: p.base,
+            cap: p.cap,
+            max: p.max_attempts,
+            prev: p.base,
             attempts: 0,
         }
     }
 
     /// Reset after a successful connect — next backoff starts at `base` again.
     pub fn reset(&mut self) {
-        self.prev     = self.base;
+        self.prev = self.base;
         self.attempts = 0;
     }
 
@@ -45,10 +45,10 @@ impl Backoff {
         let lo = self.base.as_nanos() as u64;
         let hi = (self.prev.as_nanos() as u64).saturating_mul(3).max(lo + 1);
         let pick_ns = fastrand::u64(lo..hi);
-        let cap_ns  = self.cap.as_nanos() as u64;
-        let chosen  = pick_ns.min(cap_ns);
+        let cap_ns = self.cap.as_nanos() as u64;
+        let chosen = pick_ns.min(cap_ns);
         let d = Duration::from_nanos(chosen);
-        self.prev      = d;
+        self.prev = d;
         self.attempts += 1;
         Some(d)
     }
@@ -65,8 +65,8 @@ mod tests {
     #[test]
     fn within_bounds_and_caps() {
         let p = ReconnectPolicy {
-            base:         Duration::from_millis(100),
-            cap:          Duration::from_secs(1),
+            base: Duration::from_millis(100),
+            cap: Duration::from_secs(1),
             max_attempts: None,
         };
         let mut b = Backoff::new(&p);
@@ -80,8 +80,8 @@ mod tests {
     #[test]
     fn max_attempts_terminates() {
         let p = ReconnectPolicy {
-            base:         Duration::from_millis(1),
-            cap:          Duration::from_millis(10),
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(10),
             max_attempts: Some(3),
         };
         let mut b = Backoff::new(&p);
@@ -94,8 +94,8 @@ mod tests {
     #[test]
     fn reset_starts_over() {
         let p = ReconnectPolicy {
-            base:         Duration::from_millis(1),
-            cap:          Duration::from_millis(10),
+            base: Duration::from_millis(1),
+            cap: Duration::from_millis(10),
             max_attempts: Some(2),
         };
         let mut b = Backoff::new(&p);

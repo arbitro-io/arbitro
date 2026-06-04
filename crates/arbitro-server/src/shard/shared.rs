@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::shard::worker::ActiveBinding;
 use arbitro_engine_v2::catalog::match_table::MatchTable;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
-use crate::shard::worker::ActiveBinding;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

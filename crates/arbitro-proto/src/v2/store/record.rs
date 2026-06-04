@@ -24,9 +24,9 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct RecordBody {
-    pub stream_id:    U32,
+    pub stream_id: U32,
     pub subject_hash: U32,
-    pub subject_len:  U16,
+    pub subject_len: U16,
     pub record_flags: U16,
 }
 pub const RECORD_BODY_FIXED: usize = core::mem::size_of::<RecordBody>();
@@ -34,7 +34,7 @@ const _: () = assert!(RECORD_BODY_FIXED == 12);
 
 /// Record flag bits.
 pub mod flag {
-    pub const TOMBSTONE:  u16 = 1 << 0;
+    pub const TOMBSTONE: u16 = 1 << 0;
     pub const COMPRESSED: u16 = 1 << 1;
     // bits 2..=15 reserved
 }
@@ -43,8 +43,8 @@ pub mod flag {
 #[repr(C)]
 pub struct Record {
     pub header: Header,
-    pub body:   RecordBody,
-    pub tail:   [u8],
+    pub body: RecordBody,
+    pub tail: [u8],
 }
 
 impl Record {
@@ -88,9 +88,9 @@ impl Record {
         // code can be added later without changing the wire layout.
         frame.header = Header::new(crate::action::Action::Publish.as_u16(), msg_len, seq);
         frame.body = RecordBody {
-            stream_id:    U32::new(stream_id),
+            stream_id: U32::new(stream_id),
             subject_hash: U32::new(subject_hash),
-            subject_len:  U16::new(subject.len() as u16),
+            subject_len: U16::new(subject.len() as u16),
             record_flags: U16::new(record_flags),
         };
         frame.tail[..subject.len()].copy_from_slice(subject);

@@ -55,7 +55,9 @@ impl TcpRaftTransport {
 
     async fn accept_loop(listener: TcpListener, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { break };
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
             let frame_tx = tx.clone();
             tokio::spawn(async move {
                 Self::read_raft_frames(stream, frame_tx).await;
@@ -106,7 +108,6 @@ impl TcpRaftTransport {
             }
         }
     }
-
 }
 
 impl RaftTransport for TcpRaftTransport {
@@ -119,12 +120,12 @@ impl RaftTransport for TcpRaftTransport {
         let peers = self.peers.clone();
 
         // SAFETY: RaftNode guarantees the slices live until this future completes.
-        let slices_static = unsafe {
-            std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices)
-        };
+        let slices_static =
+            unsafe { std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices) };
 
         async move {
-            let addr = *peers.get(&peer)
+            let addr = *peers
+                .get(&peer)
                 .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
 
             let stream = {
@@ -148,12 +149,10 @@ impl RaftTransport for TcpRaftTransport {
                 slices_static.iter().map(|s| IoSlice::new(s)).collect();
             let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
             while !bufs.is_empty() {
-                let n = s.write_vectored(bufs)
-                    .await
-                    .map_err(|e| {
-                        // Don't hold the lock while removing — just flag for cleanup.
-                        RaftError::Transport(format!("write to peer {}: {e}", peer.0))
-                    })?;
+                let n = s.write_vectored(bufs).await.map_err(|e| {
+                    // Don't hold the lock while removing — just flag for cleanup.
+                    RaftError::Transport(format!("write to peer {}: {e}", peer.0))
+                })?;
                 if n == 0 {
                     return Err(RaftError::Transport("write_vectored returned 0".into()));
                 }
@@ -171,7 +170,8 @@ impl RaftTransport for TcpRaftTransport {
         let connections = self.connections.clone();
         let peers = self.peers.clone();
         async move {
-            let addr = *peers.get(&peer)
+            let addr = *peers
+                .get(&peer)
                 .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
 
             let stream = {
@@ -202,12 +202,15 @@ impl RaftTransport for TcpRaftTransport {
     ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
         async move {
             let mut rx = self.incoming_rx.lock().await;
-            let frame = rx.recv().await
+            let frame = rx
+                .recv()
+                .await
                 .ok_or_else(|| RaftError::Transport("incoming channel closed".into()))?;
             let len = frame.len();
             if out.len() < len {
                 return Err(RaftError::Transport(format!(
-                    "recv buffer too small: need {len}, have {}", out.len()
+                    "recv buffer too small: need {len}, have {}",
+                    out.len()
                 )));
             }
             out[..len].copy_from_slice(&frame);
@@ -227,7 +230,8 @@ impl RaftTransport for TcpRaftTransport {
                     let len = frame.len();
                     if out.len() < len {
                         return Err(RaftError::Transport(format!(
-                            "recv buffer too small: need {len}, have {}", out.len()
+                            "recv buffer too small: need {len}, have {}",
+                            out.len()
                         )));
                     }
                     out[..len].copy_from_slice(&frame);

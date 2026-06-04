@@ -12,16 +12,16 @@ use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::frame::{WriteFrame, INLINE_CAP, MAX_WRITE_PRODUCERS};
     use arbitro_kit::route::MpscAsync;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
-    use crate::transport::frame::{WriteFrame, INLINE_CAP, MAX_WRITE_PRODUCERS};
 
     /// Three inline frames arrive at the reader in the same order they were enqueued.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_writer_drains_in_order() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr     = listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let (mut producers, mut consumer, _shutdown) =
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
@@ -29,16 +29,18 @@ mod tests {
 
         // Enqueue 3 fixed payloads (pad inline arrays with zeros after content).
         let chunks: &[&[u8]] = &[b"aaa", b"bbbbb", b"cc"];
-        let total: usize     = chunks.iter().map(|c| c.len()).sum();
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
         for chunk in chunks {
             let mut data = [0u8; INLINE_CAP];
             data[..chunk.len()].copy_from_slice(chunk);
-            producer.try_send(WriteFrame::Inline(data, chunk.len() as u16)).unwrap();
+            producer
+                .try_send(WriteFrame::Inline(data, chunk.len() as u16))
+                .unwrap();
         }
 
         // Accept the write side.
         let accept_h = tokio::spawn(async move { listener.accept().await.unwrap().0 });
-        let client   = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (_, write_half) = client.into_split();
         let mut server_read = accept_h.await.unwrap();
 
@@ -52,8 +54,8 @@ mod tests {
         server_read.read_exact(&mut buf).await.unwrap();
         cancel.cancel();
 
-        assert_eq!(&buf[0..3],  b"aaa");
-        assert_eq!(&buf[3..8],  b"bbbbb");
+        assert_eq!(&buf[0..3], b"aaa");
+        assert_eq!(&buf[3..8], b"bbbbb");
         assert_eq!(&buf[8..10], b"cc");
     }
 }

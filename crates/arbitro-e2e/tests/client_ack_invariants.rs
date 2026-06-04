@@ -433,18 +433,33 @@ async fn t11_reconnect_resumes_unacked_tail() {
         let stream_id = TestServer::parse_id(&resp);
         let resp = client_a
             .create_consumer(
-                stream_id, consumer_name, b"", b"", 100u16,
-                1u8, /* Explicit */ 0u8, 0u8, 30_000u32, 0u64,
+                stream_id,
+                consumer_name,
+                b"",
+                b"",
+                100u16,
+                1u8,
+                /* Explicit */ 0u8,
+                0u8,
+                30_000u32,
+                0u64,
             )
             .await
             .unwrap();
         let consumer_id = TestServer::parse_id(&resp);
 
-        let mut handle = client_a.subscribe(stream_id, consumer_id, b"").await.unwrap();
+        let mut handle = client_a
+            .subscribe(stream_id, consumer_id, b"")
+            .await
+            .unwrap();
         for i in 0u32..5 {
             let p = format!("m-{i}");
             client_a
-                .publish_sync(stream_id, b"sub.event", Bytes::copy_from_slice(p.as_bytes()))
+                .publish_sync(
+                    stream_id,
+                    b"sub.event",
+                    Bytes::copy_from_slice(p.as_bytes()),
+                )
                 .await
                 .expect("publish_sync");
         }
@@ -471,7 +486,10 @@ async fn t11_reconnect_resumes_unacked_tail() {
     // Client B — fresh handle, same consumer id (the broker keyed it by
     // name so a `create_consumer` with the same name returns it).
     let client_b = server.connect().await;
-    let mut handle = client_b.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let mut handle = client_b
+        .subscribe(stream_id, consumer_id, b"")
+        .await
+        .unwrap();
 
     let mut received = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -533,7 +551,11 @@ async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
     let mut handle = owner.subscribe(stream_id, consumer_id, b"").await.unwrap();
     for i in 0u32..5 {
         owner
-            .publish_sync(stream_id, b"t7.ev", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"t7.ev",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }

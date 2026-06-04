@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use arbitro_client_tokio::{Client, ClientConfig, BatchEntry};
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,13 +22,18 @@ async fn start_server() -> String {
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(64);
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
@@ -36,7 +41,7 @@ async fn connect(addr: &str) -> Client {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_single_and_batch_no_errors() {
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     // Create a stream so the server accepts publishes.
@@ -49,7 +54,11 @@ async fn publish_single_and_batch_no_errors() {
     // Fire-and-forget single publish (1000 frames — all async, lock-free).
     for i in 0u32..1000 {
         client
-            .publish(stream_id, b"test.subject", Bytes::from(i.to_le_bytes().to_vec()))
+            .publish(
+                stream_id,
+                b"test.subject",
+                Bytes::from(i.to_le_bytes().to_vec()),
+            )
             .expect("publish");
     }
 
@@ -67,13 +76,16 @@ async fn publish_single_and_batch_no_errors() {
         .await
         .expect("publish_sync");
 
-    client.delete_stream(b"pub-test").await.expect("delete_stream");
+    client
+        .delete_stream(b"pub-test")
+        .await
+        .expect("delete_stream");
     client.close();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_publish_sync_no_timeout() {
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     let resp = client

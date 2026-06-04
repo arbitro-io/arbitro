@@ -173,10 +173,7 @@ impl DelayedJournal {
         // The `matured` byte is at offset + 19 (after the 19 header bytes
         // before it: 8 + 4 + 2 + 4 + 1 = 19).
         let matured_pos = offset + 19;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-        {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
             use std::io::Seek;
             let _ = f.seek(std::io::SeekFrom::Start(matured_pos));
             let _ = f.write_all(&[1u8]);

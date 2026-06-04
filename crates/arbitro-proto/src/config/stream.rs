@@ -73,13 +73,34 @@ impl StreamConfig {
 }
 
 impl StreamConfigBuilder {
-    pub fn max_msgs(mut self, v: u64) -> Self { self.max_msgs = v; self }
-    pub fn max_bytes(mut self, v: u64) -> Self { self.max_bytes = v; self }
-    pub fn max_age_secs(mut self, v: u64) -> Self { self.max_age_secs = v; self }
-    pub fn replicas(mut self, v: u8) -> Self { self.replicas = v; self }
-    pub fn journal_kind(mut self, v: JournalKind) -> Self { self.journal_kind = v; self }
-    pub fn retention(mut self, v: RetentionPolicy) -> Self { self.retention = v; self }
-    pub fn discard(mut self, v: DiscardPolicy) -> Self { self.discard = v; self }
+    pub fn max_msgs(mut self, v: u64) -> Self {
+        self.max_msgs = v;
+        self
+    }
+    pub fn max_bytes(mut self, v: u64) -> Self {
+        self.max_bytes = v;
+        self
+    }
+    pub fn max_age_secs(mut self, v: u64) -> Self {
+        self.max_age_secs = v;
+        self
+    }
+    pub fn replicas(mut self, v: u8) -> Self {
+        self.replicas = v;
+        self
+    }
+    pub fn journal_kind(mut self, v: JournalKind) -> Self {
+        self.journal_kind = v;
+        self
+    }
+    pub fn retention(mut self, v: RetentionPolicy) -> Self {
+        self.retention = v;
+        self
+    }
+    pub fn discard(mut self, v: DiscardPolicy) -> Self {
+        self.discard = v;
+        self
+    }
 
     pub fn build(self) -> StreamConfig {
         let stream_id = wire_hash_32(&self.name);
@@ -104,10 +125,10 @@ impl StreamConfigBuilder {
 #[repr(u8)]
 pub enum RetentionPolicy {
     /// Discard oldest messages to make room — ring buffer behavior. Default.
-    Limits    = 0,
+    Limits = 0,
     /// Keep messages only while consumers with matching filters exist.
     /// Once all interested consumers ack, the message is eligible for removal.
-    Interest  = 1,
+    Interest = 1,
     /// Messages deleted immediately after ack — work queue pattern.
     WorkQueue = 2,
 }
@@ -151,7 +172,7 @@ impl DiscardPolicy {
 #[repr(u8)]
 pub enum JournalKind {
     Memory = 0,
-    Disk   = 1,
+    Disk = 1,
     Tolerant = 2,
 }
 

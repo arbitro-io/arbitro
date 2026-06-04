@@ -4,8 +4,8 @@
 //! with a Pong header.  If no Pong arrives within `cfg.timeout` the session
 //! cancellation token is fired, which tears down writer and reader siblings.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
@@ -33,8 +33,8 @@ fn now_ns() -> u64 {
 /// - If stale → cancels the session → returns `Err(Disconnected)`.
 /// - Otherwise → sends a `Ping` header (16 B inline frame, zero heap alloc).
 pub(crate) async fn heartbeat_task(
-    inner:  Arc<Inner>,
-    cfg:    KeepAlive,
+    inner: Arc<Inner>,
+    cfg: KeepAlive,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
     // Initialise last_pong to now so we don't time-out during handshake.
@@ -83,37 +83,37 @@ mod tests {
         // Use a very long interval so the sleep never fires in the test.
         let cfg = KeepAlive {
             interval: std::time::Duration::from_secs(3600),
-            timeout:  std::time::Duration::from_secs(7200),
+            timeout: std::time::Duration::from_secs(7200),
         };
         let cancel = CancellationToken::new();
-        cancel.cancel();   // pre-cancel
+        cancel.cancel(); // pre-cancel
 
         // Build a minimal Inner just to satisfy the signature.
         // We use a real ring so try_send doesn't panic.
-        use arbitro_kit::route::MpscAsync;
-        use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP, MAX_WRITE_PRODUCERS};
-        use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
         use crate::config::ClientConfig;
+        use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
+        use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
+        use arbitro_kit::route::MpscAsync;
         use std::sync::Mutex;
 
         let (mut producers, _consumer, _shutdown) =
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
         let admin = producers.remove(0);
-        let (ack_tx,  _ack_rx)  = tokio::sync::mpsc::channel(4);
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(4);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(4);
         let inner = Arc::new(Inner {
-            cfg:            ClientConfig::default(),
-            producer_pool:  Mutex::new(producers),
-            pending:        Arc::new(Pending::new()),
-            seq_alloc:      SeqAllocator::new(),
-            cancel:         cancel.clone(),
-            subscriptions:  Arc::new(Subscriptions::new()),
+            cfg: ClientConfig::default(),
+            producer_pool: Mutex::new(producers),
+            pending: Arc::new(Pending::new()),
+            seq_alloc: SeqAllocator::new(),
+            cancel: cancel.clone(),
+            subscriptions: Arc::new(Subscriptions::new()),
             admin_producer: Mutex::new(admin),
             ack_tx,
             nack_tx,
-            last_pong_ns:   std::sync::atomic::AtomicU64::new(0),
-            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
-            cron_state:     crate::cron::CronState::new(),
+            last_pong_ns: std::sync::atomic::AtomicU64::new(0),
+            metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+            cron_state: crate::cron::CronState::new(),
             workflow_state: crate::workflow::WorkflowState::new(),
         });
 

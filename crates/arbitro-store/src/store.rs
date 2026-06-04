@@ -71,11 +71,15 @@ pub trait Store: Send + Sync {
 
     /// Initialize the store — open files, create dirs, recover state.
     /// Called once before any reads/writes. Default: no-op.
-    fn init(&mut self) -> Result<(), StoreError> { Ok(()) }
+    fn init(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     /// Graceful shutdown — flush buffers, sync to disk, close handles.
     /// Called once on engine shutdown. Default: no-op.
-    fn shutdown(&mut self) -> Result<(), StoreError> { Ok(()) }
+    fn shutdown(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
 
     // ── Hot path ────────────────────────────────────────────────────
 
@@ -84,7 +88,8 @@ pub trait Store: Send + Sync {
 
     /// Append a batch of messages. Returns the first assigned sequence.
     /// All entries get consecutive sequences.
-    fn append_batch(&mut self, entries: &[EntryRef<'_>], timestamp: u64) -> Result<u64, StoreError>;
+    fn append_batch(&mut self, entries: &[EntryRef<'_>], timestamp: u64)
+        -> Result<u64, StoreError>;
 
     /// Read a single entry by sequence.
     /// Deprecated: users should prefer get() or for_each() for better performance.
@@ -100,7 +105,12 @@ pub trait Store: Send + Sync {
 
     /// Zero-alloc: calls `f` for each entry in `[start..end)`.
     /// Borrows directly from internal storage — no cloning.
-    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError>;
+    fn for_each(
+        &self,
+        start: u64,
+        end: u64,
+        f: &mut dyn FnMut(&Entry<'_>),
+    ) -> Result<(), StoreError>;
 
     // ── Management ──────────────────────────────────────────────────
 

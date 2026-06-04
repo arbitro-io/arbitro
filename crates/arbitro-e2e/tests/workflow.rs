@@ -1,12 +1,12 @@
 mod test_helper;
 use test_helper::TestServerBuilder;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use arbitro_client_tokio::workflow::StepResult;
+use bytes::Bytes;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 1. workflow_basic_3_steps — trigger → 3 steps → verify context passes through
@@ -70,7 +70,9 @@ async fn workflow_basic_3_steps() {
                     "expected context to contain '|processed', got: {ctx_str}"
                 );
                 done.store(true, Ordering::Relaxed);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()
@@ -203,14 +205,18 @@ async fn workflow_cancel() {
                 s1.store(true, Ordering::Relaxed);
                 // Simulate slow work — the cancel should prevent step2.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .step(b"step2", move |ctx| {
             let s2 = s2.clone();
             async move {
                 s2.store(true, Ordering::Relaxed);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()

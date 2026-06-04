@@ -1,10 +1,9 @@
 mod test_helper;
 use test_helper::{TestServer, TestServerBuilder};
 
-use std::time::Duration;
-use bytes::Bytes;
 use arbitro_client_tokio::{BatchEntry, SubjectLimit};
-
+use bytes::Bytes;
+use std::time::Duration;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Stream CRUD
@@ -16,7 +15,10 @@ async fn stream_create_then_list() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(TestServer::stream_count(&resp), 1);
@@ -31,9 +33,15 @@ async fn stream_create_idempotent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     // Second create should not fail
-    client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(TestServer::stream_count(&resp), 1);
@@ -46,7 +54,10 @@ async fn create_and_list_streams() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     let resp = client.list_streams(0, 1000).await.unwrap();
     assert_eq!(TestServer::stream_count(&resp), 1);
@@ -84,11 +95,16 @@ async fn create_consumer_and_delete() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -110,11 +126,16 @@ async fn publish_single_delivers_correctly() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -142,11 +163,16 @@ async fn publish_batch_delivers_all() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -155,7 +181,10 @@ async fn publish_batch_delivers_all() {
     let entries: Vec<BatchEntry<'_>> = (0..50)
         .map(|_| BatchEntry::new(&b"logs_line"[..], Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .expect("publish_batch");
 
     let mut count = 0u32;
     loop {
@@ -178,7 +207,10 @@ async fn publish_sequences_monotonic() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp1 = client
@@ -211,18 +243,35 @@ async fn replay_deliver_all_historical() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     // Publish 100 messages BEFORE any consumer exists.
     let entries: Vec<BatchEntry<'_>> = (0..100)
         .map(|_| BatchEntry::new(&b"history.evt"[..], Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .expect("publish_batch");
 
     // Create consumer with deliver_policy=0 (All) — should replay from seq=1.
     let resp = client
-        .create_consumer(stream_id, b"replayer", b"", b"", 200u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"replayer",
+            b"",
+            b"",
+            200u16,
+            1u8,
+            0u8,
+            0u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -237,7 +286,10 @@ async fn replay_deliver_all_historical() {
         }
     }
 
-    assert_eq!(count, 100, "replay should deliver all 100 historical messages, got {count}");
+    assert_eq!(
+        count, 100,
+        "replay should deliver all 100 historical messages, got {count}"
+    );
     server.shutdown().await;
 }
 
@@ -251,11 +303,16 @@ async fn ack_prevents_redelivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"acker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"acker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -284,11 +341,16 @@ async fn nack_causes_redelivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"nacker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"nacker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -328,11 +390,16 @@ async fn delivery_preserves_order() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -374,18 +441,25 @@ async fn fanout_two_consumers_each_receive_all() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     // Two consumers with DIFFERENT groups → separate queues → fan-out
     let resp = client
-        .create_consumer(stream_id, b"svc_a", b"group_a", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"svc_a", b"group_a", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"svc_b", b"group_b", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"svc_b", b"group_b", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -396,7 +470,11 @@ async fn fanout_two_consumers_each_receive_all() {
     // Publish 5 messages
     for i in 0..5u32 {
         client
-            .publish_sync(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"events_tick",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -424,18 +502,25 @@ async fn queue_group_distributes_messages() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     // Two consumers with the SAME group + deliver_mode=1 (Queue) → round-robin
     let resp = client
-        .create_consumer(stream_id, b"worker1", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"worker1", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"worker2", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"worker2", b"workers", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -446,7 +531,11 @@ async fn queue_group_distributes_messages() {
     // Publish 10 messages
     for i in 0..10u32 {
         client
-            .publish_sync(stream_id, b"tasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"tasks_job",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -500,25 +589,37 @@ async fn fanout_with_subject_filters() {
     // Consumer A: subscribes to `orders.*`
     let cli_a = server.connect().await;
     let resp = cli_a
-        .create_consumer(stream_id, b"fa", b"ga", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"fa", b"ga", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid_a = TestServer::parse_id(&resp);
-    let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"orders.*").await.unwrap();
+    let mut handle_a = cli_a
+        .subscribe(stream_id, cid_a, b"orders.*")
+        .await
+        .unwrap();
 
     // Consumer B: subscribes to `payments.*`
     let cli_b = server.connect().await;
     let resp = cli_b
-        .create_consumer(stream_id, b"fb", b"gb", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"fb", b"gb", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
-    let mut handle_b = cli_b.subscribe(stream_id, cid_b, b"payments.*").await.unwrap();
+    let mut handle_b = cli_b
+        .subscribe(stream_id, cid_b, b"payments.*")
+        .await
+        .unwrap();
 
     // Consumer C: subscribes to `>` (catch-all)
     let cli_c = server.connect().await;
     let resp = cli_c
-        .create_consumer(stream_id, b"fc", b"gc", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"fc", b"gc", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid_c = TestServer::parse_id(&resp);
@@ -529,14 +630,22 @@ async fn fanout_with_subject_filters() {
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         publisher
-            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"order-data"))
+            .publish_sync(
+                stream_id,
+                subj.as_bytes(),
+                Bytes::copy_from_slice(b"order-data"),
+            )
             .await
             .expect("publish");
     }
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         publisher
-            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"pay-data"))
+            .publish_sync(
+                stream_id,
+                subj.as_bytes(),
+                Bytes::copy_from_slice(b"pay-data"),
+            )
             .await
             .expect("publish");
     }
@@ -557,7 +666,10 @@ async fn fanout_with_subject_filters() {
             _ => break,
         }
     }
-    assert_eq!(count_a, 3, "consumer A (orders.*) should get 3, got {count_a}");
+    assert_eq!(
+        count_a, 3,
+        "consumer A (orders.*) should get 3, got {count_a}"
+    );
 
     // Consumer B: should get 2 (payments.* only)
     let mut count_b = 0u32;
@@ -575,7 +687,10 @@ async fn fanout_with_subject_filters() {
             _ => break,
         }
     }
-    assert_eq!(count_b, 2, "consumer B (payments.*) should get 2, got {count_b}");
+    assert_eq!(
+        count_b, 2,
+        "consumer B (payments.*) should get 2, got {count_b}"
+    );
 
     // Consumer C: should get all 5 (catch-all)
     let mut count_c = 0u32;
@@ -612,19 +727,29 @@ async fn queue_with_subject_filters_no_false_dedup() {
     // Same default group (queue mode) but different subject filters
     let cli_a = server.connect().await;
     let resp = cli_a
-        .create_consumer(stream_id, b"qfa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"qfa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid_a = TestServer::parse_id(&resp);
-    let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"orders.*").await.unwrap();
+    let mut handle_a = cli_a
+        .subscribe(stream_id, cid_a, b"orders.*")
+        .await
+        .unwrap();
 
     let cli_b = server.connect().await;
     let resp = cli_b
-        .create_consumer(stream_id, b"qfb", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"qfb", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
-    let mut handle_b = cli_b.subscribe(stream_id, cid_b, b"payments.*").await.unwrap();
+    let mut handle_b = cli_b
+        .subscribe(stream_id, cid_b, b"payments.*")
+        .await
+        .unwrap();
 
     let publisher = server.connect().await;
 
@@ -700,15 +825,40 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let cli_a = server.connect().await;
     let resp = cli_a
-        .create_consumer(stream_id, b"qoa", b"qovlp-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"qoa",
+            b"qovlp-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid_a = TestServer::parse_id(&resp);
-    let mut handle_a = cli_a.subscribe(stream_id, cid_a, b"events.*").await.unwrap();
+    let mut handle_a = cli_a
+        .subscribe(stream_id, cid_a, b"events.*")
+        .await
+        .unwrap();
 
     let cli_b = server.connect().await;
     let resp = cli_b
-        .create_consumer(stream_id, b"qob", b"qovlp-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"qob",
+            b"qovlp-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
@@ -718,7 +868,11 @@ async fn queue_overlapping_filters_no_duplicates() {
     for i in 0..10u32 {
         let subj = format!("events.{i}");
         publisher
-            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                subj.as_bytes(),
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -753,8 +907,16 @@ async fn queue_overlapping_filters_no_duplicates() {
     }
 
     let total = count_a + count_b;
-    assert_eq!(total, 10, "total should be 10, got {count_a}+{count_b}={total}");
-    assert_eq!(seqs.len(), 10, "all seqs unique (no duplicates), got {}", seqs.len());
+    assert_eq!(
+        total, 10,
+        "total should be 10, got {count_a}+{count_b}={total}"
+    );
+    assert_eq!(
+        seqs.len(),
+        10,
+        "all seqs unique (no duplicates), got {}",
+        seqs.len()
+    );
     server.shutdown().await;
 }
 
@@ -764,19 +926,47 @@ async fn consumers_on_different_streams_isolated() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp1 = client.create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp1 = client
+        .create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id1 = TestServer::parse_id(&resp1);
-    let resp2 = client.create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp2 = client
+        .create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id2 = TestServer::parse_id(&resp2);
 
     let resp = client
-        .create_consumer(stream_id1, b"log_sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id1,
+            b"log_sink",
+            b"",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            0u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id2, b"metric_sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id2,
+            b"metric_sink",
+            b"",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            0u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -826,13 +1016,35 @@ async fn queue_group_multi_client() {
     let client2 = server.connect().await;
 
     let resp = client1
-        .create_consumer(stream_id, b"qw1", b"qtasks-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"qw1",
+            b"qtasks-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = client2
-        .create_consumer(stream_id, b"qw2", b"qtasks-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"qw2",
+            b"qtasks-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -844,7 +1056,11 @@ async fn queue_group_multi_client() {
     let publisher = server.connect().await;
     for i in 0..10u32 {
         publisher
-            .publish_sync(stream_id, b"qtasks_job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"qtasks_job",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -880,7 +1096,10 @@ async fn queue_group_multi_client() {
     }
 
     let total = count1 + count2;
-    assert_eq!(total, 10, "queue total should be 10, got {count1}+{count2}={total}");
+    assert_eq!(
+        total, 10,
+        "queue total should be 10, got {count1}+{count2}={total}"
+    );
     assert_eq!(seqs.len(), 10, "all 10 seqs must be unique (no duplicates)");
     assert!(count1 > 0 || count2 > 0, "at least one worker got messages");
     server.shutdown().await;
@@ -908,7 +1127,18 @@ async fn fanout_multi_client() {
         let name = format!("fc{i}");
         let group = format!("fgrp{i}");
         let resp = cli
-            .create_consumer(stream_id, name.as_bytes(), group.as_bytes(), b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .create_consumer(
+                stream_id,
+                name.as_bytes(),
+                group.as_bytes(),
+                b"",
+                100u16,
+                1u8,
+                0u8,
+                0u8,
+                0u32,
+                0u64,
+            )
             .await
             .unwrap();
         let consumer_id = TestServer::parse_id(&resp);
@@ -920,7 +1150,11 @@ async fn fanout_multi_client() {
     let publisher = server.connect().await;
     for i in 0..5u32 {
         publisher
-            .publish_sync(stream_id, b"fevents_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_sync(
+                stream_id,
+                b"fevents_tick",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -937,7 +1171,10 @@ async fn fanout_multi_client() {
                 _ => break,
             }
         }
-        assert_eq!(count, 5, "fanout consumer {idx} should receive all 5, got {count}");
+        assert_eq!(
+            count, 5,
+            "fanout consumer {idx} should receive all 5, got {count}"
+        );
     }
     server.shutdown().await;
 }
@@ -962,19 +1199,52 @@ async fn queue_group_three_clients_100_msgs() {
     let cli2 = server.connect().await;
 
     let resp = cli0
-        .create_consumer(stream_id, b"q3w0", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"q3w0",
+            b"q3-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid0 = TestServer::parse_id(&resp);
 
     let resp = cli1
-        .create_consumer(stream_id, b"q3w1", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"q3w1",
+            b"q3-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid1 = TestServer::parse_id(&resp);
 
     let resp = cli2
-        .create_consumer(stream_id, b"q3w2", b"q3-group", b"", 100u16, 1u8, 0u8, 1u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"q3w2",
+            b"q3-group",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            1u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid2 = TestServer::parse_id(&resp);
@@ -988,7 +1258,10 @@ async fn queue_group_three_clients_100_msgs() {
     let entries: Vec<BatchEntry<'_>> = (0..100)
         .map(|_| BatchEntry::new(&b"q3_job"[..], Bytes::copy_from_slice(b"work")))
         .collect();
-    publisher.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
+    publisher
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .expect("publish_batch");
 
     // Drain all 3 concurrently
     let mut counts = [0u32; 3];
@@ -1051,13 +1324,30 @@ async fn streams_are_isolated() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp_a = client.create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp_a = client
+        .create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id_a = TestServer::parse_id(&resp_a);
-    let resp_b = client.create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp_b = client
+        .create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id_b = TestServer::parse_id(&resp_b);
 
     let resp = client
-        .create_consumer(stream_id_b, b"beta_reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id_b,
+            b"beta_reader",
+            b"",
+            b"",
+            100u16,
+            1u8,
+            0u8,
+            0u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
@@ -1085,11 +1375,16 @@ async fn ack_sync_returns_ok() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"syncer", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, b"syncer", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -1112,10 +1407,7 @@ async fn ack_sync_returns_ok() {
 
     // No redelivery after confirmed ack
     let extra = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await;
-    assert!(
-        extra.is_err(),
-        "after ack, no redelivery should happen"
-    );
+    assert!(extra.is_err(), "after ack, no redelivery should happen");
     server.shutdown().await;
 }
 
@@ -1132,11 +1424,25 @@ async fn max_inflight_caps_delivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"inf_consumer", b"", b"", 2u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id,
+            b"inf_consumer",
+            b"",
+            b"",
+            2u16,
+            1u8,
+            0u8,
+            0u8,
+            0u32,
+            0u64,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -1194,19 +1500,26 @@ async fn max_subject_inflight_multiple_patterns() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     // Per-subject inflight caps: premium 3, freemium 1. `other.*` has no cap.
     let limits = [
-        SubjectLimit { pattern: b"message.premium.>",  limit: 3 },
-        SubjectLimit { pattern: b"message.freemium.>", limit: 1 },
+        SubjectLimit {
+            pattern: b"message.premium.>",
+            limit: 3,
+        },
+        SubjectLimit {
+            pattern: b"message.freemium.>",
+            limit: 1,
+        },
     ];
     let resp = client
         .create_consumer_with_limits(
-            stream_id, b"msi_c", b"", b"",
-            100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
-            &limits,
+            stream_id, b"msi_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64, &limits,
         )
         .await
         .unwrap();
@@ -1227,7 +1540,10 @@ async fn max_subject_inflight_multiple_patterns() {
         BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P3")),
         BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P4")),
     ];
-    client.publish_batch_sync(stream_id, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .expect("publish_batch");
 
     // Let all publishes and drain cycles settle
     tokio::time::sleep(Duration::from_millis(50)).await;

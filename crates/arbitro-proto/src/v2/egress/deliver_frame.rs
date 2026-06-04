@@ -41,10 +41,10 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct DeliverBody {
-    pub consumer_id:  U32,
+    pub consumer_id: U32,
     pub subject_hash: U32,
-    pub subject_len:  U16,
-    pub _pad:         U16,
+    pub subject_len: U16,
+    pub _pad: U16,
 }
 pub const DELIVER_BODY_FIXED: usize = core::mem::size_of::<DeliverBody>();
 const _: () = assert!(DELIVER_BODY_FIXED == 12);
@@ -53,8 +53,8 @@ const _: () = assert!(DELIVER_BODY_FIXED == 12);
 #[repr(C)]
 pub struct DeliverFrame {
     pub header: Header,
-    pub body:   DeliverBody,
-    pub tail:   [u8],
+    pub body: DeliverBody,
+    pub tail: [u8],
 }
 
 impl DeliverFrame {
@@ -94,10 +94,10 @@ impl DeliverFrame {
                 deliver_seq,
             ),
             body: DeliverBody {
-                consumer_id:  U32::new(consumer_id),
+                consumer_id: U32::new(consumer_id),
                 subject_hash: U32::new(subject_hash),
-                subject_len:  U16::new(subject_len),
-                _pad:         U16::new(0),
+                subject_len: U16::new(subject_len),
+                _pad: U16::new(0),
             },
         }
     }
@@ -135,7 +135,7 @@ impl DeliverFrame {
 #[repr(C)]
 pub struct DeliverPrefix {
     pub header: Header,
-    pub body:   DeliverBody,
+    pub body: DeliverBody,
 }
 const _: () = assert!(core::mem::size_of::<DeliverPrefix>() == HEADER_SIZE + DELIVER_BODY_FIXED);
 
@@ -145,7 +145,7 @@ const _: () = assert!(core::mem::size_of::<DeliverPrefix>() == HEADER_SIZE + DEL
 #[repr(C)]
 pub struct DeliverBatchHeader {
     pub consumer_id: U32,
-    pub count:       U32,
+    pub count: U32,
 }
 pub const DELIVER_BATCH_HEADER_FIXED: usize = core::mem::size_of::<DeliverBatchHeader>();
 const _: () = assert!(DELIVER_BATCH_HEADER_FIXED == 8);
@@ -153,10 +153,10 @@ const _: () = assert!(DELIVER_BATCH_HEADER_FIXED == 8);
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct DeliverBatchEntry {
-    pub deliver_seq:  U64,
+    pub deliver_seq: U64,
     pub subject_hash: U32,
-    pub subject_len:  U16,
-    pub payload_len:  U16,
+    pub subject_len: U16,
+    pub payload_len: U16,
 }
 pub const DELIVER_BATCH_ENTRY_FIXED: usize = core::mem::size_of::<DeliverBatchEntry>();
 const _: () = assert!(DELIVER_BATCH_ENTRY_FIXED == 16);

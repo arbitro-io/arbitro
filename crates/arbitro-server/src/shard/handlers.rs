@@ -18,10 +18,7 @@ use crate::shard::worker::{AccumCaller, ActiveBinding, CommandWorker, StreamAccu
 impl CommandWorker {
     // ── Hot path — accumulator ──────────────────────────────────────────
 
-    pub(in crate::shard) fn handle_publish_accumulate(
-        &mut self,
-        cmd: PublishCmd,
-    ) {
+    pub(in crate::shard) fn handle_publish_accumulate(&mut self, cmd: PublishCmd) {
         if !self.engine.ctx().catalog.stream_exists(cmd.stream_id) {
             send_error_v2(
                 &self.registry,
@@ -59,10 +56,8 @@ impl CommandWorker {
         self.accum_total += entry_count as usize;
         self.accum_bytes += entry_bytes;
 
-        let interval =
-            Duration::from_millis(self.flusher_config.interval_ms);
-        self.accum_deadline =
-            Some(std::time::Instant::now() + interval);
+        let interval = Duration::from_millis(self.flusher_config.interval_ms);
+        self.accum_deadline = Some(std::time::Instant::now() + interval);
 
         self.check_accumulator_flush();
     }
@@ -79,19 +74,18 @@ impl CommandWorker {
 
         // F27: reuse the persistent scratch vec on every flush.
         self.flush_stream_ids.clear();
-        self.flush_stream_ids.extend(self.accum_streams.keys().copied());
+        self.flush_stream_ids
+            .extend(self.accum_streams.keys().copied());
         let stream_ids = std::mem::take(&mut self.flush_stream_ids);
 
         for stream_id in &stream_ids {
             let stream_id = *stream_id;
-            let accum =
-                self.accum_streams.get_mut(&stream_id).unwrap();
+            let accum = self.accum_streams.get_mut(&stream_id).unwrap();
             if accum.store_entries.is_empty() {
                 continue;
             }
 
-            let store_entries =
-                std::mem::take(&mut accum.store_entries);
+            let store_entries = std::mem::take(&mut accum.store_entries);
             let callers = std::mem::take(&mut accum.callers);
             accum.bytes = 0;
 
@@ -135,9 +129,13 @@ impl CommandWorker {
                             let excess_bytes = if ret.max_bytes > 0 && info.bytes > ret.max_bytes {
                                 // Estimate how many leading messages to drop to bring bytes under limit.
                                 // Simple heuristic: drop proportionally using average message size.
-                                let avg = if info.messages > 0 { info.bytes / info.messages } else { 1 };
+                                let avg = if info.messages > 0 {
+                                    info.bytes / info.messages
+                                } else {
+                                    1
+                                };
                                 let over = info.bytes - ret.max_bytes;
-                                over.div_ceil(avg)  // ceiling division
+                                over.div_ceil(avg) // ceiling division
                             } else {
                                 0
                             };
@@ -174,17 +172,18 @@ impl CommandWorker {
     // ── Hot path — ack / nack ───────────────────────────────────────────
 
     pub(in crate::shard) fn handle_ack(&mut self, cmd: AckCmd) {
-        crate::lifecycle_trace!(
-            "a10_acker_enter",
-            0,
-            cmd.entries.len() as u64,
-            "shard"
-        );
+        crate::lifecycle_trace!("a10_acker_enter", 0, cmd.entries.len() as u64, "shard");
 
         // Tenant Isolation Check: verify connection owns this consumer
-        let owns = self.bindings.iter().any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
+        let owns = self
+            .bindings
+            .iter()
+            .any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
         if !owns {
-            let _ = cmd.reply.send(AckReply { accepted: 0, rejected: cmd.entries.len() as u32 });
+            let _ = cmd.reply.send(AckReply {
+                accepted: 0,
+                rejected: cmd.entries.len() as u32,
+            });
             return;
         }
 
@@ -211,12 +210,7 @@ impl CommandWorker {
         }
 
         let accepted = cmd.entries.len() as u32;
-        crate::lifecycle_trace!(
-            "a12_engine_ack_done",
-            0,
-            accepted as u64,
-            "shard"
-        );
+        crate::lifecycle_trace!("a12_engine_ack_done", 0, accepted as u64, "shard");
 
         // Decrement atomic inflight counters.
         // The engine already decremented its internal counters via execute().
@@ -224,7 +218,8 @@ impl CommandWorker {
         if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
             let queue_id = consumer.queue_id;
             if accepted > 0 {
-                self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, accepted);
+                self.counters
+                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, accepted);
             }
         }
         // Subject inflight decremented by apply_delta_and_sync below.
@@ -233,19 +228,9 @@ impl CommandWorker {
             // Release gate so drain re-checks from current cursor.
             // Cursor already stopped at lowest_skipped in drain_cycle,
             // so freed capacity will be used on the next cycle.
-            crate::lifecycle_trace!(
-                "a12c_acker_gate_fire",
-                0,
-                0,
-                "shard"
-            );
+            crate::lifecycle_trace!("a12c_acker_gate_fire", 0, 0, "shard");
             self.gate.release();
-            crate::lifecycle_trace!(
-                "a13_acker_gate_released",
-                0,
-                0,
-                "shard"
-            );
+            crate::lifecycle_trace!("a13_acker_gate_released", 0, 0, "shard");
         }
 
         // Handle delta (demand changes, binding retirements).
@@ -260,9 +245,15 @@ impl CommandWorker {
 
     pub(in crate::shard) fn handle_nack(&mut self, cmd: NackCmd) {
         // Tenant Isolation Check: verify connection owns this consumer
-        let owns = self.bindings.iter().any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
+        let owns = self
+            .bindings
+            .iter()
+            .any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
         if !owns {
-            let _ = cmd.reply.send(NackReply { requeued: 0, not_found: cmd.entries.len() as u32 });
+            let _ = cmd.reply.send(NackReply {
+                requeued: 0,
+                not_found: cmd.entries.len() as u32,
+            });
             return;
         }
 
@@ -363,7 +354,8 @@ impl CommandWorker {
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
                 if requeued > 0 {
-                    self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
+                    self.counters
+                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
                 }
             }
 
@@ -407,7 +399,8 @@ impl CommandWorker {
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
                 if requeued > 0 {
-                    self.counters.dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
+                    self.counters
+                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
                 }
             }
 
@@ -433,22 +426,20 @@ impl CommandWorker {
 
     // ── Admin — subscribe / unsubscribe ─────────────────────────────────
 
-    pub(in crate::shard) fn handle_subscribe(
-        &mut self,
-        cmd: SubscribeCmd,
-    ) {
+    pub(in crate::shard) fn handle_subscribe(&mut self, cmd: SubscribeCmd) {
         let connection_id = cmd.connection_id;
         let consumer_id = cmd.consumer_config.id;
 
-        let stream_ok =
-            self.engine.create_stream(cmd.stream_config).is_ok();
+        let stream_ok = self.engine.create_stream(cmd.stream_config).is_ok();
         // Subscribe's ensure-consumer is best-effort — if the consumer
         // already exists (from a prior CreateConsumer), just proceed
         // regardless of config differences. ConfigMismatch only matters
         // for explicit CreateConsumer requests.
         let consumer_ok = match self.engine.create_consumer(cmd.consumer_config) {
             Ok(_) => true,
-            Err(e) if e.code() == arbitro_engine_v2::error::ErrorCode::ConsumerConfigMismatch => true,
+            Err(e) if e.code() == arbitro_engine_v2::error::ErrorCode::ConsumerConfigMismatch => {
+                true
+            }
             Err(_) => false,
         };
         let sub_ok = self
@@ -458,33 +449,28 @@ impl CommandWorker {
 
         if stream_ok && consumer_ok && sub_ok {
             let subscription_id = SubscriptionId(consumer_id.0);
-            let (result, events) =
-                self.engine.subscribe(connection_id, subscription_id);
+            let (result, events) = self.engine.subscribe(connection_id, subscription_id);
 
             if let Ok(binding_id) = result {
                 let consumer = self.engine.consumer(consumer_id);
 
-                let max_inflight = consumer
-                    .map(|c| c.max_inflight)
-                    .unwrap_or(u32::MAX);
-                let stream_id = consumer
-                    .map(|c| c.stream_id)
-                    .unwrap_or(StreamId(0));
-                let queue_id = consumer
-                    .map(|c| c.queue_id)
-                    .unwrap_or(QueueId(0));
+                let max_inflight = consumer.map(|c| c.max_inflight).unwrap_or(u32::MAX);
+                let stream_id = consumer.map(|c| c.stream_id).unwrap_or(StreamId(0));
+                let queue_id = consumer.map(|c| c.queue_id).unwrap_or(QueueId(0));
                 let fire_and_forget = consumer
                     .map(|c| c.ack_policy == AckPolicy::None)
                     .unwrap_or(false);
-                let ack_wait_ms = consumer
-                    .map(|c| c.ack_wait_ms)
-                    .unwrap_or(0);
+                let ack_wait_ms = consumer.map(|c| c.ack_wait_ms).unwrap_or(0);
 
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
                 if let Some(write_tx) = self.registry.get_write_tx(connection_id.0) {
-                    let write_failed = self.registry.get_write_failed(connection_id.0)
-                        .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+                    let write_failed = self
+                        .registry
+                        .get_write_failed(connection_id.0)
+                        .unwrap_or_else(|| {
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))
+                        });
                     self.bindings.push(ActiveBinding {
                         binding_id,
                         connection_id,
@@ -566,14 +552,10 @@ impl CommandWorker {
             self.gate.release();
         }
 
-        let _ =
-            cmd.reply.send(stream_ok && consumer_ok && sub_ok);
+        let _ = cmd.reply.send(stream_ok && consumer_ok && sub_ok);
     }
 
-    pub(in crate::shard) fn handle_unsubscribe(
-        &mut self,
-        cmd: UnsubscribeCmd,
-    ) {
+    pub(in crate::shard) fn handle_unsubscribe(&mut self, cmd: UnsubscribeCmd) {
         let consumer_id = ConsumerId(cmd.subscription_id.0);
         let binding_ids: Vec<_> = self
             .bindings
@@ -595,30 +577,27 @@ impl CommandWorker {
 
     // ── Admin — stream lifecycle ────────────────────────────────────────
 
-    pub(in crate::shard) fn handle_create_stream(
-        &mut self,
-        cmd: CreateStreamCmd,
-    ) {
+    pub(in crate::shard) fn handle_create_stream(&mut self, cmd: CreateStreamCmd) {
         let stream_id = cmd.config.id;
         let ok = self.engine.create_stream(cmd.config).is_ok();
         if ok {
             // Persist per-stream retention config (even if all zeros).
             // Zero-valued limits are no-ops; storing them is harmless and
             // avoids a branch at set time.
-            self.stream_retention.insert(stream_id, crate::shard::worker::StreamRetention {
-                max_msgs:   cmd.max_msgs,
-                max_bytes:  cmd.max_bytes,
-                max_age_ms: cmd.max_age_ms,
-            });
+            self.stream_retention.insert(
+                stream_id,
+                crate::shard::worker::StreamRetention {
+                    max_msgs: cmd.max_msgs,
+                    max_bytes: cmd.max_bytes,
+                    max_age_ms: cmd.max_age_ms,
+                },
+            );
             self.rebuild_and_swap_snapshot();
         }
         let _ = cmd.reply.send(ok);
     }
 
-    pub(in crate::shard) fn handle_delete_stream(
-        &mut self,
-        cmd: DeleteStreamCmd,
-    ) {
+    pub(in crate::shard) fn handle_delete_stream(&mut self, cmd: DeleteStreamCmd) {
         // Decrement demand for all bindings on this stream.
         let stream_binding_count = self
             .bindings
@@ -638,18 +617,15 @@ impl CommandWorker {
 
     // ── Admin — consumer lifecycle ──────────────────────────────────────
 
-    pub(in crate::shard) fn handle_create_consumer(
-        &mut self,
-        cmd: CreateConsumerCmd,
-    ) {
+    pub(in crate::shard) fn handle_create_consumer(&mut self, cmd: CreateConsumerCmd) {
         let stream_id = cmd.config.stream_id;
         match self.engine.create_consumer(cmd.config) {
             Ok(true) => {
                 // Newly created — apply subject limits.
                 for (pattern, limit) in &cmd.max_subject_inflights {
-                    let _ = self.engine.set_max_subject_inflight(
-                        stream_id, pattern, *limit,
-                    );
+                    let _ = self
+                        .engine
+                        .set_max_subject_inflight(stream_id, pattern, *limit);
                 }
                 let _ = cmd.reply.send(1); // created
             }
@@ -666,10 +642,7 @@ impl CommandWorker {
         }
     }
 
-    pub(in crate::shard) fn handle_delete_consumer(
-        &mut self,
-        cmd: DeleteConsumerCmd,
-    ) {
+    pub(in crate::shard) fn handle_delete_consumer(&mut self, cmd: DeleteConsumerCmd) {
         // Decrement demand for all bindings of this consumer.
         let consumer_bindings: Vec<_> = self
             .bindings
@@ -690,11 +663,13 @@ impl CommandWorker {
         // it on the next iteration — leaving the slot allocated would
         // wedge the ConsumerSubjects index forever once the consumer
         // is gone (no future Ack will arrive to dec the count).
-        if self.drain_evt_tx.try_send(
-            crate::shard::drain_events::DrainEvent::ConsumerRemoved {
+        if self
+            .drain_evt_tx
+            .try_send(crate::shard::drain_events::DrainEvent::ConsumerRemoved {
                 consumer_id: cmd.consumer_id,
-            },
-        ).is_err() {
+            })
+            .is_err()
+        {
             self.silent_drops.inc_drain_evt();
             self.pending_consumer_remove.push(cmd.consumer_id);
         }
@@ -706,19 +681,12 @@ impl CommandWorker {
 
     // ── Admin — connection lifecycle ────────────────────────────────────
 
-    pub(in crate::shard) fn handle_open_connection(
-        &mut self,
-        cmd: OpenConnectionCmd,
-    ) {
-        self.engine
-            .open_connection(cmd.connection_id, cmd.node_id);
+    pub(in crate::shard) fn handle_open_connection(&mut self, cmd: OpenConnectionCmd) {
+        self.engine.open_connection(cmd.connection_id, cmd.node_id);
         let _ = cmd.reply.send(());
     }
 
-    pub(in crate::shard) fn handle_drain_connection(
-        &mut self,
-        cmd: DrainConnectionCmd,
-    ) {
+    pub(in crate::shard) fn handle_drain_connection(&mut self, cmd: DrainConnectionCmd) {
         // Decrement demand for all bindings of this connection.
         let conn_bindings: Vec<_> = self
             .bindings
@@ -730,8 +698,7 @@ impl CommandWorker {
             self.counters.dec_demand(stream_id.raw());
         }
 
-        let events =
-            self.engine.mark_connection_dead(cmd.connection_id);
+        let events = self.engine.mark_connection_dead(cmd.connection_id);
         self.apply_delta_and_sync(&events);
         self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(());
@@ -748,25 +715,21 @@ impl CommandWorker {
             let consumer_id = ConsumerId(cmd.subscription_id.0);
             let consumer = self.engine.consumer(consumer_id);
 
-            let max_inflight = consumer
-                .map(|c| c.max_inflight)
-                .unwrap_or(u32::MAX);
-            let stream_id = consumer
-                .map(|c| c.stream_id)
-                .unwrap_or(StreamId(0));
-            let queue_id = consumer
-                .map(|c| c.queue_id)
-                .unwrap_or(QueueId(0));
+            let max_inflight = consumer.map(|c| c.max_inflight).unwrap_or(u32::MAX);
+            let stream_id = consumer.map(|c| c.stream_id).unwrap_or(StreamId(0));
+            let queue_id = consumer.map(|c| c.queue_id).unwrap_or(QueueId(0));
             let fire_and_forget = consumer
                 .map(|c| c.ack_policy == AckPolicy::None)
                 .unwrap_or(false);
-            let ack_wait_ms = consumer
-                .map(|c| c.ack_wait_ms)
-                .unwrap_or(0);
+            let ack_wait_ms = consumer.map(|c| c.ack_wait_ms).unwrap_or(0);
 
             if let Some(write_tx) = self.registry.get_write_tx(cmd.connection_id.0) {
-                let write_failed = self.registry.get_write_failed(cmd.connection_id.0)
-                    .unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+                let write_failed = self
+                    .registry
+                    .get_write_failed(cmd.connection_id.0)
+                    .unwrap_or_else(|| {
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))
+                    });
                 self.bindings.push(ActiveBinding {
                     binding_id,
                     connection_id: cmd.connection_id,
@@ -804,10 +767,7 @@ impl CommandWorker {
 
     // ── Query ───────────────────────────────────────────────────────────
 
-    pub(in crate::shard) fn handle_list_streams(
-        &mut self,
-        cmd: ListStreamsCmd,
-    ) {
+    pub(in crate::shard) fn handle_list_streams(&mut self, cmd: ListStreamsCmd) {
         let streams = self
             .engine
             .list_streams()
@@ -817,25 +777,17 @@ impl CommandWorker {
         let _ = cmd.reply.send(ListStreamsReply { streams });
     }
 
-    pub(in crate::shard) fn handle_list_consumers(
-        &mut self,
-        cmd: ListConsumersCmd,
-    ) {
+    pub(in crate::shard) fn handle_list_consumers(&mut self, cmd: ListConsumersCmd) {
         let consumers = self
             .engine
             .list_consumers()
             .into_iter()
-            .map(|(cid, sid, qid, paused)| {
-                (cid.0, sid.raw(), qid.0, paused)
-            })
+            .map(|(cid, sid, qid, paused)| (cid.0, sid.raw(), qid.0, paused))
             .collect();
         let _ = cmd.reply.send(ListConsumersReply { consumers });
     }
 
-    pub(in crate::shard) fn handle_store_info(
-        &mut self,
-        cmd: StoreInfoCmd,
-    ) {
+    pub(in crate::shard) fn handle_store_info(&mut self, cmd: StoreInfoCmd) {
         let info = self.store.lock().info();
         let _ = cmd.reply.send(StoreInfoReply {
             messages: info.messages,
@@ -845,10 +797,7 @@ impl CommandWorker {
 
     // ── Stream content management ───────────────────────────────────────
 
-    pub(in crate::shard) fn handle_purge_stream(
-        &mut self,
-        cmd: PurgeStreamCmd,
-    ) {
+    pub(in crate::shard) fn handle_purge_stream(&mut self, cmd: PurgeStreamCmd) {
         let new_last_seq = {
             let mut g = self.store.lock();
             let deleted = g.purge();
@@ -872,10 +821,7 @@ impl CommandWorker {
         let _ = cmd.reply.send(deleted);
     }
 
-    pub(in crate::shard) fn handle_drain_subject(
-        &mut self,
-        cmd: DrainSubjectCmd,
-    ) {
+    pub(in crate::shard) fn handle_drain_subject(&mut self, cmd: DrainSubjectCmd) {
         let deleted = self.store.lock().drain(&cmd.subject);
         let _ = cmd.reply.send(deleted);
     }
@@ -1032,10 +978,7 @@ impl CommandWorker {
 
     // ── Admin — pause / resume ──────────────────────────────────────────
 
-    pub(in crate::shard) fn handle_pause_consumer(
-        &mut self,
-        cmd: PauseConsumerCmd,
-    ) {
+    pub(in crate::shard) fn handle_pause_consumer(&mut self, cmd: PauseConsumerCmd) {
         let ok = self.engine.pause_consumer(cmd.consumer_id);
         if ok {
             self.counters.set_paused(cmd.consumer_id.0, true);
@@ -1043,10 +986,7 @@ impl CommandWorker {
         let _ = cmd.reply.send(ok);
     }
 
-    pub(in crate::shard) fn handle_resume_consumer(
-        &mut self,
-        cmd: ResumeConsumerCmd,
-    ) {
+    pub(in crate::shard) fn handle_resume_consumer(&mut self, cmd: ResumeConsumerCmd) {
         let ok = self.engine.resume_consumer(cmd.consumer_id);
         if ok {
             self.counters.set_paused(cmd.consumer_id.0, false);

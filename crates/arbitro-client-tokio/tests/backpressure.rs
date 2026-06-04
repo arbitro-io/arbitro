@@ -16,10 +16,10 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use arbitro_client_tokio::{Client, ClientConfig, ClientError};
 use arbitro_client_tokio::transport_internal::WRITE_QUEUE_CAP;
+use arbitro_client_tokio::{Client, ClientConfig, ClientError};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -34,13 +34,18 @@ async fn start_server() -> String {
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(64);
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
@@ -51,7 +56,7 @@ async fn connect(addr: &str) -> Client {
 /// Wrapped in a 1-second timeout to catch any potential deadlock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publish_after_close_returns_channel_closed_no_panic() {
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     let resp = client
@@ -71,7 +76,7 @@ async fn publish_after_close_returns_channel_closed_no_panic() {
     let result = tokio::time::timeout(Duration::from_secs(1), async {
         for i in 0u32..(WRITE_QUEUE_CAP as u32 + 100) {
             match client.publish(stream_id, b"bp.subj", Bytes::from(i.to_le_bytes().to_vec())) {
-                Ok(()) => {} // Ring still had space; keep going.
+                Ok(()) => {}                               // Ring still had space; keep going.
                 Err(ClientError::ChannelClosed) => return, // Expected — exit cleanly.
                 Err(e) => panic!("unexpected error: {e}"),
             }
@@ -82,7 +87,10 @@ async fn publish_after_close_returns_channel_closed_no_panic() {
     })
     .await;
 
-    assert!(result.is_ok(), "deadlock detected: publish loop did not complete within 1s");
+    assert!(
+        result.is_ok(),
+        "deadlock detected: publish loop did not complete within 1s"
+    );
 }
 
 // ── test 2: ring saturation under slow reader ─────────────────────────────────
@@ -141,7 +149,10 @@ async fn publish_ring_saturation_no_panic_no_deadlock() {
     })
     .await;
 
-    assert!(result.is_ok(), "deadlock: saturation loop did not finish within 3s");
+    assert!(
+        result.is_ok(),
+        "deadlock: saturation loop did not finish within 3s"
+    );
 
     client.close();
 }

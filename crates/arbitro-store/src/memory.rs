@@ -11,7 +11,7 @@
 //! `MemoryStore` uses `MmapMut::map_anon(..)` (pure RAM, no file, no
 //! persistence) while `TolerantStore` maps a real file for durability.
 
-use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo, entry_matches};
+use crate::store::{entry_matches, Entry, EntryRef, Store, StoreError, StoreInfo};
 use arbitro_engine_v2::catalog::wire_hash_32;
 use memmap2::{MmapMut, MmapOptions};
 
@@ -80,9 +80,7 @@ impl MemoryStore {
     /// (avoiding rotation overhead) while huge workloads get a larger
     /// backing segment.
     pub fn with_capacity(data_cap: usize, index_cap: usize) -> Self {
-        let segment_size = data_cap
-            .max(DEFAULT_SEGMENT_SIZE)
-            .max(MIN_SEGMENT_SIZE);
+        let segment_size = data_cap.max(DEFAULT_SEGMENT_SIZE).max(MIN_SEGMENT_SIZE);
         Self::with_segment_size(segment_size, index_cap)
     }
 
@@ -364,7 +362,11 @@ impl Store for MemoryStore {
     }
 
     #[inline]
-    fn append_batch(&mut self, entries: &[EntryRef<'_>], timestamp: u64) -> Result<u64, StoreError> {
+    fn append_batch(
+        &mut self,
+        entries: &[EntryRef<'_>],
+        timestamp: u64,
+    ) -> Result<u64, StoreError> {
         if entries.is_empty() {
             return Ok(self.next_seq);
         }
@@ -416,7 +418,12 @@ impl Store for MemoryStore {
         }
     }
 
-    fn for_each(&self, start: u64, end: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
+    fn for_each(
+        &self,
+        start: u64,
+        end: u64,
+        f: &mut dyn FnMut(&Entry<'_>),
+    ) -> Result<(), StoreError> {
         let s = self.find_lower_bound(start);
         let e = self.find_lower_bound(end);
         let e = e.min(self.index.len());
@@ -587,9 +594,27 @@ mod tests {
     fn append_batch() {
         let mut s = MemoryStore::new();
         let entries = [
-            EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 },
-            EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 },
-            EntryRef { subject: b"c", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+            EntryRef {
+                subject: b"a",
+                payload: b"1",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            EntryRef {
+                subject: b"b",
+                payload: b"2",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            EntryRef {
+                subject: b"c",
+                payload: b"3",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
         ];
         let first = s.append_batch(&entries, 100).unwrap();
         assert_eq!(first, 1);
@@ -604,7 +629,13 @@ mod tests {
         let mut s = MemoryStore::new();
         for i in 0..5 {
             s.append(
-                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                EntryRef {
+                    subject: b"x",
+                    payload: &[i],
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
                 0,
             )
             .unwrap();
@@ -627,7 +658,13 @@ mod tests {
         let mut s = MemoryStore::new();
         for i in 0..10 {
             s.append(
-                EntryRef { subject: b"x", payload: &[i], stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                EntryRef {
+                    subject: b"x",
+                    payload: &[i],
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
                 0,
             )
             .unwrap();
@@ -639,7 +676,13 @@ mod tests {
 
         let seq = s
             .append(
-                EntryRef { subject: b"y", payload: b"new", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                EntryRef {
+                    subject: b"y",
+                    payload: b"new",
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
                 0,
             )
             .unwrap();
@@ -649,10 +692,50 @@ mod tests {
     #[test]
     fn drain_by_subject() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.created", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"payments.done", payload: b"4", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"orders.created",
+                payload: b"1",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"orders.updated",
+                payload: b"2",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"orders.created",
+                payload: b"3",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"payments.done",
+                payload: b"4",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
 
         let drained = s.drain(b"orders.created");
         assert_eq!(drained, 2);
@@ -667,9 +750,39 @@ mod tests {
     #[test]
     fn drain_with_wildcard() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"orders.created", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"orders.updated", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"payments.done", payload: b"3", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"orders.created",
+                payload: b"1",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"orders.updated",
+                payload: b"2",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"payments.done",
+                payload: b"3",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
 
         let drained = s.drain(b"orders.>");
         assert_eq!(drained, 2);
@@ -682,16 +795,46 @@ mod tests {
     #[test]
     fn info_tracks_bytes() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"ab", payload: b"cd", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"ab",
+                payload: b"cd",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(s.info().bytes, 4);
-        s.append(EntryRef { subject: b"ef", payload: b"ghij", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"ef",
+                payload: b"ghij",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(s.info().bytes, 10);
     }
 
     #[test]
     fn empty_batch_returns_next_seq() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"x", payload: b"y", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"x",
+                payload: b"y",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
         let seq = s.append_batch(&[], 0).unwrap();
         assert_eq!(seq, 2);
     }
@@ -699,8 +842,28 @@ mod tests {
     #[test]
     fn for_each_borrows_without_clone() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"a", payload: b"1", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
-        s.append(EntryRef { subject: b"b", payload: b"2", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 0).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"a",
+                payload: b"1",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
+        s.append(
+            EntryRef {
+                subject: b"b",
+                payload: b"2",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            0,
+        )
+        .unwrap();
 
         let mut seen = 0;
         s.for_each(1, 3, &mut |e| {
@@ -714,7 +877,17 @@ mod tests {
     #[test]
     fn get_borrows_without_clone() {
         let mut s = MemoryStore::new();
-        s.append(EntryRef { subject: b"hello", payload: b"world", stream_id: 0, flags: 0, deliver_at_ms: 0 }, 42).unwrap();
+        s.append(
+            EntryRef {
+                subject: b"hello",
+                payload: b"world",
+                stream_id: 0,
+                flags: 0,
+                deliver_at_ms: 0,
+            },
+            42,
+        )
+        .unwrap();
 
         let mut captured_ts = 0;
         let found = s
@@ -736,14 +909,23 @@ mod tests {
         let payload = vec![0u8; 1024];
         for _ in 0..6 {
             s.append(
-                EntryRef { subject: b"x", payload: &payload, stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                EntryRef {
+                    subject: b"x",
+                    payload: &payload,
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
                 0,
             )
             .unwrap();
         }
         // 6 entries, 2 segments expected (4 + 2 = 6 under 4096 each).
         assert_eq!(s.info().messages, 6);
-        assert!(!s.sealed.is_empty(), "at least one segment should be sealed");
+        assert!(
+            !s.sealed.is_empty(),
+            "at least one segment should be sealed"
+        );
 
         // Verify we can still read across segments.
         for i in 1..=6 {

@@ -18,5 +18,5 @@
 pub mod batch;
 pub mod record;
 
-pub use batch::{BatchHeader, BATCH_HEADER_SIZE, PAGE_SIZE, align_up_to_page};
+pub use batch::{align_up_to_page, BatchHeader, BATCH_HEADER_SIZE, PAGE_SIZE};
 pub use record::{Record, RecordBody, RECORD_BODY_FIXED};

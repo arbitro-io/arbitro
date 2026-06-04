@@ -50,7 +50,11 @@ pub async fn apply_loop(
         if last_log <= last_applied {
             continue;
         }
-        tracing::debug!(last_log = last_log.0, last_applied = last_applied.0, "apply_loop: new entries");
+        tracing::debug!(
+            last_log = last_log.0,
+            last_applied = last_applied.0,
+            "apply_loop: new entries"
+        );
 
         let from = LogIndex(last_applied.0 + 1);
         let to = LogIndex(last_log.0 + 1);

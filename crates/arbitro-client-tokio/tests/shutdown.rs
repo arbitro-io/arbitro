@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use arbitro_client_tokio::{Client, ClientConfig, ClientError};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,13 +22,18 @@ async fn start_server() -> String {
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(64);
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
@@ -42,7 +47,7 @@ async fn connect(addr: &str) -> Client {
 /// fails via timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drop_client_cancels_all_tasks_under_500ms() {
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     let resp = client
@@ -58,7 +63,11 @@ async fn drop_client_cancels_all_tasks_under_500ms() {
         let h = tokio::spawn(async move {
             let mut i = 0u32;
             loop {
-                match c.publish(stream_id, b"shutdown.subj", Bytes::from(i.to_le_bytes().to_vec())) {
+                match c.publish(
+                    stream_id,
+                    b"shutdown.subj",
+                    Bytes::from(i.to_le_bytes().to_vec()),
+                ) {
                     Ok(()) => {}
                     Err(ClientError::ChannelClosed) => break, // cancel propagated
                     Err(e) => panic!("unexpected publish error: {e}"),
@@ -97,7 +106,7 @@ async fn drop_client_cancels_all_tasks_under_500ms() {
 /// Calling `close()` multiple times must be idempotent — no panic, no deadlock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_is_idempotent() {
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     client.close();

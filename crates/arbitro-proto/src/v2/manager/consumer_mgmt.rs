@@ -41,17 +41,17 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct CreateConsumerBody {
-    pub name_len:       U16,
-    pub subj_len:       U16,
-    pub stream_id:      U32,
-    pub max_inflight:   U16,
-    pub ack_policy:     u8,
+    pub name_len: U16,
+    pub subj_len: U16,
+    pub stream_id: U32,
+    pub max_inflight: U16,
+    pub ack_policy: u8,
     pub deliver_policy: u8,
-    pub deliver_mode:   u8,
-    pub _pad:           u8,
-    pub group_len:      U16,
-    pub ack_wait_ms:    U32,
-    pub start_seq:      U64,
+    pub deliver_mode: u8,
+    pub _pad: u8,
+    pub group_len: U16,
+    pub ack_wait_ms: U32,
+    pub start_seq: U64,
 }
 pub const CREATE_CONSUMER_BODY_FIXED: usize = core::mem::size_of::<CreateConsumerBody>();
 const _: () = assert!(CREATE_CONSUMER_BODY_FIXED == 28);
@@ -60,7 +60,7 @@ const _: () = assert!(CREATE_CONSUMER_BODY_FIXED == 28);
 #[derive(Debug, Clone, Copy)]
 pub struct SubjectLimit<'a> {
     pub pattern: &'a [u8],
-    pub limit:   u32,
+    pub limit: u32,
 }
 
 /// Header bytes per limit entry on the wire: `[limit u32][pattern_len u16]`.
@@ -72,7 +72,9 @@ pub const SUBJECT_LIMITS_COUNT_SIZE: usize = 2;
 /// Returns 0 when `limits` is empty (no trailer is written).
 #[inline]
 pub fn subject_limits_tail_len(limits: &[SubjectLimit<'_>]) -> usize {
-    if limits.is_empty() { return 0; }
+    if limits.is_empty() {
+        return 0;
+    }
     let mut total = SUBJECT_LIMITS_COUNT_SIZE;
     for l in limits {
         total += SUBJECT_LIMIT_HEADER_SIZE + l.pattern.len();
@@ -84,8 +86,8 @@ pub fn subject_limits_tail_len(limits: &[SubjectLimit<'_>]) -> usize {
 #[repr(C)]
 pub struct CreateConsumerFrame {
     pub header: Header,
-    pub body:   CreateConsumerBody,
-    pub tail:   [u8],
+    pub body: CreateConsumerBody,
+    pub tail: [u8],
 }
 
 impl CreateConsumerFrame {
@@ -145,27 +147,27 @@ impl CreateConsumerFrame {
             return None;
         }
 
-        let count = u16::from_le_bytes([
-            self.tail[trailer_start],
-            self.tail[trailer_start + 1],
-        ]) as usize;
+        let count =
+            u16::from_le_bytes([self.tail[trailer_start], self.tail[trailer_start + 1]]) as usize;
         let mut cursor = trailer_start + SUBJECT_LIMITS_COUNT_SIZE;
 
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            if cursor + SUBJECT_LIMIT_HEADER_SIZE > self.tail.len() { return None; }
+            if cursor + SUBJECT_LIMIT_HEADER_SIZE > self.tail.len() {
+                return None;
+            }
             let limit = u32::from_le_bytes([
                 self.tail[cursor],
                 self.tail[cursor + 1],
                 self.tail[cursor + 2],
                 self.tail[cursor + 3],
             ]);
-            let pattern_len = u16::from_le_bytes([
-                self.tail[cursor + 4],
-                self.tail[cursor + 5],
-            ]) as usize;
+            let pattern_len =
+                u16::from_le_bytes([self.tail[cursor + 4], self.tail[cursor + 5]]) as usize;
             cursor += SUBJECT_LIMIT_HEADER_SIZE;
-            if cursor + pattern_len > self.tail.len() { return None; }
+            if cursor + pattern_len > self.tail.len() {
+                return None;
+            }
             let pattern = self.tail[cursor..cursor + pattern_len].to_vec();
             cursor += pattern_len;
             out.push((pattern, limit));
@@ -194,25 +196,23 @@ impl CreateConsumerFrame {
             out.len(),
             Self::wire_size(name.len(), group.len(), subject.len(), limits_tail),
         );
-        let msg_len = (CREATE_CONSUMER_BODY_FIXED
-            + name.len()
-            + group.len()
-            + subject.len()
-            + limits_tail) as u32;
+        let msg_len =
+            (CREATE_CONSUMER_BODY_FIXED + name.len() + group.len() + subject.len() + limits_tail)
+                as u32;
         let frame = Self::mut_from_bytes(out).expect("CreateConsumerFrame layout");
         frame.header = Header::new(Action::CreateConsumer.as_u16(), msg_len, seq);
         frame.body = CreateConsumerBody {
-            name_len:       U16::new(name.len() as u16),
-            subj_len:       U16::new(subject.len() as u16),
-            stream_id:      U32::new(stream_id),
-            max_inflight:   U16::new(max_inflight),
+            name_len: U16::new(name.len() as u16),
+            subj_len: U16::new(subject.len() as u16),
+            stream_id: U32::new(stream_id),
+            max_inflight: U16::new(max_inflight),
             ack_policy,
             deliver_policy,
             deliver_mode,
-            _pad:           0,
-            group_len:      U16::new(group.len() as u16),
-            ack_wait_ms:    U32::new(ack_wait_ms),
-            start_seq:      U64::new(start_seq),
+            _pad: 0,
+            group_len: U16::new(group.len() as u16),
+            ack_wait_ms: U32::new(ack_wait_ms),
+            start_seq: U64::new(start_seq),
         };
         let n = name.len();
         let g = group.len();
@@ -230,8 +230,7 @@ impl CreateConsumerFrame {
                 .copy_from_slice(&(subject_limits.len() as u16).to_le_bytes());
             cursor += SUBJECT_LIMITS_COUNT_SIZE;
             for l in subject_limits {
-                frame.tail[cursor..cursor + 4]
-                    .copy_from_slice(&l.limit.to_le_bytes());
+                frame.tail[cursor..cursor + 4].copy_from_slice(&l.limit.to_le_bytes());
                 frame.tail[cursor + 4..cursor + 6]
                     .copy_from_slice(&(l.pattern.len() as u16).to_le_bytes());
                 cursor += SUBJECT_LIMIT_HEADER_SIZE;
@@ -257,7 +256,19 @@ mod tests {
         let size = CreateConsumerFrame::wire_size(4, 0, 5, 0);
         let mut buf = vec![0u8; size];
         CreateConsumerFrame::encode_into(
-            &mut buf, 1, 7, b"name", b"", b"a.b.c", 16, 1, 2, 3, 30_000, 0, &[],
+            &mut buf,
+            1,
+            7,
+            b"name",
+            b"",
+            b"a.b.c",
+            16,
+            1,
+            2,
+            3,
+            30_000,
+            0,
+            &[],
         );
         let f = CreateConsumerFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(f.header.action.get(), Action::CreateConsumer.as_u16());
@@ -274,16 +285,20 @@ mod tests {
     #[test]
     fn create_consumer_with_subject_limits_roundtrip() {
         let limits = [
-            SubjectLimit { pattern: b"vip.>", limit: 10 },
-            SubjectLimit { pattern: b"free.*", limit: 2 },
+            SubjectLimit {
+                pattern: b"vip.>",
+                limit: 10,
+            },
+            SubjectLimit {
+                pattern: b"free.*",
+                limit: 2,
+            },
         ];
         let tail_len = subject_limits_tail_len(&limits);
         let size = CreateConsumerFrame::wire_size(4, 3, 5, tail_len);
         let mut buf = vec![0u8; size];
         CreateConsumerFrame::encode_into(
-            &mut buf, 1, 7, b"name", b"grp", b"a.b.c",
-            16, 1, 2, 3, 30_000, 0,
-            &limits,
+            &mut buf, 1, 7, b"name", b"grp", b"a.b.c", 16, 1, 2, 3, 30_000, 0, &limits,
         );
         let f = CreateConsumerFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(f.name(), b"name");
@@ -305,16 +320,20 @@ mod tests {
         use crate::wire::manager::CreateConsumerView;
 
         let limits = [
-            SubjectLimit { pattern: b"vip.>", limit: 10 },
-            SubjectLimit { pattern: b"free.*", limit: 2 },
+            SubjectLimit {
+                pattern: b"vip.>",
+                limit: 10,
+            },
+            SubjectLimit {
+                pattern: b"free.*",
+                limit: 2,
+            },
         ];
         let tail_len = subject_limits_tail_len(&limits);
         let size = CreateConsumerFrame::wire_size(4, 3, 5, tail_len);
         let mut buf = vec![0u8; size];
         CreateConsumerFrame::encode_into(
-            &mut buf, 1, 7, b"name", b"grp", b"a.b.c",
-            16, 1, 2, 3, 30_000, 0,
-            &limits,
+            &mut buf, 1, 7, b"name", b"grp", b"a.b.c", 16, 1, 2, 3, 30_000, 0, &limits,
         );
 
         // Metadata log stores `&frame[HEADER_SIZE..]` (body + tail).

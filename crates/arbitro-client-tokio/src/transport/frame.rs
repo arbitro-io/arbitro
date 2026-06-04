@@ -41,8 +41,7 @@ const _: () = {
 };
 
 /// Convenience alias used across publish/manage/session.
-pub(crate) type WriteProducer =
-    arbitro_kit::route::MpscAsyncProducer<WriteFrame, WRITE_QUEUE_CAP>;
+pub(crate) type WriteProducer = arbitro_kit::route::MpscAsyncProducer<WriteFrame, WRITE_QUEUE_CAP>;
 
 /// Work item enqueued by producers and drained by the single writer task.
 #[derive(Debug)]

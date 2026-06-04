@@ -13,9 +13,9 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use zerocopy::IntoBytes;
 
+use arbitro_engine_v2::types::ConnectionId;
 use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
-use arbitro_engine_v2::types::ConnectionId;
 use arbitro_proto::v2::egress::rep_frame::RepErrFrame;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE as HEADER_SIZE_V2};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, HELLO_FRAME_SIZE};
@@ -26,9 +26,9 @@ use arbitro_proto::lifecycle::LifeCycle;
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
+use crate::transport::dispatch_v2;
 use crate::transport::registry::{ConnReader, ConnWriter};
 use crate::transport::ConnectionRegistry;
-use crate::transport::dispatch_v2;
 
 /// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
@@ -145,9 +145,7 @@ impl ArbitroServer {
                 let key = match self.config.tls_key.as_ref() {
                     Some(k) => k,
                     None => {
-                        tracing::error!(
-                            "ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set"
-                        );
+                        tracing::error!("ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set");
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "ARBITRO_TLS_KEY required when ARBITRO_TLS_CERT is set",
@@ -192,8 +190,13 @@ impl ArbitroServer {
             let metrics_registry = self.registry.clone();
             let metrics_shutdown = shutdown_rx.clone();
             Some(tokio::spawn(async move {
-                metrics_loop(metrics_server, metrics_registry, metrics_interval, metrics_shutdown)
-                    .await;
+                metrics_loop(
+                    metrics_server,
+                    metrics_registry,
+                    metrics_interval,
+                    metrics_shutdown,
+                )
+                .await;
             }))
         };
 
@@ -217,71 +220,71 @@ impl ArbitroServer {
         });
 
         // Delayed publish journal — append-only file + min-heap maturation.
-        let delayed_journal: Option<crate::delayed::SharedDelayedJournal> =
-            if let Some(dir) = self.config.data_dir.as_deref() {
-                let data_path = std::path::Path::new(dir);
-                let mut journal = crate::delayed::DelayedJournal::new(data_path);
-                // Recovery: scan existing journal, rebuild heap, catch-up matured.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                match journal.recover(now_ms) {
-                    Ok(catch_up) => {
-                        if !catch_up.is_empty() {
-                            tracing::info!(
-                                count = catch_up.len(),
-                                "delayed journal: catching up matured entries from previous run"
-                            );
-                            for entry in catch_up {
-                                let seq_stream = arbitro_engine_v2::types::StreamId(entry.stream_id);
-                                let store_entry = arbitro_store::EntryRef {
-                                    stream_id: entry.stream_id,
-                                    subject: &entry.subject,
-                                    payload: &entry.payload,
-                                    flags: entry.flags,
-                                    deliver_at_ms: 0,
-                                };
-                                let shared_store = self.server.store_for(seq_stream);
-                                match shared_store.lock().append(store_entry, now_ms) {
-                                    Ok(_) => {
-                                        self.server.gate_for(seq_stream).release();
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            stream_id = entry.stream_id,
-                                            error = ?e,
-                                            "delayed catch-up: failed to append to main store"
-                                        );
-                                    }
+        let delayed_journal: Option<crate::delayed::SharedDelayedJournal> = if let Some(dir) =
+            self.config.data_dir.as_deref()
+        {
+            let data_path = std::path::Path::new(dir);
+            let mut journal = crate::delayed::DelayedJournal::new(data_path);
+            // Recovery: scan existing journal, rebuild heap, catch-up matured.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            match journal.recover(now_ms) {
+                Ok(catch_up) => {
+                    if !catch_up.is_empty() {
+                        tracing::info!(
+                            count = catch_up.len(),
+                            "delayed journal: catching up matured entries from previous run"
+                        );
+                        for entry in catch_up {
+                            let seq_stream = arbitro_engine_v2::types::StreamId(entry.stream_id);
+                            let store_entry = arbitro_store::EntryRef {
+                                stream_id: entry.stream_id,
+                                subject: &entry.subject,
+                                payload: &entry.payload,
+                                flags: entry.flags,
+                                deliver_at_ms: 0,
+                            };
+                            let shared_store = self.server.store_for(seq_stream);
+                            match shared_store.lock().append(store_entry, now_ms) {
+                                Ok(_) => {
+                                    self.server.gate_for(seq_stream).release();
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        stream_id = entry.stream_id,
+                                        error = ?e,
+                                        "delayed catch-up: failed to append to main store"
+                                    );
                                 }
                             }
                         }
-                        if !journal.is_empty() {
-                            tracing::info!(
-                                pending = journal.len(),
-                                "delayed journal: pending entries recovered"
-                            );
-                        }
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "delayed journal recovery failed");
+                    if !journal.is_empty() {
+                        tracing::info!(
+                            pending = journal.len(),
+                            "delayed journal: pending entries recovered"
+                        );
                     }
                 }
-                let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
-                // Spawn maturation task.
-                let mat_journal = std::sync::Arc::clone(&shared);
-                let mat_server = self.server.clone();
-                let mat_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    crate::delayed::delayed_maturation_loop(
-                        mat_journal, mat_server, mat_shutdown,
-                    ).await;
-                });
-                Some(shared)
-            } else {
-                None
-            };
+                Err(e) => {
+                    tracing::error!(error = %e, "delayed journal recovery failed");
+                }
+            }
+            let shared = std::sync::Arc::new(parking_lot::Mutex::new(journal));
+            // Spawn maturation task.
+            let mat_journal = std::sync::Arc::clone(&shared);
+            let mat_server = self.server.clone();
+            let mat_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                crate::delayed::delayed_maturation_loop(mat_journal, mat_server, mat_shutdown)
+                    .await;
+            });
+            Some(shared)
+        } else {
+            None
+        };
 
         // ── Cluster: Raft boot (when feature = "cluster") ─────────────
         #[cfg(feature = "cluster")]
@@ -291,10 +294,10 @@ impl ArbitroServer {
         {
             if !self.config.cluster_peers.is_empty() {
                 use crate::cluster::{
+                    apply_loop,
+                    state_machine::ArbitroStateMachine,
                     storage::{FileRaftStorage, SharedRaftStorage},
                     transport::TcpRaftTransport,
-                    state_machine::ArbitroStateMachine,
-                    apply_loop,
                 };
                 use arbitro_raft::*;
 
@@ -305,17 +308,24 @@ impl ArbitroServer {
                     "cluster mode: initializing Raft node"
                 );
 
-                let data_dir = self.config.data_dir.clone()
+                let data_dir = self
+                    .config
+                    .data_dir
+                    .clone()
                     .unwrap_or_else(|| "/tmp/arbitro-raft".into());
                 let raft_dir = std::path::PathBuf::from(&data_dir).join("raft");
                 std::fs::create_dir_all(&raft_dir).expect("failed to create raft data dir");
 
                 let node_id = PeerId(self.config.cluster_node_id);
-                let peers: Vec<PeerId> = self.config.cluster_peers
+                let peers: Vec<PeerId> = self
+                    .config
+                    .cluster_peers
                     .iter()
                     .map(|(id, _)| PeerId(*id))
                     .collect();
-                let bootstrap_peers: Vec<BootstrapPeer> = self.config.cluster_peers
+                let bootstrap_peers: Vec<BootstrapPeer> = self
+                    .config
+                    .cluster_peers
                     .iter()
                     .map(|(id, addr)| BootstrapPeer {
                         id: PeerId(*id),
@@ -347,12 +357,15 @@ impl ArbitroServer {
                 let storage_inner = std::sync::Arc::new(FileRaftStorage::new(&raft_dir));
                 let storage_for_raft = SharedRaftStorage(storage_inner.clone());
 
-                let peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> =
-                    self.config.cluster_peers
-                        .iter()
-                        .map(|(id, addr)| (PeerId(*id), addr.parse().expect("invalid peer addr")))
-                        .collect();
-                let bind_addr: std::net::SocketAddr = self.config.cluster_listen
+                let peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> = self
+                    .config
+                    .cluster_peers
+                    .iter()
+                    .map(|(id, addr)| (PeerId(*id), addr.parse().expect("invalid peer addr")))
+                    .collect();
+                let bind_addr: std::net::SocketAddr = self
+                    .config
+                    .cluster_listen
                     .parse()
                     .expect("invalid cluster_listen addr");
                 let transport = TcpRaftTransport::new(bind_addr, peer_addrs)
@@ -393,12 +406,10 @@ impl ArbitroServer {
                 });
 
                 tracing::info!(node_id = node_id.0, "raft node started");
-                cluster_state = std::sync::Arc::new(
-                    crate::cluster::ClusterState::Clustered {
-                        client: std::sync::Arc::new(client_handle),
-                        peer_id: node_id,
-                    }
-                );
+                cluster_state = std::sync::Arc::new(crate::cluster::ClusterState::Clustered {
+                    client: std::sync::Arc::new(client_handle),
+                    peer_id: node_id,
+                });
             }
         }
 
@@ -447,9 +458,7 @@ impl ArbitroServer {
         #[cfg(feature = "tls")]
         let tls_acceptor_shared = tls_acceptor.map(std::sync::Arc::new);
 
-        let auth_token_shared: Option<Arc<str>> = self.config.auth_token
-            .as_deref()
-            .map(Arc::from);
+        let auth_token_shared: Option<Arc<str>> = self.config.auth_token.as_deref().map(Arc::from);
         let max_frame_size = self.config.max_frame_size;
         let max_ops_per_sec = self.config.max_ops_per_sec;
 
@@ -548,8 +557,8 @@ impl ArbitroServer {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
 
             // L15: SIGUSR1 dumps a diagnostic JSON snapshot to
             // /tmp/arbitro-dump-{pid}.json. Listens forever (until process
@@ -564,8 +573,12 @@ impl ArbitroServer {
                         let path = format!("/tmp/arbitro-dump-{pid}.json");
                         let dump = build_diagnostic_dump(&server_dump, &registry_dump).await;
                         match std::fs::write(&path, &dump) {
-                            Ok(()) => tracing::info!(path = %path, "SIGUSR1 diagnostic dump written"),
-                            Err(e) => tracing::warn!(path = %path, error = ?e, "SIGUSR1 dump write failed"),
+                            Ok(()) => {
+                                tracing::info!(path = %path, "SIGUSR1 diagnostic dump written")
+                            }
+                            Err(e) => {
+                                tracing::warn!(path = %path, error = ?e, "SIGUSR1 dump write failed")
+                            }
                         }
                     }
                 });
@@ -603,7 +616,9 @@ impl ArbitroServer {
         let _ = shutdown_tx.send(true);
         accept_handle.abort();
         keepalive_handle.abort();
-        if let Some(h) = metrics_handle { h.abort(); }
+        if let Some(h) = metrics_handle {
+            h.abort();
+        }
 
         // Send ServerShuttingDown to all connections
         let all_conns = self.registry.all_conn_ids();
@@ -657,8 +672,7 @@ async fn read_loop(
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
     workflow_registry: std::sync::Arc<crate::workflow::WorkflowRegistry>,
     delayed_journal: Option<crate::delayed::SharedDelayedJournal>,
-    #[cfg(feature = "cluster")]
-    cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
+    #[cfg(feature = "cluster")] cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -678,73 +692,76 @@ async fn read_loop(
 
     'outer: loop {
         // ---- Mandatory v2 handshake ---------------------------------------
-        if !hello_done
-            && acc.len() >= 4 {
-                let m = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]);
-                if m != ARBITRO_MAGIC_V2 {
-                    tracing::warn!(conn_id, magic = format!("{m:#010x}"), "non-v2 client, closing");
-                    break 'outer;
-                }
-                if acc.len() >= HELLO_FRAME_SIZE {
-                    let _ = HelloFrame::parse(&acc[..HELLO_FRAME_SIZE]); // validates
-                    let _ = acc.split_to(HELLO_FRAME_SIZE);
-                    hello_done = true;
-                    tracing::debug!(conn_id, "v2 HELLO accepted");
-                }
+        if !hello_done && acc.len() >= 4 {
+            let m = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]);
+            if m != ARBITRO_MAGIC_V2 {
+                tracing::warn!(
+                    conn_id,
+                    magic = format!("{m:#010x}"),
+                    "non-v2 client, closing"
+                );
+                break 'outer;
             }
+            if acc.len() >= HELLO_FRAME_SIZE {
+                let _ = HelloFrame::parse(&acc[..HELLO_FRAME_SIZE]); // validates
+                let _ = acc.split_to(HELLO_FRAME_SIZE);
+                hello_done = true;
+                tracing::debug!(conn_id, "v2 HELLO accepted");
+            }
+        }
 
         // ---- Auth check (first frame after Hello must be Auth) ------------
-        if hello_done && !auth_done
-            && acc.len() >= HEADER_SIZE_V2 {
-                let msg_len = u32::from_le_bytes([
-                    acc[4], acc[5], acc[6], acc[7],
-                ]) as usize;
-                let total = HEADER_SIZE_V2 + msg_len;
-                if acc.len() >= total {
-                    let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
-                    if action_raw != Action::Auth.as_u16() {
-                        // H2: surface the real reason (AuthRequired) instead
-                        // of pretending the server is shutting down. The
-                        // client needs to distinguish "send a token" from
-                        // "stop trying, the broker is down".
-                        tracing::warn!(conn_id, "auth required but first frame is not Auth, closing");
-                        send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
-                        break 'outer;
-                    }
-                    // Token is the body (after 16-byte header)
-                    let token_bytes = &acc[HEADER_SIZE_V2..total];
-                    let expected = auth_token.as_ref().unwrap();
-                    // M14: constant-time comparison so a network
-                    // observer can't recover the token byte-by-byte
-                    // via timing of `!=`. We keep the early
-                    // length-mismatch reject (constant against a known
-                    // expected length is fine — the attacker already
-                    // knows it from a single failed attempt).
-                    let token_ok = {
-                        let e = expected.as_bytes();
-                        if token_bytes.len() != e.len() {
-                            false
-                        } else {
-                            let mut diff: u8 = 0;
-                            for (a, b) in token_bytes.iter().zip(e.iter()) {
-                                diff |= a ^ b;
-                            }
-                            diff == 0
-                        }
-                    };
-                    if !token_ok {
-                        // H2: a wrong token is AuthFailed, not a server
-                        // shutdown signal. Mis-coding this confuses
-                        // bootstrap loops and credential-rotation logic.
-                        tracing::warn!(conn_id, "auth failed: invalid token");
-                        send_error_frame(&registry, conn_id, ErrorCode::AuthFailed);
-                        break 'outer;
-                    }
-                    let _ = acc.split_to(total);
-                    auth_done = true;
-                    tracing::debug!(conn_id, "auth accepted");
+        if hello_done && !auth_done && acc.len() >= HEADER_SIZE_V2 {
+            let msg_len = u32::from_le_bytes([acc[4], acc[5], acc[6], acc[7]]) as usize;
+            let total = HEADER_SIZE_V2 + msg_len;
+            if acc.len() >= total {
+                let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
+                if action_raw != Action::Auth.as_u16() {
+                    // H2: surface the real reason (AuthRequired) instead
+                    // of pretending the server is shutting down. The
+                    // client needs to distinguish "send a token" from
+                    // "stop trying, the broker is down".
+                    tracing::warn!(
+                        conn_id,
+                        "auth required but first frame is not Auth, closing"
+                    );
+                    send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
+                    break 'outer;
                 }
+                // Token is the body (after 16-byte header)
+                let token_bytes = &acc[HEADER_SIZE_V2..total];
+                let expected = auth_token.as_ref().unwrap();
+                // M14: constant-time comparison so a network
+                // observer can't recover the token byte-by-byte
+                // via timing of `!=`. We keep the early
+                // length-mismatch reject (constant against a known
+                // expected length is fine — the attacker already
+                // knows it from a single failed attempt).
+                let token_ok = {
+                    let e = expected.as_bytes();
+                    if token_bytes.len() != e.len() {
+                        false
+                    } else {
+                        let mut diff: u8 = 0;
+                        for (a, b) in token_bytes.iter().zip(e.iter()) {
+                            diff |= a ^ b;
+                        }
+                        diff == 0
+                    }
+                };
+                if !token_ok {
+                    // H2: a wrong token is AuthFailed, not a server
+                    // shutdown signal. Mis-coding this confuses
+                    // bootstrap loops and credential-rotation logic.
+                    tracing::warn!(conn_id, "auth failed: invalid token");
+                    send_error_frame(&registry, conn_id, ErrorCode::AuthFailed);
+                    break 'outer;
+                }
+                let _ = acc.split_to(total);
+                auth_done = true;
+                tracing::debug!(conn_id, "auth accepted");
             }
+        }
 
         // ---- Drain whole v2 frames already in the accumulator -------------
         if hello_done && auth_done {
@@ -753,15 +770,18 @@ async fn read_loop(
                     break;
                 }
                 // v2 Header: msg_len at bytes 4..8 LE u32.
-                let msg_len = u32::from_le_bytes([
-                    acc[4], acc[5], acc[6], acc[7],
-                ]) as usize;
-                
+                let msg_len = u32::from_le_bytes([acc[4], acc[5], acc[6], acc[7]]) as usize;
+
                 if msg_len > max_frame_size {
-                    tracing::warn!(conn_id, msg_len, max_frame_size, "frame exceeds max_frame_size, dropping connection");
+                    tracing::warn!(
+                        conn_id,
+                        msg_len,
+                        max_frame_size,
+                        "frame exceeds max_frame_size, dropping connection"
+                    );
                     break 'outer;
                 }
-                
+
                 let total = HEADER_SIZE_V2 + msg_len;
                 if acc.len() < total {
                     break;
@@ -769,12 +789,19 @@ async fn read_loop(
                 let frame = acc.split_to(total).freeze();
                 registry.touch(conn_id);
                 if dispatch_v2::dispatch_frame_v2(
-                    conn_id, frame, &server, &registry, &cron_registry,
+                    conn_id,
+                    frame,
+                    &server,
+                    &registry,
+                    &cron_registry,
                     &workflow_registry,
                     &delayed_journal,
                     #[cfg(feature = "cluster")]
                     &cluster_state,
-                ).await.is_err() {
+                )
+                .await
+                .is_err()
+                {
                     tracing::warn!(conn_id, "malformed frame, dropping connection");
                     break 'outer;
                 }
@@ -825,7 +852,10 @@ async fn read_loop(
     // EOF / shutdown / error: drain the engine bookkeeping for this conn,
     // then drop the connection from the registry. No frame is synthesized.
     for i in 0..server.shard_count() {
-        let _ = server.shard(i).drain_connection(ConnectionId(conn_id)).await;
+        let _ = server
+            .shard(i)
+            .drain_connection(ConnectionId(conn_id))
+            .await;
     }
     registry.remove(conn_id);
 }
@@ -895,10 +925,7 @@ fn check_or_persist_shard_count(data_dir: &str, shard_count: usize) {
         }
         Err(_) => {
             // First boot for this data dir — write the marker.
-            if let Err(e) = std::fs::write(
-                &marker_path,
-                format!("shard_count = {shard_count}\n"),
-            ) {
+            if let Err(e) = std::fs::write(&marker_path, format!("shard_count = {shard_count}\n")) {
                 tracing::error!(error = %e, path = %marker_path.display(), "M1: failed to write shard_count marker");
                 std::process::exit(2);
             }
@@ -958,7 +985,10 @@ async fn log_startup_state(server: &ShardRouter) {
         if let Ok(reply) = shard.list_streams().await {
             for (stream_id, name) in &reply.streams {
                 total_streams += 1;
-                if let Ok(info) = shard.store_info(arbitro_engine_v2::types::StreamId(*stream_id)).await {
+                if let Ok(info) = shard
+                    .store_info(arbitro_engine_v2::types::StreamId(*stream_id))
+                    .await
+                {
                     total_messages += info.messages;
                     total_bytes += info.bytes;
                     tracing::info!(
@@ -991,11 +1021,7 @@ async fn log_startup_state(server: &ShardRouter) {
 /// line + headers (`\r\n\r\n`), and replies 200 OK if the shard router
 /// has at least one live shard. No HTTP parser dependency — we never
 /// inspect method/path beyond confirming the request terminates.
-async fn run_healthcheck(
-    addr: String,
-    server: ShardRouter,
-    mut shutdown: watch::Receiver<bool>,
-) {
+async fn run_healthcheck(addr: String, server: ShardRouter, mut shutdown: watch::Receiver<bool>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -1076,61 +1102,64 @@ async fn metrics_loop(
         let mut acc = MetricsSnapshot::default();
         for i in 0..server.shard_count() {
             let snap = server.shard(i).metrics();
-            acc.publish_entries_accepted   += snap.publish_entries_accepted;
+            acc.publish_entries_accepted += snap.publish_entries_accepted;
             acc.publish_duplicates_skipped += snap.publish_duplicates_skipped;
-            acc.publish_no_match           += snap.publish_no_match;
-            acc.publish_queues_pushed      += snap.publish_queues_pushed;
-            acc.publish_fanout_notified    += snap.publish_fanout_notified;
+            acc.publish_no_match += snap.publish_no_match;
+            acc.publish_queues_pushed += snap.publish_queues_pushed;
+            acc.publish_fanout_notified += snap.publish_fanout_notified;
             // L11: catch up the previously-unaggregated fields so
             // dashboards see the full set of engine counters.
-            acc.claim_batches              += snap.claim_batches;
-            acc.claim_entries_delivered    += snap.claim_entries_delivered;
+            acc.claim_batches += snap.claim_batches;
+            acc.claim_entries_delivered += snap.claim_entries_delivered;
             acc.claim_skipped_consumer_paused += snap.claim_skipped_consumer_paused;
             acc.claim_skipped_max_inflight += snap.claim_skipped_max_inflight;
             acc.claim_skipped_subject_limit += snap.claim_skipped_subject_limit;
-            acc.claim_skipped_credit_conn  += snap.claim_skipped_credit_conn;
+            acc.claim_skipped_credit_conn += snap.claim_skipped_credit_conn;
             acc.claim_skipped_credit_subject += snap.claim_skipped_credit_subject;
-            acc.claim_empty_pop            += snap.claim_empty_pop;
-            acc.ack_accepted               += snap.ack_accepted;
-            acc.ack_not_found              += snap.ack_not_found;
-            acc.nack_accepted              += snap.nack_accepted;
-            acc.nack_not_found             += snap.nack_not_found;
-            acc.seed_entries               += snap.seed_entries;
-            acc.seed_queues_pushed         += snap.seed_queues_pushed;
-            acc.seed_no_match              += snap.seed_no_match;
-            acc.drain_pending_removed      += snap.drain_pending_removed;
-            acc.drain_connections          += snap.drain_connections;
-            acc.drain_consumers            += snap.drain_consumers;
+            acc.claim_empty_pop += snap.claim_empty_pop;
+            acc.ack_accepted += snap.ack_accepted;
+            acc.ack_not_found += snap.ack_not_found;
+            acc.nack_accepted += snap.nack_accepted;
+            acc.nack_not_found += snap.nack_not_found;
+            acc.seed_entries += snap.seed_entries;
+            acc.seed_queues_pushed += snap.seed_queues_pushed;
+            acc.seed_no_match += snap.seed_no_match;
+            acc.drain_pending_removed += snap.drain_pending_removed;
+            acc.drain_connections += snap.drain_connections;
+            acc.drain_consumers += snap.drain_consumers;
         }
 
         // Counts of active entities and current saturation gauges.
         // `ack_pending` is the broker's headline saturation indicator —
         // sum of in-flight (delivered, unacked) messages across every
         // consumer. Operators watch this for backpressure formation.
-        let mut streams        = 0usize;
-        let mut consumers      = 0usize;
+        let mut streams = 0usize;
+        let mut consumers = 0usize;
         let mut consumers_paused = 0usize;
-        let mut ack_pending    = 0u64;
+        let mut ack_pending = 0u64;
         let mut max_consumer_ack_pending = 0u32;
         let mut stream_messages = 0u64;
-        let mut stream_bytes    = 0u64;
+        let mut stream_bytes = 0u64;
         for i in 0..server.shard_count() {
             let shard = server.shard(i);
             if let Ok(r) = shard.list_streams().await {
                 streams += r.streams.len();
                 for (sid, _) in &r.streams {
-                    if let Ok(info) = shard.store_info(
-                        arbitro_engine_v2::types::StreamId(*sid),
-                    ).await {
+                    if let Ok(info) = shard
+                        .store_info(arbitro_engine_v2::types::StreamId(*sid))
+                        .await
+                    {
                         stream_messages += info.messages;
-                        stream_bytes    += info.bytes;
+                        stream_bytes += info.bytes;
                     }
                 }
             }
             if let Ok(states) = shard.consumer_states().await {
                 consumers += states.len();
                 for s in &states {
-                    if s.paused { consumers_paused += 1; }
+                    if s.paused {
+                        consumers_paused += 1;
+                    }
                     ack_pending += s.ack_pending as u64;
                     if s.ack_pending > max_consumer_ack_pending {
                         max_consumer_ack_pending = s.ack_pending;
@@ -1148,27 +1177,35 @@ async fn metrics_loop(
         prev_drops = drops_now;
 
         tracing::info!(
-            interval_s    = interval.as_secs(),
+            interval_s = interval.as_secs(),
             // ── Gauges (current state) ─────────────────────────────────
-            connections      = connections,
-            streams          = streams,
-            consumers        = consumers,
+            connections = connections,
+            streams = streams,
+            consumers = consumers,
             consumers_paused = consumers_paused,
-            ack_pending      = ack_pending,            // total in-flight unacked
-            max_ack_pending  = max_consumer_ack_pending, // worst-loaded consumer
-            stream_messages  = stream_messages,
-            stream_bytes     = stream_bytes,
+            ack_pending = ack_pending, // total in-flight unacked
+            max_ack_pending = max_consumer_ack_pending, // worst-loaded consumer
+            stream_messages = stream_messages,
+            stream_bytes = stream_bytes,
             // ── Deltas this tick (per-interval rate) ───────────────────
             // L7: saturating_sub so a counter that fell below the previous
             // snapshot (shard restart, recovery rebuild) emits 0 instead of
             // wrapping into a 2^63 spike in the dashboard.
-            published     = acc.publish_entries_accepted.saturating_sub(prev.publish_entries_accepted),
-            delivered     = acc.claim_entries_delivered.saturating_sub(prev.claim_entries_delivered),
-            acked         = acc.ack_accepted.saturating_sub(prev.ack_accepted),
-            nacked        = acc.nack_accepted.saturating_sub(prev.nack_accepted),
-            pub_no_match  = acc.publish_no_match.saturating_sub(prev.publish_no_match),
-            held_inflight = acc.claim_skipped_max_inflight.saturating_sub(prev.claim_skipped_max_inflight),
-            held_subject  = acc.claim_skipped_subject_limit.saturating_sub(prev.claim_skipped_subject_limit),
+            published = acc
+                .publish_entries_accepted
+                .saturating_sub(prev.publish_entries_accepted),
+            delivered = acc
+                .claim_entries_delivered
+                .saturating_sub(prev.claim_entries_delivered),
+            acked = acc.ack_accepted.saturating_sub(prev.ack_accepted),
+            nacked = acc.nack_accepted.saturating_sub(prev.nack_accepted),
+            pub_no_match = acc.publish_no_match.saturating_sub(prev.publish_no_match),
+            held_inflight = acc
+                .claim_skipped_max_inflight
+                .saturating_sub(prev.claim_skipped_max_inflight),
+            held_subject = acc
+                .claim_skipped_subject_limit
+                .saturating_sub(prev.claim_skipped_subject_limit),
             // H10: silent drops at the conn-write / drain-event / notify-ring sites.
             drop_conn_write = drop_conn_write,
             drop_notify_ring = drop_notify_ring,
@@ -1280,9 +1317,15 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
     let mut out = String::with_capacity(2048);
 
     // ── Per-shard counters ──────────────────────────────────────────
-    let _ = writeln!(out, "# HELP arbitro_publish_total Total publish entries accepted.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_publish_total Total publish entries accepted."
+    );
     let _ = writeln!(out, "# TYPE arbitro_publish_total counter");
-    let _ = writeln!(out, "# HELP arbitro_deliver_total Total deliveries to consumers.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_deliver_total Total deliveries to consumers."
+    );
     let _ = writeln!(out, "# TYPE arbitro_deliver_total counter");
     let _ = writeln!(out, "# HELP arbitro_ack_total Total acks accepted.");
     let _ = writeln!(out, "# TYPE arbitro_ack_total counter");
@@ -1296,12 +1339,36 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
         let shard = server.shard(i);
         {
             let snap = shard.metrics();
-            let _ = writeln!(out, "arbitro_publish_total{{shard=\"{i}\"}} {}", snap.publish_entries_accepted);
-            let _ = writeln!(out, "arbitro_deliver_total{{shard=\"{i}\"}} {}", snap.claim_entries_delivered);
-            let _ = writeln!(out, "arbitro_ack_total{{shard=\"{i}\"}} {}", snap.ack_accepted);
-            let _ = writeln!(out, "arbitro_ack_not_found_total{{shard=\"{i}\"}} {}", snap.ack_not_found);
-            let _ = writeln!(out, "arbitro_nack_total{{shard=\"{i}\"}} {}", snap.nack_accepted);
-            let _ = writeln!(out, "arbitro_nack_not_found_total{{shard=\"{i}\"}} {}", snap.nack_not_found);
+            let _ = writeln!(
+                out,
+                "arbitro_publish_total{{shard=\"{i}\"}} {}",
+                snap.publish_entries_accepted
+            );
+            let _ = writeln!(
+                out,
+                "arbitro_deliver_total{{shard=\"{i}\"}} {}",
+                snap.claim_entries_delivered
+            );
+            let _ = writeln!(
+                out,
+                "arbitro_ack_total{{shard=\"{i}\"}} {}",
+                snap.ack_accepted
+            );
+            let _ = writeln!(
+                out,
+                "arbitro_ack_not_found_total{{shard=\"{i}\"}} {}",
+                snap.ack_not_found
+            );
+            let _ = writeln!(
+                out,
+                "arbitro_nack_total{{shard=\"{i}\"}} {}",
+                snap.nack_accepted
+            );
+            let _ = writeln!(
+                out,
+                "arbitro_nack_not_found_total{{shard=\"{i}\"}} {}",
+                snap.nack_not_found
+            );
         }
         if let Ok(r) = shard.list_streams().await {
             total_streams += r.streams.len();
@@ -1327,21 +1394,37 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
     let _ = writeln!(out, "# TYPE arbitro_connections gauge");
     let _ = writeln!(out, "arbitro_connections {}", registry.active_count());
 
-    let _ = writeln!(out, "# HELP arbitro_ack_pending Total in-flight unacked deliveries.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_ack_pending Total in-flight unacked deliveries."
+    );
     let _ = writeln!(out, "# TYPE arbitro_ack_pending gauge");
     let _ = writeln!(out, "arbitro_ack_pending {total_ack_pending}");
 
     // ── Silent drops ────────────────────────────────────────────────
     let drops = server.silent_drops().snapshot();
-    let _ = writeln!(out, "# HELP arbitro_silent_drops_conn_write Frames dropped at conn writer queue.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_silent_drops_conn_write Frames dropped at conn writer queue."
+    );
     let _ = writeln!(out, "# TYPE arbitro_silent_drops_conn_write counter");
     let _ = writeln!(out, "arbitro_silent_drops_conn_write {}", drops.conn_write);
 
-    let _ = writeln!(out, "# HELP arbitro_silent_drops_notify_ring Drain notify-ring drops.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_silent_drops_notify_ring Drain notify-ring drops."
+    );
     let _ = writeln!(out, "# TYPE arbitro_silent_drops_notify_ring counter");
-    let _ = writeln!(out, "arbitro_silent_drops_notify_ring {}", drops.notify_ring);
+    let _ = writeln!(
+        out,
+        "arbitro_silent_drops_notify_ring {}",
+        drops.notify_ring
+    );
 
-    let _ = writeln!(out, "# HELP arbitro_silent_drops_drain_evt Drain-event drops.");
+    let _ = writeln!(
+        out,
+        "# HELP arbitro_silent_drops_drain_evt Drain-event drops."
+    );
     let _ = writeln!(out, "# TYPE arbitro_silent_drops_drain_evt counter");
     let _ = writeln!(out, "arbitro_silent_drops_drain_evt {}", drops.drain_evt);
 
@@ -1356,10 +1439,7 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
 /// the most-loaded broker, and so dumping doesn't pull serde_json into the
 /// server crate's dep graph.
 #[cfg(unix)]
-async fn build_diagnostic_dump(
-    server: &ShardRouter,
-    registry: &ConnectionRegistry,
-) -> String {
+async fn build_diagnostic_dump(server: &ShardRouter, registry: &ConnectionRegistry) -> String {
     use arbitro_engine_v2::MetricsSnapshot;
     let mut acc = MetricsSnapshot::default();
     for i in 0..server.shard_count() {

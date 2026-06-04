@@ -17,7 +17,6 @@ use arbitro_store::MemoryStore;
 use tokio::sync::mpsc;
 
 use crate::common::{Gate, NameRegistry};
-use arbitro_common::SharedClock;
 use crate::config::Config;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::drain_events::DrainEventRing;
@@ -25,6 +24,7 @@ use crate::shard::handle::ShardHandle;
 use crate::shard::shared::{DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
 use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
 use crate::transport::ConnectionRegistry;
+use arbitro_common::SharedClock;
 
 /// Shared store handle — publish writes, drain reads.
 /// Shared store handle — publish writes, drain reads.
@@ -113,8 +113,7 @@ impl ShardRouter {
     #[inline]
     pub fn store_list_streams(&self, v: Vec<(u32, Vec<u8>)>) -> Arc<Vec<(u32, Vec<u8>)>> {
         let v = Arc::new(v);
-        self.list_cache.lock().streams =
-            Some((std::time::Instant::now(), Arc::clone(&v)));
+        self.list_cache.lock().streams = Some((std::time::Instant::now(), Arc::clone(&v)));
         v
     }
 
@@ -136,8 +135,7 @@ impl ShardRouter {
         v: Vec<(u32, u32, u32, bool)>,
     ) -> Arc<Vec<(u32, u32, u32, bool)>> {
         let v = Arc::new(v);
-        self.list_cache.lock().consumers =
-            Some((std::time::Instant::now(), Arc::clone(&v)));
+        self.list_cache.lock().consumers = Some((std::time::Instant::now(), Arc::clone(&v)));
         v
     }
 
@@ -288,13 +286,25 @@ impl ShardRouter {
             tokio::spawn(async move {
                 match cmd_handle.await {
                     Ok(()) => {
-                        tracing::debug!(target = "supervisor", shard = shard_id_for_log, "command worker exited cleanly");
+                        tracing::debug!(
+                            target = "supervisor",
+                            shard = shard_id_for_log,
+                            "command worker exited cleanly"
+                        );
                     }
                     Err(e) if e.is_panic() => {
-                        tracing::error!(target = "supervisor", shard = shard_id_for_log, "command worker panicked: {e}");
+                        tracing::error!(
+                            target = "supervisor",
+                            shard = shard_id_for_log,
+                            "command worker panicked: {e}"
+                        );
                     }
                     Err(e) => {
-                        tracing::warn!(target = "supervisor", shard = shard_id_for_log, "command worker join error: {e}");
+                        tracing::warn!(
+                            target = "supervisor",
+                            shard = shard_id_for_log,
+                            "command worker join error: {e}"
+                        );
                     }
                 }
             });
@@ -323,9 +333,7 @@ impl ShardRouter {
         {
             let clk = clock.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(
-                    std::time::Duration::from_millis(1),
-                );
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
                 loop {
                     interval.tick().await;
                     clk.refresh();
@@ -406,10 +414,7 @@ impl ShardRouter {
     /// `Option<...>` inside the Mutex is `None` until the first
     /// idempotent publish allocates it lazily.
     #[inline]
-    pub fn idempotency_for(
-        &self,
-        stream_id: StreamId,
-    ) -> &super::idempotency::SharedIdempotency {
+    pub fn idempotency_for(&self, stream_id: StreamId) -> &super::idempotency::SharedIdempotency {
         let idx = stream_id.raw() as usize % self.idempotency.len();
         &self.idempotency[idx]
     }
@@ -421,8 +426,7 @@ impl ShardRouter {
     #[inline]
     pub fn mark_idempotency_allocated(&self, stream_id: StreamId) {
         let idx = stream_id.raw() as usize % self.has_idempotency.len();
-        self.has_idempotency[idx]
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.has_idempotency[idx].store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]

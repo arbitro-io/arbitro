@@ -249,7 +249,7 @@ cold_body! {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubjectLimit {
     pub pattern: Vec<u8>,
-    pub limit:   u32,
+    pub limit: u32,
 }
 
 #[cfg(test)]
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn drain_subject_roundtrip() {
         let original = DrainSubject {
-            name:    b"orders".to_vec(),
+            name: b"orders".to_vec(),
             subject: b"orders.eu.*".to_vec(),
         };
         let bytes = original.encode(1);

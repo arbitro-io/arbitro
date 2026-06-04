@@ -25,10 +25,10 @@ use tokio::runtime::{Builder, Runtime};
 
 use arbitro_client_tokio::{Client, ClientConfig};
 
-const PAYLOAD_LEN:        usize = 64;
-const BATCH_SIZE:         usize = 100;
+const PAYLOAD_LEN: usize = 64;
+const BATCH_SIZE: usize = 100;
 const CONCURRENCY_LEVELS: &[usize] = &[1, 2, 4, 8, 16];
-const STREAM_ID:          u32 = 1;
+const STREAM_ID: u32 = 1;
 
 // ── drain server ─────────────────────────────────────────────────────────────
 
@@ -37,7 +37,9 @@ async fn start_drain_server() -> String {
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
@@ -55,25 +57,38 @@ async fn start_drain_server() -> String {
 // ── client connect ────────────────────────────────────────────────────────────
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
 // ── runtime ───────────────────────────────────────────────────────────────────
 
 fn build_rt() -> Runtime {
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    Builder::new_multi_thread().worker_threads(workers).enable_all().build().unwrap()
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap()
 }
 
 // ── fixture ───────────────────────────────────────────────────────────────────
 
-struct Fixture { clients: Vec<Client> }
+struct Fixture {
+    clients: Vec<Client>,
+}
 
 async fn fixture(conns: usize) -> Fixture {
     let addr = start_drain_server().await;
     let mut clients = Vec::with_capacity(conns);
-    for _ in 0..conns { clients.push(connect(&addr).await); }
+    for _ in 0..conns {
+        clients.push(connect(&addr).await);
+    }
     Fixture { clients }
 }
 
@@ -101,7 +116,9 @@ fn bench_publish_single(c: &mut Criterion) {
                             let _ = client.publish(STREAM_ID, b"bench", payload);
                         }));
                     }
-                    for j in joins { let _ = j.await; }
+                    for j in joins {
+                        let _ = j.await;
+                    }
                 }
             });
         });
@@ -138,7 +155,9 @@ fn bench_publish_batch(c: &mut Criterion) {
                             let _ = client.publish_batch(STREAM_ID, &entries);
                         }));
                     }
-                    for j in joins { let _ = j.await; }
+                    for j in joins {
+                        let _ = j.await;
+                    }
                 }
             });
         });
@@ -158,16 +177,21 @@ fn bench_step1(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
+    let seq = std::sync::atomic::AtomicU64::new(1);
 
     g.bench_function("encode", |b| {
         b.iter(|| {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
         });
     });
@@ -188,15 +212,17 @@ fn bench_step2(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<usize>(4096);
     rt.block_on(async {
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(64);
-            while rx.recv_many(&mut batch, 64).await > 0 { batch.clear(); }
+            while rx.recv_many(&mut batch, 64).await > 0 {
+                batch.clear();
+            }
         });
     });
 
@@ -205,11 +231,18 @@ fn bench_step2(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let ptr = buf.as_ptr() as usize;
-            let tx  = tx.clone();
-            async move { let _ = tx.send(ptr).await; }
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(ptr).await;
+            }
         });
     });
     g.finish();
@@ -229,20 +262,24 @@ fn bench_step3(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
-    let (tx, mut rx)         = mpsc::channel::<usize>(4096);
+    let (tx, mut rx) = mpsc::channel::<usize>(4096);
     let (fwd_tx, mut fwd_rx) = mpsc::channel::<usize>(1024);
 
     rt.block_on(async {
         tokio::spawn(async move {
-            while let Some(p) = rx.recv().await { let _ = fwd_tx.send(p).await; }
+            while let Some(p) = rx.recv().await {
+                let _ = fwd_tx.send(p).await;
+            }
         });
         tokio::spawn(async move {
             let mut batch = Vec::with_capacity(64);
-            while fwd_rx.recv_many(&mut batch, 64).await > 0 { batch.clear(); }
+            while fwd_rx.recv_many(&mut batch, 64).await > 0 {
+                batch.clear();
+            }
         });
     });
 
@@ -251,11 +288,18 @@ fn bench_step3(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let ptr = buf.as_ptr() as usize;
-            let tx  = tx.clone();
-            async move { let _ = tx.send(ptr).await; }
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(ptr).await;
+            }
         });
     });
     g.finish();
@@ -264,8 +308,8 @@ fn bench_step3(c: &mut Criterion) {
 // ── bench: step 4 — encode + kit::MpscAsync try_send (pure sync) ─────────────
 
 fn bench_step4_kit(c: &mut Criterion) {
-    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use arbitro_kit::route::MpscAsync;
+    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 
     let rt = build_rt();
     let mut g = c.benchmark_group("step_4_kit_mpsc");
@@ -275,8 +319,8 @@ fn bench_step4_kit(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
@@ -292,7 +336,12 @@ fn bench_step4_kit(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let _ = producer.try_send(buf.as_ptr() as usize);
         });
@@ -316,8 +365,8 @@ fn bench_step5(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<usize>(4096);
@@ -330,10 +379,14 @@ fn bench_step5(c: &mut Criterion) {
             let mut batch: Vec<usize> = Vec::with_capacity(64);
             loop {
                 let n = rx.recv_many(&mut batch, 64).await;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 for ptr in batch.drain(..) {
                     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-                    if w.write_all(slice).await.is_err() { return; }
+                    if w.write_all(slice).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -344,11 +397,18 @@ fn bench_step5(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let ptr = buf.as_ptr() as usize;
-            let tx  = tx.clone();
-            async move { let _ = tx.send(ptr).await; }
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(ptr).await;
+            }
         });
     });
     g.finish();
@@ -357,8 +417,8 @@ fn bench_step5(c: &mut Criterion) {
 // ── bench: step 6 — encode + kit::MpscAsync + write_all (pure sync send) ─────
 
 fn bench_step6(c: &mut Criterion) {
-    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use arbitro_kit::route::MpscAsync;
+    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -370,8 +430,8 @@ fn bench_step6(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
@@ -383,12 +443,18 @@ fn bench_step6(c: &mut Criterion) {
         let (_, mut w) = stream.into_split();
         tokio::spawn(async move {
             loop {
-                let Ok(ptr) = consumer.recv_async().await else { break };
+                let Ok(ptr) = consumer.recv_async().await else {
+                    break;
+                };
                 let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-                if w.write_all(slice).await.is_err() { break; }
+                if w.write_all(slice).await.is_err() {
+                    break;
+                }
                 while let Some(ptr) = consumer.try_recv() {
                     let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-                    if w.write_all(slice).await.is_err() { return; }
+                    if w.write_all(slice).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -400,7 +466,12 @@ fn bench_step6(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let _ = producer.try_send(buf.as_ptr() as usize);
         });
@@ -424,8 +495,8 @@ fn bench_step7(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (tx, mut rx) = mpsc::channel::<(usize, oneshot::Sender<()>)>(4096);
@@ -437,7 +508,9 @@ fn bench_step7(c: &mut Criterion) {
         tokio::spawn(async move {
             while let Some((ptr, ack)) = rx.recv().await {
                 let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-                if w.write_all(slice).await.is_err() { return; }
+                if w.write_all(slice).await.is_err() {
+                    return;
+                }
                 let _ = ack.send(());
             }
         });
@@ -448,10 +521,15 @@ fn bench_step7(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let ptr = buf.as_ptr() as usize;
-            let tx  = tx.clone();
+            let tx = tx.clone();
             let (ack_tx, ack_rx) = oneshot::channel::<()>();
             async move {
                 let _ = tx.send((ptr, ack_tx)).await;
@@ -465,8 +543,8 @@ fn bench_step7(c: &mut Criterion) {
 // ── bench: step 8 — encode + kit mpsc + write + kit OneShotAsync ack ─────────
 
 fn bench_step8(c: &mut Criterion) {
-    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use arbitro_kit::route::{MpscAsync, OneShotAsync, OneShotAsyncSender};
+    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -478,8 +556,8 @@ fn bench_step8(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = std::sync::atomic::AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = std::sync::atomic::AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) =
@@ -492,9 +570,13 @@ fn bench_step8(c: &mut Criterion) {
         let (_, mut w) = stream.into_split();
         tokio::spawn(async move {
             loop {
-                let Ok((ptr, ack)) = consumer.recv_async().await else { break };
+                let Ok((ptr, ack)) = consumer.recv_async().await else {
+                    break;
+                };
                 let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
-                if w.write_all(slice).await.is_err() { return; }
+                if w.write_all(slice).await.is_err() {
+                    return;
+                }
                 ack.send(());
             }
         });
@@ -505,13 +587,20 @@ fn bench_step8(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let ptr = buf.as_ptr() as usize;
             let (ack_tx, ack_rx) = OneShotAsync::<()>::new();
             // try_send is sync — call before the async block, no move needed
             let _ = producer.try_send((ptr, ack_tx));
-            async move { let _ = ack_rx.recv_async().await; }
+            async move {
+                let _ = ack_rx.recv_async().await;
+            }
         });
     });
     g.finish();
@@ -529,8 +618,8 @@ fn bench_step8(c: &mut Criterion) {
 fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use arbitro_kit::route::MpscAsync;
+    use arbitro_proto::v2::ingress::pub_frame::PubFrame;
     use bytes::Bytes;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -545,11 +634,10 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
 
     let subject = b"bench";
     let payload = [0u8; PAYLOAD_LEN];
-    let seq     = AtomicU64::new(1);
-    let size    = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
+    let seq = AtomicU64::new(1);
+    let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
 
-    let (mut producers, mut consumer, _shutdown) =
-        MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(1);
+    let (mut producers, mut consumer, _shutdown) = MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(1);
     let producer = producers.remove(0);
 
     let addr = rt.block_on(start_drain_server());
@@ -558,10 +646,16 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
         let (_, mut w) = stream.into_split();
         tokio::spawn(async move {
             loop {
-                let Ok(f) = consumer.recv_async().await else { break };
-                if w.write_all(f.as_slice()).await.is_err() { break; }
+                let Ok(f) = consumer.recv_async().await else {
+                    break;
+                };
+                if w.write_all(f.as_slice()).await.is_err() {
+                    break;
+                }
                 while let Some(f) = consumer.try_recv() {
-                    if w.write_all(f.as_slice()).await.is_err() { return; }
+                    if w.write_all(f.as_slice()).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -574,7 +668,12 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut buf,
                 seq.fetch_add(1, Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let _ = producer.try_send(WriteFrame::Mono(Bytes::from(buf)));
         });
@@ -587,7 +686,12 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
             PubFrame::encode_into(
                 &mut data[..size],
                 seq.fetch_add(1, Ordering::Relaxed),
-                STREAM_ID, 0, 0, subject, &[], &payload,
+                STREAM_ID,
+                0,
+                0,
+                subject,
+                &[],
+                &payload,
             );
             let _ = producer.try_send(WriteFrame::Inline(data, size as u16));
         });

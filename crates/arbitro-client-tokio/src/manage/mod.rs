@@ -15,17 +15,17 @@ use bytes::Bytes;
 
 pub use arbitro_proto::v2::manager::SubjectLimit;
 
-use crate::transport::frame::WriteProducer;
 use crate::error::ClientError;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::transport::encode::{
     encode_consumer_stats_v2, encode_create_consumer_v2, encode_create_stream_v2,
     encode_delete_consumer_v2, encode_delete_stream_v2, encode_drain_subject_v2,
-    encode_get_consumer_v2, encode_get_stream_v2, encode_list_consumers_v2,
-    encode_list_streams_v2, encode_purge_stream_v2,
+    encode_get_consumer_v2, encode_get_stream_v2, encode_list_consumers_v2, encode_list_streams_v2,
+    encode_purge_stream_v2,
 };
 use crate::transport::frame::WriteFrame;
+use crate::transport::frame::WriteProducer;
 
 #[inline]
 async fn request(
@@ -36,59 +36,98 @@ async fn request(
 ) -> Result<Bytes, ClientError> {
     let rx = pending.register(seq);
     crate::publish::enqueue(tx, WriteFrame::Mono(body))?;
-    rx.recv_async().await
+    rx.recv_async()
+        .await
         .map_err(|_| ClientError::ChannelClosed)
         .and_then(|r| r)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_stream(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    name: &[u8], filter: &[u8],
-    max_msgs: u64, max_bytes: u64, max_age_secs: u64,
-    replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
+    filter: &[u8],
+    max_msgs: u64,
+    max_bytes: u64,
+    max_age_secs: u64,
+    replicas: u8,
+    journal_kind: u8,
+    retention: u8,
+    discard: u8,
     idempotency_window_ms: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     let buf = encode_create_stream_v2(
-        seq, name, filter, max_msgs, max_bytes, max_age_secs,
-        replicas, journal_kind, retention, discard, idempotency_window_ms,
+        seq,
+        name,
+        filter,
+        max_msgs,
+        max_bytes,
+        max_age_secs,
+        replicas,
+        journal_kind,
+        retention,
+        discard,
+        idempotency_window_ms,
     );
     request(tx, pending, seq, buf).await
 }
 
 pub(crate) async fn delete_stream(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, name: &[u8],
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_delete_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn get_stream(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, name: &[u8],
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_get_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn purge_stream(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, name: &[u8],
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_purge_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn drain_subject(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    name: &[u8], subject: &[u8],
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
+    subject: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_drain_subject_v2(seq, name, subject)).await
+    request(
+        tx,
+        pending,
+        seq,
+        encode_drain_subject_v2(seq, name, subject),
+    )
+    .await
 }
 
 pub(crate) async fn list_streams(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    offset: u32, limit: u32,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    offset: u32,
+    limit: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_list_streams_v2(seq, offset, limit)).await
@@ -96,47 +135,96 @@ pub(crate) async fn list_streams(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_consumer(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
-    max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
-    ack_wait_ms: u32, start_seq: u64,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    name: &[u8],
+    group: &[u8],
+    subject: &[u8],
+    max_inflight: u16,
+    ack_policy: u8,
+    deliver_policy: u8,
+    deliver_mode: u8,
+    ack_wait_ms: u32,
+    start_seq: u64,
     subject_limits: &[SubjectLimit<'_>],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     let buf = encode_create_consumer_v2(
-        seq, stream_id, name, group, subject, max_inflight,
-        ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+        seq,
+        stream_id,
+        name,
+        group,
+        subject,
+        max_inflight,
+        ack_policy,
+        deliver_policy,
+        deliver_mode,
+        ack_wait_ms,
+        start_seq,
         subject_limits,
     );
     request(tx, pending, seq, buf).await
 }
 
 pub(crate) async fn delete_consumer(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, consumer_id: u32,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_delete_consumer_v2(seq, consumer_id)).await
+    request(
+        tx,
+        pending,
+        seq,
+        encode_delete_consumer_v2(seq, consumer_id),
+    )
+    .await
 }
 
 pub(crate) async fn consumer_stats(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator, consumer_id: u32,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(tx, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
 }
 
 pub(crate) async fn get_consumer(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    stream_id: u32, name: &[u8],
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_get_consumer_v2(seq, stream_id, name)).await
+    request(
+        tx,
+        pending,
+        seq,
+        encode_get_consumer_v2(seq, stream_id, name),
+    )
+    .await
 }
 
 pub(crate) async fn list_consumers(
-    tx: &WriteProducer, pending: &Pending, seq_alloc: &SeqAllocator,
-    stream_id: u32, offset: u32, limit: u32,
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    offset: u32,
+    limit: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_list_consumers_v2(seq, stream_id, offset, limit)).await
+    request(
+        tx,
+        pending,
+        seq,
+        encode_list_consumers_v2(seq, stream_id, offset, limit),
+    )
+    .await
 }

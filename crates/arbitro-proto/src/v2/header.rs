@@ -51,11 +51,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct Header {
-    pub action:      U16,
-    pub flags:       u8,
+    pub action: U16,
+    pub flags: u8,
     pub entry_flags: u8,
-    pub msg_len:     U32,
-    pub seq:         U64,
+    pub msg_len: U32,
+    pub seq: U64,
 }
 
 pub const HEADER_SIZE: usize = 16;
@@ -70,11 +70,11 @@ impl Header {
     #[inline(always)]
     pub fn new(action: u16, msg_len: u32, seq: u64) -> Self {
         Self {
-            action:      U16::new(action),
-            flags:       0,
+            action: U16::new(action),
+            flags: 0,
             entry_flags: 0,
-            msg_len:     U32::new(msg_len),
-            seq:         U64::new(seq),
+            msg_len: U32::new(msg_len),
+            seq: U64::new(seq),
         }
     }
 
@@ -105,13 +105,13 @@ impl Header {
 // without renegotiating the wire layout. The header tests reference these
 // constants; do not delete them without renumbering reserved bits first.
 pub mod flag {
-    pub const ACK_REQ:        u8 = 1 << 0;
+    pub const ACK_REQ: u8 = 1 << 0;
     /// Reserved (TODO §5). Set by clients that detect retransmission;
     /// the broker does NOT use this bit for deduplication today.
-    pub const DUP:            u8 = 1 << 1;
+    pub const DUP: u8 = 1 << 1;
     /// Reserved (TODO §5). No priority queue exists yet — the broker
     /// treats high-priority publishes identically to normal ones.
-    pub const PRIORITY_HIGH:  u8 = 1 << 2;
+    pub const PRIORITY_HIGH: u8 = 1 << 2;
     // bits 3..7 reserved
 }
 
@@ -122,13 +122,13 @@ pub mod flag {
 // existing clients that already happen to set them.
 pub mod entry_flag {
     /// Reserved (TODO §5). No retain semantics implemented.
-    pub const RETAIN:           u8 = 1 << 0;
+    pub const RETAIN: u8 = 1 << 0;
     /// Reserved (TODO §5). Broker never decompresses on the read path —
     /// payloads are stored exactly as received.
-    pub const COMPRESSED:       u8 = 1 << 1;
+    pub const COMPRESSED: u8 = 1 << 1;
     /// Reserved (TODO §5). Broker has only one backpressure policy
     /// today (drop on per-conn mpsc full); this bit is not consulted.
-    pub const NO_BACKPRESSURE:  u8 = 1 << 2;
+    pub const NO_BACKPRESSURE: u8 = 1 << 2;
     // bits 3..7 reserved
 }
 

@@ -96,16 +96,19 @@ pub enum EngineError {
     },
 
     /// Config/IO error.
-    Config {
-        code: ErrorCode,
-        detail: String,
-    },
+    Config { code: ErrorCode, detail: String },
 }
 
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EngineError::StaleKey { entity, index, expected_gen, actual_gen, .. } => {
+            EngineError::StaleKey {
+                entity,
+                index,
+                expected_gen,
+                actual_gen,
+                ..
+            } => {
                 write!(f, "stale key for {entity}[{index}]: expected gen {expected_gen}, got {actual_gen}")
             }
             EngineError::NotFound { entity, .. } => {
@@ -143,43 +146,73 @@ impl EngineError {
     }
 
     pub fn stream_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::StreamNotFound, entity: "stream" }
+        EngineError::NotFound {
+            code: ErrorCode::StreamNotFound,
+            entity: "stream",
+        }
     }
 
     pub fn consumer_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::ConsumerNotFound, entity: "consumer" }
+        EngineError::NotFound {
+            code: ErrorCode::ConsumerNotFound,
+            entity: "consumer",
+        }
     }
 
     pub fn subscription_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::SubscriptionNotFound, entity: "subscription" }
+        EngineError::NotFound {
+            code: ErrorCode::SubscriptionNotFound,
+            entity: "subscription",
+        }
     }
 
     pub fn queue_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::QueueNotFound, entity: "queue" }
+        EngineError::NotFound {
+            code: ErrorCode::QueueNotFound,
+            entity: "queue",
+        }
     }
 
     pub fn connection_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::ConnectionNotFound, entity: "connection" }
+        EngineError::NotFound {
+            code: ErrorCode::ConnectionNotFound,
+            entity: "connection",
+        }
     }
 
     pub fn pending_not_found() -> Self {
-        EngineError::NotFound { code: ErrorCode::PendingNotFound, entity: "pending" }
+        EngineError::NotFound {
+            code: ErrorCode::PendingNotFound,
+            entity: "pending",
+        }
     }
 
     pub fn credit_exhausted() -> Self {
-        EngineError::LimitExceeded { code: ErrorCode::CreditExhausted, detail: "credit exhausted" }
+        EngineError::LimitExceeded {
+            code: ErrorCode::CreditExhausted,
+            detail: "credit exhausted",
+        }
     }
 
     pub fn idempotency_duplicate() -> Self {
-        EngineError::Duplicate { code: ErrorCode::IdempotencyDuplicate, entity: "idempotency key" }
+        EngineError::Duplicate {
+            code: ErrorCode::IdempotencyDuplicate,
+            entity: "idempotency key",
+        }
     }
 
     pub fn plugin_not_found(name: &'static str) -> Self {
-        EngineError::Plugin { code: ErrorCode::PluginNotFound, plugin: name }
+        EngineError::Plugin {
+            code: ErrorCode::PluginNotFound,
+            plugin: name,
+        }
     }
 
     pub fn edge_not_found(name: &'static str) -> Self {
-        EngineError::Plugin { code: ErrorCode::EdgeNotFound, plugin: name }
+        EngineError::Plugin {
+            code: ErrorCode::EdgeNotFound,
+            plugin: name,
+        }
     }
 
     pub fn consumer_config_mismatch() -> Self {
@@ -199,8 +232,14 @@ mod tests {
 
     #[test]
     fn error_codes_are_distinct() {
-        assert_ne!(ErrorCode::StaleGeneration as u16, ErrorCode::SlotVacant as u16);
-        assert_ne!(ErrorCode::StreamNotFound as u16, ErrorCode::ConsumerNotFound as u16);
+        assert_ne!(
+            ErrorCode::StaleGeneration as u16,
+            ErrorCode::SlotVacant as u16
+        );
+        assert_ne!(
+            ErrorCode::StreamNotFound as u16,
+            ErrorCode::ConsumerNotFound as u16
+        );
     }
 
     #[test]

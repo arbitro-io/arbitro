@@ -7,15 +7,15 @@
 //! (connection too slow); the tokio reactor is never starved.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
-use arbitro_proto::lifecycle::LifeCycle;
 use arbitro_common::SharedClock;
+use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::common::session::{ConnIdGen, Session, CONN_WRITE_CAP};
 
@@ -104,7 +104,6 @@ impl tokio::io::AsyncRead for ConnReader {
     }
 }
 
-
 /// TCP transport. Clone-friendly — backed by Arc.
 #[derive(Clone)]
 pub struct ConnectionRegistry {
@@ -142,7 +141,9 @@ impl ConnectionRegistry {
         let cap = write_buffer_cap.max(MIN_WRITE_BUFFER_CAP);
         Self {
             inner: Arc::new(Inner {
-                sessions: parking_lot::Mutex::new(HashMap::with_hasher(foldhash::fast::FixedState::default())),
+                sessions: parking_lot::Mutex::new(HashMap::with_hasher(
+                    foldhash::fast::FixedState::default(),
+                )),
                 conn_id_gen: ConnIdGen::new(),
                 clock: parking_lot::RwLock::new(None),
                 write_buffer_cap: cap,
@@ -206,10 +207,18 @@ impl ConnectionRegistry {
             match writer_handle.await {
                 Ok(()) => {}
                 Err(e) if e.is_panic() => {
-                    tracing::error!(target = "supervisor", conn = cid_for_log, "conn writer task panicked: {e}");
+                    tracing::error!(
+                        target = "supervisor",
+                        conn = cid_for_log,
+                        "conn writer task panicked: {e}"
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!(target = "supervisor", conn = cid_for_log, "conn writer join error: {e}");
+                    tracing::warn!(
+                        target = "supervisor",
+                        conn = cid_for_log,
+                        "conn writer join error: {e}"
+                    );
                 }
             }
         });
@@ -404,9 +413,6 @@ impl LifeCycle for ConnectionRegistry {
         let mut sessions = self.inner.sessions.lock();
         let count = sessions.len();
         sessions.clear(); // drops all Senders → writer tasks exit
-        tracing::info!(
-            "ConnectionRegistry: shutdown, closed {} sessions",
-            count
-        );
+        tracing::info!("ConnectionRegistry: shutdown, closed {} sessions", count);
     }
 }

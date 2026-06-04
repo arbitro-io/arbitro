@@ -1,5 +1,5 @@
-mod stream;
 mod consumer;
+mod stream;
 
-pub use stream::*;
 pub use consumer::*;
+pub use stream::*;

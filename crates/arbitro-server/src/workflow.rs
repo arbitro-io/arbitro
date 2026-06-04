@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::transport::registry::ConnectionRegistry;
 use arbitro_proto::wire::workflow::{
-    WorkflowInfo, InstanceInfo, encode_workflow_step, encode_workflow_error,
+    encode_workflow_error, encode_workflow_step, InstanceInfo, WorkflowInfo,
 };
 
 // ── StepConfig ─────────────────────────────────────────────────────────────
@@ -241,7 +241,9 @@ impl WorkflowRegistry {
                 inner.instances.remove(&id);
             }
             // Clean up dedup entries for this workflow.
-            inner.dedup.retain(|(wf_name, _), _| wf_name.as_ref() != name);
+            inner
+                .dedup
+                .retain(|(wf_name, _), _| wf_name.as_ref() != name);
             info!(name = %String::from_utf8_lossy(name), "workflow deleted");
         }
         existed
@@ -249,11 +251,7 @@ impl WorkflowRegistry {
 
     /// Trigger a workflow by subject match. Returns a list of
     /// (conn_id, step_frame) for the first step to be sent.
-    pub fn trigger(
-        &self,
-        subject: &[u8],
-        initial_context: &[u8],
-    ) -> Vec<(u64, Bytes)> {
+    pub fn trigger(&self, subject: &[u8], initial_context: &[u8]) -> Vec<(u64, Bytes)> {
         let mut inner = self.inner.lock();
         let mut results = Vec::new();
 
@@ -347,13 +345,7 @@ impl WorkflowRegistry {
 
             inner.instances.insert(instance_id, instance);
 
-            let frame = encode_workflow_step(
-                0,
-                &name,
-                instance_id,
-                0,
-                initial_context,
-            );
+            let frame = encode_workflow_step(0, &name, instance_id, 0, initial_context);
             results.push((conn_id, frame));
 
             debug!(
@@ -370,12 +362,7 @@ impl WorkflowRegistry {
     /// Advance a workflow instance after receiving a step result.
     /// Returns Some((conn_id, frame)) for the next step, or None if
     /// the workflow completed or errored.
-    pub fn advance(
-        &self,
-        instance_id: u32,
-        ok: bool,
-        new_context: &[u8],
-    ) -> Option<(u64, Bytes)> {
+    pub fn advance(&self, instance_id: u32, ok: bool, new_context: &[u8]) -> Option<(u64, Bytes)> {
         let mut inner = self.inner.lock();
 
         // Extract instance state first.
@@ -411,13 +398,8 @@ impl WorkflowRegistry {
                 inst.running_conn = Some(conn_id);
                 inst.running_since = Some(Instant::now());
 
-                let frame = encode_workflow_step(
-                    0,
-                    &name,
-                    instance_id,
-                    current_step,
-                    &context_clone,
-                );
+                let frame =
+                    encode_workflow_step(0, &name, instance_id, current_step, &context_clone);
                 return Some((conn_id, frame));
             }
 
@@ -467,13 +449,7 @@ impl WorkflowRegistry {
         inst.running_conn = Some(conn_id);
         inst.running_since = Some(Instant::now());
 
-        let frame = encode_workflow_step(
-            0,
-            &name,
-            instance_id,
-            next_step,
-            new_context,
-        );
+        let frame = encode_workflow_step(0, &name, instance_id, next_step, new_context);
         Some((conn_id, frame))
     }
 
@@ -559,8 +535,7 @@ impl WorkflowRegistry {
                     }
                 }
                 if slot.timeout_ms > 0
-                    && inst.created_at.elapsed()
-                        > Duration::from_millis(slot.timeout_ms as u64)
+                    && inst.created_at.elapsed() > Duration::from_millis(slot.timeout_ms as u64)
                 {
                     return Some((id, inst.current_step));
                 }

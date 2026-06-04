@@ -44,7 +44,10 @@ impl CommandLog {
     }
 
     /// Open with a specific fsync policy.
-    pub fn open_with_policy(path: impl Into<PathBuf>, fsync_policy: FsyncPolicy) -> std::io::Result<Self> {
+    pub fn open_with_policy(
+        path: impl Into<PathBuf>,
+        fsync_policy: FsyncPolicy,
+    ) -> std::io::Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -56,7 +59,11 @@ impl CommandLog {
             .read(true)
             .open(&path)?;
 
-        Ok(Self { path, file, fsync_policy })
+        Ok(Self {
+            path,
+            file,
+            fsync_policy,
+        })
     }
 
     /// Append a raw metadata command to the log.
@@ -180,7 +187,9 @@ pub struct SharedCommandLog {
 
 impl SharedCommandLog {
     pub fn new(log: CommandLog) -> Self {
-        Self { inner: Arc::new(Mutex::new(log)) }
+        Self {
+            inner: Arc::new(Mutex::new(log)),
+        }
     }
 
     /// Record a raw metadata command. Cold path — Mutex is fine.
@@ -226,10 +235,10 @@ impl LifeCycle for CommandLog {
 mod tests {
     use super::*;
     use arbitro_proto::metadata::*;
-    use arbitro_proto::wire::stream::{CreateStreamFixed, CreateStreamView};
     use arbitro_proto::wire::manager::{DeleteConsumerAction, DeleteConsumerView};
-    use zerocopy::IntoBytes;
+    use arbitro_proto::wire::stream::{CreateStreamFixed, CreateStreamView};
     use zerocopy::byteorder::little_endian::{U16, U32, U64};
+    use zerocopy::IntoBytes;
 
     /// Test applier that collects raw commands.
     struct CollectApplier {
@@ -237,7 +246,11 @@ mod tests {
     }
 
     impl CollectApplier {
-        fn new() -> Self { Self { commands: Vec::new() } }
+        fn new() -> Self {
+            Self {
+                commands: Vec::new(),
+            }
+        }
     }
 
     impl MetadataApplier for CollectApplier {
@@ -249,8 +262,13 @@ mod tests {
     fn tmp_path() -> PathBuf {
         let dir = std::env::temp_dir().join("arbitro-test-cmdlog");
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("test-{}.log", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))
+        dir.join(format!(
+            "test-{}.log",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]

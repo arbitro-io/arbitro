@@ -10,8 +10,8 @@
 //! Resolution is 1 ms which is fine for timestamping store entries —
 //! age-based eviction and idempotency windows operate in seconds.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Shared cached "now" in milliseconds since the UNIX epoch.
@@ -46,7 +46,9 @@ struct ClockInner {
 }
 
 impl Default for SharedClock {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SharedClock {

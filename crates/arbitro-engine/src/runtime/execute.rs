@@ -81,16 +81,13 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
                     for ack in entries.iter() {
-                        if let Some(pos) =
-                            binding.pending.iter().position(|p| p.seq == ack.seq)
-                        {
+                        if let Some(pos) = binding.pending.iter().position(|p| p.seq == ack.seq) {
                             let pending = binding.pending.swap_remove(pos);
                             binding.pending_seqs.remove(&pending.seq);
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
-                            ctx.inflight
-                                .dec_pending(consumer_id.raw(), queue_raw);
+                            ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
                         }
                     }
@@ -118,16 +115,13 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
                     for ack in entries.iter() {
-                        if let Some(pos) =
-                            binding.pending.iter().position(|p| p.seq == ack.seq)
-                        {
+                        if let Some(pos) = binding.pending.iter().position(|p| p.seq == ack.seq) {
                             let pending = binding.pending.swap_remove(pos);
                             binding.pending_seqs.remove(&pending.seq);
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
-                            ctx.inflight
-                                .dec_pending(consumer_id.raw(), queue_raw);
+                            ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
                         }
                     }
@@ -140,8 +134,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
         }
 
         Command::PublishAccepted { .. } => {
-            m.publish_entries_accepted
-                .fetch_add(1, Ordering::Relaxed);
+            m.publish_entries_accepted.fetch_add(1, Ordering::Relaxed);
         }
 
         Command::Tombstone { reason, .. } => match reason {

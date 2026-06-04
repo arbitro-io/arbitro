@@ -97,7 +97,8 @@ pub struct MatchTable {
     /// F32: parallel HashSet keyed by subject_hash that mirrors `exact`
     /// for O(1) dedup on `add_exact` — the Vec is still the source of
     /// truth for ordered iteration at lookup time.
-    exact_dedup: HashMap<u32, HashSet<MatchEntry, foldhash::fast::FixedState>, foldhash::fast::FixedState>,
+    exact_dedup:
+        HashMap<u32, HashSet<MatchEntry, foldhash::fast::FixedState>, foldhash::fast::FixedState>,
 
     /// Wildcard subscriptions that match all subjects on a stream.
     /// These are appended to every lookup result.
@@ -180,8 +181,10 @@ impl MatchTable {
 
     /// Remove all entries for a subscription.
     pub fn remove_subscription(&mut self, subscription_id: SubscriptionId) {
-        self.catch_all.retain(|e| e.subscription_id != subscription_id);
-        self.catch_all_dedup.retain(|e| e.subscription_id != subscription_id);
+        self.catch_all
+            .retain(|e| e.subscription_id != subscription_id);
+        self.catch_all_dedup
+            .retain(|e| e.subscription_id != subscription_id);
 
         self.exact.retain(|_, entries| {
             entries.retain(|e| e.subscription_id != subscription_id);
@@ -192,8 +195,12 @@ impl MatchTable {
             !set.is_empty()
         });
 
-        let had_patterns = self.patterns.iter().any(|(_, e)| e.subscription_id == subscription_id);
-        self.patterns.retain(|(_, e)| e.subscription_id != subscription_id);
+        let had_patterns = self
+            .patterns
+            .iter()
+            .any(|(_, e)| e.subscription_id == subscription_id);
+        self.patterns
+            .retain(|(_, e)| e.subscription_id != subscription_id);
         if had_patterns {
             self.rebuild_pattern_trie();
         }
@@ -209,8 +216,7 @@ impl MatchTable {
         }
         self.exact_dedup.clear();
         for (h, entries) in &self.exact {
-            let mut set =
-                HashSet::with_hasher(foldhash::fast::FixedState::default());
+            let mut set = HashSet::with_hasher(foldhash::fast::FixedState::default());
             for e in entries {
                 set.insert(*e);
             }
@@ -224,7 +230,9 @@ impl MatchTable {
     /// For new subjects with patterns, resolves and caches.
     #[inline]
     pub fn lookup(&self, subject_hash: u32) -> MatchResult<'_> {
-        let exact = self.exact.get(&subject_hash)
+        let exact = self
+            .exact
+            .get(&subject_hash)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
@@ -295,11 +303,7 @@ impl MatchTable {
     /// Resolve wildcard subject limits without mutating self.
     /// Used by drain thread on a snapshot. Returns the min limit found,
     /// or None if no wildcard patterns match.
-    pub fn resolve_subject_limit_readonly(
-        &self,
-        subject_hash: u32,
-        subject: &[u8],
-    ) -> Option<u32> {
+    pub fn resolve_subject_limit_readonly(&self, subject_hash: u32, subject: &[u8]) -> Option<u32> {
         // Already resolved (literal or previous resolve_patterns call)?
         if let Some(&limit) = self.max_subject_inflights.get(&subject_hash) {
             return Some(limit);
@@ -330,7 +334,11 @@ impl MatchTable {
 
     /// Set the connection_id on all match entries for a subscription.
     /// Called at bind time. O(S + C + P) where S = subjects, C = catch_all, P = patterns.
-    pub fn bind_subscription(&mut self, subscription_id: SubscriptionId, connection_id: ConnectionId) {
+    pub fn bind_subscription(
+        &mut self,
+        subscription_id: SubscriptionId,
+        connection_id: ConnectionId,
+    ) {
         for entries in self.exact.values_mut() {
             for e in entries.iter_mut() {
                 if e.subscription_id == subscription_id {
@@ -386,9 +394,8 @@ impl MatchTable {
         connection_id: ConnectionId,
         binding_idx: u32,
     ) {
-        let matches = |e: &MatchEntry| {
-            e.consumer_id == consumer_id && e.connection_id == connection_id
-        };
+        let matches =
+            |e: &MatchEntry| e.consumer_id == consumer_id && e.connection_id == connection_id;
         for entries in self.exact.values_mut() {
             for e in entries.iter_mut() {
                 if matches(e) {
@@ -414,13 +421,19 @@ impl MatchTable {
     }
 
     /// Number of exact subject mappings.
-    pub fn exact_count(&self) -> usize { self.exact.len() }
+    pub fn exact_count(&self) -> usize {
+        self.exact.len()
+    }
 
     /// Number of catch-all subscriptions.
-    pub fn catch_all_count(&self) -> usize { self.catch_all.len() }
+    pub fn catch_all_count(&self) -> usize {
+        self.catch_all.len()
+    }
 
     /// Number of pattern subscriptions.
-    pub fn pattern_count(&self) -> usize { self.patterns.len() }
+    pub fn pattern_count(&self) -> usize {
+        self.patterns.len()
+    }
 
     // ── Trie rebuild (management path) ─────────────────────────────────────
 
@@ -461,7 +474,9 @@ impl MatchTable {
 }
 
 impl Default for MatchTable {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Result of a match table lookup. Combines exact + catch-all.
@@ -517,13 +532,22 @@ mod tests {
             connection_id: ConnectionId(42),
             binding_idx: BINDING_IDX_UNBOUND,
         };
-        let b = MatchEntry { binding_idx: 7, ..a };
-        let c = MatchEntry { binding_idx: 99, ..a };
+        let b = MatchEntry {
+            binding_idx: 7,
+            ..a
+        };
+        let c = MatchEntry {
+            binding_idx: 99,
+            ..a
+        };
         assert_eq!(a, b, "binding_idx must NOT participate in PartialEq");
         assert_eq!(b, c, "binding_idx must NOT participate in PartialEq");
 
         // Other fields DO participate
-        let d = MatchEntry { consumer_id: ConsumerId(2), ..a };
+        let d = MatchEntry {
+            consumer_id: ConsumerId(2),
+            ..a
+        };
         assert_ne!(a, d);
     }
 
@@ -532,28 +556,40 @@ mod tests {
         // Simulates the snapshot rebuild: same subscription inserted
         // twice with different binding_idx stamps must not duplicate.
         let mut mt = MatchTable::new();
-        let e0 = MatchEntry { binding_idx: BINDING_IDX_UNBOUND, ..entry(1, 10, 100) };
+        let e0 = MatchEntry {
+            binding_idx: BINDING_IDX_UNBOUND,
+            ..entry(1, 10, 100)
+        };
         mt.add_exact(0xBEEF, e0);
-        let e1 = MatchEntry { binding_idx: 42, ..entry(1, 10, 100) };
+        let e1 = MatchEntry {
+            binding_idx: 42,
+            ..entry(1, 10, 100)
+        };
         mt.add_exact(0xBEEF, e1);
 
         let r = mt.lookup(0xBEEF);
-        assert_eq!(r.count(), 1, "re-insert with different binding_idx must dedup");
+        assert_eq!(
+            r.count(),
+            1,
+            "re-insert with different binding_idx must dedup"
+        );
     }
 
     #[test]
     fn set_binding_idx_for_stamps_all_locations() {
         let mut mt = MatchTable::new();
-        let e_exact = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
-        let e_catch = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
+        let e_exact = MatchEntry {
+            connection_id: ConnectionId(5),
+            ..entry(1, 10, 100)
+        };
+        let e_catch = MatchEntry {
+            connection_id: ConnectionId(5),
+            ..entry(1, 10, 100)
+        };
         mt.add_exact(0xBEEF, e_exact);
         mt.add_catch_all(e_catch);
 
-        mt.set_binding_idx_for(
-            ConsumerId(1),
-            ConnectionId(5),
-            777,
-        );
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
 
         let r = mt.lookup(0xBEEF);
         assert!(r.exact.iter().all(|e| e.binding_idx == 777));
@@ -564,17 +600,19 @@ mod tests {
     fn set_binding_idx_only_stamps_matching_pair() {
         let mut mt = MatchTable::new();
         // Two different (consumer, connection) pairs on the same subject.
-        let e1 = MatchEntry { connection_id: ConnectionId(5), ..entry(1, 10, 100) };
-        let e2 = MatchEntry { connection_id: ConnectionId(6), ..entry(2, 20, 200) };
+        let e1 = MatchEntry {
+            connection_id: ConnectionId(5),
+            ..entry(1, 10, 100)
+        };
+        let e2 = MatchEntry {
+            connection_id: ConnectionId(6),
+            ..entry(2, 20, 200)
+        };
         mt.add_exact(0xBEEF, e1);
         mt.add_exact(0xBEEF, e2);
 
         // Stamp only (consumer 1, conn 5)
-        mt.set_binding_idx_for(
-            ConsumerId(1),
-            ConnectionId(5),
-            777,
-        );
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
 
         let r = mt.lookup(0xBEEF);
         let mut seen_777 = 0;
@@ -595,8 +633,14 @@ mod tests {
         // A single binding (consumer 1, conn 5) might have MULTIPLE subscriptions
         // (different patterns). All must get the same binding_idx.
         let mut mt = MatchTable::new();
-        let e_sub_a = MatchEntry { subscription_id: SubscriptionId(100), ..entry(1, 10, 100) };
-        let e_sub_b = MatchEntry { subscription_id: SubscriptionId(101), ..entry(1, 10, 101) };
+        let e_sub_a = MatchEntry {
+            subscription_id: SubscriptionId(100),
+            ..entry(1, 10, 100)
+        };
+        let e_sub_b = MatchEntry {
+            subscription_id: SubscriptionId(101),
+            ..entry(1, 10, 101)
+        };
         let mut e_sub_a = e_sub_a;
         let mut e_sub_b = e_sub_b;
         e_sub_a.connection_id = ConnectionId(5);
@@ -719,5 +763,4 @@ mod tests {
         assert!(subject_matches(b"*.orders.>", b"eu.orders.updated.v2"));
         assert!(!subject_matches(b"*.orders.>", b"us.users.created"));
     }
-
 }

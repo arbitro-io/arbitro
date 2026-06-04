@@ -1,7 +1,7 @@
 //! arbitro-server — TCP message broker.
 
-use arbitro_server::{ArbitroServer, Config};
 use arbitro_server::command_log::{CommandLog, SharedCommandLog};
+use arbitro_server::{ArbitroServer, Config};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

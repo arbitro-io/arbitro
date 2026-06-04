@@ -8,8 +8,9 @@ pub mod deliver_frame;
 pub mod rep_frame;
 
 pub use deliver_frame::{
-    DeliverFrame, DeliverBody, DELIVER_BODY_FIXED,
-    DeliverBatchHeader, DELIVER_BATCH_HEADER_FIXED,
-    DeliverBatchEntry, DELIVER_BATCH_ENTRY_FIXED,
+    DeliverBatchEntry, DeliverBatchHeader, DeliverBody, DeliverFrame, DELIVER_BATCH_ENTRY_FIXED,
+    DELIVER_BATCH_HEADER_FIXED, DELIVER_BODY_FIXED,
 };
-pub use rep_frame::{RepOkFrame, RepOkBody, REP_OK_BODY_SIZE, RepErrFrame, RepErrBody, REP_ERR_BODY_SIZE};
+pub use rep_frame::{
+    RepErrBody, RepErrFrame, RepOkBody, RepOkFrame, REP_ERR_BODY_SIZE, REP_OK_BODY_SIZE,
+};

@@ -10,9 +10,9 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use arbitro_client_tokio::{Client, ClientConfig};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,13 +27,18 @@ async fn start_server() -> String {
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(64);
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
@@ -43,7 +48,7 @@ async fn connect(addr: &str) -> Client {
 async fn wildcard_subject_fanout_correct() {
     const MSG_COUNT: u32 = 100;
 
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     // ── set up stream ────────────────────────────────────────────────────────
@@ -61,12 +66,12 @@ async fn wildcard_subject_fanout_correct() {
         .create_consumer(
             stream_id,
             b"deliver-consumer",
-            b"",   // group
-            b"",   // subject = catch-all
-            256,   // max_inflight
-            0,     // ack_policy = None
-            0,     // deliver_policy = All (from beginning)
-            0,     // deliver_mode = Push
+            b"", // group
+            b"", // subject = catch-all
+            256, // max_inflight
+            0,   // ack_policy = None
+            0,   // deliver_policy = All (from beginning)
+            0,   // deliver_mode = Push
             30_000,
             0,
         )
@@ -86,7 +91,11 @@ async fn wildcard_subject_fanout_correct() {
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
             pub_client
-                .publish(stream_id, b"deliver.test", Bytes::from(i.to_le_bytes().to_vec()))
+                .publish(
+                    stream_id,
+                    b"deliver.test",
+                    Bytes::from(i.to_le_bytes().to_vec()),
+                )
                 .expect("publish");
         }
     });
@@ -114,7 +123,10 @@ async fn wildcard_subject_fanout_correct() {
         }
     }
 
-    assert_eq!(received, MSG_COUNT, "must receive exactly {MSG_COUNT} messages");
+    assert_eq!(
+        received, MSG_COUNT,
+        "must receive exactly {MSG_COUNT} messages"
+    );
 
     // ── clean up ─────────────────────────────────────────────────────────────
     drop(sub);
@@ -133,46 +145,60 @@ async fn wildcard_subject_fanout_correct() {
 async fn two_consumers_independent_streams_no_crosstalk() {
     const MSG_COUNT: u32 = 50;
 
-    let addr   = start_server().await;
+    let addr = start_server().await;
     let client = connect(&addr).await;
 
     // ── Stream A + consumer A ─────────────────────────────────────────────────
     let resp_sa = client
         .create_stream(b"demux-stream-a", b">", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await.expect("create stream A");
+        .await
+        .expect("create stream A");
     let stream_a = u64::from_le_bytes(resp_sa[..8].try_into().unwrap()) as u32;
 
     let resp_ca = client
         .create_consumer(stream_a, b"cons-a", b"", b"", 256, 0, 0, 0, 30_000, 0)
-        .await.expect("create consumer A");
+        .await
+        .expect("create consumer A");
     let cons_a = u64::from_le_bytes(resp_ca[..8].try_into().unwrap()) as u32;
 
     // ── Stream B + consumer B ─────────────────────────────────────────────────
     let resp_sb = client
         .create_stream(b"demux-stream-b", b">", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await.expect("create stream B");
+        .await
+        .expect("create stream B");
     let stream_b = u64::from_le_bytes(resp_sb[..8].try_into().unwrap()) as u32;
 
     let resp_cb = client
         .create_consumer(stream_b, b"cons-b", b"", b"", 256, 0, 0, 0, 30_000, 0)
-        .await.expect("create consumer B");
+        .await
+        .expect("create consumer B");
     let cons_b = u64::from_le_bytes(resp_cb[..8].try_into().unwrap()) as u32;
 
     // ── subscribe (catch-all filter) ─────────────────────────────────────────
-    let mut sub_a = client.subscribe(stream_a, cons_a, b"").await.expect("subscribe A");
-    let mut sub_b = client.subscribe(stream_b, cons_b, b"").await.expect("subscribe B");
+    let mut sub_a = client
+        .subscribe(stream_a, cons_a, b"")
+        .await
+        .expect("subscribe A");
+    let mut sub_b = client
+        .subscribe(stream_b, cons_b, b"")
+        .await
+        .expect("subscribe B");
 
     // ── publish to each stream independently ─────────────────────────────────
     let pub_a = client.clone();
     let pub_b = client.clone();
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
-            pub_a.publish(stream_a, b"a.subj", Bytes::from(i.to_le_bytes().to_vec())).expect("pub A");
+            pub_a
+                .publish(stream_a, b"a.subj", Bytes::from(i.to_le_bytes().to_vec()))
+                .expect("pub A");
         }
     });
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
-            pub_b.publish(stream_b, b"b.subj", Bytes::from(i.to_le_bytes().to_vec())).expect("pub B");
+            pub_b
+                .publish(stream_b, b"b.subj", Bytes::from(i.to_le_bytes().to_vec()))
+                .expect("pub B");
         }
     });
 
@@ -182,7 +208,9 @@ async fn two_consumers_independent_streams_no_crosstalk() {
             let mut n = 0u32;
             while n < MSG_COUNT {
                 tokio::time::timeout(Duration::from_secs(10), sub_a.recv())
-                    .await.expect("timeout A").expect("channel A closed");
+                    .await
+                    .expect("timeout A")
+                    .expect("channel A closed");
                 n += 1;
             }
             n
@@ -191,7 +219,9 @@ async fn two_consumers_independent_streams_no_crosstalk() {
             let mut n = 0u32;
             while n < MSG_COUNT {
                 tokio::time::timeout(Duration::from_secs(10), sub_b.recv())
-                    .await.expect("timeout B").expect("channel B closed");
+                    .await
+                    .expect("timeout B")
+                    .expect("channel B closed");
                 n += 1;
             }
             n

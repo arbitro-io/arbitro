@@ -7,15 +7,21 @@
 //! Replies for create/delete/get use the existing `egress::rep_frame::RepOkFrame`
 //! / `RepErrFrame`. Lists use `egress::list_reply::ListReplyFrame`.
 
-pub mod stream_mgmt;
 pub mod consumer_mgmt;
+pub mod stream_mgmt;
 
-pub use stream_mgmt::{
-    CreateStreamBody, CreateStreamFrame, CREATE_STREAM_BODY_FIXED,
-    // ListStreams + Delete/Get/Purge/DrainSubject migrated to v2::cold.
-};
 pub use consumer_mgmt::{
-    CreateConsumerBody, CreateConsumerFrame, CREATE_CONSUMER_BODY_FIXED,
+    subject_limits_tail_len,
+    CreateConsumerBody,
+    CreateConsumerFrame,
     // ListConsumers + ConsumerStats + Delete/Get/Pause/Resume migrated to v2::cold.
-    SubjectLimit, SUBJECT_LIMIT_HEADER_SIZE, subject_limits_tail_len,
+    SubjectLimit,
+    CREATE_CONSUMER_BODY_FIXED,
+    SUBJECT_LIMIT_HEADER_SIZE,
+};
+pub use stream_mgmt::{
+    CreateStreamBody,
+    CreateStreamFrame,
+    CREATE_STREAM_BODY_FIXED,
+    // ListStreams + Delete/Get/Purge/DrainSubject migrated to v2::cold.
 };

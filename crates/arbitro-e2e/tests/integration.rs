@@ -78,7 +78,10 @@ async fn test_publish_ack_cycle() {
     let entries: Vec<BatchEntry<'_>> = (0..100)
         .map(|_| BatchEntry::new(b"orders.new", Bytes::copy_from_slice(b"test-payload")))
         .collect();
-    client.publish_batch_sync(sid, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(sid, &entries)
+        .await
+        .expect("publish_batch");
 
     for _ in 0..100 {
         let msg = sub.recv().await.unwrap();
@@ -99,7 +102,10 @@ async fn test_publish_batch() {
     let entries: Vec<BatchEntry<'_>> = (0..1000)
         .map(|_| BatchEntry::new(b"batch.msg", Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch_sync(sid, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(sid, &entries)
+        .await
+        .expect("publish_batch");
     server.shutdown().await;
 }
 
@@ -201,7 +207,10 @@ async fn test_replay_publish_then_subscribe() {
     let entries: Vec<BatchEntry<'_>> = (0..500)
         .map(|_| BatchEntry::new(b"replay.evt", Bytes::copy_from_slice(b"data")))
         .collect();
-    client.publish_batch_sync(sid, &entries).await.expect("publish_batch");
+    client
+        .publish_batch_sync(sid, &entries)
+        .await
+        .expect("publish_batch");
 
     let resp = client
         .create_consumer(sid, b"replayer", b"", b"", u16::MAX, 0, 0, 0, 0, 0)

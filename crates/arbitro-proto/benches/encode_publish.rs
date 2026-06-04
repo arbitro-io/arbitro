@@ -28,9 +28,9 @@ use std::time::Instant;
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use arbitro_proto::wire::publish::PublishEntry;
-use arbitro_proto::v2::ingress::pub_frame::PubFrame;
 use arbitro_proto::v2::header::Header;
+use arbitro_proto::v2::ingress::pub_frame::PubFrame;
+use arbitro_proto::wire::publish::PublishEntry;
 
 // User's idea: combine the v2 Header + subject_len into a single SIZED
 // struct. Build it as a struct literal, serialize via `as_bytes()`
@@ -40,9 +40,9 @@ use arbitro_proto::v2::header::Header;
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 struct PublishFixed {
-    header: Header,    // 16 B
-    subject_len: U16,  //  2 B  (LE u16)
-    _pad: [u8; 6],     //  6 B  (align to 24 = multiple of 8)
+    header: Header,   // 16 B
+    subject_len: U16, //  2 B  (LE u16)
+    _pad: [u8; 6],    //  6 B  (align to 24 = multiple of 8)
 }
 const PUBLISH_FIXED_SIZE: usize = core::mem::size_of::<PublishFixed>();
 const _: () = assert!(PUBLISH_FIXED_SIZE == 24);
@@ -51,12 +51,12 @@ const _: () = assert!(PUBLISH_FIXED_SIZE == 24);
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 struct BatchHeader {
-    count:     U32, // 4
-    data_len:  U32, // 4
-    subj_len:  U16, // 2
+    count: U32,     // 4
+    data_len: U32,  // 4
+    subj_len: U16,  // 2
     reply_len: U16, // 2
-    flags:     u8,  // 1
-    _pad:      [u8; 3], // 3
+    flags: u8,      // 1
+    _pad: [u8; 3],  // 3
 }
 const BATCH_HEADER_SIZE: usize = core::mem::size_of::<BatchHeader>(); // = 16
 const _: () = assert!(BATCH_HEADER_SIZE == 16);
@@ -65,11 +65,11 @@ const _: () = assert!(BATCH_HEADER_SIZE == 16);
 #[inline]
 fn encode_piecewise(subject: &[u8], payload: &[u8]) -> Vec<u8> {
     let entry = PublishEntry {
-        data_len:  U32::new(payload.len() as u32),
-        subj_len:  U16::new(subject.len() as u16),
+        data_len: U32::new(payload.len() as u32),
+        subj_len: U16::new(subject.len() as u16),
         reply_len: U16::new(0),
         flags: 0,
-        _pad:  [0u8; 3],
+        _pad: [0u8; 3],
     };
     let body_len = 4 + 12 + subject.len() + payload.len();
     let mut body = Vec::with_capacity(body_len);
@@ -84,12 +84,12 @@ fn encode_piecewise(subject: &[u8], payload: &[u8]) -> Vec<u8> {
 #[inline]
 fn encode_fixed_struct(subject: &[u8], payload: &[u8]) -> Vec<u8> {
     let hdr = BatchHeader {
-        count:     U32::new(1),
-        data_len:  U32::new(payload.len() as u32),
-        subj_len:  U16::new(subject.len() as u16),
+        count: U32::new(1),
+        data_len: U32::new(payload.len() as u32),
+        subj_len: U16::new(subject.len() as u16),
         reply_len: U16::new(0),
-        flags:     0,
-        _pad:      [0u8; 3],
+        flags: 0,
+        _pad: [0u8; 3],
     };
     let total = BATCH_HEADER_SIZE + subject.len() + payload.len();
     let mut body = Vec::with_capacity(total);
@@ -172,8 +172,11 @@ fn encode_libc_memcpy(subject: &[u8], payload: &[u8]) -> Vec<u8> {
         let p = buf.as_mut_ptr();
         memcpy(p, pf_bytes.as_ptr(), PUBLISH_FIXED_SIZE);
         memcpy(p.add(PUBLISH_FIXED_SIZE), subject.as_ptr(), subject.len());
-        memcpy(p.add(PUBLISH_FIXED_SIZE + subject.len()),
-               payload.as_ptr(), payload.len());
+        memcpy(
+            p.add(PUBLISH_FIXED_SIZE + subject.len()),
+            payload.as_ptr(),
+            payload.len(),
+        );
     }
     buf
 }
@@ -188,14 +191,13 @@ fn encode_libc_memcpy(subject: &[u8], payload: &[u8]) -> Vec<u8> {
 fn encode_sized_as_bytes(subject: &[u8], payload: &[u8]) -> Vec<u8> {
     let msg_len = (PUBLISH_FIXED_SIZE - 16 + subject.len() + payload.len()) as u32;
     let pf = PublishFixed {
-        header: Header::new(0x0101 /*Action::Publish*/, msg_len, 1)
-            .with_flags(0),
+        header: Header::new(0x0101 /*Action::Publish*/, msg_len, 1).with_flags(0),
         subject_len: U16::new(subject.len() as u16),
         _pad: [0u8; 6],
     };
     let total = PUBLISH_FIXED_SIZE + subject.len() + payload.len();
     let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(pf.as_bytes());      // ← 24 B header in one go
+    buf.extend_from_slice(pf.as_bytes()); // ← 24 B header in one go
     buf.extend_from_slice(subject);
     buf.extend_from_slice(payload);
     buf
@@ -229,26 +231,28 @@ fn encode_v2_raw(subject: &[u8], payload: &[u8]) -> Vec<u8> {
         // offset  3:     entry_flags  u8     = 0
         // offset  4..8:  msg_len      u32 LE
         // offset  8..16: seq          u64 LE = 1
-        (p           as *mut u16).write_unaligned(0x0101u16.to_le());
-        *p.add(2) = 0;     // flags
-        *p.add(3) = 0;     // entry_flags
-        (p.add(4)    as *mut u32).write_unaligned(msg_len.to_le());
-        (p.add(8)    as *mut u64).write_unaligned(1u64.to_le());
+        (p as *mut u16).write_unaligned(0x0101u16.to_le());
+        *p.add(2) = 0; // flags
+        *p.add(3) = 0; // entry_flags
+        (p.add(4) as *mut u32).write_unaligned(msg_len.to_le());
+        (p.add(8) as *mut u64).write_unaligned(1u64.to_le());
 
         // ── PubBody (8B) ────────────────────────────────────────────
         // offset 16..20: stream_id   u32 LE = 0
         // offset 20..22: subject_len u16 LE
         // offset 22..24: _pad        u16 LE = 0
-        (p.add(16)   as *mut u32).write_unaligned(0u32);
-        (p.add(20)   as *mut u16).write_unaligned((subject.len() as u16).to_le());
-        (p.add(22)   as *mut u16).write_unaligned(0u16);
+        (p.add(16) as *mut u32).write_unaligned(0u32);
+        (p.add(20) as *mut u16).write_unaligned((subject.len() as u16).to_le());
+        (p.add(22) as *mut u16).write_unaligned(0u16);
 
         // ── Tail (subject || payload) ──────────────────────────────
         let tail_off = HEADER_SIZE + PUB_BODY_FIXED;
+        std::ptr::copy_nonoverlapping(subject.as_ptr(), p.add(tail_off), subject.len());
         std::ptr::copy_nonoverlapping(
-            subject.as_ptr(), p.add(tail_off), subject.len());
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(), p.add(tail_off + subject.len()), payload.len());
+            payload.as_ptr(),
+            p.add(tail_off + subject.len()),
+            payload.len(),
+        );
     }
     buf
 }
@@ -261,15 +265,17 @@ fn encode_v2_pubframe(subject: &[u8], payload: &[u8]) -> Vec<u8> {
     let size = PubFrame::wire_size(subject.len(), 0, payload.len());
     // SAFETY: encode_into writes every byte before any read.
     let mut buf = Vec::<u8>::with_capacity(size);
-    unsafe { buf.set_len(size); }
+    unsafe {
+        buf.set_len(size);
+    }
     let _ = PubFrame::encode_into(
         &mut buf,
-        /*seq*/         1,
-        /*stream_id*/   0,
-        /*flags*/       0,
+        /*seq*/ 1,
+        /*stream_id*/ 0,
+        /*flags*/ 0,
         /*entry_flags*/ 0,
         subject,
-        /*msg_id*/      &[],
+        /*msg_id*/ &[],
         payload,
     );
     buf
@@ -287,17 +293,15 @@ fn encode_inplace(subject: &[u8], payload: &[u8]) -> Vec<u8> {
         let p = body.as_mut_ptr();
         // count + data_len + subj_len + reply_len in one shot, four LE
         // unaligned stores. No `[u8; 4]` stack temporaries.
-        (p           as *mut u32).write_unaligned(1u32.to_le());
-        (p.add(4)    as *mut u32).write_unaligned((payload.len() as u32).to_le());
-        (p.add(8)    as *mut u16).write_unaligned((subject.len() as u16).to_le());
-        (p.add(10)   as *mut u16).write_unaligned(0u16.to_le());
+        (p as *mut u32).write_unaligned(1u32.to_le());
+        (p.add(4) as *mut u32).write_unaligned((payload.len() as u32).to_le());
+        (p.add(8) as *mut u16).write_unaligned((subject.len() as u16).to_le());
+        (p.add(10) as *mut u16).write_unaligned(0u16.to_le());
         // flags + 3 pad bytes — single u32 zero store.
-        (p.add(12)   as *mut u32).write_unaligned(0u32);
+        (p.add(12) as *mut u32).write_unaligned(0u32);
         // Variable-length suffix.
-        std::ptr::copy_nonoverlapping(
-            subject.as_ptr(), p.add(16), subject.len());
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(), p.add(16 + subject.len()), payload.len());
+        std::ptr::copy_nonoverlapping(subject.as_ptr(), p.add(16), subject.len());
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(16 + subject.len()), payload.len());
     }
     body
 }
@@ -318,13 +322,22 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
     let e = encode_v2_raw(subject, &payload);
     assert_eq!(a, b, "piecewise vs fixed_struct mismatch");
     assert_eq!(a, c, "piecewise vs inplace mismatch");
-    assert_eq!(d.len(), 16 + 8 + subject.len() + payload.len(),
-               "v2 pubframe wire size mismatch");
-    assert_eq!(d, e, "v2_pubframe (zerocopy) vs v2_raw (unsafe ptr) mismatch");
+    assert_eq!(
+        d.len(),
+        16 + 8 + subject.len() + payload.len(),
+        "v2 pubframe wire size mismatch"
+    );
+    assert_eq!(
+        d, e,
+        "v2_pubframe (zerocopy) vs v2_raw (unsafe ptr) mismatch"
+    );
 
     fn run(iters: usize, f: impl Fn() -> Vec<u8>) -> u128 {
         // Warmup
-        for _ in 0..1000 { let v = f(); black_box(v); }
+        for _ in 0..1000 {
+            let v = f();
+            black_box(v);
+        }
         let t0 = Instant::now();
         for _ in 0..iters {
             let v = f();
@@ -334,18 +347,23 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
     }
 
     println!("\n── {name} (payload={payload_size}B, iters={iters}) ──");
-    println!("{:<18} {:>10} {:>14} {:>14}",
-             "variant", "min ns/op", "mean ns/op", "ops/sec");
+    println!(
+        "{:<18} {:>10} {:>14} {:>14}",
+        "variant", "min ns/op", "mean ns/op", "ops/sec"
+    );
     println!("{}", "─".repeat(60));
 
     for (label, f) in [
-        ("piecewise",       &(encode_piecewise as fn(&[u8], &[u8]) -> Vec<u8>)),
-        ("fixed_struct",    &(encode_fixed_struct as _)),
-        ("inplace",         &(encode_inplace as _)),
-        ("v2_pubframe_zc",  &(encode_v2_pubframe as _)),
-        ("v2_raw",          &(encode_v2_raw as _)),
-        ("sized_as_bytes",  &(encode_sized_as_bytes as _)),
-        ("libc_memcpy",     &(encode_libc_memcpy as _)),
+        (
+            "piecewise",
+            &(encode_piecewise as fn(&[u8], &[u8]) -> Vec<u8>),
+        ),
+        ("fixed_struct", &(encode_fixed_struct as _)),
+        ("inplace", &(encode_inplace as _)),
+        ("v2_pubframe_zc", &(encode_v2_pubframe as _)),
+        ("v2_raw", &(encode_v2_raw as _)),
+        ("sized_as_bytes", &(encode_sized_as_bytes as _)),
+        ("libc_memcpy", &(encode_libc_memcpy as _)),
     ] {
         let mut samples: Vec<u128> = Vec::with_capacity(runs);
         for _ in 0..runs {
@@ -356,8 +374,10 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
         let min = samples[0] as f64 / iters as f64;
         let mean = samples.iter().sum::<u128>() as f64 / runs as f64 / iters as f64;
         let ops_per_sec = 1.0e9 / min;
-        println!("{:<18} {:>10.2} {:>14.2} {:>14.0}",
-                 label, min, mean, ops_per_sec);
+        println!(
+            "{:<18} {:>10.2} {:>14.2} {:>14.0}",
+            label, min, mean, ops_per_sec
+        );
     }
 
     // ── Variants 8 + 9: zero-alloc per call. Outer loop reuses one buffer.
@@ -365,8 +385,8 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
     {
         let mut samples: Vec<u128> = Vec::with_capacity(runs);
         for _ in 0..runs {
-            let mut reuse = Vec::<u8>::with_capacity(
-                PUBLISH_FIXED_SIZE + subject.len() + payload_size);
+            let mut reuse =
+                Vec::<u8>::with_capacity(PUBLISH_FIXED_SIZE + subject.len() + payload_size);
             // Warmup
             for _ in 0..1000 {
                 encode_into_existing_buf(&mut reuse, subject, &payload);
@@ -383,8 +403,10 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
         let min = samples[0] as f64 / iters as f64;
         let mean = samples.iter().sum::<u128>() as f64 / runs as f64 / iters as f64;
         let ops_per_sec = 1.0e9 / min;
-        println!("{:<18} {:>10.2} {:>14.2} {:>14.0}",
-                 "reuse_vec", min, mean, ops_per_sec);
+        println!(
+            "{:<18} {:>10.2} {:>14.2} {:>14.0}",
+            "reuse_vec", min, mean, ops_per_sec
+        );
     }
 
     // ── Variant 9: `encode_into_slice` — pre-sized &mut [u8].
@@ -409,8 +431,10 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
         let min = samples[0] as f64 / iters as f64;
         let mean = samples.iter().sum::<u128>() as f64 / runs as f64 / iters as f64;
         let ops_per_sec = 1.0e9 / min;
-        println!("{:<18} {:>10.2} {:>14.2} {:>14.0}",
-                 "into_slice", min, mean, ops_per_sec);
+        println!(
+            "{:<18} {:>10.2} {:>14.2} {:>14.0}",
+            "into_slice", min, mean, ops_per_sec
+        );
     }
 }
 

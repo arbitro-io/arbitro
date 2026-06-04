@@ -31,9 +31,7 @@ pub fn subject_matches(pattern: &[u8], subject: &[u8]) -> bool {
             (b">", s) if !s.is_empty() => return true,
             (b"*", s) if !s.is_empty() => {}
             (p, s) if p == s && !p.is_empty() => {}
-            (p, s) if p.is_empty() && s.is_empty() => {
-                return prest.is_empty() && srest.is_empty()
-            }
+            (p, s) if p.is_empty() && s.is_empty() => return prest.is_empty() && srest.is_empty(),
             _ => return false,
         }
 
@@ -96,7 +94,13 @@ mod tests {
 
     #[test]
     fn four_level() {
-        assert!(subject_matches(b"msg.qr.*.premium", b"msg.qr.user1.premium"));
-        assert!(!subject_matches(b"msg.qr.*.premium", b"msg.qr.user1.standard"));
+        assert!(subject_matches(
+            b"msg.qr.*.premium",
+            b"msg.qr.user1.premium"
+        ));
+        assert!(!subject_matches(
+            b"msg.qr.*.premium",
+            b"msg.qr.user1.standard"
+        ));
     }
 }

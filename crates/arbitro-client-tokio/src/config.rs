@@ -26,12 +26,12 @@ impl Default for ClientConfig {
         Self {
             // Server defaults to "0.0.0.0:9898" — see
             // `crates/arbitro-server/src/config.rs::ARBITRO_LISTEN`.
-            addr:                 "127.0.0.1:9898".to_string(),
-            reconnect:            ReconnectPolicy::default(),
-            keep_alive:           KeepAlive::default(),
+            addr: "127.0.0.1:9898".to_string(),
+            reconnect: ReconnectPolicy::default(),
+            keep_alive: KeepAlive::default(),
             write_queue_capacity: 4096,
             #[cfg(feature = "tls")]
-            tls:                  None,
+            tls: None,
         }
     }
 }
@@ -65,8 +65,8 @@ pub struct ReconnectPolicy {
 impl Default for ReconnectPolicy {
     fn default() -> Self {
         Self {
-            base:         Duration::from_millis(100),
-            cap:          Duration::from_secs(30),
+            base: Duration::from_millis(100),
+            cap: Duration::from_secs(30),
             max_attempts: None,
         }
     }
@@ -85,7 +85,7 @@ impl Default for KeepAlive {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),
-            timeout:  Duration::from_secs(60),
+            timeout: Duration::from_secs(60),
         }
     }
 }

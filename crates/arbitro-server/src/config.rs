@@ -78,7 +78,9 @@ impl Config {
             listen_addr: env_or("ARBITRO_LISTEN", "0.0.0.0:9898"),
             shard_count: env_parse(
                 "ARBITRO_SHARDS",
-                std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(4),
             ),
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
             max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
@@ -110,16 +112,34 @@ impl Config {
     /// runtime.
     pub fn validate(&self) {
         assert!(self.shard_count > 0, "ARBITRO_SHARDS must be > 0");
-        assert!(self.channel_capacity > 0, "ARBITRO_CHANNEL_CAPACITY must be > 0");
-        assert!(self.max_connections > 0, "ARBITRO_MAX_CONNECTIONS must be > 0");
-        assert!(self.write_buffer_cap > 0, "ARBITRO_WRITE_BUFFER_CAP must be > 0");
-        assert!(self.max_frame_size > 0, "ARBITRO_MAX_FRAME_SIZE must be > 0");
+        assert!(
+            self.channel_capacity > 0,
+            "ARBITRO_CHANNEL_CAPACITY must be > 0"
+        );
+        assert!(
+            self.max_connections > 0,
+            "ARBITRO_MAX_CONNECTIONS must be > 0"
+        );
+        assert!(
+            self.write_buffer_cap > 0,
+            "ARBITRO_WRITE_BUFFER_CAP must be > 0"
+        );
+        assert!(
+            self.max_frame_size > 0,
+            "ARBITRO_MAX_FRAME_SIZE must be > 0"
+        );
         assert!(
             self.max_frame_size <= 256 * 1024 * 1024,
             "ARBITRO_MAX_FRAME_SIZE must be <= 256 MiB"
         );
-        assert!(self.max_feed_per_cycle > 0, "ARBITRO_MAX_FEED_PER_CYCLE must be > 0");
-        assert!(self.drain_batch_size > 0, "ARBITRO_DRAIN_BATCH_SIZE must be > 0");
+        assert!(
+            self.max_feed_per_cycle > 0,
+            "ARBITRO_MAX_FEED_PER_CYCLE must be > 0"
+        );
+        assert!(
+            self.drain_batch_size > 0,
+            "ARBITRO_DRAIN_BATCH_SIZE must be > 0"
+        );
         if self.tls_cert.is_some() != self.tls_key.is_some() {
             panic!("ARBITRO_TLS_CERT and ARBITRO_TLS_KEY must both be set or both unset");
         }
@@ -200,7 +220,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:9898".into(),
-            shard_count: std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4),
+            shard_count: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4),
             channel_capacity: 4096,
             max_feed_per_cycle: 256,
             drain_batch_size: 256,

@@ -437,11 +437,14 @@ impl Store for TolerantStore {
         // integer compare so the win is small in absolute terms, but
         // it also lets the compiler keep all the per-entry work in
         // tight loop without a branch that's almost never taken.
-        let total_needed: u64 = entries.iter()
-            .map(|e| (HEADER_SIZE as u64)
-                + (e.subject.len() as u64)
-                + (e.payload.len() as u64)
-                + RECORD_CRC_SIZE as u64) // B5
+        let total_needed: u64 = entries
+            .iter()
+            .map(|e| {
+                (HEADER_SIZE as u64)
+                    + (e.subject.len() as u64)
+                    + (e.payload.len() as u64)
+                    + RECORD_CRC_SIZE as u64
+            }) // B5
             .sum();
 
         if (self.current_segment_offset as u64) + total_needed < MAX_SEGMENT_BYTES {
@@ -491,8 +494,16 @@ impl Store for TolerantStore {
         }))
     }
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
-        let s = if start < self.first_seq { 0 } else { (start - self.first_seq) as usize };
-        let e = if end < self.first_seq { 0 } else { (end - self.first_seq) as usize };
+        let s = if start < self.first_seq {
+            0
+        } else {
+            (start - self.first_seq) as usize
+        };
+        let e = if end < self.first_seq {
+            0
+        } else {
+            (end - self.first_seq) as usize
+        };
         let e = e.min(self.index.len());
         let s = s.min(e);
 
@@ -539,10 +550,7 @@ impl Store for TolerantStore {
         // Cache the active-segment id once. The `sealed_segments.len()` value
         // can't change during this read-only walk (we hold `&self`).
         let active_seg_id = self.sealed_segments.len() as u32;
-        let active_slice: Option<&[u8]> = self
-            .active_mmap
-            .as_ref()
-            .map(|m| &m[..]);
+        let active_slice: Option<&[u8]> = self.active_mmap.as_ref().map(|m| &m[..]);
 
         for i in start..end {
             let m = &self.index[i];
@@ -577,7 +585,13 @@ mod tests {
     use crate::store::{EntryRef, Store};
 
     fn make_entry<'a>(subject: &'a [u8], payload: &'a [u8]) -> EntryRef<'a> {
-        EntryRef { stream_id: 0, subject, payload, flags: 0, deliver_at_ms: 0 }
+        EntryRef {
+            stream_id: 0,
+            subject,
+            payload,
+            flags: 0,
+            deliver_at_ms: 0,
+        }
     }
 
     #[test]
@@ -653,8 +667,12 @@ mod tests {
 
         const N: usize = 1_000;
         // Build owned buffers so the EntryRef borrows live the whole call.
-        let subjects: Vec<Vec<u8>> = (0..N).map(|i| format!("subj.{i:04}").into_bytes()).collect();
-        let payloads: Vec<Vec<u8>> = (0..N).map(|i| format!("payload-{i}").into_bytes()).collect();
+        let subjects: Vec<Vec<u8>> = (0..N)
+            .map(|i| format!("subj.{i:04}").into_bytes())
+            .collect();
+        let payloads: Vec<Vec<u8>> = (0..N)
+            .map(|i| format!("payload-{i}").into_bytes())
+            .collect();
         let entries: Vec<EntryRef<'_>> = (0..N)
             .map(|i| make_entry(&subjects[i], &payloads[i]))
             .collect();
@@ -678,8 +696,14 @@ mod tests {
                 .unwrap();
             assert!(ok, "entry seq={seq} must be present");
             assert_eq!(got_seq, seq, "stored seq must match expected");
-            assert_eq!(&got_subject, &subjects[i], "subject roundtrip mismatch at i={i}");
-            assert_eq!(&got_payload, &payloads[i], "payload roundtrip mismatch at i={i}");
+            assert_eq!(
+                &got_subject, &subjects[i],
+                "subject roundtrip mismatch at i={i}"
+            );
+            assert_eq!(
+                &got_payload, &payloads[i],
+                "payload roundtrip mismatch at i={i}"
+            );
         }
     }
 
@@ -697,14 +721,18 @@ mod tests {
         // by batch index so a misordering would show up.
         let mut next_expected_first = 1u64;
         for batch_idx in 0..3u32 {
-            let subjects: Vec<Vec<u8>> =
-                (0..50).map(|i| format!("b{batch_idx}.{i:02}").into_bytes()).collect();
-            let payloads: Vec<Vec<u8>> =
-                (0..50).map(|i| format!("v{batch_idx}-{i}").into_bytes()).collect();
+            let subjects: Vec<Vec<u8>> = (0..50)
+                .map(|i| format!("b{batch_idx}.{i:02}").into_bytes())
+                .collect();
+            let payloads: Vec<Vec<u8>> = (0..50)
+                .map(|i| format!("v{batch_idx}-{i}").into_bytes())
+                .collect();
             let entries: Vec<EntryRef<'_>> = (0..50)
                 .map(|i| make_entry(&subjects[i], &payloads[i]))
                 .collect();
-            let first = store.append_batch(&entries, 100 + batch_idx as u64).unwrap();
+            let first = store
+                .append_batch(&entries, 100 + batch_idx as u64)
+                .unwrap();
             assert_eq!(
                 first, next_expected_first,
                 "batch {batch_idx}: first seq must continue from previous batch",
@@ -719,7 +747,10 @@ mod tests {
             .for_each(1, 151, &mut |entry| seqs.push(entry.seq))
             .unwrap();
         let expected: Vec<u64> = (1..=150).collect();
-        assert_eq!(seqs, expected, "150 entries across 3 batches must be 1..=150 in order");
+        assert_eq!(
+            seqs, expected,
+            "150 entries across 3 batches must be 1..=150 in order"
+        );
     }
 
     /// Empty batch — must be a no-op that doesn't corrupt seq state
@@ -738,7 +769,11 @@ mod tests {
         // Empty batch must NOT advance next_seq or touch the index.
         let first = store.append_batch(&[], 999).unwrap();
         assert_eq!(first, 2, "empty batch returns next_seq, not 0");
-        assert_eq!(store.info().messages, 1, "empty batch must not change message count");
+        assert_eq!(
+            store.info().messages,
+            1,
+            "empty batch must not change message count"
+        );
 
         // Subsequent append still works and gets seq=2 (proves
         // `next_seq` wasn't perturbed).
@@ -1017,13 +1052,25 @@ mod tests {
             store.init().unwrap();
             store
                 .append(
-                    EntryRef { subject: b"good", payload: b"first", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                    EntryRef {
+                        subject: b"good",
+                        payload: b"first",
+                        stream_id: 0,
+                        flags: 0,
+                        deliver_at_ms: 0,
+                    },
                     1_000,
                 )
                 .unwrap();
             store
                 .append(
-                    EntryRef { subject: b"good", payload: b"second", stream_id: 0, flags: 0, deliver_at_ms: 0 },
+                    EntryRef {
+                        subject: b"good",
+                        payload: b"second",
+                        stream_id: 0,
+                        flags: 0,
+                        deliver_at_ms: 0,
+                    },
                     2_000,
                 )
                 .unwrap();

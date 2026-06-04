@@ -58,7 +58,11 @@ async fn cluster_server_boots_and_serves() {
 
     // List streams — should see the one we just created.
     let resp = client.list_streams(0, 1000).await.unwrap();
-    assert_eq!(TestServer::stream_count(&resp), 1, "expected 1 stream after create");
+    assert_eq!(
+        TestServer::stream_count(&resp),
+        1,
+        "expected 1 stream after create"
+    );
 
     // Shutdown.
     let _ = tx.send(true);
@@ -188,11 +192,8 @@ async fn three_node_cluster_replicates_stream() {
     drop(clients);
     for (i, addr) in client_addrs.iter().enumerate() {
         let fresh_client = TestServer::connect_to(addr).await;
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            fresh_client.list_streams(0, 1000),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(3), fresh_client.list_streams(0, 1000)).await;
 
         match result {
             Ok(Ok(resp)) => {
@@ -209,9 +210,7 @@ async fn three_node_cluster_replicates_stream() {
         }
     }
 
-    eprintln!(
-        "cluster test summary: any_create_succeeded={any_create_succeeded}"
-    );
+    eprintln!("cluster test summary: any_create_succeeded={any_create_succeeded}");
 
     // ── Step 8: Shutdown all 3 nodes ─────────────────────────────────
     for tx in &shutdown_txs {

@@ -157,7 +157,9 @@ pub struct CronRegistry {
 
 impl Default for CronRegistry {
     fn default() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 }
 

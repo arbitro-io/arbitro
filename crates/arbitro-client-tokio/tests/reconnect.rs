@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use arbitro_client_tokio::{Client, ClientConfig, ReconnectPolicy, KeepAlive};
+use arbitro_client_tokio::{Client, ClientConfig, KeepAlive, ReconnectPolicy};
 use arbitro_server::{ArbitroServer, Config};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -28,7 +28,9 @@ async fn spawn_server(addr: &str) -> tokio::task::JoinHandle<()> {
     let cfg = Config::default()
         .listen_addr(addr.to_string())
         .max_connections(64);
-    let h = tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    let h = tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     h
 }
@@ -47,20 +49,23 @@ async fn client_reconnects_after_server_restart() {
     let cfg = ClientConfig {
         addr: addr.clone(),
         reconnect: ReconnectPolicy {
-            base:         Duration::from_millis(50),
-            cap:          Duration::from_millis(200),
+            base: Duration::from_millis(50),
+            cap: Duration::from_millis(200),
             max_attempts: None,
         },
         keep_alive: KeepAlive {
             interval: Duration::from_secs(60),
-            timeout:  Duration::from_secs(120),
+            timeout: Duration::from_secs(120),
         },
         ..ClientConfig::default()
     };
     let client = Client::connect(cfg).await.expect("initial connect");
 
     // Verify the connection is live before killing the server.
-    client.list_streams(0, 10).await.expect("pre-restart list_streams");
+    client
+        .list_streams(0, 10)
+        .await
+        .expect("pre-restart list_streams");
 
     // Kill server_1 — the TCP connection drops; reconnect loop starts.
     server1.abort();
@@ -82,7 +87,10 @@ async fn client_reconnects_after_server_restart() {
     })
     .await;
 
-    assert!(reconnected.is_ok(), "client did not reconnect within 3 s after server restart");
+    assert!(
+        reconnected.is_ok(),
+        "client did not reconnect within 3 s after server restart"
+    );
 
     client.close();
 }
@@ -99,13 +107,13 @@ async fn close_stops_reconnect_loop() {
     let cfg = ClientConfig {
         addr: addr.clone(),
         reconnect: ReconnectPolicy {
-            base:         Duration::from_millis(20),
-            cap:          Duration::from_millis(50),
+            base: Duration::from_millis(20),
+            cap: Duration::from_millis(50),
             max_attempts: None,
         },
         keep_alive: KeepAlive {
             interval: Duration::from_secs(60),
-            timeout:  Duration::from_secs(120),
+            timeout: Duration::from_secs(120),
         },
         ..ClientConfig::default()
     };

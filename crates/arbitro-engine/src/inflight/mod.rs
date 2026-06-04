@@ -142,7 +142,9 @@ impl InFlightCounters {
 }
 
 impl Default for InFlightCounters {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

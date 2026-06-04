@@ -42,8 +42,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arbitro_common::{foldhash::fast::FixedState, TimingWheel};
 use arbitro_engine_v2::types::StreamId;
-use arbitro_common::{TimingWheel, foldhash::fast::FixedState};
 
 /// Shared handle to a shard's idempotency state.
 ///
@@ -63,13 +63,14 @@ use arbitro_common::{TimingWheel, foldhash::fast::FixedState};
 /// worker tick iterates the map under a read lock and `tick()`s each
 /// tracker. The outer write-lock is only taken on first publish for a
 /// given stream (lazy allocation) and on stream deletion.
-pub type SharedIdempotency = Arc<parking_lot::RwLock<
-    HashMap<u32, Arc<parking_lot::Mutex<IdempotencyTracker>>, FixedState>,
->>;
+pub type SharedIdempotency =
+    Arc<parking_lot::RwLock<HashMap<u32, Arc<parking_lot::Mutex<IdempotencyTracker>>, FixedState>>>;
 
 /// Build a fresh shared handle with no trackers allocated yet.
 pub fn new_shared_idempotency() -> SharedIdempotency {
-    Arc::new(parking_lot::RwLock::new(HashMap::with_hasher(FixedState::default())))
+    Arc::new(parking_lot::RwLock::new(HashMap::with_hasher(
+        FixedState::default(),
+    )))
 }
 
 /// Get-or-create the per-stream tracker handle. Cheap when the entry
@@ -90,9 +91,10 @@ pub fn idempotency_for_stream(
     }
     // Slow path: insert under write lock.
     let mut g = shared.write();
-    Arc::clone(g.entry(key).or_insert_with(|| {
-        Arc::new(parking_lot::Mutex::new(IdempotencyTracker::new()))
-    }))
+    Arc::clone(
+        g.entry(key)
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(IdempotencyTracker::new()))),
+    )
 }
 
 /// Wheel resolution: each bucket represents one second. We round
@@ -318,7 +320,10 @@ mod tests {
     fn first_record_returns_true_repeat_returns_false() {
         let mut t = IdempotencyTracker::new();
         assert!(t.record(s(1), 0xABC, b"id-1", 1000), "first must be true");
-        assert!(!t.record(s(1), 0xABC, b"id-1", 1000), "duplicate must be false");
+        assert!(
+            !t.record(s(1), 0xABC, b"id-1", 1000),
+            "duplicate must be false"
+        );
         assert!(t.contains(s(1), 0xABC, b"id-1"));
     }
 
@@ -327,7 +332,10 @@ mod tests {
         let mut t = IdempotencyTracker::new();
         t.record(s(1), 0xABC, b"id", 1000);
         // Same hash but different stream — must NOT collide.
-        assert!(t.record(s(2), 0xABC, b"id", 1000), "different stream is independent");
+        assert!(
+            t.record(s(2), 0xABC, b"id", 1000),
+            "different stream is independent"
+        );
         assert!(t.contains(s(1), 0xABC, b"id"));
         assert!(t.contains(s(2), 0xABC, b"id"));
     }
@@ -340,9 +348,15 @@ mod tests {
         t.record(s(1), 0xDEAD, b"x", 1500);
         assert!(t.contains(s(1), 0xDEAD, b"x"));
         t.tick();
-        assert!(t.contains(s(1), 0xDEAD, b"x"), "still alive after 1s of a 1.5s window");
+        assert!(
+            t.contains(s(1), 0xDEAD, b"x"),
+            "still alive after 1s of a 1.5s window"
+        );
         t.tick();
-        assert!(!t.contains(s(1), 0xDEAD, b"x"), "must be gone after 2s of a 1.5s window");
+        assert!(
+            !t.contains(s(1), 0xDEAD, b"x"),
+            "must be gone after 2s of a 1.5s window"
+        );
         assert_eq!(t.len(), 0);
     }
 
@@ -354,10 +368,13 @@ mod tests {
         // subsequent record calls.
         let mut t = IdempotencyTracker::new();
         t.record(s(1), 0xFEED, b"a", 1500); // expires at tick 2
-        t.tick();                                     // tick 1
+        t.tick(); // tick 1
         let _ = t.record(s(1), 0xFEED, b"a", 9999); // sliding attempt
-        t.tick();                                     // tick 2
-        assert!(!t.contains(s(1), 0xFEED, b"a"), "must expire on the ORIGINAL schedule");
+        t.tick(); // tick 2
+        assert!(
+            !t.contains(s(1), 0xFEED, b"a"),
+            "must expire on the ORIGINAL schedule"
+        );
     }
 
     #[test]
@@ -422,7 +439,10 @@ mod tests {
         // Second call: same hash, different id. Must NOT be reported
         // as a duplicate — that would silently drop a legitimate
         // publish.
-        assert!(t.record(s(1), hash, b"id-B", 1000), "distinct id at same hash must record");
+        assert!(
+            t.record(s(1), hash, b"id-B", 1000),
+            "distinct id at same hash must record"
+        );
         assert!(t.contains(s(1), hash, b"id-A"));
         assert!(t.contains(s(1), hash, b"id-B"));
         assert!(!t.contains(s(1), hash, b"id-C"));

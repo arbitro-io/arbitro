@@ -28,9 +28,9 @@
 
 // ── Feature ON: real implementation ────────────────────────────────────────
 #[cfg(feature = "lifecycle_trace")]
-use std::sync::Mutex;
-#[cfg(feature = "lifecycle_trace")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "lifecycle_trace")]
+use std::sync::Mutex;
 #[cfg(feature = "lifecycle_trace")]
 use std::time::Instant;
 

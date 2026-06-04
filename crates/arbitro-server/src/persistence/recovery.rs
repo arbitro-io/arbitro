@@ -10,7 +10,7 @@ use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig};
 use arbitro_engine_v2::types::*;
 use arbitro_proto::metadata::{
     MetadataApplier, MetadataCommandView, CMD_CREATE_CONSUMER, CMD_CREATE_STREAM,
-    CMD_DELETE_CONSUMER, CMD_DELETE_STREAM, CMD_CURSOR_UPDATE,
+    CMD_CURSOR_UPDATE, CMD_DELETE_CONSUMER, CMD_DELETE_STREAM,
 };
 use arbitro_proto::wire::manager::CreateConsumerView;
 use arbitro_proto::wire::stream::CreateStreamView;
@@ -83,7 +83,10 @@ impl ReplayApplier {
                 } => {
                     let shard = self.server.shard_for(stream_id);
                     let _ = journal_kind; // no longer needed — single store per shard
-                    match shard.create_stream(config, max_msgs, max_bytes, max_age_ms).await {
+                    match shard
+                        .create_stream(config, max_msgs, max_bytes, max_age_ms)
+                        .await
+                    {
                         Ok(true) => {
                             streams_recovered += 1;
                             tracing::debug!(?stream_id, "replayed CreateStream");
@@ -122,7 +125,8 @@ impl ReplayApplier {
                             "CreateConsumer already exists (idempotent)"
                         ),
                         Ok(code) => tracing::warn!(
-                            ?consumer_id, code,
+                            ?consumer_id,
+                            code,
                             "replay CreateConsumer rejected (config mismatch?)"
                         ),
                         Err(e) => {
@@ -150,11 +154,7 @@ impl ReplayApplier {
                     self.server
                         .names()
                         .set_consumer_cursor(consumer_id, last_acked_seq);
-                    tracing::debug!(
-                        ?consumer_id,
-                        last_acked_seq,
-                        "replayed CursorUpdate"
-                    );
+                    tracing::debug!(?consumer_id, last_acked_seq, "replayed CursorUpdate");
                 }
             }
         }
@@ -211,10 +211,9 @@ impl MetadataApplier for ReplayApplier {
                 // `v2_create_stream` makes on the live path. Without this,
                 // a stream that was idempotent at write time would lose
                 // its dedup window across restart.
-                self.server.names().set_stream_idempotency(
-                    stream_id,
-                    sv.idempotency_window_ms(),
-                );
+                self.server
+                    .names()
+                    .set_stream_idempotency(stream_id, sv.idempotency_window_ms());
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
                     config: StreamConfig {
@@ -225,8 +224,8 @@ impl MetadataApplier for ReplayApplier {
                     // H3: extract retention from the wire body, so a
                     // restart restores what the operator configured at
                     // CreateStream time.
-                    max_msgs:   sv.max_msgs(),
-                    max_bytes:  sv.max_bytes(),
+                    max_msgs: sv.max_msgs(),
+                    max_bytes: sv.max_bytes(),
                     max_age_ms: sv.max_age_secs().saturating_mul(1_000),
                 });
             }
@@ -261,7 +260,10 @@ impl MetadataApplier for ReplayApplier {
                 let (stream_id, _) = self.server.names().get_or_create_stream(wire_stream);
 
                 let consumer_name = cv.name();
-                let (consumer_id, _) = self.server.names().get_or_create_consumer(stream_id, consumer_name);
+                let (consumer_id, _) = self
+                    .server
+                    .names()
+                    .get_or_create_consumer(stream_id, consumer_name);
 
                 // GAP-5 (mirrored from live dispatch): Fanout consumers
                 // (deliver_mode == 0) use QueueId(0) directly — the
@@ -326,12 +328,12 @@ impl MetadataApplier for ReplayApplier {
                     .names()
                     .consumer_stream(consumer_id)
                     .unwrap_or(StreamId(0)); // fallback: consumer already absent, no-op
-                // Mirror the wire handler's cascade (`v2_delete_consumer` in
-                // dispatch_v2.rs): drop the wire-name → id mapping and the
-                // reverse indexes from NameRegistry. Without this, a
-                // pre-restart create→delete sequence replays the create into
-                // NameRegistry but never undoes it, leaving a phantom name
-                // mapping that aliases a future re-create on the same name.
+                                             // Mirror the wire handler's cascade (`v2_delete_consumer` in
+                                             // dispatch_v2.rs): drop the wire-name → id mapping and the
+                                             // reverse indexes from NameRegistry. Without this, a
+                                             // pre-restart create→delete sequence replays the create into
+                                             // NameRegistry but never undoes it, leaving a phantom name
+                                             // mapping that aliases a future re-create on the same name.
                 self.server.names().remove_consumer_by_id(consumer_id);
                 self.commands.push(ReplayCommand::DeleteConsumer {
                     stream_id,
@@ -342,12 +344,10 @@ impl MetadataApplier for ReplayApplier {
                 // Body: [4 consumer_id LE][8 last_acked_seq LE]
                 let body = view.body();
                 if body.len() >= 12 {
-                    let consumer_id = ConsumerId(u32::from_le_bytes([
-                        body[0], body[1], body[2], body[3],
-                    ]));
+                    let consumer_id =
+                        ConsumerId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
                     let last_acked_seq = u64::from_le_bytes([
-                        body[4], body[5], body[6], body[7],
-                        body[8], body[9], body[10], body[11],
+                        body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
                     ]);
                     self.commands.push(ReplayCommand::CursorUpdate {
                         consumer_id,

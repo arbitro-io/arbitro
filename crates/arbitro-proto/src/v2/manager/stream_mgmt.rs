@@ -41,17 +41,17 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct CreateStreamBody {
-    pub name_len:              U16,
-    pub filter_len:            U16,
-    pub max_msgs:              U64,
-    pub max_bytes:             U64,
-    pub max_age_secs:          U64,
-    pub replicas:              u8,
-    pub journal_kind:          u8,
-    pub retention:             u8,
-    pub discard:               u8,
+    pub name_len: U16,
+    pub filter_len: U16,
+    pub max_msgs: U64,
+    pub max_bytes: U64,
+    pub max_age_secs: U64,
+    pub replicas: u8,
+    pub journal_kind: u8,
+    pub retention: u8,
+    pub discard: u8,
     pub idempotency_window_ms: U32,
-    pub _pad:                  U32,
+    pub _pad: U32,
 }
 pub const CREATE_STREAM_BODY_FIXED: usize = core::mem::size_of::<CreateStreamBody>();
 const _: () = assert!(CREATE_STREAM_BODY_FIXED == 40);
@@ -60,8 +60,8 @@ const _: () = assert!(CREATE_STREAM_BODY_FIXED == 40);
 #[repr(C)]
 pub struct CreateStreamFrame {
     pub header: Header,
-    pub body:   CreateStreamBody,
-    pub tail:   [u8],
+    pub body: CreateStreamBody,
+    pub tail: [u8],
 }
 
 impl CreateStreamFrame {
@@ -103,17 +103,17 @@ impl CreateStreamFrame {
         let frame = Self::mut_from_bytes(out).expect("CreateStreamFrame layout");
         frame.header = Header::new(Action::CreateStream.as_u16(), msg_len, seq);
         frame.body = CreateStreamBody {
-            name_len:              U16::new(name.len() as u16),
-            filter_len:            U16::new(filter.len() as u16),
-            max_msgs:              U64::new(max_msgs),
-            max_bytes:             U64::new(max_bytes),
-            max_age_secs:          U64::new(max_age_secs),
+            name_len: U16::new(name.len() as u16),
+            filter_len: U16::new(filter.len() as u16),
+            max_msgs: U64::new(max_msgs),
+            max_bytes: U64::new(max_bytes),
+            max_age_secs: U64::new(max_age_secs),
             replicas,
             journal_kind,
             retention,
             discard,
             idempotency_window_ms: U32::new(idempotency_window_ms),
-            _pad:                  U32::new(0),
+            _pad: U32::new(0),
         };
         let n = name.len();
         frame.tail[..n].copy_from_slice(name);
@@ -136,8 +136,7 @@ mod tests {
         let size = CreateStreamFrame::wire_size(5, 7);
         let mut buf = vec![0u8; size];
         CreateStreamFrame::encode_into(
-            &mut buf, 1, b"hello", b"orders.",
-            100, 200, 300, 1, 2, 3, 4, 60_000,
+            &mut buf, 1, b"hello", b"orders.", 100, 200, 300, 1, 2, 3, 4, 60_000,
         );
         let frame = CreateStreamFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(frame.header.action.get(), Action::CreateStream.as_u16());

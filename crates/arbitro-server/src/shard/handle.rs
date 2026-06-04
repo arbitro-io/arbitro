@@ -12,8 +12,8 @@ use arbitro_engine_v2::{ConsumerStateSnapshot, EngineMetrics, MetricsSnapshot};
 use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::common::Gate;
 use crate::common::reply_v2::send_rep_ok_v2;
+use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::router::SharedStore;
 use crate::transport::ConnectionRegistry;
@@ -173,10 +173,7 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn unsubscribe(
-        &self,
-        subscription_id: SubscriptionId,
-    ) -> Result<bool, SendError> {
+    pub async fn unsubscribe(&self, subscription_id: SubscriptionId) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Unsubscribe(UnsubscribeCmd {
             subscription_id,
@@ -190,9 +187,9 @@ impl ShardHandle {
 
     pub async fn create_stream(
         &self,
-        config:     StreamConfig,
-        max_msgs:   u64,
-        max_bytes:  u64,
+        config: StreamConfig,
+        max_msgs: u64,
+        max_bytes: u64,
         max_age_ms: u64,
     ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
@@ -208,10 +205,7 @@ impl ShardHandle {
     }
 
     /// Purge all messages from a stream's store. Returns the deleted count.
-    pub async fn purge_stream(
-        &self,
-        stream_id: StreamId,
-    ) -> Result<u64, SendError> {
+    pub async fn purge_stream(&self, stream_id: StreamId) -> Result<u64, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::PurgeStream(PurgeStreamCmd {
             stream_id,
@@ -274,10 +268,7 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn delete_consumer(
-        &self,
-        consumer_id: ConsumerId,
-    ) -> Result<bool, SendError> {
+    pub async fn delete_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DeleteConsumer(DeleteConsumerCmd {
             consumer_id,
@@ -304,10 +295,7 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn drain_connection(
-        &self,
-        connection_id: ConnectionId,
-    ) -> Result<(), SendError> {
+    pub async fn drain_connection(&self, connection_id: ConnectionId) -> Result<(), SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::DrainConnection(DrainConnectionCmd {
             connection_id,
@@ -336,32 +324,21 @@ impl ShardHandle {
 
     // ── Query ───────────────────────────────────────────────────────────
 
-    pub async fn list_streams(
-        &self,
-    ) -> Result<ListStreamsReply, SendError> {
+    pub async fn list_streams(&self) -> Result<ListStreamsReply, SendError> {
         let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::ListStreams(ListStreamsCmd {
-            reply: tx,
-        }))
-        .await?;
+        self.send(ShardCommand::ListStreams(ListStreamsCmd { reply: tx }))
+            .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn list_consumers(
-        &self,
-    ) -> Result<ListConsumersReply, SendError> {
+    pub async fn list_consumers(&self) -> Result<ListConsumersReply, SendError> {
         let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::ListConsumers(ListConsumersCmd {
-            reply: tx,
-        }))
-        .await?;
+        self.send(ShardCommand::ListConsumers(ListConsumersCmd { reply: tx }))
+            .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn store_info(
-        &self,
-        stream_id: StreamId,
-    ) -> Result<StoreInfoReply, SendError> {
+    pub async fn store_info(&self, stream_id: StreamId) -> Result<StoreInfoReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::StoreInfo(StoreInfoCmd {
             stream_id,
@@ -382,16 +359,16 @@ impl ShardHandle {
     /// One round-trip per shard — operators aggregate across shards.
     pub async fn consumer_states(&self) -> Result<Vec<ConsumerStateSnapshot>, SendError> {
         let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::ConsumerStates(ConsumerStatesCmd { reply: tx })).await?;
+        self.send(ShardCommand::ConsumerStates(ConsumerStatesCmd {
+            reply: tx,
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
     /// Get the live pending-ack count for a single consumer. Returns 0 if
     /// the consumer doesn't exist on this shard.
-    pub async fn consumer_pending(
-        &self,
-        consumer_id: ConsumerId,
-    ) -> Result<u64, SendError> {
+    pub async fn consumer_pending(&self, consumer_id: ConsumerId) -> Result<u64, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::ConsumerPending(ConsumerPendingCmd {
             consumer_id,
@@ -403,10 +380,7 @@ impl ShardHandle {
 
     // ── Admin ───────────────────────────────────────────────────────────
 
-    pub async fn pause_consumer(
-        &self,
-        consumer_id: ConsumerId,
-    ) -> Result<bool, SendError> {
+    pub async fn pause_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::PauseConsumer(PauseConsumerCmd {
             consumer_id,
@@ -416,10 +390,7 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn resume_consumer(
-        &self,
-        consumer_id: ConsumerId,
-    ) -> Result<bool, SendError> {
+    pub async fn resume_consumer(&self, consumer_id: ConsumerId) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::ResumeConsumer(ResumeConsumerCmd {
             consumer_id,
@@ -431,26 +402,10 @@ impl ShardHandle {
 
     // ── Internal ────────────────────────────────────────────────────────
 
-    pub async fn send(
-        &self,
-        cmd: ShardCommand,
-    ) -> Result<(), SendError> {
-        crate::lifecycle_trace!(
-            "07_handle_send_enter",
-            0,
-            0,
-            "frame_loop"
-        );
-        self.tx
-            .send(cmd)
-            .await
-            .map_err(|_| SendError::SHARD_DOWN)?;
-        crate::lifecycle_trace!(
-            "08_handle_send_done",
-            0,
-            0,
-            "frame_loop"
-        );
+    pub async fn send(&self, cmd: ShardCommand) -> Result<(), SendError> {
+        crate::lifecycle_trace!("07_handle_send_enter", 0, 0, "frame_loop");
+        self.tx.send(cmd).await.map_err(|_| SendError::SHARD_DOWN)?;
+        crate::lifecycle_trace!("08_handle_send_done", 0, 0, "frame_loop");
         Ok(())
     }
 

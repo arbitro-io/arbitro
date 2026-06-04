@@ -7,9 +7,9 @@
 use zerocopy::byteorder::little_endian::U16;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+pub use crate::wire::delivery::{DeliveryEntryHeader, RepBatchFixed, RepErrorAction, RepOkAction};
 use crate::wire::envelope::Envelope;
 use crate::wire::publish::PublishEntry;
-pub use crate::wire::delivery::{RepBatchFixed, RepOkAction, RepErrorAction, DeliveryEntryHeader};
 
 /// Header for a batch of messages (General).
 /// Combines the 16B transport envelope and the 2B batch count.
@@ -67,7 +67,7 @@ mod tests {
         assert_eq!(size_of::<BatchHeader>(), 16 + 2);
         assert_eq!(size_of::<PublishHeader>(), 16 + 2 + 12);
         assert_eq!(size_of::<DeliverBatchHeader>(), 16 + 4);
-        assert_eq!(size_of::<RepOkHeader>(), 16 + 16); 
-        assert_eq!(size_of::<RepErrorHeader>(), 16 + 16); 
+        assert_eq!(size_of::<RepOkHeader>(), 16 + 16);
+        assert_eq!(size_of::<RepErrorHeader>(), 16 + 16);
     }
 }

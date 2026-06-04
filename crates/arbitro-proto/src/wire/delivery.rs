@@ -125,7 +125,9 @@ pub struct AckView<'a> {
 
 impl<'a> AckView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn inner(&self) -> &AckAction {
@@ -133,10 +135,14 @@ impl<'a> AckView<'a> {
     }
 
     #[inline(always)]
-    pub fn sequence(&self) -> u64 { self.inner().sequence.get() }
+    pub fn sequence(&self) -> u64 {
+        self.inner().sequence.get()
+    }
 
     #[inline(always)]
-    pub fn consumer_id(&self) -> u32 { self.inner().consumer_id.get() }
+    pub fn consumer_id(&self) -> u32 {
+        self.inner().consumer_id.get()
+    }
 }
 
 pub struct NackView<'a> {
@@ -145,7 +151,9 @@ pub struct NackView<'a> {
 
 impl<'a> NackView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn inner(&self) -> &NackAction {
@@ -153,13 +161,19 @@ impl<'a> NackView<'a> {
     }
 
     #[inline(always)]
-    pub fn sequence(&self) -> u64 { self.inner().sequence.get() }
+    pub fn sequence(&self) -> u64 {
+        self.inner().sequence.get()
+    }
 
     #[inline(always)]
-    pub fn consumer_id(&self) -> u32 { self.inner().consumer_id.get() }
+    pub fn consumer_id(&self) -> u32 {
+        self.inner().consumer_id.get()
+    }
 
     #[inline(always)]
-    pub fn delay_ms(&self) -> u32 { self.inner().delay_ms.get() }
+    pub fn delay_ms(&self) -> u32 {
+        self.inner().delay_ms.get()
+    }
 }
 
 pub struct RepOkView<'a> {
@@ -168,11 +182,16 @@ pub struct RepOkView<'a> {
 
 impl<'a> RepOkView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn ref_seq(&self) -> u64 {
-        RepOkAction::ref_from_bytes(&self.buf[..core::mem::size_of::<RepOkAction>()]).unwrap().ref_seq.get()
+        RepOkAction::ref_from_bytes(&self.buf[..core::mem::size_of::<RepOkAction>()])
+            .unwrap()
+            .ref_seq
+            .get()
     }
 }
 
@@ -182,7 +201,9 @@ pub struct RepErrorView<'a> {
 
 impl<'a> RepErrorView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn inner(&self) -> &RepErrorAction {
@@ -190,10 +211,14 @@ impl<'a> RepErrorView<'a> {
     }
 
     #[inline(always)]
-    pub fn ref_seq(&self) -> u64 { self.inner().ref_seq.get() }
+    pub fn ref_seq(&self) -> u64 {
+        self.inner().ref_seq.get()
+    }
 
     #[inline(always)]
-    pub fn error_code(&self) -> u16 { self.inner().error_code.get() }
+    pub fn error_code(&self) -> u16 {
+        self.inner().error_code.get()
+    }
 }
 
 /// View over a BatchAck frame body.
@@ -207,7 +232,9 @@ pub struct BatchAckView<'a> {
 
 impl<'a> BatchAckView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &BatchAckFixed {
@@ -215,17 +242,25 @@ impl<'a> BatchAckView<'a> {
     }
 
     #[inline(always)]
-    pub fn consumer_id(&self) -> u32 { self.fixed().consumer_id.get() }
+    pub fn consumer_id(&self) -> u32 {
+        self.fixed().consumer_id.get()
+    }
 
     #[inline(always)]
-    pub fn count(&self) -> u16 { self.fixed().count.get() }
+    pub fn count(&self) -> u16 {
+        self.fixed().count.get()
+    }
 
     /// Iterator over the acked entries, yielding `(seq, subject_hash)`.
     #[inline]
     pub fn entries(&self) -> BatchAckEntryIter<'a> {
         let count = self.count() as usize;
         let start = core::mem::size_of::<BatchAckFixed>();
-        BatchAckEntryIter { buf: self.buf, offset: start, remaining: count }
+        BatchAckEntryIter {
+            buf: self.buf,
+            offset: start,
+            remaining: count,
+        }
     }
 }
 
@@ -240,11 +275,14 @@ impl Iterator for BatchAckEntryIter<'_> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<(u64, u32)> {
-        if self.remaining == 0 { return None; }
+        if self.remaining == 0 {
+            return None;
+        }
         self.remaining -= 1;
         let entry = BatchAckEntry::ref_from_bytes(
-            &self.buf[self.offset..self.offset + BATCH_ACK_ENTRY_SIZE]
-        ).unwrap();
+            &self.buf[self.offset..self.offset + BATCH_ACK_ENTRY_SIZE],
+        )
+        .unwrap();
         let out = (entry.seq.get(), entry.subject_hash.get());
         self.offset += BATCH_ACK_ENTRY_SIZE;
         Some(out)
@@ -267,7 +305,9 @@ pub struct RepBatchView<'a> {
 
 impl<'a> RepBatchView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &RepBatchFixed {
@@ -275,7 +315,9 @@ impl<'a> RepBatchView<'a> {
     }
 
     #[inline(always)]
-    pub fn count(&self) -> u16 { self.fixed().count.get() }
+    pub fn count(&self) -> u16 {
+        self.fixed().count.get()
+    }
 
     /// Iterator over delivered entries.
     #[inline]
@@ -309,12 +351,15 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 { return None; }
+        if self.remaining == 0 {
+            return None;
+        }
         self.remaining -= 1;
 
         let header = DeliveryEntryHeader::ref_from_bytes(
-            &self.buf[self.offset..self.offset + DELIVERY_ENTRY_HEADER_SIZE]
-        ).unwrap();
+            &self.buf[self.offset..self.offset + DELIVERY_ENTRY_HEADER_SIZE],
+        )
+        .unwrap();
         let consumer_id = header.consumer_id.get();
         let seq = header.seq.get();
         let subj_len = header.subj_len.get() as usize;
@@ -330,6 +375,13 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let payload = &self.buf[payload_start..payload_start + payload_len];
         self.offset += data_len;
 
-        Some(RepBatchEntry { consumer_id, seq, subject_hash, subject, reply_to, payload })
+        Some(RepBatchEntry {
+            consumer_id,
+            seq,
+            subject_hash,
+            subject,
+            reply_to,
+            payload,
+        })
     }
 }

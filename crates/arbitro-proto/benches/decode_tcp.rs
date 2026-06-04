@@ -43,16 +43,16 @@ use tokio::runtime::Builder;
 
 // ---------- workload size ----------------------------------------------------
 
-const N_FRAMES:    usize = 100_000;  // explicit user override of the 1000-cap
+const N_FRAMES: usize = 100_000; // explicit user override of the 1000-cap
 const SUBJECT_LEN: usize = 16;
 const PAYLOAD_LEN: usize = 256;
 
-const HEADER_SIZE:   usize = 16;
+const HEADER_SIZE: usize = 16;
 const PUB_BODY_SIZE: usize = 8;
 const TOTAL_FRAME_SIZE: usize = HEADER_SIZE + PUB_BODY_SIZE + SUBJECT_LEN + PAYLOAD_LEN;
 
 const ITERATIONS: usize = 20;
-const WARMUP:     usize = 3;
+const WARMUP: usize = 3;
 
 // ---------- frame builder (manual LE bytes — independent of struct layout) ---
 
@@ -109,12 +109,17 @@ async fn run_naive(mut stream: TcpStream) -> usize {
     let mut frames: Vec<Bytes> = Vec::with_capacity(N_FRAMES);
 
     for _ in 0..N_FRAMES {
-        stream.read_exact(&mut header_buf).await.expect("read header");
+        stream
+            .read_exact(&mut header_buf)
+            .await
+            .expect("read header");
         let msg_len = parse_msg_len(&header_buf);
 
         let mut body = BytesMut::with_capacity(msg_len);
         // SAFETY: read_exact below writes msg_len bytes before any read.
-        unsafe { body.set_len(msg_len); }
+        unsafe {
+            body.set_len(msg_len);
+        }
         stream.read_exact(&mut body[..]).await.expect("read body");
         let body: Bytes = body.freeze();
 
@@ -138,10 +143,14 @@ async fn run_bufreader(stream: TcpStream) -> usize {
         // Fast path: drain whole frames already buffered.
         loop {
             let buf = reader.buffer();
-            if buf.len() < HEADER_SIZE { break; }
+            if buf.len() < HEADER_SIZE {
+                break;
+            }
             let msg_len = parse_msg_len(&buf[..HEADER_SIZE]);
-            let total   = HEADER_SIZE + msg_len;
-            if buf.len() < total { break; }
+            let total = HEADER_SIZE + msg_len;
+            if buf.len() < total {
+                break;
+            }
 
             let body = &buf[HEADER_SIZE..total];
             let sl = parse_subject_len(body);
@@ -150,7 +159,9 @@ async fn run_bufreader(stream: TcpStream) -> usize {
 
             reader.consume(total);
             count += 1;
-            if count >= N_FRAMES { return count; }
+            if count >= N_FRAMES {
+                return count;
+            }
         }
 
         // Slow path: not enough buffered for the next frame — refill.
@@ -158,18 +169,27 @@ async fn run_bufreader(stream: TcpStream) -> usize {
         // we fall through to `read_exact` which uses leftovers + reads more.
         if reader.buffer().is_empty() {
             let buf = reader.fill_buf().await.expect("fill_buf");
-            if buf.is_empty() { break; }
+            if buf.is_empty() {
+                break;
+            }
         } else {
             // Frame straddles. One read into reusable staging vec.
             let mut header_buf = [0u8; HEADER_SIZE];
-            if reader.read_exact(&mut header_buf).await.is_err() { break; }
+            if reader.read_exact(&mut header_buf).await.is_err() {
+                break;
+            }
             let msg_len = parse_msg_len(&header_buf);
             if staging.capacity() < msg_len {
                 staging.reserve(msg_len - staging.capacity());
             }
             // SAFETY: read_exact below writes msg_len bytes.
-            unsafe { staging.set_len(msg_len); }
-            reader.read_exact(&mut staging[..msg_len]).await.expect("read body");
+            unsafe {
+                staging.set_len(msg_len);
+            }
+            reader
+                .read_exact(&mut staging[..msg_len])
+                .await
+                .expect("read body");
             let sl = parse_subject_len(&staging[..msg_len]);
             black_box(sl);
             black_box(&staging[..msg_len]);
@@ -183,22 +203,26 @@ async fn run_bufreader(stream: TcpStream) -> usize {
 
 async fn run_prealloc_split(mut stream: TcpStream) -> usize {
     let mut buf: Vec<u8> = vec![0u8; 4 * 1024];
-    let mut filled:   usize = 0;
+    let mut filled: usize = 0;
     let mut consumed: usize = 0;
-    let mut count:    usize = 0;
+    let mut count: usize = 0;
 
     while count < N_FRAMES {
         // Fast path: drain whole frames out of the live region.
         loop {
             let avail = filled - consumed;
-            if avail < HEADER_SIZE { break; }
+            if avail < HEADER_SIZE {
+                break;
+            }
 
-            let header  = &buf[consumed..consumed + HEADER_SIZE];
-            let action  = parse_action(header);
+            let header = &buf[consumed..consumed + HEADER_SIZE];
+            let action = parse_action(header);
             let msg_len = parse_msg_len(header);
-            let total   = HEADER_SIZE + msg_len;
+            let total = HEADER_SIZE + msg_len;
 
-            if avail < total { break; }
+            if avail < total {
+                break;
+            }
 
             let frame_slice = &buf[consumed..consumed + total];
 
@@ -215,7 +239,9 @@ async fn run_prealloc_split(mut stream: TcpStream) -> usize {
 
             consumed += total;
             count += 1;
-            if count >= N_FRAMES { return count; }
+            if count >= N_FRAMES {
+                return count;
+            }
         }
 
         // Compact partial frame to the front.
@@ -235,7 +261,9 @@ async fn run_prealloc_split(mut stream: TcpStream) -> usize {
 
         // One async read into the free tail.
         let n = stream.read(&mut buf[filled..]).await.expect("read");
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         filled += n;
     }
 
@@ -271,10 +299,14 @@ async fn run_read_buf_split(mut stream: TcpStream) -> usize {
     while count < N_FRAMES {
         // Fast path: drain whole frames out of the accumulator.
         loop {
-            if acc.len() < HEADER_SIZE { break; }
+            if acc.len() < HEADER_SIZE {
+                break;
+            }
             let msg_len = parse_msg_len(&acc[..HEADER_SIZE]);
             let total = HEADER_SIZE + msg_len;
-            if acc.len() < total { break; }
+            if acc.len() < total {
+                break;
+            }
 
             // O(1): bumps Arc, sets indices. No memcpy, no heap alloc.
             // `frame` owns bytes [0..total]; `acc` keeps [total..].
@@ -287,7 +319,9 @@ async fn run_read_buf_split(mut stream: TcpStream) -> usize {
             black_box(&frame);
 
             count += 1;
-            if count >= N_FRAMES { return count; }
+            if count >= N_FRAMES {
+                return count;
+            }
         }
 
         // Need more bytes — ensure spare capacity, then read_buf.
@@ -297,7 +331,9 @@ async fn run_read_buf_split(mut stream: TcpStream) -> usize {
             acc.reserve(TOTAL_FRAME_SIZE);
         }
         let n = stream.read_buf(&mut acc).await.expect("read_buf");
-        if n == 0 { break; } // EOF
+        if n == 0 {
+            break;
+        } // EOF
     }
     count
 }
@@ -350,15 +386,15 @@ where
     }
     samples.sort();
 
-    let min     = samples[0];
-    let median  = samples[ITERATIONS / 2];
+    let min = samples[0];
+    let median = samples[ITERATIONS / 2];
     let p99_idx = ((ITERATIONS as f64) * 0.99) as usize;
-    let p99     = samples[p99_idx.min(ITERATIONS - 1)];
+    let p99 = samples[p99_idx.min(ITERATIONS - 1)];
 
-    let bytes_total      = (N_FRAMES * TOTAL_FRAME_SIZE) as f64;
-    let throughput_mbs   = bytes_total / median.as_secs_f64() / 1e6;
+    let bytes_total = (N_FRAMES * TOTAL_FRAME_SIZE) as f64;
+    let throughput_mbs = bytes_total / median.as_secs_f64() / 1e6;
     let frames_per_sec_m = (N_FRAMES as f64) / median.as_secs_f64() / 1e6;
-    let per_frame_ns     = median.as_nanos() as f64 / N_FRAMES as f64;
+    let per_frame_ns = median.as_nanos() as f64 / N_FRAMES as f64;
 
     println!(
         "{:<22} min={:>9.2}ms  median={:>9.2}ms  p99={:>9.2}ms   {:>7.1}ns/frame  {:>5.2} M msg/s  {:>5.0} MB/s",
@@ -381,7 +417,10 @@ fn main() {
     println!("  SUBJECT_LEN     = {}", SUBJECT_LEN);
     println!("  PAYLOAD_LEN     = {}", PAYLOAD_LEN);
     println!("  frame size      = {} B", TOTAL_FRAME_SIZE);
-    println!("  total blob      = {} KiB", N_FRAMES * TOTAL_FRAME_SIZE / 1024);
+    println!(
+        "  total blob      = {} KiB",
+        N_FRAMES * TOTAL_FRAME_SIZE / 1024
+    );
     println!("  iterations      = {} (+{} warmup)", ITERATIONS, WARMUP);
     println!("  runtime         = tokio multi_thread (2 workers)");
     println!();
@@ -396,9 +435,9 @@ fn main() {
 
     let blob = build_blob();
 
-    measure(&rt, "naive_two_read",    &blob, |s| run_naive(s));
+    measure(&rt, "naive_two_read", &blob, |s| run_naive(s));
     measure(&rt, "bufreader_inplace", &blob, |s| run_bufreader(s));
-    measure(&rt, "prealloc_split",    &blob, |s| run_prealloc_split(s));
+    measure(&rt, "prealloc_split", &blob, |s| run_prealloc_split(s));
     measure(&rt, "read_buf_split_to", &blob, |s| run_read_buf_split(s));
 
     println!();

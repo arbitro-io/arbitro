@@ -28,15 +28,15 @@ pub(crate) struct Pending {
 
 impl std::fmt::Debug for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pending")
-            .field("len", &self.len())
-            .finish()
+        f.debug_struct("Pending").field("len", &self.len()).finish()
     }
 }
 
 impl Pending {
     pub fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()) }
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Reserve a slot for `seq`; the returned receiver yields the reply
@@ -103,9 +103,9 @@ impl Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use bytes::Bytes;
     use crate::error::ClientError;
+    use bytes::Bytes;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn insert_remove_does_not_dangle() {

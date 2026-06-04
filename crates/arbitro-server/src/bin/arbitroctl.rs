@@ -102,7 +102,9 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             }
         }
         "create-stream" => {
-            let name = rest.first().ok_or_else(|| "create-stream requires NAME".to_string())?;
+            let name = rest
+                .first()
+                .ok_or_else(|| "create-stream requires NAME".to_string())?;
             let max_msgs = parse_named_u64(rest, "--max-msgs").unwrap_or(0);
             let max_bytes = parse_named_u64(rest, "--max-bytes").unwrap_or(0);
             let max_age_secs = parse_named_u64(rest, "--max-age-secs").unwrap_or(0);
@@ -111,8 +113,14 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                 .create_stream(
                     name.as_bytes(),
                     b">",
-                    max_msgs, max_bytes, max_age_secs,
-                    1, 0, 0, 0, 0,
+                    max_msgs,
+                    max_bytes,
+                    max_age_secs,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
                 )
                 .await
                 .map_err(|e| format!("create-stream failed: {e:?}"))?;
@@ -120,7 +128,9 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             println!("created stream={name} id={sid}");
         }
         "delete-stream" => {
-            let name = rest.first().ok_or_else(|| "delete-stream requires NAME".to_string())?;
+            let name = rest
+                .first()
+                .ok_or_else(|| "delete-stream requires NAME".to_string())?;
             let client = connect(&addr).await?;
             client
                 .delete_stream(name.as_bytes())
@@ -129,7 +139,9 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             println!("deleted stream={name}");
         }
         "purge-stream" => {
-            let name = rest.first().ok_or_else(|| "purge-stream requires NAME".to_string())?;
+            let name = rest
+                .first()
+                .ok_or_else(|| "purge-stream requires NAME".to_string())?;
             let client = connect(&addr).await?;
             client
                 .purge_stream(name.as_bytes())
@@ -167,7 +179,10 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                 .get_pending(consumer_id)
                 .await
                 .map_err(|e| format!("consumer-pending failed: {e:?}"))?;
-            println!("consumer={} id={} ack_pending={}", rest[1], consumer_id, pending);
+            println!(
+                "consumer={} id={} ack_pending={}",
+                rest[1], consumer_id, pending
+            );
         }
         _ => {
             eprintln!("{}", usage());
@@ -249,5 +264,8 @@ async fn resolve_stream_id(client: &Client, name: &[u8]) -> Result<u32, String> 
             return Ok(sid);
         }
     }
-    Err(format!("stream not found: {}", String::from_utf8_lossy(name)))
+    Err(format!(
+        "stream not found: {}",
+        String::from_utf8_lossy(name)
+    ))
 }

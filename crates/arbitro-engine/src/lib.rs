@@ -53,9 +53,9 @@ pub use metrics::{EngineMetrics, MetricsSnapshot};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerStateSnapshot {
     pub consumer_id: u32,
-    pub stream_id:   u32,
-    pub queue_id:    u32,
-    pub paused:      bool,
+    pub stream_id: u32,
+    pub queue_id: u32,
+    pub paused: bool,
     pub ack_pending: u32,
 }
 
@@ -96,11 +96,7 @@ impl ArbitroEngine {
 
     /// Consumer has capacity for more in-flight messages. ~3 ns.
     #[inline]
-    pub fn consumer_has_capacity(
-        &self,
-        consumer_id: ConsumerId,
-        max_inflight: u32,
-    ) -> bool {
+    pub fn consumer_has_capacity(&self, consumer_id: ConsumerId, max_inflight: u32) -> bool {
         self.ctx.inflight.has_capacity(
             inflight::InFlightScope::Consumer,
             consumer_id.raw(),
@@ -128,10 +124,7 @@ impl ArbitroEngine {
     // ── Catalog admin (cold path, returns events) ───────────────────────
 
     /// Create or ensure a stream exists.
-    pub fn create_stream(
-        &mut self,
-        config: catalog::StreamConfig,
-    ) -> error::EngineResult<()> {
+    pub fn create_stream(&mut self, config: catalog::StreamConfig) -> error::EngineResult<()> {
         self.ctx.catalog.ensure_stream(config)
     }
 
@@ -231,10 +224,10 @@ impl ArbitroEngine {
         subscription_id: SubscriptionId,
     ) -> (error::EngineResult<BindingId>, DeltaEvents) {
         let mut events = DeltaEvents::default();
-        let result =
-            self.ctx
-                .catalog
-                .subscribe(connection_id, subscription_id, &mut events);
+        let result = self
+            .ctx
+            .catalog
+            .subscribe(connection_id, subscription_id, &mut events);
         (result, events)
     }
 
@@ -253,11 +246,7 @@ impl ArbitroEngine {
     /// Mark a connection as dead. Retires all bindings on this connection.
     pub fn mark_connection_dead(&mut self, connection_id: ConnectionId) -> DeltaEvents {
         let mut events = DeltaEvents::default();
-        runtime::retire::retire_bindings_for_connection(
-            &mut self.ctx,
-            connection_id,
-            &mut events,
-        );
+        runtime::retire::retire_bindings_for_connection(&mut self.ctx, connection_id, &mut events);
         self.ctx.catalog.remove_connection_entity(connection_id);
         events
     }
@@ -318,13 +307,15 @@ impl ArbitroEngine {
     pub fn consumer_states_snapshot(&self) -> Vec<ConsumerStateSnapshot> {
         self.list_consumers()
             .into_iter()
-            .map(|(consumer_id, stream_id, queue_id, paused)| ConsumerStateSnapshot {
-                consumer_id: consumer_id.raw(),
-                stream_id:   stream_id.raw(),
-                queue_id:    queue_id.raw(),
-                paused,
-                ack_pending: self.consumer_inflight(consumer_id),
-            })
+            .map(
+                |(consumer_id, stream_id, queue_id, paused)| ConsumerStateSnapshot {
+                    consumer_id: consumer_id.raw(),
+                    stream_id: stream_id.raw(),
+                    queue_id: queue_id.raw(),
+                    paused,
+                    ack_pending: self.consumer_inflight(consumer_id),
+                },
+            )
             .collect()
     }
 
@@ -399,8 +390,7 @@ mod engine_tests {
 
         // Open connection + subscribe.
         engine.open_connection(ConnectionId(100), NodeId(1));
-        let (result, events) =
-            engine.subscribe(ConnectionId(100), SubscriptionId(1));
+        let (result, events) = engine.subscribe(ConnectionId(100), SubscriptionId(1));
         let binding_id = result.unwrap();
         assert!(!events.is_empty());
         assert!(engine.has_any_demand());
@@ -474,8 +464,7 @@ mod engine_tests {
             .unwrap();
 
         engine.open_connection(ConnectionId(42), NodeId(1));
-        let (result, _) =
-            engine.subscribe(ConnectionId(42), SubscriptionId(1));
+        let (result, _) = engine.subscribe(ConnectionId(42), SubscriptionId(1));
         let _bid = result.unwrap();
         assert!(engine.has_demand(StreamId(1)));
 
@@ -516,8 +505,7 @@ mod engine_tests {
             })
             .unwrap();
         engine.open_connection(ConnectionId(1), NodeId(1));
-        let (r, _) =
-            engine.subscribe(ConnectionId(1), SubscriptionId(1));
+        let (r, _) = engine.subscribe(ConnectionId(1), SubscriptionId(1));
         r.unwrap();
 
         // Deliver + leave pending.

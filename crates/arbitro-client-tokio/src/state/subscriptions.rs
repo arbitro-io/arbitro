@@ -16,9 +16,9 @@ pub(crate) struct SubRecord {
     /// Stream the consumer belongs to (informational).
     pub stream_id: u32,
     /// Pre-encoded `SubFrame` replayed verbatim on every reconnect.
-    pub sub_body:  Bytes,
+    pub sub_body: Bytes,
     /// Sender end of the message delivery channel.
-    pub tx:        mpsc::Sender<Message>,
+    pub tx: mpsc::Sender<Message>,
 }
 
 impl std::fmt::Debug for SubRecord {
@@ -37,7 +37,9 @@ pub(crate) struct Subscriptions {
 
 impl Subscriptions {
     pub fn new() -> Self {
-        Self { inner: RwLock::new(HashMap::new()) }
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Register a subscription for `consumer_id`.
@@ -47,12 +49,18 @@ impl Subscriptions {
     pub fn register(
         &self,
         consumer_id: u32,
-        stream_id:   u32,
-        sub_body:    Bytes,
+        stream_id: u32,
+        sub_body: Bytes,
     ) -> mpsc::Receiver<Message> {
         let (tx, rx) = mpsc::channel(4096);
-        self.inner.write().unwrap()
-            .insert(consumer_id, SubRecord { stream_id, sub_body, tx });
+        self.inner.write().unwrap().insert(
+            consumer_id,
+            SubRecord {
+                stream_id,
+                sub_body,
+                tx,
+            },
+        );
         rx
     }
 
@@ -85,7 +93,9 @@ impl Subscriptions {
 
     /// Look up the `stream_id` for a registered consumer.
     pub fn stream_id_of(&self, consumer_id: u32) -> Option<u32> {
-        self.inner.read().unwrap()
+        self.inner
+            .read()
+            .unwrap()
             .get(&consumer_id)
             .map(|r| r.stream_id)
     }
@@ -93,7 +103,9 @@ impl Subscriptions {
     /// Return all stored `sub_body` buffers for reconnect replay.
     /// Non-destructive — subscriptions remain registered.
     pub fn all_sub_bodies(&self) -> Vec<Bytes> {
-        self.inner.read().unwrap()
+        self.inner
+            .read()
+            .unwrap()
             .values()
             .map(|r| r.sub_body.clone())
             .collect()

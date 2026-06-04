@@ -38,12 +38,12 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct PubBody {
-    pub stream_id:   U32,
+    pub stream_id: U32,
     pub subject_len: U16,
     /// Length of an opaque per-message id used for broker-side dedup
     /// when the target stream has idempotency enabled. `0` = no id
     /// (legacy publish, never deduped).
-    pub msg_id_len:  U16,
+    pub msg_id_len: U16,
 }
 
 pub const PUB_BODY_FIXED: usize = core::mem::size_of::<PubBody>();
@@ -54,8 +54,8 @@ const _: () = assert!(PUB_BODY_FIXED == 8);
 #[repr(C)]
 pub struct PubFrame {
     pub header: Header,
-    pub body:   PubBody,
-    pub tail:   [u8], // subject || msg_id || payload
+    pub body: PubBody,
+    pub tail: [u8], // subject || msg_id || payload
 }
 
 impl PubFrame {
@@ -67,14 +67,17 @@ impl PubFrame {
     pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
         let s = self.body.subject_len.get() as usize;
         let m = self.body.msg_id_len.get() as usize;
-        let head_total = s.checked_add(m).ok_or(crate::error::ErrorCode::InvalidLength)?;
+        let head_total = s
+            .checked_add(m)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if head_total > self.tail.len() {
             return Err(crate::error::ErrorCode::InvalidLength);
         }
         // payload_len() computes msg_len - PUB_BODY_FIXED - s - m.
         // The fixed parts must fit inside `msg_len`.
         let msg = self.header.msg_len.get() as usize;
-        let lower = PUB_BODY_FIXED.checked_add(head_total)
+        let lower = PUB_BODY_FIXED
+            .checked_add(head_total)
             .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if msg < lower {
             return Err(crate::error::ErrorCode::InvalidLength);
@@ -138,16 +141,15 @@ impl PubFrame {
             out.len(),
             Self::wire_size(subject.len(), msg_id.len(), payload.len())
         );
-        let msg_len =
-            (PUB_BODY_FIXED + subject.len() + msg_id.len() + payload.len()) as u32;
+        let msg_len = (PUB_BODY_FIXED + subject.len() + msg_id.len() + payload.len()) as u32;
         let frame = Self::mut_from_bytes(out).expect("PubFrame layout");
         frame.header = Header::new(crate::action::Action::Publish.as_u16(), msg_len, seq)
             .with_flags(flags)
             .with_entry_flags(entry_flags);
         frame.body = PubBody {
-            stream_id:   U32::new(stream_id),
+            stream_id: U32::new(stream_id),
             subject_len: U16::new(subject.len() as u16),
-            msg_id_len:  U16::new(msg_id.len() as u16),
+            msg_id_len: U16::new(msg_id.len() as u16),
         };
         let s = subject.len();
         let m = msg_id.len();
@@ -189,7 +191,7 @@ mod tests {
     #[test]
     fn msg_id_roundtrips_and_isolates_subject_payload() {
         let subject = b"orders.new";
-        let msg_id  = b"order-id-12345";
+        let msg_id = b"order-id-12345";
         let payload = b"some opaque payload";
         let size = PubFrame::wire_size(subject.len(), msg_id.len(), payload.len());
         let mut buf = vec![0u8; size];
@@ -241,7 +243,7 @@ mod tests {
         // Forge subject_len out of bounds — offset for subject_len
         // is HEADER_SIZE + 4 (stream_id u32 first).
         let off = HEADER_SIZE + 4;
-        buf[off]     = 0xFF;
+        buf[off] = 0xFF;
         buf[off + 1] = 0xFF; // subject_len = 65535
         let f = PubFrame::ref_from_bytes(&buf).unwrap();
         assert!(
@@ -261,7 +263,7 @@ mod tests {
         // when treated as usize on a hypothetical 16-bit accumulator,
         // and clearly exceeds tail.len() anyway.
         let off = HEADER_SIZE + 4;
-        buf[off]     = 0xFF;
+        buf[off] = 0xFF;
         buf[off + 1] = 0xFF;
         buf[off + 2] = 0xFF;
         buf[off + 3] = 0xFF;
@@ -276,9 +278,14 @@ mod tests {
         let size = PubFrame::wire_size(0, 0, payload.len());
         let mut buf = vec![0u8; size];
         PubFrame::encode_into(
-            &mut buf, 1, 0, 0,
+            &mut buf,
+            1,
+            0,
+            0,
             entry_flag::RETAIN | entry_flag::COMPRESSED,
-            &[], &[], &payload,
+            &[],
+            &[],
+            &payload,
         );
         let f = PubFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(f.header.entry_flags, 0b0000_0011);

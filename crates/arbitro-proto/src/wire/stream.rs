@@ -89,7 +89,9 @@ pub struct CreateStreamView<'a> {
 
 impl<'a> CreateStreamView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &CreateStreamFixed {
@@ -111,25 +113,39 @@ impl<'a> CreateStreamView<'a> {
     }
 
     #[inline(always)]
-    pub fn max_msgs(&self) -> u64 { self.fixed().max_msgs.get() }
+    pub fn max_msgs(&self) -> u64 {
+        self.fixed().max_msgs.get()
+    }
 
     #[inline(always)]
-    pub fn max_bytes(&self) -> u64 { self.fixed().max_bytes.get() }
+    pub fn max_bytes(&self) -> u64 {
+        self.fixed().max_bytes.get()
+    }
 
     #[inline(always)]
-    pub fn max_age_secs(&self) -> u64 { self.fixed().max_age_secs.get() }
+    pub fn max_age_secs(&self) -> u64 {
+        self.fixed().max_age_secs.get()
+    }
 
     #[inline(always)]
-    pub fn replicas(&self) -> u8 { self.fixed().replicas }
+    pub fn replicas(&self) -> u8 {
+        self.fixed().replicas
+    }
 
     #[inline(always)]
-    pub fn journal_kind(&self) -> u8 { self.fixed().journal_kind }
+    pub fn journal_kind(&self) -> u8 {
+        self.fixed().journal_kind
+    }
 
     #[inline(always)]
-    pub fn retention(&self) -> u8 { self.fixed().retention }
+    pub fn retention(&self) -> u8 {
+        self.fixed().retention
+    }
 
     #[inline(always)]
-    pub fn discard(&self) -> u8 { self.fixed().discard }
+    pub fn discard(&self) -> u8 {
+        self.fixed().discard
+    }
 
     /// Per-stream idempotency window in milliseconds. `0` means the
     /// stream is NOT idempotent (legacy default — no dedup). A
@@ -138,7 +154,9 @@ impl<'a> CreateStreamView<'a> {
     /// `NameRegistry::set_stream_idempotency` to rebuild the per-stream
     /// state lost by a restart.
     #[inline(always)]
-    pub fn idempotency_window_ms(&self) -> u32 { self.fixed().idempotency_window_ms.get() }
+    pub fn idempotency_window_ms(&self) -> u32 {
+        self.fixed().idempotency_window_ms.get()
+    }
 }
 
 pub struct DeleteStreamView<'a> {
@@ -147,7 +165,9 @@ pub struct DeleteStreamView<'a> {
 
 impl<'a> DeleteStreamView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
@@ -163,13 +183,17 @@ pub struct GetStreamView<'a> {
 
 impl<'a> GetStreamView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
-        let f = GetStreamFixed::ref_from_bytes(&self.buf[..core::mem::size_of::<GetStreamFixed>()]).unwrap();
+        let f = GetStreamFixed::ref_from_bytes(&self.buf[..core::mem::size_of::<GetStreamFixed>()])
+            .unwrap();
         let nl = f.name_len.get() as usize;
-        &self.buf[core::mem::size_of::<GetStreamFixed>()..core::mem::size_of::<GetStreamFixed>() + nl]
+        &self.buf
+            [core::mem::size_of::<GetStreamFixed>()..core::mem::size_of::<GetStreamFixed>() + nl]
     }
 }
 
@@ -179,7 +203,9 @@ pub struct PurgeStreamView<'a> {
 
 impl<'a> PurgeStreamView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
@@ -195,7 +221,9 @@ pub struct DrainSubjectView<'a> {
 
 impl<'a> DrainSubjectView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &DrainSubjectFixed {

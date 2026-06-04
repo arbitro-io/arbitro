@@ -30,8 +30,7 @@ use zerocopy::FromBytes;
 
 // RepBatch uses the server's internal wire types (Envelope + DeliveryEntryHeader).
 use arbitro_proto::wire::{
-    RepBatchFixed, REP_BATCH_FIXED_SIZE,
-    DeliveryEntryHeader, DELIVERY_ENTRY_HEADER_SIZE,
+    DeliveryEntryHeader, RepBatchFixed, DELIVERY_ENTRY_HEADER_SIZE, REP_BATCH_FIXED_SIZE,
 };
 // Single Deliver still uses v2 egress types.
 use arbitro_proto::v2::egress::{DeliverBody, DELIVER_BODY_FIXED};
@@ -62,27 +61,34 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
         Err(_) => return,
     };
 
-    let consumer_id  = body.consumer_id.get();
+    let consumer_id = body.consumer_id.get();
     let subject_hash = body.subject_hash.get();
-    let subject_len  = body.subject_len.get() as usize;
-    let payload_off  = body_end + subject_len;
+    let subject_len = body.subject_len.get() as usize;
+    let payload_off = body_end + subject_len;
 
     if frame.len() < payload_off {
         return;
     }
 
-    let subject   = Box::from(&frame[body_end..payload_off]);
-    let reply_to  = Bytes::new(); // Single Deliver does not carry reply_to
-    let payload   = frame.slice(payload_off..);
+    let subject = Box::from(&frame[body_end..payload_off]);
+    let reply_to = Bytes::new(); // Single Deliver does not carry reply_to
+    let payload = frame.slice(payload_off..);
     let stream_id = inner.subscriptions.stream_id_of(consumer_id).unwrap_or(0);
 
     let msg = Message::new(
-        deliver_seq, consumer_id, stream_id, subject_hash,
-        subject, reply_to, payload,
+        deliver_seq,
+        consumer_id,
+        stream_id,
+        subject_hash,
+        subject,
+        reply_to,
+        payload,
         inner.ack_tx.clone(),
         inner.nack_tx.clone(),
     );
-    inner.metrics.deliveries_received
+    inner
+        .metrics
+        .deliveries_received
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     inner.subscriptions.send(consumer_id, msg).await;
 }
@@ -99,7 +105,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
 pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
     // The Envelope (16B) precedes the batch header.
     let bh_start = ENVELOPE_SIZE;
-    let bh_end   = bh_start + REP_BATCH_FIXED_SIZE;   // 16 + 4 = 20
+    let bh_end = bh_start + REP_BATCH_FIXED_SIZE; // 16 + 4 = 20
     if frame.len() < bh_end {
         return;
     }
@@ -109,10 +115,10 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
     };
 
     let count = batch_hdr.count.get() as usize;
-    let mut off = bh_end;  // start of first entry
+    let mut off = bh_end; // start of first entry
 
     for _ in 0..count {
-        let entry_end = off + DELIVERY_ENTRY_HEADER_SIZE;   // +24
+        let entry_end = off + DELIVERY_ENTRY_HEADER_SIZE; // +24
         if frame.len() < entry_end {
             break;
         }
@@ -121,36 +127,43 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
             Err(_) => break,
         };
 
-        let consumer_id  = entry.consumer_id.get();
-        let deliver_seq  = entry.seq.get();
-        let subj_len     = entry.subj_len.get() as usize;
-        let reply_len    = entry.reply_len.get() as usize;
-        let data_len     = entry.data_len.get() as usize;
+        let consumer_id = entry.consumer_id.get();
+        let deliver_seq = entry.seq.get();
+        let subj_len = entry.subj_len.get() as usize;
+        let reply_len = entry.reply_len.get() as usize;
+        let data_len = entry.data_len.get() as usize;
         let subject_hash = entry.subject_hash.get();
         off = entry_end;
 
         if frame.len() < off + data_len {
             break;
         }
-        let subject     = Box::from(&frame[off..off + subj_len]);
-        let reply_to    = if reply_len > 0 {
+        let subject = Box::from(&frame[off..off + subj_len]);
+        let reply_to = if reply_len > 0 {
             frame.slice(off + subj_len..off + subj_len + reply_len)
         } else {
             Bytes::new()
         };
         let payload_start = off + subj_len + reply_len;
-        let payload     = frame.slice(payload_start..off + data_len);
-        off            += data_len;
+        let payload = frame.slice(payload_start..off + data_len);
+        off += data_len;
 
         let stream_id = inner.subscriptions.stream_id_of(consumer_id).unwrap_or(0);
 
         let msg = Message::new(
-            deliver_seq, consumer_id, stream_id, subject_hash,
-            subject, reply_to, payload,
+            deliver_seq,
+            consumer_id,
+            stream_id,
+            subject_hash,
+            subject,
+            reply_to,
+            payload,
             inner.ack_tx.clone(),
             inner.nack_tx.clone(),
         );
-        inner.metrics.deliveries_received
+        inner
+            .metrics
+            .deliveries_received
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         inner.subscriptions.send(consumer_id, msg).await;
     }

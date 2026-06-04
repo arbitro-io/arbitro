@@ -6,7 +6,7 @@
 //! zero-copy cast between `&[T]` ↔ `&[u8]`. No serialization, no copies.
 
 use bytes::Bytes;
-use zerocopy::{IntoBytes, FromBytes, Immutable, KnownLayout, TryFromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 // ── ID Newtypes ──────────────────────────────────────────────────────────────
 
@@ -53,22 +53,40 @@ id_newtype_u32!(
 );
 
 /// Unique identifier for a connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-         IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    IntoBytes,
+    FromBytes,
+    Immutable,
+    KnownLayout,
+)]
 #[repr(transparent)]
 pub struct ConnectionId(pub u64);
 
 impl ConnectionId {
     #[inline]
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
 
     #[inline]
-    pub const fn raw(self) -> u64 { self.0 }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 impl From<u64> for ConnectionId {
     #[inline]
-    fn from(v: u64) -> Self { Self(v) }
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
 }
 
 // ── Slab Key ─────────────────────────────────────────────────────────────────
@@ -76,8 +94,7 @@ impl From<u64> for ConnectionId {
 /// Generational key into a `TypedSlab`.
 ///
 /// Combines a slot index with a generation counter for ABA protection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash,
-         IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct SlabKey {
     pub index: u32,
@@ -91,27 +108,48 @@ impl SlabKey {
     }
 
     /// Sentinel value representing an invalid / uninitialized key.
-    pub const DANGLING: Self = Self { index: u32::MAX, generation: 0 };
+    pub const DANGLING: Self = Self {
+        index: u32::MAX,
+        generation: 0,
+    };
 }
 
 // ── Timestamp ────────────────────────────────────────────────────────────────
 
 /// Monotonic nanosecond timestamp. Passed from caller, never read from clock
 /// on the hot path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
-         IntoBytes, FromBytes, Immutable, KnownLayout)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    IntoBytes,
+    FromBytes,
+    Immutable,
+    KnownLayout,
+)]
 #[repr(transparent)]
 pub struct Timestamp(pub u64);
 
 impl Timestamp {
     #[inline]
-    pub const fn new(ns: u64) -> Self { Self(ns) }
+    pub const fn new(ns: u64) -> Self {
+        Self(ns)
+    }
 
     #[inline]
-    pub const fn as_ns(self) -> u64 { self.0 }
+    pub const fn as_ns(self) -> u64 {
+        self.0
+    }
 
     #[inline]
-    pub const fn as_ms(self) -> u64 { self.0 / 1_000_000 }
+    pub const fn as_ms(self) -> u64 {
+        self.0 / 1_000_000
+    }
 }
 
 // ── PayloadRef ───────────────────────────────────────────────────────────────
@@ -143,14 +181,17 @@ impl PayloadRef<'_> {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 // ── CreditScope ──────────────────────────────────────────────────────────────
 
 /// Scope for multi-level credit tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash,
-         IntoBytes, TryFromBytes, Immutable, KnownLayout)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, IntoBytes, TryFromBytes, Immutable, KnownLayout,
+)]
 #[repr(u8)]
 pub enum CreditScope {
     Node = 0,
@@ -159,8 +200,7 @@ pub enum CreditScope {
 }
 
 /// A single credit reservation stored inline in PendingNode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq,
-         IntoBytes, TryFromBytes, Immutable, KnownLayout)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, TryFromBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct CreditEntry {
     pub scope: CreditScope,

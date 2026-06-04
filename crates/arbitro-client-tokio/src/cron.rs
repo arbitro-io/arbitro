@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use arbitro_proto::wire::cron::{
-    CreateCronBody, decode_cron_fire, encode_cron_ack, encode_create_cron, encode_delete_cron,
+    decode_cron_fire, encode_create_cron, encode_cron_ack, encode_delete_cron, CreateCronBody,
 };
 
 use crate::error::ClientError;
@@ -38,9 +38,8 @@ pub struct CronContext {
 // ── Handler type ────────────────────────────────────────────────────────────
 
 /// Type-erased async cron handler.
-pub(crate) type CronHandler = Arc<
-    dyn Fn(CronContext) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub(crate) type CronHandler =
+    Arc<dyn Fn(CronContext) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // ── CronState ───────────────────────────────────────────────────────────────
 
@@ -69,7 +68,10 @@ impl CronState {
 
     /// Register a handler for a cron name.
     pub(crate) fn register(&self, name: Bytes, config: CreateCronBody, handler: CronHandler) {
-        self.handlers.lock().unwrap().insert(name, CronEntry { handler, config });
+        self.handlers
+            .lock()
+            .unwrap()
+            .insert(name, CronEntry { handler, config });
     }
 
     /// Remove a cron handler.
@@ -79,13 +81,20 @@ impl CronState {
 
     /// Look up a handler by name (returns a clone of the Arc).
     pub(crate) fn get_handler(&self, name: &[u8]) -> Option<CronHandler> {
-        self.handlers.lock().unwrap().get(name).map(|e| e.handler.clone())
+        self.handlers
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|e| e.handler.clone())
     }
 
     /// Get all registered cron configs (for re-registration on reconnect).
     pub(crate) fn all_configs(&self) -> Vec<(Bytes, CreateCronBody)> {
         let guard = self.handlers.lock().unwrap();
-        guard.iter().map(|(k, v)| (k.clone(), v.config.clone())).collect()
+        guard
+            .iter()
+            .map(|(k, v)| (k.clone(), v.config.clone()))
+            .collect()
     }
 }
 
@@ -177,8 +186,12 @@ impl<'a> CronBuilder<'a> {
         let frame = encode_create_cron(seq, &body);
 
         let rx = self.client.inner.pending.register(seq);
-        crate::publish::enqueue(self.client.producer(), crate::transport::frame::WriteFrame::Mono(frame))?;
-        rx.recv_async().await
+        crate::publish::enqueue(
+            self.client.producer(),
+            crate::transport::frame::WriteFrame::Mono(frame),
+        )?;
+        rx.recv_async()
+            .await
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)?;
 

@@ -2,8 +2,8 @@
 
 use std::future::Future;
 
-use bytes::Bytes;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
+use bytes::Bytes;
 
 use crate::error::ClientError;
 use crate::state::pending::Pending;
@@ -43,7 +43,14 @@ fn encode_pub_frame(
     if size <= INLINE_CAP {
         let mut data = [0u8; INLINE_CAP];
         PubFrame::encode_into(
-            &mut data[..size], seq, stream_id, 0, 0, subject, msg_id, payload,
+            &mut data[..size],
+            seq,
+            stream_id,
+            0,
+            0,
+            subject,
+            msg_id,
+            payload,
         );
         WriteFrame::Inline(data, size as u16)
     } else {
@@ -64,7 +71,10 @@ pub(crate) fn publish_async(
     payload: Bytes,
 ) -> Result<(), ClientError> {
     let seq = seq_alloc.next();
-    enqueue(tx, encode_pub_frame(seq, stream_id, subject, msg_id, &payload))
+    enqueue(
+        tx,
+        encode_pub_frame(seq, stream_id, subject, msg_id, &payload),
+    )
 }
 
 /// Fire-and-forget batch publish.
@@ -79,7 +89,10 @@ pub(crate) fn publish_batch_async(
 ) -> Result<(), ClientError> {
     for chunk in entries.chunks(PUBLISH_BATCH_MAX) {
         let seq = seq_alloc.next();
-        enqueue(tx, WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, chunk)))?;
+        enqueue(
+            tx,
+            WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, chunk)),
+        )?;
     }
     Ok(())
 }
@@ -100,13 +113,14 @@ pub(crate) fn publish_sync_async(
     msg_id: &[u8],
     payload: Bytes,
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
-    let seq   = seq_alloc.next();
+    let seq = seq_alloc.next();
     let frame = encode_pub_frame(seq, stream_id, subject, msg_id, &payload);
-    let rx    = pending.register(seq);
+    let rx = pending.register(seq);
     let enqueue_result = enqueue(tx, frame);
     async move {
         enqueue_result?;
-        rx.recv_async().await
+        rx.recv_async()
+            .await
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)
     }
@@ -124,15 +138,16 @@ pub(crate) fn publish_delayed_async(
     payload: Bytes,
     delay_ms: u64,
 ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
-    let seq   = seq_alloc.next();
-    let frame = WriteFrame::Mono(
-        crate::transport::encode::encode_pub_delayed_v2(seq, stream_id, subject, &payload, delay_ms)
-    );
-    let rx    = pending.register(seq);
+    let seq = seq_alloc.next();
+    let frame = WriteFrame::Mono(crate::transport::encode::encode_pub_delayed_v2(
+        seq, stream_id, subject, &payload, delay_ms,
+    ));
+    let rx = pending.register(seq);
     let enqueue_result = enqueue(tx, frame);
     async move {
         enqueue_result?;
-        rx.recv_async().await
+        rx.recv_async()
+            .await
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)
     }
@@ -154,13 +169,16 @@ pub(crate) fn publish_with_reply_async(
     msg_id: &[u8],
     payload: Bytes,
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
-    let seq   = seq_alloc.next();
-    let frame = WriteFrame::Mono(encode_pub_with_reply_v2(seq, stream_id, subject, reply_to, msg_id, &payload));
-    let rx    = pending.register(seq);
+    let seq = seq_alloc.next();
+    let frame = WriteFrame::Mono(encode_pub_with_reply_v2(
+        seq, stream_id, subject, reply_to, msg_id, &payload,
+    ));
+    let rx = pending.register(seq);
     let enqueue_result = enqueue(tx, frame);
     async move {
         enqueue_result?;
-        rx.recv_async().await
+        rx.recv_async()
+            .await
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)
     }
@@ -184,7 +202,7 @@ pub(crate) fn publish_batch_sync_async(
     // First chunk — register a pending slot so we can await the reply.
     let first_chunk = chunks.next().unwrap_or(&[]);
     let seq = seq_alloc.next();
-    let rx  = pending.register(seq);
+    let rx = pending.register(seq);
     let mut enqueue_result = enqueue(
         tx,
         WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, first_chunk)),
@@ -206,7 +224,8 @@ pub(crate) fn publish_batch_sync_async(
 
     async move {
         enqueue_result?;
-        rx.recv_async().await
+        rx.recv_async()
+            .await
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)
     }

@@ -324,7 +324,8 @@ impl NameRegistry {
             }
             g.streams_seq_to_wire[id.0 as usize] = wire_id;
             if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
-                g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
+                g.streams_idempotency_window_ms
+                    .resize((id.0 as usize) + 1, 0);
             }
             g.streams_idempotency_window_ms[id.0 as usize] = 0;
             (id, true)
@@ -369,13 +370,15 @@ impl NameRegistry {
             let id = StreamId(g.next_stream);
             g.next_stream += 1;
             g.streams_by_wire.insert(wire_id, id);
-            g.streams_name_by_wire.insert(wire_id, expected_name.to_vec());
+            g.streams_name_by_wire
+                .insert(wire_id, expected_name.to_vec());
             if (id.0 as usize) >= g.streams_seq_to_wire.len() {
                 g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
             }
             g.streams_seq_to_wire[id.0 as usize] = wire_id;
             if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
-                g.streams_idempotency_window_ms.resize((id.0 as usize) + 1, 0);
+                g.streams_idempotency_window_ms
+                    .resize((id.0 as usize) + 1, 0);
             }
             g.streams_idempotency_window_ms[id.0 as usize] = 0;
             (id, true)
@@ -459,13 +462,7 @@ impl NameRegistry {
     /// Set the quota limits for an already-allocated stream. Called at
     /// `CreateStream` time. Values of `0` mean unlimited for that
     /// dimension.
-    pub fn set_stream_quota(
-        &self,
-        seq: StreamId,
-        max_msgs: u64,
-        max_bytes: u64,
-        discard: u8,
-    ) {
+    pub fn set_stream_quota(&self, seq: StreamId, max_msgs: u64, max_bytes: u64, discard: u8) {
         self.with_inner_swap(|g| {
             let idx = seq.0 as usize;
             if idx >= g.stream_quotas.len() {
@@ -485,11 +482,7 @@ impl NameRegistry {
     /// **Hot path**: lock-free `ArcSwap` load + indexed `Vec` access.
     #[inline]
     pub fn stream_quota(&self, seq: StreamId) -> Option<StreamQuota> {
-        self.hot
-            .load()
-            .stream_quotas
-            .get(seq.0 as usize)
-            .copied()
+        self.hot.load().stream_quotas.get(seq.0 as usize).copied()
     }
 
     // ── Consumers ──────────────────────────────────────────────────────────
@@ -579,9 +572,13 @@ impl NameRegistry {
     /// Drop a consumer mapping by ID (reverse lookup).
     pub fn remove_consumer_by_id(&self, id: ConsumerId) -> Option<Vec<u8>> {
         self.with_inner_swap(|g| {
-            let key = g.consumers_by_name
-                .iter()
-                .find_map(|(k, &v)| if v == id { Some(k.clone()) } else { None })?;
+            let key = g.consumers_by_name.iter().find_map(|(k, &v)| {
+                if v == id {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })?;
             let name = key.1.clone();
             g.consumers_by_name.remove(&key);
             g.consumer_queue.remove(&id);
@@ -804,11 +801,17 @@ mod tests {
         let s = StreamId(0);
         assert_eq!(r.get_or_create_consumer(s, b"alice"), (ConsumerId(1), true));
         assert_eq!(r.get_or_create_consumer(s, b"bob"), (ConsumerId(2), true));
-        assert_eq!(r.get_or_create_consumer(s, b"alice"), (ConsumerId(1), false));
+        assert_eq!(
+            r.get_or_create_consumer(s, b"alice"),
+            (ConsumerId(1), false)
+        );
         assert_eq!(r.consumer_id(s, b"alice"), Some(ConsumerId(1)));
         // GAP-6: same name on a different stream → different ConsumerId.
         let s2 = StreamId(1);
-        assert_eq!(r.get_or_create_consumer(s2, b"alice"), (ConsumerId(3), true));
+        assert_eq!(
+            r.get_or_create_consumer(s2, b"alice"),
+            (ConsumerId(3), true)
+        );
     }
 
     #[test]

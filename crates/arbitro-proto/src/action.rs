@@ -8,9 +8,9 @@ pub enum Action {
     // discriminator byte inside the payload, no inner branching.
     // TODO §5.1: 0x0102 (PublishAccumulate) deleted — v1-only, never
     // dispatched by the v2 server. Reserved; do not reuse the slot.
-    Publish                  = 0x0101,
-    PublishBatch             = 0x0103,
-    PublishWithReply         = 0x0104, // + reply_to (RPC)
+    Publish = 0x0101,
+    PublishBatch = 0x0103,
+    PublishWithReply = 0x0104, // + reply_to (RPC)
     // 0x0105, 0x0106 reserved (deleted PublishWithHeaders /
     // PublishBatchWithHeaders) — §5.1: frame defs existed but no
     // dispatcher was ever wired. Reserved; do not reuse the slots.
@@ -18,58 +18,58 @@ pub enum Action {
     // 0x00xx — Handshake / control (pre-Header). Hello is *not* a v2 frame:
     // its on-wire representation is a 8B HelloFrame starting with the v2
     // magic, sent as the first bytes of every connection.
-    Hello                    = 0x0001,
+    Hello = 0x0001,
     /// Auth frame — Header + raw token bytes. Must be the first frame
     /// after Hello when the server requires authentication.
-    Auth                     = 0x0002,
+    Auth = 0x0002,
 
     // 0x02xx — Delivery
-    Deliver       = 0x0200,
-    Ack           = 0x0201,
-    Nack          = 0x0202,
-    RepOk         = 0x0203,
-    RepError      = 0x0204,
-    RepBatch      = 0x0205,
-    BatchAck      = 0x0206,
-    FanoutBatch   = 0x0207,
+    Deliver = 0x0200,
+    Ack = 0x0201,
+    Nack = 0x0202,
+    RepOk = 0x0203,
+    RepError = 0x0204,
+    RepBatch = 0x0205,
+    BatchAck = 0x0206,
+    FanoutBatch = 0x0207,
     // TODO §5.1: 0x0208 (AckSync) and 0x0209 (BatchAckSync) deleted —
     // collapsed into Ack / BatchAck (both wait for store fsync before
     // replying). Reserved; do not reuse the slots.
-    BatchNack     = 0x020A,
+    BatchNack = 0x020A,
 
     // 0x03xx — Subscription
-    Subscribe     = 0x0301,
-    Unsubscribe   = 0x0302,
+    Subscribe = 0x0301,
+    Unsubscribe = 0x0302,
 
     // 0x04xx — Stream management
-    CreateStream  = 0x0401,
-    DeleteStream  = 0x0402,
-    GetStream     = 0x0403,
-    ListStreams   = 0x0404,
-    PurgeStream   = 0x0405,
-    DrainSubject  = 0x0406,
+    CreateStream = 0x0401,
+    DeleteStream = 0x0402,
+    GetStream = 0x0403,
+    ListStreams = 0x0404,
+    PurgeStream = 0x0405,
+    DrainSubject = 0x0406,
 
     // 0x05xx — Consumer management
     CreateConsumer = 0x0501,
     DeleteConsumer = 0x0502,
-    GetConsumer    = 0x0503,
-    ListConsumers  = 0x0504,
+    GetConsumer = 0x0503,
+    ListConsumers = 0x0504,
     /// Query a single consumer's live pending-ack count. Reply is a
     /// standard `RepOk` whose `ref_seq` field carries the count as a u64.
-    ConsumerStats  = 0x0505,
+    ConsumerStats = 0x0505,
     /// M11: pause delivery to a consumer. Body = u32 consumer_id.
     /// Reply is `RepOk` (ref_seq mirrors req_seq).
-    PauseConsumer  = 0x0506,
+    PauseConsumer = 0x0506,
     /// M11: resume delivery to a previously paused consumer.
     ResumeConsumer = 0x0507,
 
     // 0x06xx — System
-    Ping          = 0x0601,
-    Pong          = 0x0602,
+    Ping = 0x0601,
+    Pong = 0x0602,
     // L1: 0x0603 (Connect) / 0x0604 (Connected) deleted — v2 uses
     // HelloFrame for the handshake, so these wire codes have no
     // dispatcher. Reserved; do not reuse the slots.
-    Disconnect    = 0x0605,
+    Disconnect = 0x0605,
 
     // 0x08xx — Delayed publish
     /// Publish with a delivery delay. Body = normal PubFrame body + u64
@@ -80,43 +80,43 @@ pub enum Action {
     // 0x07xx — Cron scheduling
     /// Register a cron job. JSON body: name, cron_expr, tz (optional).
     /// Reply: RepOk on success.
-    CreateCron    = 0x0701,
+    CreateCron = 0x0701,
     /// Remove a cron job by name. Body: name bytes.
     /// Reply: RepOk.
-    DeleteCron    = 0x0702,
+    DeleteCron = 0x0702,
     /// List active cron jobs. No body.
     /// Reply: RepOk with JSON array of cron definitions.
-    ListCrons     = 0x0703,
+    ListCrons = 0x0703,
     /// Broker→client: a cron job fired. Body: name + fire_time + fire_count.
-    CronFire      = 0x0704,
+    CronFire = 0x0704,
     /// Client→broker: acknowledges cron fire execution.
     /// Body: name + status (0=ok, 1=error).
-    CronAck       = 0x0705,
+    CronAck = 0x0705,
 
     // 0x09xx — Workflow orchestration
     /// Register a workflow. JSON body: name, trigger, steps[], config.
     /// Reply: RepOk on success.
-    CreateWorkflow  = 0x0901,
+    CreateWorkflow = 0x0901,
     /// Remove a workflow by name. Body: name bytes.
     /// Reply: RepOk.
-    DeleteWorkflow  = 0x0902,
+    DeleteWorkflow = 0x0902,
     /// List active workflows. No body.
     /// Reply: RepOk with JSON array of workflow definitions.
-    ListWorkflows   = 0x0903,
+    ListWorkflows = 0x0903,
     /// Broker→client: execute the next step of a workflow instance.
     /// Body: name_len + instance_id + step_index + name + context_json.
-    WorkflowStep    = 0x0904,
+    WorkflowStep = 0x0904,
     /// Client→broker: result of a workflow step execution.
     /// Body: name_len + instance_id + status + name + context_json.
-    WorkflowResult  = 0x0905,
+    WorkflowResult = 0x0905,
     /// Cancel a running workflow instance. Body: instance_id (4 bytes).
-    CancelWorkflow  = 0x0906,
+    CancelWorkflow = 0x0906,
     /// List instances of a workflow. Body: name bytes.
     /// Reply: RepOk with JSON array of instance states.
-    ListInstances   = 0x0907,
+    ListInstances = 0x0907,
     /// Broker→client: a workflow step errored and the onError handler
     /// should be invoked. Body: name_len + instance_id + name + error_json.
-    WorkflowError   = 0x0908,
+    WorkflowError = 0x0908,
 }
 
 impl Action {
@@ -132,7 +132,6 @@ impl Action {
             0x0103 => Some(Self::PublishBatch),
             0x0104 => Some(Self::PublishWithReply),
             // 0x0105, 0x0106 reserved (deleted §5.1).
-
             0x0200 => Some(Self::Deliver),
             0x0201 => Some(Self::Ack),
             0x0202 => Some(Self::Nack),
@@ -226,10 +225,7 @@ impl Action {
     pub const fn is_publish(self) -> bool {
         matches!(
             self,
-            Self::Publish
-                | Self::PublishBatch
-                | Self::PublishWithReply
-                | Self::PublishDelayed
+            Self::Publish | Self::PublishBatch | Self::PublishWithReply | Self::PublishDelayed
         )
     }
 }

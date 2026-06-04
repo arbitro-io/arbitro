@@ -29,7 +29,9 @@ use arbitro_store::Store;
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
-use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, NotifyRing, SharedCounters};
+use crate::shard::shared::{
+    find_writer, DrainNotification, DrainSnapshot, NotifyRing, SharedCounters,
+};
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -231,7 +233,8 @@ pub(in crate::shard) fn drain_read(
         .for_each(start, end, &mut |entry| {
             // Per-stream max_age_ms takes precedence over the global default;
             // falls back to global cfg if the stream has no specific limit.
-            let stream_max_age = snap.stream_max_age_ms
+            let stream_max_age = snap
+                .stream_max_age_ms
                 .get(entry.stream_id as usize)
                 .copied()
                 .filter(|&v| v > 0)
@@ -317,7 +320,10 @@ pub(in crate::shard) fn drain_deliver(
             // I/O error, skip this connection immediately. Frames sent
             // to a dead writer's channel would pile up until the session
             // is reaped, wasting memory and CPU.
-            if writer.write_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            if writer
+                .write_failed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
                 return false;
             }
@@ -340,12 +346,7 @@ pub(in crate::shard) fn drain_deliver(
             let ok = writer.write_tx.try_send(frame.bytes).is_ok();
 
             if ok {
-                crate::lifecycle_trace!(
-                    "30_send_bytes_done",
-                    conn.0,
-                    count as u64,
-                    "shard"
-                );
+                crate::lifecycle_trace!("30_send_bytes_done", conn.0, count as u64, "shard");
                 flush_results.push((conn, FlushOutcome::Ok));
             } else {
                 // Channel full → backpressure, NOT dead. Record first_seq
@@ -391,8 +392,7 @@ pub(in crate::shard) fn drain_deliver(
             counters.inc_inflight(d.consumer_id, d.queue_id);
             // Drain owns the per-(consumer, subject) inflight map; this
             // is a local HashMap mutation, no atomics, no contention.
-            consumer_subjects_slot_mut(consumer_subjects, d.consumer_id)
-                .inc(d.subject_hash);
+            consumer_subjects_slot_mut(consumer_subjects, d.consumer_id).inc(d.subject_hash);
         }
     }
 
@@ -415,7 +415,9 @@ pub(in crate::shard) fn drain_deliver(
     scratch.flush_results = flush_results;
 
     // Cursor advances to last fully-processed entry.
-    let new_cursor = result.lowest_skipped.map_or(result.end - 1, |ls| ls.saturating_sub(1));
+    let new_cursor = result
+        .lowest_skipped
+        .map_or(result.end - 1, |ls| ls.saturating_sub(1));
     counters.set_cursor(new_cursor);
 
     if result.end <= result.last_seq || result.lowest_skipped.is_some() {
@@ -459,7 +461,15 @@ pub(in crate::shard) fn drain_cycle(
     silent_drops: &crate::common::SilentDrops,
     now_ms: u64,
 ) {
-    match drain_read(counters, snap, store, cfg, scratch, consumer_subjects, now_ms) {
+    match drain_read(
+        counters,
+        snap,
+        store,
+        cfg,
+        scratch,
+        consumer_subjects,
+        now_ms,
+    ) {
         Some(result) => drain_deliver(
             counters,
             snap,
@@ -711,8 +721,7 @@ fn dispatch_recipients(
         // Store format: [reply_len:u16 LE][reply_to bytes][actual payload].
         let (reply_to, actual_payload): (&[u8], &[u8]) =
             if entry.flags & arbitro_store::flags::HAS_REPLY_TO != 0 && entry.payload.len() >= 2 {
-                let reply_len =
-                    u16::from_le_bytes([entry.payload[0], entry.payload[1]]) as usize;
+                let reply_len = u16::from_le_bytes([entry.payload[0], entry.payload[1]]) as usize;
                 if entry.payload.len() >= 2 + reply_len {
                     (
                         &entry.payload[2..2 + reply_len],

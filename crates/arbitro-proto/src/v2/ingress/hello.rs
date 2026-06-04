@@ -44,18 +44,18 @@
 use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::v2::magic::ARBITRO_MAGIC_V2;
 use crate::v2::header::CURRENT_VERSION;
+use crate::v2::magic::ARBITRO_MAGIC_V2;
 
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct HelloFrame {
-    pub magic:   U32,
+    pub magic: U32,
     pub version: u8,
-    pub role:    u8,
+    pub role: u8,
     /// Reserved (M9 — was `caps: u16`, removed). Must be 0. Reserved
     /// for a future `HelloAck` negotiation; see module docs.
-    pub _pad:    U16,
+    pub _pad: U16,
 }
 
 pub const HELLO_FRAME_SIZE: usize = core::mem::size_of::<HelloFrame>();
@@ -73,10 +73,10 @@ impl HelloFrame {
     #[inline(always)]
     pub fn new(role: Role) -> Self {
         Self {
-            magic:   U32::new(ARBITRO_MAGIC_V2),
+            magic: U32::new(ARBITRO_MAGIC_V2),
             version: CURRENT_VERSION,
-            role:    role as u8,
-            _pad:    U16::new(0),
+            role: role as u8,
+            _pad: U16::new(0),
         }
     }
 

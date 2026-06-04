@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 use arbitro_client_tokio::{
     AckPolicy, BatchEntry, Client, ClientConfig, ConsumerBuilder, SubscriptionHandle,
 };
-use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 const DEFAULT_ITERS: u64 = 1_000;
 const BASIC_BACKLOG: u32 = 100;
@@ -72,7 +72,10 @@ const PAT_PREMIUM_CAP: u32 = 100;
 const PAT_DYNAMIC_CAP: u32 = 1;
 
 fn env_u64(var: &str, fallback: u64) -> u64 {
-    std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn portpicker() -> u16 {
@@ -97,9 +100,12 @@ async fn spawn_server() -> String {
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client connects")
+    Client::connect(ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    })
+    .await
+    .expect("client connects")
 }
 
 async fn create_stream(client: &Client, name: &[u8]) -> u32 {
@@ -190,7 +196,10 @@ async fn stage0_cap_enforced() -> (u32, u32, Duration) {
     let entries: Vec<BatchEntry<'_>> = (0..total)
         .map(|_| BatchEntry::new(one_subject, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
-    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     // Receive up to PAT_PREMIUM_CAP — must succeed inside a short budget.
     let start = Instant::now();
@@ -221,7 +230,8 @@ async fn stage0_cap_enforced() -> (u32, u32, Duration) {
     }
 
     assert_eq!(
-        extras, 0,
+        extras,
+        0,
         "cap_enforcement FAILED — published {total} msgs to one subject \
          with cap={PAT_PREMIUM_CAP}, expected exactly {PAT_PREMIUM_CAP} to \
          deliver and the next {} to be held. Got {} extras inside a \
@@ -262,13 +272,17 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
     let payload = vec![0u8; PAYLOAD_SIZE];
 
     // Pin 100 basic subjects at 1/1 — drain without ack.
-    let basic_subjects: Vec<String> =
-        (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
+    let basic_subjects: Vec<String> = (0..BASIC_BACKLOG)
+        .map(|i| format!("orders.basic.user_{i}"))
+        .collect();
     let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
         .iter()
         .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
-    client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &basic_entries)
+        .await
+        .unwrap();
     let mut got = 0u32;
     while got < BASIC_BACKLOG {
         let _msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
@@ -285,7 +299,10 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
         .map(|_| BatchEntry::new(one_subject, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     let start = Instant::now();
-    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     let mut delivered = 0u32;
     while delivered < PAT_PREMIUM_CAP {
@@ -378,13 +395,17 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
     let payload = vec![0u8; PAYLOAD_SIZE];
 
     // Pin 100 unique basic subjects at 1/1.
-    let basic_subjects: Vec<String> =
-        (0..BASIC_BACKLOG).map(|i| format!("orders.basic.user_{i}")).collect();
+    let basic_subjects: Vec<String> = (0..BASIC_BACKLOG)
+        .map(|i| format!("orders.basic.user_{i}"))
+        .collect();
     let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
         .iter()
         .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
-    client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &basic_entries)
+        .await
+        .unwrap();
 
     let mut got = 0u32;
     while got < BASIC_BACKLOG {
@@ -397,18 +418,14 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
     // Do NOT ack — basic subjects stay pinned at 1/1 for the whole
     // measurement window.
 
-    let (latencies, _c, _s) =
-        measure_vip_latency(client, stream_id, sub, payload, iters).await;
+    let (latencies, _c, _s) = measure_vip_latency(client, stream_id, sub, payload, iters).await;
     latencies
 }
 
 // ── Stage 3 — multi-client isolated ────────────────────────────────
 
 /// Same as Stage 2 but with N parallel clients on N independent streams.
-async fn multi_client_isolated_latency(
-    iters: u64,
-    n_clients: u64,
-) -> Vec<Vec<Duration>> {
+async fn multi_client_isolated_latency(iters: u64, n_clients: u64) -> Vec<Vec<Duration>> {
     let addr = spawn_server().await;
 
     let mut futs = Vec::new();
@@ -433,13 +450,17 @@ async fn multi_client_isolated_latency(
             let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
             let payload = vec![0u8; PAYLOAD_SIZE];
 
-            let basic_subjects: Vec<String> =
-                (0..BASIC_BACKLOG).map(|j| format!("orders.basic.user_{j}")).collect();
+            let basic_subjects: Vec<String> = (0..BASIC_BACKLOG)
+                .map(|j| format!("orders.basic.user_{j}"))
+                .collect();
             let basic_entries: Vec<BatchEntry<'_>> = basic_subjects
                 .iter()
                 .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
                 .collect();
-            client.publish_batch_sync(stream_id, &basic_entries).await.unwrap();
+            client
+                .publish_batch_sync(stream_id, &basic_entries)
+                .await
+                .unwrap();
 
             let mut got = 0u32;
             while got < BASIC_BACKLOG {
@@ -509,8 +530,7 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
     let payload = vec![0u8; PAYLOAD_SIZE];
 
-    let subjects: Vec<String> =
-        (0..n_users).map(|i| format!("notif.user.{i}")).collect();
+    let subjects: Vec<String> = (0..n_users).map(|i| format!("notif.user.{i}")).collect();
     let entries: Vec<BatchEntry<'_>> = subjects
         .iter()
         .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
@@ -519,7 +539,10 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let start = Instant::now();
-    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     let mut got = 0u64;
     while got < n_users {
@@ -549,9 +572,7 @@ async fn main() {
     println!("========================================================");
     println!("  iters={iters}   payload={PAYLOAD_SIZE}B");
     println!("  All stages use max_subject_inflight via ConsumerBuilder.");
-    println!(
-        "  Caps: basic={PAT_BASIC_CAP}, premium={PAT_PREMIUM_CAP}, dynamic={PAT_DYNAMIC_CAP}"
-    );
+    println!("  Caps: basic={PAT_BASIC_CAP}, premium={PAT_PREMIUM_CAP}, dynamic={PAT_DYNAMIC_CAP}");
     println!("  Stage 2/3 hold {BASIC_BACKLOG} basic subjects at 1/1.");
     println!();
 
@@ -599,10 +620,8 @@ async fn main() {
     let iso = isolated_latency(iters).await;
     report("VIP under basic load", &iso);
 
-    let avg_base: Duration =
-        base.iter().sum::<Duration>() / base.len() as u32;
-    let avg_iso: Duration =
-        iso.iter().sum::<Duration>() / iso.len() as u32;
+    let avg_base: Duration = base.iter().sum::<Duration>() / base.len() as u32;
+    let avg_iso: Duration = iso.iter().sum::<Duration>() / iso.len() as u32;
     let ratio = avg_iso.as_secs_f64() / avg_base.as_secs_f64();
 
     // Stage 3 — multi-client isolated
@@ -629,18 +648,25 @@ async fn main() {
     println!("--------------------------------------------------------");
     println!("  Summary");
     println!("--------------------------------------------------------");
-    println!("  baseline (1 client, no backlog)        avg : {:>9.2?}", avg_base);
-    println!("  isolated (1 client, 100 basic at 1/1)  avg : {:>9.2?}", avg_iso);
-    println!("  multi    ({n_clients} clients, 100 basic each)   avg : {:>9.2?}", avg_multi);
+    println!(
+        "  baseline (1 client, no backlog)        avg : {:>9.2?}",
+        avg_base
+    );
+    println!(
+        "  isolated (1 client, 100 basic at 1/1)  avg : {:>9.2?}",
+        avg_iso
+    );
+    println!(
+        "  multi    ({n_clients} clients, 100 basic each)   avg : {:>9.2?}",
+        avg_multi
+    );
     println!("  ratios (vs baseline):  isolated={ratio:.2}x   multi={ratio_multi:.2}x");
     println!("  (closer to 1.0 = better isolation)");
     println!();
 
     // Stage 4 — dynamic subjects throughput
     println!("--------------------------------------------------------");
-    println!(
-        "  Stage 4 — dynamic subjects throughput ({dynamic_users} unique users)"
-    );
+    println!("  Stage 4 — dynamic subjects throughput ({dynamic_users} unique users)");
     println!("  Pattern: notif.user.<id> with max_subject_inflight(notif.user.>, 1)");
     println!("  Exercises: HashMap insert+remove on every msg lifecycle");
     println!("--------------------------------------------------------");

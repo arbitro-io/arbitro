@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use super::stream::wire_hash_32;
+use serde::{Deserialize, Serialize};
 
 /// Consumer configuration — cold path, created once.
 ///
@@ -73,21 +73,21 @@ pub enum ConsumerConfigError {
 impl std::fmt::Display for ConsumerConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingAckPolicy => f.write_str(
-                "ConsumerConfig: ack_policy must be set explicitly (None or Explicit)",
-            ),
-            Self::InflightWithoutAck => f.write_str(
-                "ConsumerConfig: max_inflight requires AckPolicy::Explicit",
-            ),
-            Self::SubjectInflightWithoutAck => f.write_str(
-                "ConsumerConfig: max_subject_inflights requires AckPolicy::Explicit",
-            ),
-            Self::AckWaitWithoutAck => f.write_str(
-                "ConsumerConfig: ack_wait_ms requires AckPolicy::Explicit",
-            ),
-            Self::StartSeqRequired => f.write_str(
-                "ConsumerConfig: DeliverPolicy::ByStartSeq requires start_seq > 0",
-            ),
+            Self::MissingAckPolicy => {
+                f.write_str("ConsumerConfig: ack_policy must be set explicitly (None or Explicit)")
+            }
+            Self::InflightWithoutAck => {
+                f.write_str("ConsumerConfig: max_inflight requires AckPolicy::Explicit")
+            }
+            Self::SubjectInflightWithoutAck => {
+                f.write_str("ConsumerConfig: max_subject_inflights requires AckPolicy::Explicit")
+            }
+            Self::AckWaitWithoutAck => {
+                f.write_str("ConsumerConfig: ack_wait_ms requires AckPolicy::Explicit")
+            }
+            Self::StartSeqRequired => {
+                f.write_str("ConsumerConfig: DeliverPolicy::ByStartSeq requires start_seq > 0")
+            }
         }
     }
 }
@@ -154,7 +154,10 @@ impl ConsumerConfig {
 impl ConsumerConfigBuilder {
     /// Set queue group name. Consumers with the same group share a
     /// ready queue (round-robin in Queue mode). Default: stream name.
-    pub fn group(mut self, name: &[u8]) -> Self { self.group = Some(Box::from(name)); self }
+    pub fn group(mut self, name: &[u8]) -> Self {
+        self.group = Some(Box::from(name));
+        self
+    }
 
     pub fn filter(mut self, pattern: &[u8]) -> Self {
         self.filters.push(Box::from(pattern));
@@ -169,18 +172,38 @@ impl ConsumerConfigBuilder {
         self
     }
 
-    pub fn max_inflight(mut self, v: u16) -> Self { self.max_inflight = v; self }
-    pub fn ack_policy(mut self, v: AckPolicy) -> Self { self.ack_policy = Some(v); self }
-    pub fn deliver_policy(mut self, v: DeliverPolicy) -> Self { self.deliver_policy = v; self }
-    pub fn deliver_mode(mut self, v: DeliverMode) -> Self { self.deliver_mode = v; self }
-    pub fn ack_wait_ms(mut self, v: u32) -> Self { self.ack_wait_ms = v; self }
-    pub fn start_seq(mut self, v: u64) -> Self { self.start_seq = v; self }
+    pub fn max_inflight(mut self, v: u16) -> Self {
+        self.max_inflight = v;
+        self
+    }
+    pub fn ack_policy(mut self, v: AckPolicy) -> Self {
+        self.ack_policy = Some(v);
+        self
+    }
+    pub fn deliver_policy(mut self, v: DeliverPolicy) -> Self {
+        self.deliver_policy = v;
+        self
+    }
+    pub fn deliver_mode(mut self, v: DeliverMode) -> Self {
+        self.deliver_mode = v;
+        self
+    }
+    pub fn ack_wait_ms(mut self, v: u32) -> Self {
+        self.ack_wait_ms = v;
+        self
+    }
+    pub fn start_seq(mut self, v: u64) -> Self {
+        self.start_seq = v;
+        self
+    }
 
     /// Validate and finalize the config. Returns a typed error for any
     /// invariant violation — see [`ConsumerConfigError`] for the full list.
     pub fn build(self) -> Result<ConsumerConfig, ConsumerConfigError> {
         // 1. ack_policy must be picked explicitly.
-        let ack_policy = self.ack_policy.ok_or(ConsumerConfigError::MissingAckPolicy)?;
+        let ack_policy = self
+            .ack_policy
+            .ok_or(ConsumerConfigError::MissingAckPolicy)?;
 
         // 2. Inflight knobs only make sense with Explicit acks.
         if ack_policy == AckPolicy::None {
@@ -232,7 +255,7 @@ pub struct MaxSubjectInflight {
 #[repr(u8)]
 pub enum AckPolicy {
     /// Fire-and-forget. No ack tracking, no redelivery.
-    None     = 0,
+    None = 0,
     /// Consumer must ack. Enables max_inflight, max_subject_inflights, ack_wait_ms.
     Explicit = 1,
 }
@@ -252,9 +275,9 @@ impl AckPolicy {
 #[repr(u8)]
 pub enum DeliverPolicy {
     /// All messages from the beginning.
-    All        = 0,
+    All = 0,
     /// Only new messages from now.
-    New        = 1,
+    New = 1,
     /// From a specific sequence (uses `start_seq`).
     ByStartSeq = 2,
 }
@@ -277,7 +300,7 @@ pub enum DeliverMode {
     /// All consumers receive every message.
     Fanout = 0,
     /// Round-robin: one consumer per message.
-    Queue  = 1,
+    Queue = 1,
 }
 
 impl DeliverMode {

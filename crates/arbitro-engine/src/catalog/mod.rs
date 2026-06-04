@@ -340,7 +340,11 @@ impl Catalog {
 
     /// Pause a consumer.
     pub fn pause_consumer(&mut self, id: ConsumerId) -> bool {
-        if let Some(info) = self.consumers.get_mut(id.0 as usize).and_then(|s| s.as_mut()) {
+        if let Some(info) = self
+            .consumers
+            .get_mut(id.0 as usize)
+            .and_then(|s| s.as_mut())
+        {
             info.paused = true;
             true
         } else {
@@ -350,7 +354,11 @@ impl Catalog {
 
     /// Resume a consumer.
     pub fn resume_consumer(&mut self, id: ConsumerId) -> bool {
-        if let Some(info) = self.consumers.get_mut(id.0 as usize).and_then(|s| s.as_mut()) {
+        if let Some(info) = self
+            .consumers
+            .get_mut(id.0 as usize)
+            .and_then(|s| s.as_mut())
+        {
             info.paused = false;
             true
         } else {
@@ -399,8 +407,7 @@ impl Catalog {
         };
 
         self.ensure_match_table_slot(config.stream_id);
-        let mt = self.match_tables[config.stream_id.0 as usize]
-            .get_or_insert_with(MatchTable::new);
+        let mt = self.match_tables[config.stream_id.0 as usize].get_or_insert_with(MatchTable::new);
         if config.filters.is_empty() {
             mt.add_catch_all(match_entry);
         } else {
@@ -650,8 +657,7 @@ impl Catalog {
             return Err(EngineError::stream_not_found());
         }
         self.ensure_match_table_slot(stream_id);
-        let mt = self.match_tables[stream_id.0 as usize]
-            .get_or_insert_with(MatchTable::new);
+        let mt = self.match_tables[stream_id.0 as usize].get_or_insert_with(MatchTable::new);
         mt.add_max_subject_inflight(pattern, max_inflight);
         Ok(())
     }
@@ -701,7 +707,8 @@ impl Catalog {
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
-                opt.as_ref().map(|info| (StreamId(i as u32), info.name.clone()))
+                opt.as_ref()
+                    .map(|info| (StreamId(i as u32), info.name.clone()))
             })
             .collect()
     }
@@ -712,8 +719,14 @@ impl Catalog {
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
-                opt.as_ref()
-                    .map(|info| (ConsumerId(i as u32), info.stream_id, info.queue_id, info.paused))
+                opt.as_ref().map(|info| {
+                    (
+                        ConsumerId(i as u32),
+                        info.stream_id,
+                        info.queue_id,
+                        info.paused,
+                    )
+                })
             })
             .collect()
     }
@@ -949,7 +962,13 @@ mod tests {
 
     #[test]
     fn fnv1a_deterministic() {
-        assert_eq!(wire_hash_32(b"orders.created"), wire_hash_32(b"orders.created"));
-        assert_ne!(wire_hash_32(b"orders.created"), wire_hash_32(b"orders.updated"));
+        assert_eq!(
+            wire_hash_32(b"orders.created"),
+            wire_hash_32(b"orders.created")
+        );
+        assert_ne!(
+            wire_hash_32(b"orders.created"),
+            wire_hash_32(b"orders.updated")
+        );
     }
 }

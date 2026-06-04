@@ -6,19 +6,19 @@
 #[repr(u16)]
 pub enum ErrorCode {
     // 0x00xx — Protocol (frame arrived malformed)
-    UnknownAction       = 0x0001,
-    BufferTooShort      = 0x0002,
-    InvalidLength       = 0x0003,
-    InvalidEntryCount   = 0x0004,
+    UnknownAction = 0x0001,
+    BufferTooShort = 0x0002,
+    InvalidLength = 0x0003,
+    InvalidEntryCount = 0x0004,
 
     // 0x01xx — Auth
-    AuthRequired        = 0x0101,
-    AuthFailed          = 0x0102,
+    AuthRequired = 0x0101,
+    AuthFailed = 0x0102,
 
     // 0x02xx — Stream
-    StreamNotFound      = 0x0201,
+    StreamNotFound = 0x0201,
     StreamAlreadyExists = 0x0202,
-    StreamFull          = 0x0203,
+    StreamFull = 0x0203,
     // 0x0204 reserved (deleted StreamFilterOverlap) — §5.2.
     // 0x0205 reserved (deleted SubjectNotFound) — §5.2.
     /// Publish carried a `msg_id` that the broker has already seen for
@@ -28,13 +28,13 @@ pub enum ErrorCode {
     IdempotencyDuplicate = 0x0206,
 
     // 0x03xx — Consumer
-    ConsumerNotFound       = 0x0301,
-    ConsumerAlreadyExists  = 0x0302,
+    ConsumerNotFound = 0x0301,
+    ConsumerAlreadyExists = 0x0302,
     // 0x0303 reserved (deleted ConsumerFilterOverlap) — §5.2.
     /// The CreateConsumer request carries mutually incompatible fields
     /// (e.g. `AckPolicy::None` + `max_inflight`, or `Fanout` + non-empty
     /// `group`). The consumer was NOT created.
-    InvalidConsumerConfig  = 0x0304,
+    InvalidConsumerConfig = 0x0304,
 
     // 0x04xx — Delivery
     // 0x0401 reserved (deleted InvalidSequence) — §5.2.
@@ -42,13 +42,13 @@ pub enum ErrorCode {
     // 0x0403 reserved (deleted AckTimeout) — §5.2.
 
     // 0x05xx — System
-    ServerShuttingDown  = 0x0501,
-    InternalError       = 0x0502,
+    ServerShuttingDown = 0x0501,
+    InternalError = 0x0502,
     /// The broker recognised the wire action code but no handler is wired
     /// (yet) — distinguishes "I don't know this code" (UnknownAction) from
     /// "I know it but won't service it in this build". Used for protocol
     /// surface that is reserved but not implemented. L2.
-    Unimplemented       = 0x0503,
+    Unimplemented = 0x0503,
 }
 
 impl ErrorCode {
@@ -75,7 +75,6 @@ impl ErrorCode {
             0x0304 => Some(Self::InvalidConsumerConfig),
 
             // 0x0401..=0x0403 reserved (deleted §5.2).
-
             0x0501 => Some(Self::ServerShuttingDown),
             0x0502 => Some(Self::InternalError),
             0x0503 => Some(Self::Unimplemented),

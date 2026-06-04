@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
-use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 const DEFAULT_TOTAL: u64 = 20_000;
 const PAYLOAD: &[u8] = b"ack-bench-64b-payload-............................";
@@ -60,9 +60,12 @@ async fn spawn_server() -> String {
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client connects")
+    Client::connect(ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    })
+    .await
+    .expect("client connects")
 }
 
 /// Prepare: create stream, consumer (ack-explicit), subscribe, publish N msgs.
@@ -108,7 +111,10 @@ async fn setup(
         .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
         .collect();
     // Use sync to ensure publish is stored before we try to receive.
-    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     sub
 }
@@ -227,7 +233,10 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
         .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(PAYLOAD)))
         .collect();
     let start = Instant::now();
-    control.publish_batch_sync(stream_id, &entries).await.unwrap();
+    control
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     // Wait for all subscribers to receive + ack all msgs.
     for h in worker_handles {
@@ -258,12 +267,7 @@ async fn correctness_probe(client: &Client, probe_count: u32) -> u32 {
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     let entries: Vec<BatchEntry<'_>> = (0..probe_count)
-        .map(|_| {
-            BatchEntry::new(
-                b"ack.bench.probe".as_slice(),
-                Bytes::copy_from_slice(b"p"),
-            )
-        })
+        .map(|_| BatchEntry::new(b"ack.bench.probe".as_slice(), Bytes::copy_from_slice(b"p")))
         .collect();
 
     // Create consumer with AckPolicy::None = 0, DeliverPolicy::All = 0
@@ -286,7 +290,10 @@ async fn correctness_probe(client: &Client, probe_count: u32) -> u32 {
     let mut sub = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Publish after subscribing so delivery is live.
-    client.publish_batch_sync(stream_id, &entries).await.unwrap();
+    client
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .unwrap();
 
     let mut got = 0u32;
     for _ in 0..probe_count {

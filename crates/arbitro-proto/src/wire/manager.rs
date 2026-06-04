@@ -56,7 +56,9 @@ pub struct CreateConsumerView<'a> {
 
 impl<'a> CreateConsumerView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &CreateConsumerFixed {
@@ -64,28 +66,44 @@ impl<'a> CreateConsumerView<'a> {
     }
 
     #[inline(always)]
-    pub fn stream_id(&self) -> u32 { self.fixed().stream_id.get() }
+    pub fn stream_id(&self) -> u32 {
+        self.fixed().stream_id.get()
+    }
 
     #[inline(always)]
-    pub fn max_inflight(&self) -> u16 { self.fixed().max_inflight.get() }
+    pub fn max_inflight(&self) -> u16 {
+        self.fixed().max_inflight.get()
+    }
 
     #[inline(always)]
-    pub fn ack_policy(&self) -> u8 { self.fixed().ack_policy }
+    pub fn ack_policy(&self) -> u8 {
+        self.fixed().ack_policy
+    }
 
     #[inline(always)]
-    pub fn deliver_policy(&self) -> u8 { self.fixed().deliver_policy }
+    pub fn deliver_policy(&self) -> u8 {
+        self.fixed().deliver_policy
+    }
 
     #[inline(always)]
-    pub fn deliver_mode(&self) -> u8 { self.fixed().deliver_mode }
+    pub fn deliver_mode(&self) -> u8 {
+        self.fixed().deliver_mode
+    }
 
     #[inline(always)]
-    pub fn ack_wait_ms(&self) -> u32 { self.fixed().ack_wait_ms.get() }
+    pub fn ack_wait_ms(&self) -> u32 {
+        self.fixed().ack_wait_ms.get()
+    }
 
     #[inline(always)]
-    pub fn start_seq(&self) -> u64 { self.fixed().start_seq.get() }
+    pub fn start_seq(&self) -> u64 {
+        self.fixed().start_seq.get()
+    }
 
     #[inline(always)]
-    pub fn group_len(&self) -> u16 { self.fixed().group_len.get() }
+    pub fn group_len(&self) -> u16 {
+        self.fixed().group_len.get()
+    }
 
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
@@ -126,10 +144,16 @@ impl<'a> CreateConsumerView<'a> {
     pub fn subject_limits(&self) -> SubjectLimitIter<'a> {
         let off = self.trailer_offset();
         if off + 2 > self.buf.len() {
-            return SubjectLimitIter { buf: &[], remaining: 0 };
+            return SubjectLimitIter {
+                buf: &[],
+                remaining: 0,
+            };
         }
         let count = u16::from_le_bytes([self.buf[off], self.buf[off + 1]]) as usize;
-        SubjectLimitIter { buf: &self.buf[off + 2..], remaining: count }
+        SubjectLimitIter {
+            buf: &self.buf[off + 2..],
+            remaining: count,
+        }
     }
 }
 
@@ -170,10 +194,17 @@ pub struct DeleteConsumerView<'a> {
 
 impl<'a> DeleteConsumerView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn consumer_id(&self) -> u32 {
-        DeleteConsumerAction::ref_from_bytes(&self.buf[..core::mem::size_of::<DeleteConsumerAction>()]).unwrap().consumer_id.get()
+        DeleteConsumerAction::ref_from_bytes(
+            &self.buf[..core::mem::size_of::<DeleteConsumerAction>()],
+        )
+        .unwrap()
+        .consumer_id
+        .get()
     }
 }

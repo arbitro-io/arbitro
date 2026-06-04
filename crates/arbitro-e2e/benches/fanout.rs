@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, SubscriptionHandle};
-use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 const N_CONSUMERS_PUBSUB: usize = 4;
 const N_CONSUMERS_REPLAY: usize = 1;
@@ -54,10 +54,26 @@ struct DistSub {
 }
 
 const DIST_SUBS: &[DistSub] = &[
-    DistSub { label: "catch-all  (>)",       filter: b"",                           expected: 3 * DIST_PER_SUBJECT },
-    DistSub { label: "message.*.vip",        filter: b"message.*.vip",              expected: 2 * DIST_PER_SUBJECT },
-    DistSub { label: "message.client.vip.>", filter: b"message.client.vip.>",      expected: 1 * DIST_PER_SUBJECT },
-    DistSub { label: "ignore.me",            filter: b"ignore.me",                 expected: 0 },
+    DistSub {
+        label: "catch-all  (>)",
+        filter: b"",
+        expected: 3 * DIST_PER_SUBJECT,
+    },
+    DistSub {
+        label: "message.*.vip",
+        filter: b"message.*.vip",
+        expected: 2 * DIST_PER_SUBJECT,
+    },
+    DistSub {
+        label: "message.client.vip.>",
+        filter: b"message.client.vip.>",
+        expected: 1 * DIST_PER_SUBJECT,
+    },
+    DistSub {
+        label: "ignore.me",
+        filter: b"ignore.me",
+        expected: 0,
+    },
 ];
 
 // ── Single-connection multi-subscription stage ──────────────────────────
@@ -80,15 +96,20 @@ async fn spawn_server() -> String {
         .max_connections(64)
         .write_buffer_cap(1024 * 1024);
     let server = ArbitroServer::new(cfg);
-    tokio::spawn(async move { let _ = server.run().await; });
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .unwrap()
+    Client::connect(ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    })
+    .await
+    .unwrap()
 }
 
 struct ConsumerStats {
@@ -166,15 +187,24 @@ async fn spawn_consumers(
                 let now = Instant::now();
                 let was = cc.fetch_add(1, Relaxed);
                 if was == 0 {
-                    if let Ok(mut g) = cf.try_lock() { *g = Some(now); }
+                    if let Ok(mut g) = cf.try_lock() {
+                        *g = Some(now);
+                    }
                 }
-                if let Ok(mut g) = cl.try_lock() { *g = Some(now); }
+                if let Ok(mut g) = cl.try_lock() {
+                    *g = Some(now);
+                }
             }
             // rx kept alive so the task doesn't exit early
             drop(rx);
         });
 
-        stats.push(ConsumerStats { name, count, first_msg_at: first, last_msg_at: last });
+        stats.push(ConsumerStats {
+            name,
+            count,
+            first_msg_at: first,
+            last_msg_at: last,
+        });
         join_handles.push(handle);
         // sub_handles now empty — sub was moved into task
     }
@@ -183,11 +213,20 @@ async fn spawn_consumers(
 }
 
 /// Wait until every consumer has received `target` messages, or `timeout` expires.
-async fn wait_for_all(stats: &[ConsumerStats], target: u64, start: Instant, timeout: Duration) -> Duration {
+async fn wait_for_all(
+    stats: &[ConsumerStats],
+    target: u64,
+    start: Instant,
+    timeout: Duration,
+) -> Duration {
     loop {
         let all_done = stats.iter().all(|s| s.count.load(Relaxed) >= target);
-        if all_done { return start.elapsed(); }
-        if start.elapsed() > timeout { return start.elapsed(); }
+        if all_done {
+            return start.elapsed();
+        }
+        if start.elapsed() > timeout {
+            return start.elapsed();
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
@@ -227,10 +266,16 @@ async fn publish_batched(client: &Client, stream_id: u32, n: u64) {
 }
 
 #[derive(Clone, Copy)]
-enum Mode { PubSub, Replay }
+enum Mode {
+    PubSub,
+    Replay,
+}
 
 #[derive(Clone, Copy)]
-enum Pub { Single, Batch }
+enum Pub {
+    Single,
+    Batch,
+}
 
 async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
     let addr = spawn_server().await;
@@ -284,7 +329,10 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
 
     // Per-consumer summary.
     let mut total_delivered = 0u64;
-    println!("\n  [{label}] publish took {:.2?}   delivery window {:.2?}", publish_done_at, elapsed);
+    println!(
+        "\n  [{label}] publish took {:.2?}   delivery window {:.2?}",
+        publish_done_at, elapsed
+    );
     for s in &stats {
         let got = s.count.load(Relaxed);
         total_delivered += got;
@@ -302,8 +350,11 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
             s.name,
             got,
             MSGS,
-            first.map(|t| t.duration_since(start).as_secs_f64() * 1000.0).unwrap_or(0.0),
-            last.map(|t| t.duration_since(start).as_secs_f64() * 1000.0).unwrap_or(0.0),
+            first
+                .map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+            last.map(|t| t.duration_since(start).as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
             per
         );
     }
@@ -406,15 +457,22 @@ async fn run_distribution() {
             .iter()
             .enumerate()
             .all(|(i, s)| counts[i].load(Relaxed) >= s.expected);
-        if all_ready { break; }
-        if wait_start.elapsed() > timeout { break; }
+        if all_ready {
+            break;
+        }
+        if wait_start.elapsed() > timeout {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let delivery_dur = wait_start.elapsed();
 
     let total_delivered: u64 = counts.iter().map(|c| c.load(Relaxed)).sum();
 
-    println!("\n  ── Subjects published (each {} msgs) ──", DIST_PER_SUBJECT);
+    println!(
+        "\n  ── Subjects published (each {} msgs) ──",
+        DIST_PER_SUBJECT
+    );
     for s in DIST_SUBJECTS {
         println!("       {}", std::str::from_utf8(s).unwrap_or("?"));
     }
@@ -423,7 +481,10 @@ async fn run_distribution() {
         pub_dur, delivery_dur, total, total_delivered
     );
     println!();
-    println!("    {:<26} {:>10}  {:>10}   status", "filter", "expected", "got");
+    println!(
+        "    {:<26} {:>10}  {:>10}   status",
+        "filter", "expected", "got"
+    );
     println!("    ──────────────────────────────────────────────────────────");
     let mut failures = 0;
     for (i, s) in DIST_SUBS.iter().enumerate() {
@@ -434,7 +495,10 @@ async fn run_distribution() {
             failures += 1;
             format!("FAIL  (Δ {:+})", got as i64 - s.expected as i64)
         };
-        println!("    {:<26} {:>10}  {:>10}   {}", s.label, s.expected, got, status);
+        println!(
+            "    {:<26} {:>10}  {:>10}   {}",
+            s.label, s.expected, got, status
+        );
     }
 
     if failures > 0 {
@@ -528,8 +592,12 @@ async fn run_single_conn_multi_sub() {
     let timeout = Duration::from_secs(30);
     loop {
         let all_ready = counts.iter().all(|c| c.load(Relaxed) >= SCMS_MSGS);
-        if all_ready { break; }
-        if wait_start.elapsed() > timeout { break; }
+        if all_ready {
+            break;
+        }
+        if wait_start.elapsed() > timeout {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let delivery_dur = wait_start.elapsed();
@@ -539,17 +607,34 @@ async fn run_single_conn_multi_sub() {
     let wire_collapsed = SCMS_MSGS;
     let reduction = SCMS_N_CONSUMERS as u64;
 
-    println!("\n  ── Shape: 1 TCP connection, {} fanout consumers, {} msgs ──",
-             SCMS_N_CONSUMERS, SCMS_MSGS);
-    println!("    publish {:.2?}   delivery window {:.2?}", pub_dur, delivery_dur);
+    println!(
+        "\n  ── Shape: 1 TCP connection, {} fanout consumers, {} msgs ──",
+        SCMS_N_CONSUMERS, SCMS_MSGS
+    );
+    println!(
+        "    publish {:.2?}   delivery window {:.2?}",
+        pub_dur, delivery_dur
+    );
     for (i, c) in counts.iter().enumerate() {
         println!("    c{i} recv {}/{}", c.load(Relaxed), SCMS_MSGS);
     }
     println!();
-    println!("    total client callbacks (delivered):     {}", total_callbacks);
-    println!("    wire entries emitted today (no collapse): {}  (msgs × consumers)", wire_today);
-    println!("    wire entries WITH broadcast collapse:     {}  (msgs × 1 conn)", wire_collapsed);
-    println!("    potential reduction:                      {}×", reduction);
+    println!(
+        "    total client callbacks (delivered):     {}",
+        total_callbacks
+    );
+    println!(
+        "    wire entries emitted today (no collapse): {}  (msgs × consumers)",
+        wire_today
+    );
+    println!(
+        "    wire entries WITH broadcast collapse:     {}  (msgs × 1 conn)",
+        wire_collapsed
+    );
+    println!(
+        "    potential reduction:                      {}×",
+        reduction
+    );
     println!();
     println!("    Run with ARBITRO_WIRE_TRACE=1 to verify the server-side");
     println!("    entry count against these numbers.");
@@ -560,35 +645,31 @@ async fn main() {
     println!("\n========================================================");
     println!("                    Fanout bench");
     println!("========================================================");
-    println!(
-        "  payload={}B  batch_size={}",
-        PAYLOAD.len(), BATCH_SIZE
-    );
+    println!("  payload={}B  batch_size={}", PAYLOAD.len(), BATCH_SIZE);
 
     println!("\n--------------------------------------------------------");
     println!("  Section 1 — throughput matrix (pub/sub × replay)");
     println!("--------------------------------------------------------");
     println!(
         "  pub/sub consumers={}   replay consumers={}   msgs={}   subject=\"{}\"   stream=\"{}\"",
-        N_CONSUMERS_PUBSUB, N_CONSUMERS_REPLAY, MSGS,
+        N_CONSUMERS_PUBSUB,
+        N_CONSUMERS_REPLAY,
+        MSGS,
         std::str::from_utf8(SUBJECT).unwrap_or("?"),
         std::str::from_utf8(STREAM).unwrap_or("?"),
     );
 
     run_stage("pub/sub × single", Mode::PubSub, Pub::Single).await;
-    run_stage("pub/sub × batch",  Mode::PubSub, Pub::Batch).await;
-    run_stage("replay × single",  Mode::Replay, Pub::Single).await;
-    run_stage("replay × batch",   Mode::Replay, Pub::Batch).await;
+    run_stage("pub/sub × batch", Mode::PubSub, Pub::Batch).await;
+    run_stage("replay × single", Mode::Replay, Pub::Single).await;
+    run_stage("replay × batch", Mode::Replay, Pub::Batch).await;
 
     println!("\n--------------------------------------------------------");
     println!("  Section 2 — single connection, many subscriptions");
     println!("--------------------------------------------------------");
-    println!(
-        "  Measures broadcast-collapse potential: today the server emits");
-    println!(
-        "  1 wire entry per (msg × consumer); with collapse it would emit");
-    println!(
-        "  1 wire entry per (msg × connection).");
+    println!("  Measures broadcast-collapse potential: today the server emits");
+    println!("  1 wire entry per (msg × consumer); with collapse it would emit");
+    println!("  1 wire entry per (msg × connection).");
     run_single_conn_multi_sub().await;
 
     println!("\n--------------------------------------------------------");
@@ -596,7 +677,8 @@ async fn main() {
     println!("--------------------------------------------------------");
     println!(
         "  consumers={}   per-subject msgs={}   total msgs={}   stream=\"{}\"",
-        DIST_SUBS.len(), DIST_PER_SUBJECT,
+        DIST_SUBS.len(),
+        DIST_PER_SUBJECT,
         DIST_SUBJECTS.len() as u64 * DIST_PER_SUBJECT,
         std::str::from_utf8(DIST_STREAM).unwrap_or("?"),
     );

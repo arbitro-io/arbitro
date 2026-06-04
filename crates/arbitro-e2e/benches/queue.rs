@@ -39,13 +39,13 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
-use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 const DEFAULT_MSGS: u64 = 10_000;
 const DEFAULT_CONSUMERS: u64 = 2;
@@ -55,11 +55,17 @@ const GROUP: &[u8] = b"queue_group";
 const SUBJECT: &[u8] = b"queue.work";
 
 fn env_u64(var: &str, fallback: u64) -> u64 {
-    std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn env_f64(var: &str, fallback: f64) -> f64 {
-    std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn portpicker() -> u16 {
@@ -114,9 +120,12 @@ async fn spawn_server() -> String {
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client connects")
+    Client::connect(ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    })
+    .await
+    .expect("client connects")
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -133,9 +142,7 @@ async fn main() {
     println!("========================================================");
     println!("                   Queue balancing bench");
     println!("========================================================");
-    println!(
-        "  msgs={msgs}   consumers={n_consumers}   payload={PAYLOAD_SIZE}B   journal=Memory"
-    );
+    println!("  msgs={msgs}   consumers={n_consumers}   payload={PAYLOAD_SIZE}B   journal=Memory");
     println!("  fairness threshold (min/avg): {fairness_min_ratio}");
     println!();
 
@@ -149,7 +156,10 @@ async fn main() {
         .expect("create stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-    println!("  Manager: created stream \"{}\"", String::from_utf8_lossy(STREAM));
+    println!(
+        "  Manager: created stream \"{}\"",
+        String::from_utf8_lossy(STREAM)
+    );
 
     // Create each consumer with a UNIQUE name + SHARED group.
     // AckPolicy::Explicit=1, DeliverPolicy::All=0, DeliverMode::Push=0
@@ -175,13 +185,17 @@ async fn main() {
         let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
         consumer_ids.push(consumer_id);
     }
-    println!("  Manager: created {n_consumers} consumers in group \"{}\"", String::from_utf8_lossy(GROUP));
+    println!(
+        "  Manager: created {n_consumers} consumers in group \"{}\"",
+        String::from_utf8_lossy(GROUP)
+    );
 
     // ── Spawn one subscriber task per consumer ─────────────────────────
     let seen_seqs: Arc<std::sync::Mutex<HashSet<u64>>> =
         Arc::new(std::sync::Mutex::new(HashSet::with_capacity(msgs as usize)));
-    let per_consumer: Vec<Arc<AtomicU64>> =
-        (0..n_consumers).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let per_consumer: Vec<Arc<AtomicU64>> = (0..n_consumers)
+        .map(|_| Arc::new(AtomicU64::new(0)))
+        .collect();
 
     let mut worker_handles = Vec::new();
     for i in 0..n_consumers {
@@ -220,7 +234,10 @@ async fn main() {
     let entries: Vec<BatchEntry<'_>> = (0..msgs)
         .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
-    manager.publish_batch_sync(stream_id, &entries).await.expect("publish_batch_sync");
+    manager
+        .publish_batch_sync(stream_id, &entries)
+        .await
+        .expect("publish_batch_sync");
     let pub_elapsed = pub_start.elapsed();
     println!(
         "  published {msgs} msgs in {:.2?} ({:.0} msg/s)",
@@ -257,8 +274,7 @@ async fn main() {
     drop(worker_handles);
 
     // ── Report ─────────────────────────────────────────────────────────
-    let per_consumer_counts: Vec<u64> =
-        per_consumer.iter().map(|a| a.load(Relaxed)).collect();
+    let per_consumer_counts: Vec<u64> = per_consumer.iter().map(|a| a.load(Relaxed)).collect();
     let total_received: u64 = per_consumer_counts.iter().sum();
     let unique = seen_seqs.lock().unwrap().len() as u64;
     let duplicates = total_received.saturating_sub(unique);

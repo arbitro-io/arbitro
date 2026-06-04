@@ -144,11 +144,11 @@ pub struct UnsubscribeCmd {
 // ── Stream management ───────────────────────────────────────────────────────
 
 pub struct CreateStreamCmd {
-    pub config:     StreamConfig,
+    pub config: StreamConfig,
     /// Maximum number of messages to retain per stream (0 = unlimited).
-    pub max_msgs:   u64,
+    pub max_msgs: u64,
     /// Maximum total bytes to retain per stream (0 = unlimited).
-    pub max_bytes:  u64,
+    pub max_bytes: u64,
     /// Age-based eviction threshold in milliseconds (0 = disabled).
     pub max_age_ms: u64,
     pub reply: oneshot::Sender<bool>,
@@ -220,7 +220,7 @@ pub struct ConsumerStatesCmd {
 /// 0 if the consumer doesn't exist on this shard.
 pub struct ConsumerPendingCmd {
     pub consumer_id: ConsumerId,
-    pub reply:       oneshot::Sender<u64>,
+    pub reply: oneshot::Sender<u64>,
 }
 
 // ── Connection lifecycle ────────────────────────────────────────────────────

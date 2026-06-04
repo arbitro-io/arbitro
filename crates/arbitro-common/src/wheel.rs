@@ -27,7 +27,7 @@ pub enum WheelEntryKind {
     /// `binding.pending` and auto-nacks if still in flight.
     AckTimeout = 0,
     /// Nack-with-delay: cursor rewind only, message is already nacked.
-    NackDelay  = 1,
+    NackDelay = 1,
 }
 
 /// Entry stored in the timing wheel. 24 bytes, Copy.
@@ -150,7 +150,12 @@ mod tests {
     #[test]
     fn basic_insert_and_advance() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 100, consumer_id: 1, subject_hash: 0xAB, kind: WheelEntryKind::AckTimeout };
+        let e = WheelEntry {
+            seq: 100,
+            consumer_id: 1,
+            subject_hash: 0xAB,
+            kind: WheelEntryKind::AckTimeout,
+        };
 
         w.insert(e, 2); // expires 2 ticks from now
         assert_eq!(w.len(), 1);
@@ -168,9 +173,24 @@ mod tests {
     #[test]
     fn multiple_entries_same_bucket() {
         let mut w = TimingWheel::new(8);
-        let e1 = WheelEntry { seq: 1, consumer_id: 10, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
-        let e2 = WheelEntry { seq: 2, consumer_id: 20, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
-        let e3 = WheelEntry { seq: 3, consumer_id: 10, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e1 = WheelEntry {
+            seq: 1,
+            consumer_id: 10,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
+        let e2 = WheelEntry {
+            seq: 2,
+            consumer_id: 20,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
+        let e3 = WheelEntry {
+            seq: 3,
+            consumer_id: 10,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
 
         w.insert(e1, 3);
         w.insert(e2, 3);
@@ -187,7 +207,12 @@ mod tests {
     #[test]
     fn delay_clamped_to_max() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 42, consumer_id: 1, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e = WheelEntry {
+            seq: 42,
+            consumer_id: 1,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
 
         // delay=100 but wheel only has 4 buckets → clamped to 3
         w.insert(e, 100);
@@ -206,7 +231,12 @@ mod tests {
         w.advance();
         w.advance();
 
-        let e = WheelEntry { seq: 7, consumer_id: 1, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e = WheelEntry {
+            seq: 7,
+            consumer_id: 1,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
         w.insert(e, 2); // should land in bucket (3+2)%4 = 1
 
         w.advance(); // current=0, no entries
@@ -218,8 +248,24 @@ mod tests {
     #[test]
     fn advance_into_reuses_buffer() {
         let mut w = TimingWheel::new(4);
-        w.insert(WheelEntry { seq: 1, consumer_id: 0, subject_hash: 0, kind: WheelEntryKind::AckTimeout }, 1);
-        w.insert(WheelEntry { seq: 2, consumer_id: 0, subject_hash: 0, kind: WheelEntryKind::AckTimeout }, 1);
+        w.insert(
+            WheelEntry {
+                seq: 1,
+                consumer_id: 0,
+                subject_hash: 0,
+                kind: WheelEntryKind::AckTimeout,
+            },
+            1,
+        );
+        w.insert(
+            WheelEntry {
+                seq: 2,
+                consumer_id: 0,
+                subject_hash: 0,
+                kind: WheelEntryKind::AckTimeout,
+            },
+            1,
+        );
 
         let mut buf = Vec::new();
         w.advance_into(&mut buf);
@@ -230,7 +276,12 @@ mod tests {
     #[test]
     fn zero_delay_fires_next_tick() {
         let mut w = TimingWheel::new(4);
-        let e = WheelEntry { seq: 99, consumer_id: 5, subject_hash: 0, kind: WheelEntryKind::AckTimeout };
+        let e = WheelEntry {
+            seq: 99,
+            consumer_id: 5,
+            subject_hash: 0,
+            kind: WheelEntryKind::AckTimeout,
+        };
 
         // delay=0 means "insert at current bucket". But current advances
         // BEFORE checking, so delay=0 → lands at current, fires on NEXT

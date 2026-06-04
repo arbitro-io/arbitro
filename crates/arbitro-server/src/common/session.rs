@@ -6,8 +6,8 @@
 //! non-blocking `try_send` — backpressure drops the frame if the per-conn
 //! queue is full, preventing deadlocks in the shared tokio runtime.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -44,12 +44,16 @@ pub struct ConnIdGen {
 }
 
 impl Default for ConnIdGen {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnIdGen {
     pub fn new() -> Self {
-        Self { next: AtomicU64::new(1) }
+        Self {
+            next: AtomicU64::new(1),
+        }
     }
 
     #[inline]

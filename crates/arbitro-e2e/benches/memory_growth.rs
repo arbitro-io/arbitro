@@ -179,9 +179,7 @@ async fn run_iteration(
                 received += 1;
             }
             Ok(None) => panic!("handle.recv returned None mid-iteration"),
-            Err(_) => panic!(
-                "iter={iter} timed out after {received}/{msgs} acks — leak or stall",
-            ),
+            Err(_) => panic!("iter={iter} timed out after {received}/{msgs} acks — leak or stall",),
         }
     }
 
@@ -222,16 +220,12 @@ fn main() {
     let iters = cfg_iterations();
     let total = msgs as u64 * iters as u64;
 
-    println!(
-        "\nMemory growth bench — verify ConsumerSubjects drops to zero on ack"
-    );
+    println!("\nMemory growth bench — verify ConsumerSubjects drops to zero on ack");
     println!(
         "Workload: in-memory store, 1 stream, 1 consumer (Explicit ack),\
          catch-all filter."
     );
-    println!(
-        "Config: msgs_per_iter={msgs}, iterations={iters}, total_unique_subjects={total}"
-    );
+    println!("Config: msgs_per_iter={msgs}, iterations={iters}, total_unique_subjects={total}");
     println!("{}", "=".repeat(70));
 
     let rt = Runtime::new().unwrap();
@@ -259,14 +253,14 @@ fn main() {
             .create_consumer(
                 stream_id,
                 b"mem_consumer",
-                b"",       // queue group (unique → fanout group of 1)
-                b"",       // no filter override
-                u16::MAX,  // max_inflight
-                1u8,       // AckPolicy::Explicit
-                0u8,       // DeliverPolicy::All
-                0u8,       // DeliverMode::Push
-                30_000,    // ack_wait_ms
-                0,         // start_seq
+                b"",      // queue group (unique → fanout group of 1)
+                b"",      // no filter override
+                u16::MAX, // max_inflight
+                1u8,      // AckPolicy::Explicit
+                0u8,      // DeliverPolicy::All
+                0u8,      // DeliverMode::Push
+                30_000,   // ack_wait_ms
+                0,        // start_seq
             )
             .await
             .expect("create_consumer");
@@ -284,7 +278,10 @@ fn main() {
         let mut last_rss = baseline;
         println!(
             "  {:>4} | {:>10} | {:>9} MiB | {:>10}",
-            "0", "(baseline)", baseline / 1024, "—"
+            "0",
+            "(baseline)",
+            baseline / 1024,
+            "—"
         );
 
         for iter in 1..=iters {
@@ -293,15 +290,8 @@ fn main() {
                 break;
             }
 
-            let elapsed = run_iteration(
-                &publisher,
-                stream_id,
-                &mut handle,
-                iter,
-                msgs,
-                &payload,
-            )
-            .await;
+            let elapsed =
+                run_iteration(&publisher, stream_id, &mut handle, iter, msgs, &payload).await;
 
             // Drop the store backlog so the next iter's RSS sample
             // reflects bookkeeping only (no acked-but-still-stored

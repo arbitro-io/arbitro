@@ -1,8 +1,8 @@
 mod test_helper;
 use test_helper::{TestServer, TestServerBuilder};
 
-use std::time::{Duration, Instant};
 use bytes::Bytes;
+use std::time::{Duration, Instant};
 
 // ===================================================================
 // Item 14: Publish with 2s delay, verify message arrives after 2s
@@ -29,38 +29,34 @@ async fn delayed_publish_arrives_after_delay() {
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
 
-    let mut handle = client
-        .subscribe(stream_id, consumer_id, b"")
-        .await
-        .unwrap();
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Publish with 2s delay.
     let delay_ms = 2000u64;
     let publish_time = Instant::now();
 
     client
-        .publish_delayed(stream_id, b"delayed_test.evt", Bytes::from_static(b"hello-delayed"), delay_ms)
+        .publish_delayed(
+            stream_id,
+            b"delayed_test.evt",
+            Bytes::from_static(b"hello-delayed"),
+            delay_ms,
+        )
         .await
         .expect("publish_delayed should succeed");
 
     // The message should NOT arrive before the delay.
-    let early_result = tokio::time::timeout(
-        Duration::from_millis(1500),
-        handle.recv(),
-    ).await;
+    let early_result = tokio::time::timeout(Duration::from_millis(1500), handle.recv()).await;
     assert!(
         early_result.is_err(),
         "message should NOT arrive before the 2s delay"
     );
 
     // The message SHOULD arrive after the delay (give it some slack).
-    let msg = tokio::time::timeout(
-        Duration::from_secs(4),
-        handle.recv(),
-    )
-    .await
-    .expect("message should arrive after the delay")
-    .expect("channel should be open");
+    let msg = tokio::time::timeout(Duration::from_secs(4), handle.recv())
+        .await
+        .expect("message should arrive after the delay")
+        .expect("channel should be open");
 
     let elapsed = publish_time.elapsed();
     assert!(
@@ -145,10 +141,7 @@ async fn delayed_publish_survives_broker_restart() {
             .unwrap();
         let consumer_id = TestServer::parse_id(&resp);
 
-        let mut handle = client
-            .subscribe(stream_id, consumer_id, b"")
-            .await
-            .unwrap();
+        let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
         // The matured delayed message should have been caught up on restart
         // and is now in the main store, so it should be delivered.

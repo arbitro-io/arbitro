@@ -186,7 +186,8 @@ impl<'a> ConsumerBuilder<'a> {
         let ack_policy = self.ack_policy.ok_or_else(|| {
             ClientError::InvalidConfig(
                 "ack_policy must be set explicitly (AckPolicy::None or \
-                 AckPolicy::Explicit) — there is no safe default".into(),
+                 AckPolicy::Explicit) — there is no safe default"
+                    .into(),
             )
         })?;
 
@@ -194,13 +195,15 @@ impl<'a> ConsumerBuilder<'a> {
             if self.max_inflight != 0 {
                 return Err(ClientError::InvalidConfig(
                     "max_inflight requires AckPolicy::Explicit (fire-and-forget \
-                     consumers don't track inflight)".into(),
+                     consumers don't track inflight)"
+                        .into(),
                 ));
             }
             if !self.subject_limits.is_empty() {
                 return Err(ClientError::InvalidConfig(
                     "max_subject_inflight requires AckPolicy::Explicit \
-                     (fire-and-forget consumers don't track inflight)".into(),
+                     (fire-and-forget consumers don't track inflight)"
+                        .into(),
                 ));
             }
             if self.ack_wait_ms != 0 {

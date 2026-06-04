@@ -57,10 +57,7 @@ async fn full_management_crud_roundtrip() {
     assert_ne!(stream_wire_id, 0, "wire stream id should be non-zero");
 
     // ── get_stream ──────────────────────────────────────────────────────
-    client
-        .get_stream(b"orders")
-        .await
-        .expect("get_stream");
+    client.get_stream(b"orders").await.expect("get_stream");
 
     // ── list_streams ────────────────────────────────────────────────────
     let body = client.list_streams(0, 100).await.expect("list_streams");
@@ -75,10 +72,10 @@ async fn full_management_crud_roundtrip() {
             b"worker",
             b"",
             b"",
-            16,    // max_inflight
-            0,     // ack_policy = None
-            0,     // deliver_policy
-            0,     // deliver_mode
+            16, // max_inflight
+            0,  // ack_policy = None
+            0,  // deliver_policy
+            0,  // deliver_mode
             30_000,
             0,
         )
@@ -89,16 +86,25 @@ async fn full_management_crud_roundtrip() {
     assert_ne!(consumer_id, 0);
 
     // ── list_consumers ──────────────────────────────────────────────────
-    let body = client.list_consumers(stream_wire_id, 0, 100).await.expect("list_consumers");
+    let body = client
+        .list_consumers(stream_wire_id, 0, 100)
+        .await
+        .expect("list_consumers");
     assert!(body.len() >= 4);
     let count = u32::from_le_bytes(body[..4].try_into().unwrap());
     assert!(count >= 1);
 
     // ── delete_consumer ─────────────────────────────────────────────────
-    client.delete_consumer(consumer_id).await.expect("delete_consumer");
+    client
+        .delete_consumer(consumer_id)
+        .await
+        .expect("delete_consumer");
 
     // ── delete_stream ───────────────────────────────────────────────────
-    client.delete_stream(b"orders").await.expect("delete_stream");
+    client
+        .delete_stream(b"orders")
+        .await
+        .expect("delete_stream");
 
     client.close();
 }

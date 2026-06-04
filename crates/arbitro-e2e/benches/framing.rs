@@ -24,8 +24,8 @@
 
 use bytes::{Buf, BufMut};
 use std::time::{Duration, Instant};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use zerocopy::big_endian::U32 as BeU32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 // ── Zerocopy header: the 14-byte fixed prefix as a typed view ────────────
 //
@@ -47,10 +47,10 @@ struct FrameHeader {
 }
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == HEADER);
 
-const N: usize = 2_000_000;                  // 2M frames per variant
+const N: usize = 2_000_000; // 2M frames per variant
 const RUNS: usize = 3;
 const SUBJECT: &[u8] = b"stream.events.orders.v1";
-const PAYLOAD_LEN: usize = 64;               // realistic small-msg size
+const PAYLOAD_LEN: usize = 64; // realistic small-msg size
 const HEADER: usize = 14;
 const FRAME_LEN: usize = HEADER + SUBJECT.len() + PAYLOAD_LEN;
 
@@ -170,7 +170,14 @@ fn decode_libc<'a>(buf: &'a [u8]) -> Frame<'a> {
         let payload_off = HEADER + slen;
         let payload_len = total_len as usize - payload_off;
         let payload = std::slice::from_raw_parts(p.add(payload_off), payload_len);
-        Frame { total_len, msg_type, seq, conn_id, subject, payload }
+        Frame {
+            total_len,
+            msg_type,
+            seq,
+            conn_id,
+            subject,
+            payload,
+        }
     }
 }
 
@@ -184,7 +191,14 @@ fn decode_rust<'a>(buf: &'a [u8]) -> Frame<'a> {
     let slen = buf[13] as usize;
     let subject = &buf[HEADER..HEADER + slen];
     let payload = &buf[HEADER + slen..total_len as usize];
-    Frame { total_len, msg_type, seq, conn_id, subject, payload }
+    Frame {
+        total_len,
+        msg_type,
+        seq,
+        conn_id,
+        subject,
+        payload,
+    }
 }
 
 // ── 3. bytes::Buf DECODE ─────────────────────────────────────────────────
@@ -200,7 +214,14 @@ fn decode_bytes<'a>(buf: &'a [u8]) -> Frame<'a> {
     // for the tails. This is still what we do in production.
     let subject = &buf[HEADER..HEADER + slen];
     let payload = &buf[HEADER + slen..total_len as usize];
-    Frame { total_len, msg_type, seq, conn_id, subject, payload }
+    Frame {
+        total_len,
+        msg_type,
+        seq,
+        conn_id,
+        subject,
+        payload,
+    }
 }
 
 // ── 4. ZEROCOPY DECODE ───────────────────────────────────────────────────
@@ -324,12 +345,21 @@ where
 }
 
 fn main() {
-    println!("══════════════════════════════════════════════════════════════════════════════════════");
+    println!(
+        "══════════════════════════════════════════════════════════════════════════════════════"
+    );
     println!(
         " framing — frame={}B (header={}B + subject={}B + payload={}B), N={} frames, {} runs",
-        FRAME_LEN, HEADER, SUBJECT.len(), PAYLOAD_LEN, N, RUNS,
+        FRAME_LEN,
+        HEADER,
+        SUBJECT.len(),
+        PAYLOAD_LEN,
+        N,
+        RUNS,
     );
-    println!("══════════════════════════════════════════════════════════════════════════════════════");
+    println!(
+        "══════════════════════════════════════════════════════════════════════════════════════"
+    );
 
     // Sanity: all three encoders produce the same bytes, all three decoders
     // parse back to the same struct. If this fails, benchmark numbers are

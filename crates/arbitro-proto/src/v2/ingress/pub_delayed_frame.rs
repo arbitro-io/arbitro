@@ -26,10 +26,10 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct PubDelayedBody {
-    pub stream_id:   U32,
+    pub stream_id: U32,
     pub subject_len: U16,
-    pub msg_id_len:  U16,
-    pub delay_ms:    U64,
+    pub msg_id_len: U16,
+    pub delay_ms: U64,
 }
 
 pub const PUB_DELAYED_BODY_FIXED: usize = core::mem::size_of::<PubDelayedBody>();
@@ -40,8 +40,8 @@ const _: () = assert!(PUB_DELAYED_BODY_FIXED == 16);
 #[repr(C)]
 pub struct PubDelayedFrame {
     pub header: Header,
-    pub body:   PubDelayedBody,
-    pub tail:   [u8], // subject || msg_id || payload
+    pub body: PubDelayedBody,
+    pub tail: [u8], // subject || msg_id || payload
 }
 
 impl PubDelayedFrame {
@@ -50,12 +50,15 @@ impl PubDelayedFrame {
     pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
         let s = self.body.subject_len.get() as usize;
         let m = self.body.msg_id_len.get() as usize;
-        let head_total = s.checked_add(m).ok_or(crate::error::ErrorCode::InvalidLength)?;
+        let head_total = s
+            .checked_add(m)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if head_total > self.tail.len() {
             return Err(crate::error::ErrorCode::InvalidLength);
         }
         let msg = self.header.msg_len.get() as usize;
-        let lower = PUB_DELAYED_BODY_FIXED.checked_add(head_total)
+        let lower = PUB_DELAYED_BODY_FIXED
+            .checked_add(head_total)
             .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if msg < lower {
             return Err(crate::error::ErrorCode::InvalidLength);
@@ -118,10 +121,10 @@ impl PubDelayedFrame {
             .with_flags(flags)
             .with_entry_flags(entry_flags);
         frame.body = PubDelayedBody {
-            stream_id:   U32::new(stream_id),
+            stream_id: U32::new(stream_id),
             subject_len: U16::new(subject.len() as u16),
-            msg_id_len:  U16::new(msg_id.len() as u16),
-            delay_ms:    U64::new(delay_ms),
+            msg_id_len: U16::new(msg_id.len() as u16),
+            delay_ms: U64::new(delay_ms),
         };
         let s = subject.len();
         let m = msg_id.len();
@@ -149,9 +152,7 @@ mod tests {
         let size = PubDelayedFrame::wire_size(subject.len(), 0, payload.len());
         let mut buf = vec![0u8; size];
 
-        PubDelayedFrame::encode_into(
-            &mut buf, 42, 0xBEEF, 0, 0, subject, &[], &payload, delay_ms,
-        );
+        PubDelayedFrame::encode_into(&mut buf, 42, 0xBEEF, 0, 0, subject, &[], &payload, delay_ms);
 
         let frame = PubDelayedFrame::ref_from_bytes(&buf).expect("parse");
         assert_eq!(frame.header.seq.get(), 42);
@@ -167,9 +168,7 @@ mod tests {
         let payload = [0u8; 4];
         let size = PubDelayedFrame::wire_size(0, 0, payload.len());
         let mut buf = vec![0u8; size];
-        PubDelayedFrame::encode_into(
-            &mut buf, 1, 0, 0, 0, &[], &[], &payload, 1000,
-        );
+        PubDelayedFrame::encode_into(&mut buf, 1, 0, 0, 0, &[], &[], &payload, 1000);
         // Forge subject_len out of bounds.
         let off = HEADER_SIZE + 4;
         buf[off] = 0xFF;

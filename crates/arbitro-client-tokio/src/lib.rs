@@ -62,16 +62,16 @@ pub mod transport_internal {
 
 // Public re-exports — keep the surface symmetric with `arbitro-client`
 // so a switch is a `Cargo.toml` line + import-path swap.
-pub use client::{Client, BatchEntry};
-pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
-pub use consume::SubscriptionHandle;
-pub use consume::message::Message;
-pub use error::{ClientError, RequestResult};
-pub use metrics::{ClientMetrics, ClientMetricsSnapshot};
-pub use publish::PUBLISH_BATCH_MAX;
 /// Per-subject inflight cap (pattern + limit). Pass a slice of these to
 /// [`Client::create_consumer_with_limits`].
 pub use arbitro_proto::v2::manager::SubjectLimit;
+pub use client::{BatchEntry, Client};
+pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
+pub use consume::message::Message;
+pub use consume::SubscriptionHandle;
+pub use error::{ClientError, RequestResult};
+pub use metrics::{ClientMetrics, ClientMetricsSnapshot};
+pub use publish::PUBLISH_BATCH_MAX;
 
 /// Fluent builder for `CreateConsumer` that validates invariants
 /// (`max_subject_inflight` requires `AckPolicy::Explicit`, etc.) before
@@ -79,11 +79,10 @@ pub use arbitro_proto::v2::manager::SubjectLimit;
 /// at call sites — it's an explicit no-broker-round-trip cost when
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
-pub use cron::{CronBuilder, CronHandle, CronContext};
-pub use workflow::{WorkflowBuilder, WorkflowHandle, WorkflowStepContext, WorkflowErrorContext};
+pub use cron::{CronBuilder, CronContext, CronHandle};
+pub use workflow::{WorkflowBuilder, WorkflowErrorContext, WorkflowHandle, WorkflowStepContext};
 
 /// Consumer-config enums lifted from `arbitro-proto` so callers don't
 /// have to depend on the proto crate directly to set `ack_policy`,
 /// `deliver_policy`, or `deliver_mode` on the builder.
 pub use arbitro_proto::config::{AckPolicy, DeliverMode, DeliverPolicy};
-

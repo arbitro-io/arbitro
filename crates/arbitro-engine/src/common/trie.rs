@@ -62,10 +62,8 @@ impl SubjectTrie {
                     curr = next;
                 }
                 lit => {
-                    let next = if let Some((_, idx)) = self.nodes[curr]
-                        .literals
-                        .iter()
-                        .find(|(t, _)| &**t == lit)
+                    let next = if let Some((_, idx)) =
+                        self.nodes[curr].literals.iter().find(|(t, _)| &**t == lit)
                     {
                         *idx as usize
                     } else {
@@ -147,7 +145,9 @@ impl SubjectTrie {
 }
 
 impl Default for SubjectTrie {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -200,9 +200,6 @@ mod tests {
         t.insert(b"message.meta.premium.*", 1);
         t.insert(b"message.>", 2);
         t.insert(b"*.meta.>", 3);
-        assert_eq!(
-            collect(&t, b"message.meta.premium.user_42"),
-            vec![1, 2, 3]
-        );
+        assert_eq!(collect(&t, b"message.meta.premium.user_42"), vec![1, 2, 3]);
     }
 }

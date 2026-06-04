@@ -41,7 +41,9 @@ pub struct SubscribeView<'a> {
 
 impl<'a> SubscribeView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     fn fixed(&self) -> &SubscribeFixed {
@@ -49,22 +51,34 @@ impl<'a> SubscribeView<'a> {
     }
 
     #[inline(always)]
-    pub fn consumer_id(&self) -> u32 { self.fixed().consumer_id.get() }
+    pub fn consumer_id(&self) -> u32 {
+        self.fixed().consumer_id.get()
+    }
 
     #[inline(always)]
-    pub fn max_inflight(&self) -> u16 { self.fixed().max_inflight.get() }
+    pub fn max_inflight(&self) -> u16 {
+        self.fixed().max_inflight.get()
+    }
 
     #[inline(always)]
-    pub fn deliver_policy(&self) -> u8 { self.fixed().deliver_policy }
+    pub fn deliver_policy(&self) -> u8 {
+        self.fixed().deliver_policy
+    }
 
     #[inline(always)]
-    pub fn deliver_mode(&self) -> u8 { self.fixed().deliver_mode }
+    pub fn deliver_mode(&self) -> u8 {
+        self.fixed().deliver_mode
+    }
 
     #[inline(always)]
-    pub fn start_seq(&self) -> u64 { self.fixed().start_seq.get() }
+    pub fn start_seq(&self) -> u64 {
+        self.fixed().start_seq.get()
+    }
 
     #[inline(always)]
-    pub fn group_len(&self) -> u16 { self.fixed().group_len.get() }
+    pub fn group_len(&self) -> u16 {
+        self.fixed().group_len.get()
+    }
 
     /// Queue group name. Empty slice means "use stream name as default".
     #[inline(always)]
@@ -88,11 +102,15 @@ pub struct UnsubscribeView<'a> {
 
 impl<'a> UnsubscribeView<'a> {
     #[inline(always)]
-    pub fn new(buf: &'a [u8]) -> Self { Self { buf } }
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
 
     #[inline(always)]
     pub fn consumer_id(&self) -> u32 {
-        UnsubscribeAction::ref_from_bytes(&self.buf[..core::mem::size_of::<UnsubscribeAction>()]).unwrap().consumer_id.get()
+        UnsubscribeAction::ref_from_bytes(&self.buf[..core::mem::size_of::<UnsubscribeAction>()])
+            .unwrap()
+            .consumer_id
+            .get()
     }
 }
-

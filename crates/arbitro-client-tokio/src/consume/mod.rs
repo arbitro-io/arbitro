@@ -8,10 +8,12 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::consume::message::{AckCmd, NackCmd, Message};
+use crate::consume::message::{AckCmd, Message, NackCmd};
 use crate::error::ClientError;
 use crate::state::Inner;
-use crate::transport::encode::{encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2};
+use crate::transport::encode::{
+    encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2,
+};
 use crate::transport::frame::{WriteFrame, INLINE_CAP};
 
 pub mod demux;
@@ -26,9 +28,9 @@ pub mod message;
 /// an explicit `Unsubscribe` is sent (not yet implemented; the drop is
 /// sufficient for correctness).
 pub struct SubscriptionHandle {
-    pub(crate) rx:          mpsc::Receiver<Message>,
+    pub(crate) rx: mpsc::Receiver<Message>,
     pub(crate) consumer_id: u32,
-    pub(crate) inner:       Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 impl std::fmt::Debug for SubscriptionHandle {
@@ -58,7 +60,11 @@ impl Drop for SubscriptionHandle {
         // Silently dropped if the channel is full or session is torn down.
         let seq = self.inner.seq_alloc.next();
         let frame = encode_unsub_v2(seq, self.consumer_id);
-        let _ = self.inner.admin_producer.lock().unwrap()
+        let _ = self
+            .inner
+            .admin_producer
+            .lock()
+            .unwrap()
             .try_send(WriteFrame::Mono(frame));
     }
 }
@@ -72,18 +78,20 @@ impl Drop for SubscriptionHandle {
 /// encode, `try_send`) happens before the `async move` block, so the
 /// returned future is `Send` and no `&Inner` reference crosses an await.
 pub(crate) fn subscribe_async(
-    inner:       Arc<Inner>,
-    stream_id:   u32,
+    inner: Arc<Inner>,
+    stream_id: u32,
     consumer_id: u32,
-    filter:      &[u8],
+    filter: &[u8],
 ) -> impl Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
-    let seq      = inner.seq_alloc.next();
+    let seq = inner.seq_alloc.next();
     let sub_body = encode_sub_v2(seq, 0, consumer_id, 0, filter);
 
     // 1. Register channel BEFORE enqueuing the SubFrame.
     //    Any Deliver frames that arrive while the round-trip is in flight
     //    are buffered in the channel (capacity = 4096).
-    let rx = inner.subscriptions.register(consumer_id, stream_id, sub_body.clone());
+    let rx = inner
+        .subscriptions
+        .register(consumer_id, stream_id, sub_body.clone());
 
     // 2. Reserve a pending slot for the RepOk reply.
     let rx_pending = inner.pending.register(seq);
@@ -107,7 +115,11 @@ pub(crate) fn subscribe_async(
                 .and_then(|r| r)
         };
         match wire_result {
-            Ok(_) => Ok(SubscriptionHandle { rx, consumer_id, inner: inner2 }),
+            Ok(_) => Ok(SubscriptionHandle {
+                rx,
+                consumer_id,
+                inner: inner2,
+            }),
             Err(e) => {
                 inner2.subscriptions.remove(consumer_id);
                 Err(e)
@@ -128,7 +140,7 @@ pub(crate) fn subscribe_async(
 /// Uses `recv().await` + `try_recv()` drain — zero spin loop.
 pub(crate) async fn ack_batcher_task(
     mut rx: mpsc::Receiver<AckCmd>,
-    inner:  Arc<Inner>,
+    inner: Arc<Inner>,
     cancel: CancellationToken,
 ) {
     use arbitro_proto::v2::ingress::ack_frame::AckFrame;
@@ -187,7 +199,7 @@ pub(crate) async fn ack_batcher_task(
 /// Identical structure to `ack_batcher_task` — see its doc for rationale.
 pub(crate) async fn nack_batcher_task(
     mut rx: mpsc::Receiver<NackCmd>,
-    inner:  Arc<Inner>,
+    inner: Arc<Inner>,
     cancel: CancellationToken,
 ) {
     use arbitro_proto::v2::ingress::nack_frame::NackFrame;

@@ -38,7 +38,9 @@ pub struct Gate {
 }
 
 impl Default for Gate {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Gate {
@@ -162,7 +164,10 @@ mod tests {
         }
         // Give the notify machinery a beat to settle on slow CI runners.
         std::thread::sleep(Duration::from_millis(5));
-        assert!(g.is_open(), "8 × 1000 concurrent releases must leave gate open");
+        assert!(
+            g.is_open(),
+            "8 × 1000 concurrent releases must leave gate open"
+        );
     }
 
     /// Drain-thread analog under tokio: a task awaits `acquire()`, a

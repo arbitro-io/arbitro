@@ -41,10 +41,9 @@ pub enum TlsBuildError {
 pub fn build_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, TlsBuildError> {
     use tokio_rustls::rustls;
 
-    let cert_file = File::open(cert_path)
-        .map_err(|e| TlsBuildError::CertOpen(cert_path.into(), e))?;
-    let key_file = File::open(key_path)
-        .map_err(|e| TlsBuildError::KeyOpen(key_path.into(), e))?;
+    let cert_file =
+        File::open(cert_path).map_err(|e| TlsBuildError::CertOpen(cert_path.into(), e))?;
+    let key_file = File::open(key_path).map_err(|e| TlsBuildError::KeyOpen(key_path.into(), e))?;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<Vec<_>, _>>()

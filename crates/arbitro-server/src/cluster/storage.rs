@@ -3,8 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use arbitro_raft::{
-    EntryPayload, HardState, LogEntry, LogIndex, PeerId, RaftError, RaftStorage, SnapshotMeta,
-    Term,
+    EntryPayload, HardState, LogEntry, LogIndex, PeerId, RaftError, RaftStorage, SnapshotMeta, Term,
 };
 use parking_lot::Mutex;
 
@@ -169,9 +168,8 @@ impl RaftStorage for FileRaftStorage {
 
             // SAFETY: payload_buf outlives the returned LogEntry because both
             // share the caller's lifetime 'a.
-            let slice = unsafe {
-                std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[..e.payload.len()])
-            };
+            let slice =
+                unsafe { std::mem::transmute::<&[u8], &'a [u8]>(&payload_buf[..e.payload.len()]) };
 
             Ok(Some(LogEntry {
                 term: e.term,

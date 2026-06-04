@@ -23,13 +23,15 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
-use arbitro_proto::v2::ingress::pub_frame::{PUB_BODY_FIXED, PubBody, PubFrame};
+use arbitro_proto::v2::ingress::pub_frame::{PubBody, PubFrame, PUB_BODY_FIXED};
 
 // ─────────────────────────────────────────────────────────────────────
 // Test 1 — sized struct (stack), the user's pattern from the bench.
 // ─────────────────────────────────────────────────────────────────────
 
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq)]
+#[derive(
+    FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq,
+)]
 #[repr(C)]
 struct MyNestedPod {
     a: U32,
@@ -37,7 +39,9 @@ struct MyNestedPod {
     _pad: U32,
 }
 
-#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq)]
+#[derive(
+    FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy, Debug, PartialEq,
+)]
 #[repr(C)]
 struct MyPod {
     nested: MyNestedPod,
@@ -121,8 +125,14 @@ fn v2_pubframe_roundtrip_via_as_bytes() {
     let mut buf = vec![0u8; size];
 
     PubFrame::encode_into(
-        &mut buf, /*seq*/ 777, /*stream_id*/ 0xCAFEBABE, /*flags*/ 0,
-        /*entry_flags*/ 0, subject, &[], payload,
+        &mut buf,
+        /*seq*/ 777,
+        /*stream_id*/ 0xCAFEBABE,
+        /*flags*/ 0,
+        /*entry_flags*/ 0,
+        subject,
+        &[],
+        payload,
     );
 
     let wire_snapshot = buf.clone();
@@ -138,12 +148,22 @@ fn v2_pubframe_roundtrip_via_as_bytes() {
     let buf_end = unsafe { buf_start.add(buf.len()) };
     let subj_ptr = frame.subject().as_ptr();
     let pay_ptr = frame.payload().as_ptr();
-    assert!(subj_ptr >= buf_start && subj_ptr < buf_end, "subject inside buf");
-    assert!(pay_ptr >= buf_start && pay_ptr < buf_end, "payload inside buf");
+    assert!(
+        subj_ptr >= buf_start && subj_ptr < buf_end,
+        "subject inside buf"
+    );
+    assert!(
+        pay_ptr >= buf_start && pay_ptr < buf_end,
+        "payload inside buf"
+    );
 
     let reemitted: &[u8] = frame.as_bytes();
     assert_eq!(reemitted.len(), size, "full wire size");
-    assert_eq!(reemitted, &wire_snapshot[..], "identity from offset 0 to end");
+    assert_eq!(
+        reemitted,
+        &wire_snapshot[..],
+        "identity from offset 0 to end"
+    );
     assert_eq!(reemitted.as_ptr(), buf_start, "view points into the buffer");
 }
 
@@ -156,16 +176,20 @@ fn pubframe_decode_then_reemit_is_identity() {
     let subject: &[u8] = b"a.b.c";
     let payload: &[u8] = b"hello world";
 
-    let header = Header::new(0x0101, (PUB_BODY_FIXED + subject.len() + payload.len()) as u32, 1);
+    let header = Header::new(
+        0x0101,
+        (PUB_BODY_FIXED + subject.len() + payload.len()) as u32,
+        1,
+    );
     let body = PubBody {
-        stream_id:   U32::new(0),
+        stream_id: U32::new(0),
         subject_len: U16::new(subject.len() as u16),
-        msg_id_len:  U16::new(0),
+        msg_id_len: U16::new(0),
     };
 
     let mut wire: Vec<u8> = Vec::new();
     wire.extend_from_slice(header.as_bytes()); // 16B
-    wire.extend_from_slice(body.as_bytes());   //  8B
+    wire.extend_from_slice(body.as_bytes()); //  8B
     wire.extend_from_slice(subject);
     wire.extend_from_slice(payload);
 
@@ -192,8 +216,8 @@ const PAY_LEN: usize = 16;
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy)]
 #[repr(C)]
 struct WholePubFrame {
-    header:  Header,
-    body:    PubBody,
+    header: Header,
+    body: PubBody,
     subject: [u8; SUBJ_LEN],
     payload: [u8; PAY_LEN],
 }
@@ -205,22 +229,21 @@ const _: () = assert!(
 #[test]
 fn whole_frame_one_struct_one_as_bytes_zero_copies() {
     let frame = WholePubFrame {
-        header: Header::new(
-            0x0101,
-            (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32,
-            777,
-        ),
+        header: Header::new(0x0101, (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32, 777),
         body: PubBody {
-            stream_id:   U32::new(0xCAFEBABE),
+            stream_id: U32::new(0xCAFEBABE),
             subject_len: U16::new(SUBJ_LEN as u16),
-            msg_id_len:  U16::new(0),
+            msg_id_len: U16::new(0),
         },
         subject: *b"orders.eu.42",
         payload: *b"hello-world-1234",
     };
 
     let wire: &[u8] = frame.as_bytes();
-    assert_eq!(wire.len(), HEADER_SIZE + PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN);
+    assert_eq!(
+        wire.len(),
+        HEADER_SIZE + PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN
+    );
     assert_eq!(wire.as_ptr(), &frame as *const _ as *const u8);
 
     let parsed: &PubFrame = PubFrame::ref_from_bytes(wire).expect("layout valid");
@@ -256,9 +279,9 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
         WholePubFrame {
             header: Header::new(0x0101, (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32, 100),
             body: PubBody {
-                stream_id:   U32::new(1),
+                stream_id: U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                msg_id_len:  U16::new(0),
+                msg_id_len: U16::new(0),
             },
             subject: *b"orders.eu.01",
             payload: *b"AAAAAAAAAAAAAAAA",
@@ -266,9 +289,9 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
         WholePubFrame {
             header: Header::new(0x0101, (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32, 101),
             body: PubBody {
-                stream_id:   U32::new(1),
+                stream_id: U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                msg_id_len:  U16::new(0),
+                msg_id_len: U16::new(0),
             },
             subject: *b"orders.eu.02",
             payload: *b"BBBBBBBBBBBBBBBB",
@@ -276,9 +299,9 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
         WholePubFrame {
             header: Header::new(0x0101, (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32, 102),
             body: PubBody {
-                stream_id:   U32::new(1),
+                stream_id: U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                msg_id_len:  U16::new(0),
+                msg_id_len: U16::new(0),
             },
             subject: *b"orders.eu.03",
             payload: *b"CCCCCCCCCCCCCCCC",
@@ -286,9 +309,9 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
         WholePubFrame {
             header: Header::new(0x0101, (PUB_BODY_FIXED + SUBJ_LEN + PAY_LEN) as u32, 103),
             body: PubBody {
-                stream_id:   U32::new(1),
+                stream_id: U32::new(1),
                 subject_len: U16::new(SUBJ_LEN as u16),
-                msg_id_len:  U16::new(0),
+                msg_id_len: U16::new(0),
             },
             subject: *b"orders.eu.04",
             payload: *b"DDDDDDDDDDDDDDDD",
@@ -304,8 +327,8 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
     let mut seen_payloads: Vec<Vec<u8>> = Vec::with_capacity(N);
 
     while offset < wire.len() {
-        let header = Header::ref_from_bytes(&wire[offset..offset + HEADER_SIZE])
-            .expect("header layout");
+        let header =
+            Header::ref_from_bytes(&wire[offset..offset + HEADER_SIZE]).expect("header layout");
         let frame_len = HEADER_SIZE + header.msg_len.get() as usize;
 
         let frame: &PubFrame =
@@ -344,8 +367,8 @@ fn batch_homogeneous_array_one_as_bytes_zero_copies() {
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy)]
 #[repr(C)]
 struct EntrySmall {
-    header:  Header,
-    body:    PubBody,
+    header: Header,
+    body: PubBody,
     subject: [u8; 5],
     payload: [u8; 4],
 }
@@ -353,8 +376,8 @@ struct EntrySmall {
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Clone, Copy)]
 #[repr(C)]
 struct EntryBig {
-    header:  Header,
-    body:    PubBody,
+    header: Header,
+    body: PubBody,
     subject: [u8; 16],
     payload: [u8; 64],
 }
@@ -364,9 +387,9 @@ fn batch_heterogeneous_per_entry_struct_zero_copies() {
     let small = EntrySmall {
         header: Header::new(0x0101, (PUB_BODY_FIXED + 5 + 4) as u32, 1),
         body: PubBody {
-            stream_id:   U32::new(7),
+            stream_id: U32::new(7),
             subject_len: U16::new(5),
-            msg_id_len:  U16::new(0),
+            msg_id_len: U16::new(0),
         },
         subject: *b"a.b.c",
         payload: *b"PING",
@@ -375,9 +398,9 @@ fn batch_heterogeneous_per_entry_struct_zero_copies() {
     let big = EntryBig {
         header: Header::new(0x0101, (PUB_BODY_FIXED + 16 + 64) as u32, 2),
         body: PubBody {
-            stream_id:   U32::new(7),
+            stream_id: U32::new(7),
             subject_len: U16::new(16),
-            msg_id_len:  U16::new(0),
+            msg_id_len: U16::new(0),
         },
         subject: *b"orders.eu.42.xx.",
         payload: [0x42; 64],

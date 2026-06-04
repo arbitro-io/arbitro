@@ -1,10 +1,10 @@
 //! Standalone Endurance Client — separated process for real stress testing.
 //! Supports Dual Roles: High-speed ingestion and aggressive ACK scavenging.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
 use bytes::Bytes;
@@ -18,8 +18,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // deliver_mode: 0=Push/Fanout, 1=Queue
     let deliver_mode: u8 = if mode_str == "queue" { 1 } else { 0 };
-    let duration_secs: u64 = env::var("ARBITRO_DURATION").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
-    let concurrency: usize = env::var("ARBITRO_CONCURRENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let duration_secs: u64 = env::var("ARBITRO_DURATION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let concurrency: usize = env::var("ARBITRO_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     let kind_str = env::var("ARBITRO_KIND").unwrap_or_else(|_| "memory".to_string());
 
     // journal_kind: 0=Memory, 2=Tolerant
@@ -31,19 +37,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- ENDURANCE CLIENT started ---");
     println!(
         "Role: {}, Group: {}, Mode: {}, Addr: {}, Duration: {}s, Kind: {}",
-        role, group_name, mode_str, addr, duration_secs,
-        if journal_kind == 2 { "tolerant" } else { "memory" }
+        role,
+        group_name,
+        mode_str,
+        addr,
+        duration_secs,
+        if journal_kind == 2 {
+            "tolerant"
+        } else {
+            "memory"
+        }
     );
 
-    let client_master = Client::connect(ClientConfig { addr: addr.clone(), ..ClientConfig::default() }).await?;
+    let client_master = Client::connect(ClientConfig {
+        addr: addr.clone(),
+        ..ClientConfig::default()
+    })
+    .await?;
     let filter = format!("{}.>", std::str::from_utf8(&stream_name).unwrap());
     let stream_id = match client_master
-        .create_stream(&stream_name, filter.as_bytes(), 0, 0, 0, 1, journal_kind, 0, 0, 0)
+        .create_stream(
+            &stream_name,
+            filter.as_bytes(),
+            0,
+            0,
+            0,
+            1,
+            journal_kind,
+            0,
+            0,
+            0,
+        )
         .await
     {
-        Ok(bytes) if bytes.len() >= 8 => {
-            u64::from_le_bytes(bytes[..8].try_into().unwrap()) as u32
-        }
+        Ok(bytes) if bytes.len() >= 8 => u64::from_le_bytes(bytes[..8].try_into().unwrap()) as u32,
         _ => {
             eprintln!("Warning: create_stream failed or returned unexpected response");
             0u32
@@ -64,9 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let counter = total_published.clone();
             let start = start_time;
             producer_futs.push(async move {
-                let client = Client::connect(ClientConfig { addr: addr_clone, ..ClientConfig::default() })
-                    .await
-                    .expect("prod connect");
+                let client = Client::connect(ClientConfig {
+                    addr: addr_clone,
+                    ..ClientConfig::default()
+                })
+                .await
+                .expect("prod connect");
                 let payload: Bytes = Bytes::from(vec![0u8; 128]);
                 let batch_size = 500usize;
                 let entries: Vec<BatchEntry<'_>> = (0..batch_size)
@@ -104,9 +134,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let group = group_name.clone();
             let start = start_time;
             consumer_futs.push(async move {
-                let client = Client::connect(ClientConfig { addr: addr_clone, ..ClientConfig::default() })
-                    .await
-                    .expect("cons connect");
+                let client = Client::connect(ClientConfig {
+                    addr: addr_clone,
+                    ..ClientConfig::default()
+                })
+                .await
+                .expect("cons connect");
 
                 let consumer_name = format!("{}-{i}", group);
                 let resp = client
@@ -116,8 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         group.as_bytes(),
                         b"",
                         5000,
-                        1,           // ack_policy = Explicit
-                        0,           // deliver_policy = All
+                        1, // ack_policy = Explicit
+                        0, // deliver_policy = All
                         deliver_mode,
                         30_000,
                         0,
@@ -160,7 +193,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let a = total_acked.load(Ordering::Relaxed);
                 let elapsed = last_report.elapsed().as_secs_f64();
                 let rate = (p - last_pub) as f64 / elapsed;
-                println!("  > Telemetry | Published: {} (avg {:.0} msg/s), Acked: {}", p, rate, a);
+                println!(
+                    "  > Telemetry | Published: {} (avg {:.0} msg/s), Acked: {}",
+                    p, rate, a
+                );
                 last_pub = p;
                 last_report = Instant::now();
             }

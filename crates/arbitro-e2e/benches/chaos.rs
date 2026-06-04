@@ -29,22 +29,22 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{Client, ClientConfig, ReconnectPolicy};
-use bytes::Bytes;
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 use tokio::sync::watch;
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
-const RUN_SECS:        u64 = 18;
-const N_PRODUCERS:     u64 = 4;
-const RATE:            u64 = 150;   // target publish_sync msg/s per producer
-const JOURNAL_DISK:    u8  = 1;
-const STREAM:          &[u8] = b"chaos";
+const RUN_SECS: u64 = 18;
+const N_PRODUCERS: u64 = 4;
+const RATE: u64 = 150; // target publish_sync msg/s per producer
+const JOURNAL_DISK: u8 = 1;
+const STREAM: &[u8] = b"chaos";
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,11 +55,15 @@ fn portpicker() -> u16 {
 }
 
 fn prune_stale() {
-    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
-        if p.file_name().and_then(|n| n.to_str())
-            .map(|n| n.starts_with("arbitro-chaos-")).unwrap_or(false)
+        if p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("arbitro-chaos-"))
+            .unwrap_or(false)
         {
             let _ = std::fs::remove_dir_all(&p);
         }
@@ -76,15 +80,17 @@ fn make_data_dir() -> PathBuf {
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn make_cfg(addr: &str) -> ClientConfig {
     ClientConfig {
         addr: addr.to_string(),
         reconnect: ReconnectPolicy {
-            base:         Duration::from_millis(100),
-            cap:          Duration::from_millis(1_000),
+            base: Duration::from_millis(100),
+            cap: Duration::from_millis(1_000),
             max_attempts: None,
         },
         ..ClientConfig::default()
@@ -99,11 +105,15 @@ async fn spawn_server(addr: &str, data_dir: &Path) -> watch::Sender<bool> {
         .max_connections(64)
         .shard_count(1)
         .data_dir(data_dir.to_string_lossy().into_owned());
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run_with_shutdown(rx).await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run_with_shutdown(rx).await;
+    });
     // Poll until the port is accepting connections.
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if std::net::TcpStream::connect(addr).is_ok() { break; }
+        if std::net::TcpStream::connect(addr).is_ok() {
+            break;
+        }
     }
     tx
 }
@@ -112,7 +122,7 @@ async fn spawn_server(addr: &str, data_dir: &Path) -> watch::Sender<bool> {
 async fn connect_retry(addr: &str) -> Client {
     loop {
         match Client::connect(make_cfg(addr)).await {
-            Ok(c)  => return c,
+            Ok(c) => return c,
             Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
         }
     }
@@ -122,26 +132,43 @@ async fn connect_retry(addr: &str) -> Client {
 /// Returns (stream_id, consumer_id).
 async fn ensure_stream_and_consumer(addr: &str) -> (u32, u32) {
     let c = connect_retry(addr).await;
-    let resp = c.create_stream(STREAM, b">", 0, 0, 0, 1, JOURNAL_DISK, 0, 0, 0)
-        .await.expect("create_stream");
+    let resp = c
+        .create_stream(STREAM, b">", 0, 0, 0, 1, JOURNAL_DISK, 0, 0, 0)
+        .await
+        .expect("create_stream");
     let sid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-    let resp = c.create_consumer(sid, b"chaos-c", b"chaos-grp", b"",
-                                 u16::MAX, 1u8, 0u8, 0u8, 30_000u32, 0u64)
-        .await.expect("create_consumer");
+    let resp = c
+        .create_consumer(
+            sid,
+            b"chaos-c",
+            b"chaos-grp",
+            b"",
+            u16::MAX,
+            1u8,
+            0u8,
+            0u8,
+            30_000u32,
+            0u64,
+        )
+        .await
+        .expect("create_consumer");
     let cid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
     (sid, cid)
 }
 
 #[cfg(target_os = "linux")]
 fn rss_mb() -> f64 {
-    std::fs::read_to_string("/proc/self/statm").ok()
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
         .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
         .map(|p| p as f64 * 4.0 / 1024.0)
         .unwrap_or(0.0)
 }
 #[cfg(not(target_os = "linux"))]
-fn rss_mb() -> f64 { 0.0 }
+fn rss_mb() -> f64 {
+    0.0
+}
 
 // ── Producer ──────────────────────────────────────────────────────────────────
 //
@@ -149,22 +176,22 @@ fn rss_mb() -> f64 { 0.0 }
 // NO management async fn(&self) calls — those require Client: Sync.
 
 async fn producer(
-    id:       u64,
+    id: u64,
     cur_addr: Arc<RwLock<String>>,
-    cur_sid:  Arc<AtomicU32>,
-    stop:     Arc<AtomicBool>,
-    acked:    Arc<std::sync::Mutex<HashSet<u64>>>,
-    ok_cnt:   Arc<AtomicU64>,
-    err_cnt:  Arc<AtomicU64>,
+    cur_sid: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    acked: Arc<std::sync::Mutex<HashSet<u64>>>,
+    ok_cnt: Arc<AtomicU64>,
+    err_cnt: Arc<AtomicU64>,
 ) {
-    let subj     = format!("prod.{id}");
-    let payload  = vec![id as u8; 32];
+    let subj = format!("prod.{id}");
+    let payload = vec![id as u8; 32];
     let interval = Duration::from_nanos(1_000_000_000 / RATE.max(1));
 
     // Option<Client> lets us drop the client eagerly when the server goes down.
     let mut client: Option<Client> = None;
     let mut last_addr = String::new();
-    let mut tick      = Instant::now();
+    let mut tick = Instant::now();
 
     while !stop.load(Relaxed) {
         let sid = cur_sid.load(Relaxed);
@@ -180,14 +207,17 @@ async fn producer(
         let cur = cur_addr.read().unwrap().clone();
         if client.is_none() || cur != last_addr {
             last_addr = cur.clone();
-            client    = Some(connect_retry(&cur).await);
-            tick      = Instant::now();
+            client = Some(connect_retry(&cur).await);
+            tick = Instant::now();
         }
 
         // publish_sync(&self) -> impl Future + 'static + Send — borrow ends
         // after the call; future is self-contained (no &Client held across .await).
-        let fut = client.as_ref().unwrap()
-            .publish_sync(sid, subj.as_bytes(), Bytes::copy_from_slice(&payload));
+        let fut = client.as_ref().unwrap().publish_sync(
+            sid,
+            subj.as_bytes(),
+            Bytes::copy_from_slice(&payload),
+        );
         let result = tokio::time::timeout(PUBLISH_TIMEOUT, fut).await;
 
         match result {
@@ -208,8 +238,11 @@ async fn producer(
 
         tick += interval;
         let now = Instant::now();
-        if tick > now { tokio::time::sleep(tick - now).await; }
-        else          { tick = now; }
+        if tick > now {
+            tokio::time::sleep(tick - now).await;
+        } else {
+            tick = now;
+        }
     }
 }
 
@@ -218,14 +251,14 @@ async fn producer(
 // Only calls `subscribe` (impl Future + Send) and `connect_retry` (free fn).
 
 async fn consumer_loop(
-    cur_addr:        Arc<RwLock<String>>,
-    cur_sid:         Arc<AtomicU32>,
-    cur_cid:         Arc<AtomicU32>,
-    stop:            Arc<AtomicBool>,
+    cur_addr: Arc<RwLock<String>>,
+    cur_sid: Arc<AtomicU32>,
+    cur_cid: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
     force_reconnect: Arc<AtomicBool>,
-    recv_seqs:       Arc<std::sync::Mutex<HashSet<u64>>>,
-    recv_total:      Arc<AtomicU64>,
-    reconnect_cnt:   Arc<AtomicU64>,
+    recv_seqs: Arc<std::sync::Mutex<HashSet<u64>>>,
+    recv_total: Arc<AtomicU64>,
+    reconnect_cnt: Arc<AtomicU64>,
 ) {
     while !stop.load(Relaxed) {
         let sid = cur_sid.load(Relaxed);
@@ -235,14 +268,17 @@ async fn consumer_loop(
             continue;
         }
 
-        let addr   = cur_addr.read().unwrap().clone();
+        let addr = cur_addr.read().unwrap().clone();
         let client = connect_retry(&addr).await;
 
         // subscribe returns impl Future + Send — safe in spawn.
         let sub = client.subscribe(sid, cid, b"").await;
         let mut sub = match sub {
-            Ok(s)  => s,
-            Err(_) => { tokio::time::sleep(Duration::from_millis(200)).await; continue; }
+            Ok(s) => s,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
         };
 
         loop {
@@ -261,7 +297,9 @@ async fn consumer_loop(
                     break;
                 }
                 Err(_timeout) => {
-                    if stop.load(Relaxed) { return; }
+                    if stop.load(Relaxed) {
+                        return;
+                    }
                     if force_reconnect.swap(false, Relaxed) {
                         reconnect_cnt.fetch_add(1, Relaxed);
                         break;
@@ -312,38 +350,48 @@ async fn main() {
     println!();
 
     // ── Shared state ───────────────────────────────────────────────────────
-    let cur_addr  = Arc::new(RwLock::new(addr0.clone()));
-    let cur_sid   = Arc::new(AtomicU32::new(sid0));
-    let cur_cid   = Arc::new(AtomicU32::new(cid0));
+    let cur_addr = Arc::new(RwLock::new(addr0.clone()));
+    let cur_sid = Arc::new(AtomicU32::new(sid0));
+    let cur_cid = Arc::new(AtomicU32::new(cid0));
 
-    let prod_stop       = Arc::new(AtomicBool::new(false));
-    let cons_stop       = Arc::new(AtomicBool::new(false));
+    let prod_stop = Arc::new(AtomicBool::new(false));
+    let cons_stop = Arc::new(AtomicBool::new(false));
     let force_reconnect = Arc::new(AtomicBool::new(false));
 
-    let acked_seqs  = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
-    let ok_cnt      = Arc::new(AtomicU64::new(0));
-    let err_cnt     = Arc::new(AtomicU64::new(0));
-    let recv_seqs   = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
-    let recv_total  = Arc::new(AtomicU64::new(0));
+    let acked_seqs = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let ok_cnt = Arc::new(AtomicU64::new(0));
+    let err_cnt = Arc::new(AtomicU64::new(0));
+    let recv_seqs = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let recv_total = Arc::new(AtomicU64::new(0));
     let reconnect_cnt = Arc::new(AtomicU64::new(0));
 
     // ── Consumer task ──────────────────────────────────────────────────────
     tokio::spawn(consumer_loop(
-        Arc::clone(&cur_addr), Arc::clone(&cur_sid), Arc::clone(&cur_cid),
-        Arc::clone(&cons_stop), Arc::clone(&force_reconnect),
-        Arc::clone(&recv_seqs), Arc::clone(&recv_total), Arc::clone(&reconnect_cnt),
+        Arc::clone(&cur_addr),
+        Arc::clone(&cur_sid),
+        Arc::clone(&cur_cid),
+        Arc::clone(&cons_stop),
+        Arc::clone(&force_reconnect),
+        Arc::clone(&recv_seqs),
+        Arc::clone(&recv_total),
+        Arc::clone(&reconnect_cnt),
     ));
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // ── Producer tasks ─────────────────────────────────────────────────────
-    let prod_handles: Vec<_> = (0..N_PRODUCERS).map(|id| {
-        tokio::spawn(producer(
-            id,
-            Arc::clone(&cur_addr), Arc::clone(&cur_sid),
-            Arc::clone(&prod_stop),
-            Arc::clone(&acked_seqs), Arc::clone(&ok_cnt), Arc::clone(&err_cnt),
-        ))
-    }).collect();
+    let prod_handles: Vec<_> = (0..N_PRODUCERS)
+        .map(|id| {
+            tokio::spawn(producer(
+                id,
+                Arc::clone(&cur_addr),
+                Arc::clone(&cur_sid),
+                Arc::clone(&prod_stop),
+                Arc::clone(&acked_seqs),
+                Arc::clone(&ok_cnt),
+                Arc::clone(&err_cnt),
+            ))
+        })
+        .collect();
 
     // ── Main ticker + inline chaos events ─────────────────────────────────
     let run_start = Instant::now();
@@ -369,8 +417,10 @@ async fn main() {
             *cur_addr.write().unwrap() = new_addr.clone();
             cur_sid.store(s, Relaxed);
             cur_cid.store(c, Relaxed);
-            println!("  [chaos] ✓  t=5s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
-                reconnect_cnt.load(Relaxed));
+            println!(
+                "  [chaos] ✓  t=5s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
+                reconnect_cnt.load(Relaxed)
+            );
         }
 
         // ── Chaos: consumer force-disconnect at t=8 ────────────────────
@@ -397,15 +447,17 @@ async fn main() {
             *cur_addr.write().unwrap() = new_addr.clone();
             cur_sid.store(s, Relaxed);
             cur_cid.store(c, Relaxed);
-            println!("  [chaos] ✓  t=13s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
-                reconnect_cnt.load(Relaxed));
+            println!(
+                "  [chaos] ✓  t=13s: server up  sid={s} cid={c}  (consumer_reconnects: {})",
+                reconnect_cnt.load(Relaxed)
+            );
         }
 
-        let pub_n  = ok_cnt.load(Relaxed);
-        let err_n  = err_cnt.load(Relaxed);
+        let pub_n = ok_cnt.load(Relaxed);
+        let err_n = err_cnt.load(Relaxed);
         let recv_n = recv_total.load(Relaxed);
         let uniq_n = recv_seqs.lock().unwrap().len();
-        let rc_n   = reconnect_cnt.load(Relaxed);
+        let rc_n = reconnect_cnt.load(Relaxed);
         println!(
             "  [t={t:>2}s] published={pub_n:>5}  received={recv_n:>5} (uniq={uniq_n:>5})  \
              errors={err_n:>4}  consumer_reconnects={rc_n}  rss={:.1}MB",
@@ -416,19 +468,23 @@ async fn main() {
 
     // ── Stop producers ─────────────────────────────────────────────────────
     prod_stop.store(true, Relaxed);
-    for h in prod_handles { let _ = h.await; }
+    for h in prod_handles {
+        let _ = h.await;
+    }
     let pub_total = ok_cnt.load(Relaxed);
     let err_total = err_cnt.load(Relaxed);
     println!();
-    println!("  producers stopped: {pub_total} acked  {err_total} errors  elapsed={:.2?}",
-        run_start.elapsed());
+    println!(
+        "  producers stopped: {pub_total} acked  {err_total} errors  elapsed={:.2?}",
+        run_start.elapsed()
+    );
 
     // ── Drain consumer ─────────────────────────────────────────────────────
     println!("  draining consumer (target={pub_total} unique seqs) ...");
-    let drain_start    = Instant::now();
+    let drain_start = Instant::now();
     let drain_deadline = drain_start + Duration::from_secs(30);
-    let mut last_uniq  = recv_seqs.lock().unwrap().len();
-    let mut stall_at   = Instant::now();
+    let mut last_uniq = recv_seqs.lock().unwrap().len();
+    let mut stall_at = Instant::now();
 
     loop {
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -444,7 +500,7 @@ async fn main() {
         }
         if uniq != last_uniq {
             last_uniq = uniq;
-            stall_at  = Instant::now();
+            stall_at = Instant::now();
         } else if Instant::now().duration_since(stall_at) > Duration::from_secs(8) {
             println!("  WARN drain stalled 8s — unique={uniq}/{pub_total}");
             break;
@@ -455,15 +511,15 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // ── Results ────────────────────────────────────────────────────────────
-    let acked    = acked_seqs.lock().unwrap().clone();
-    let recvd    = recv_seqs.lock().unwrap().clone();
+    let acked = acked_seqs.lock().unwrap().clone();
+    let recvd = recv_seqs.lock().unwrap().clone();
     let recv_tot = recv_total.load(Relaxed);
     let uniq_tot = recvd.len() as u64;
-    let dups     = recv_tot.saturating_sub(uniq_tot);
-    let rc_tot   = reconnect_cnt.load(Relaxed);
+    let dups = recv_tot.saturating_sub(uniq_tot);
+    let rc_tot = reconnect_cnt.load(Relaxed);
 
     let missing_seqs: Vec<u64> = acked.difference(&recvd).copied().take(20).collect();
-    let missing_cnt  = acked.difference(&recvd).count();
+    let missing_cnt = acked.difference(&recvd).count();
 
     println!();
     println!("╔══════════════════════════════════════════════════════════╗");
@@ -486,8 +542,14 @@ async fn main() {
     }
     println!();
 
-    assert!(pub_total > 0, "no messages published — check server restart logic");
-    assert!(rc_tot >= 3, "expected ≥3 consumer reconnects (2 kills + 1 force), got {rc_tot}");
+    assert!(
+        pub_total > 0,
+        "no messages published — check server restart logic"
+    );
+    assert!(
+        rc_tot >= 3,
+        "expected ≥3 consumer reconnects (2 kills + 1 force), got {rc_tot}"
+    );
     assert_eq!(
         missing_cnt, 0,
         "LOSS: {missing_cnt} acked seqs never received.\nFirst missing: {missing_seqs:?}"

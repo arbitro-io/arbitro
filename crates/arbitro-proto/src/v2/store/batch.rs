@@ -19,10 +19,10 @@ pub const PAGE_SIZE: usize = 4096;
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct BatchHeader {
-    pub magic:       U32,
-    pub batch_len:   U32,
+    pub magic: U32,
+    pub batch_len: U32,
     pub content_len: U32,
-    pub count:       U32,
+    pub count: U32,
 }
 pub const BATCH_HEADER_SIZE: usize = core::mem::size_of::<BatchHeader>();
 const _: () = assert!(BATCH_HEADER_SIZE == 16);
@@ -30,13 +30,12 @@ const _: () = assert!(BATCH_HEADER_SIZE == 16);
 impl BatchHeader {
     #[inline(always)]
     pub fn new(content_len: u32, count: u32) -> Self {
-        let batch_len =
-            align_up_to_page(BATCH_HEADER_SIZE + content_len as usize) as u32;
+        let batch_len = align_up_to_page(BATCH_HEADER_SIZE + content_len as usize) as u32;
         Self {
-            magic:       U32::new(ARBITRO_MAGIC_V2),
-            batch_len:   U32::new(batch_len),
+            magic: U32::new(ARBITRO_MAGIC_V2),
+            batch_len: U32::new(batch_len),
             content_len: U32::new(content_len),
-            count:       U32::new(count),
+            count: U32::new(count),
         }
     }
 

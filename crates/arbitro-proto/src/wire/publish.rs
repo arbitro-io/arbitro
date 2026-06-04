@@ -94,7 +94,11 @@ impl<'a> BatchIter<'a> {
     #[inline(always)]
     pub fn new(body: &'a [u8]) -> Self {
         let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
-        Self { buf: body, offset: 4, remaining: count }
+        Self {
+            buf: body,
+            offset: 4,
+            remaining: count,
+        }
     }
 
     #[inline(always)]

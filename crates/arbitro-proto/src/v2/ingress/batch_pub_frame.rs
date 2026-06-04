@@ -38,7 +38,7 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[repr(C)]
 pub struct BatchPubBody {
     pub stream_id: U32,
-    pub count:     U32,
+    pub count: U32,
 }
 pub const BATCH_PUB_BODY_FIXED: usize = core::mem::size_of::<BatchPubBody>();
 const _: () = assert!(BATCH_PUB_BODY_FIXED == 8);
@@ -53,7 +53,7 @@ pub struct BatchPubEntryHeader {
     /// when the target stream has idempotency enabled. `0` = no id
     /// for this entry (mixing dedup + non-dedup entries in the same
     /// batch is allowed; the broker checks each independently).
-    pub msg_id_len:  U16,
+    pub msg_id_len: U16,
     pub payload_len: U32,
 }
 pub const BATCH_PUB_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<BatchPubEntryHeader>();
@@ -65,8 +65,8 @@ const _: () = assert!(BATCH_PUB_ENTRY_HEADER_SIZE == 8);
 #[repr(C)]
 pub struct BatchPubFrame {
     pub header: Header,
-    pub body:   BatchPubBody,
-    pub tail:   [u8], // count × (BatchPubEntryHeader + subject + payload)
+    pub body: BatchPubBody,
+    pub tail: [u8], // count × (BatchPubEntryHeader + subject + payload)
 }
 
 impl BatchPubFrame {
@@ -85,8 +85,8 @@ impl BatchPubFrame {
     #[inline(always)]
     pub fn iter(&self) -> BatchPubIter<'_> {
         BatchPubIter {
-            buf:       &self.tail,
-            offset:    0,
+            buf: &self.tail,
+            offset: 0,
             remaining: self.body.count.get(),
         }
     }
@@ -109,8 +109,13 @@ impl BatchPubFrame {
             tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
         }
         Self::encode_into_iter(
-            out, seq, stream_id, flags, entry_flags,
-            entries.len() as u32, tail_bytes,
+            out,
+            seq,
+            stream_id,
+            flags,
+            entry_flags,
+            entries.len() as u32,
+            tail_bytes,
             entries.iter().copied(),
         )
     }
@@ -143,7 +148,7 @@ impl BatchPubFrame {
             .with_entry_flags(entry_flags);
         frame.body = BatchPubBody {
             stream_id: U32::new(stream_id),
-            count:     U32::new(count),
+            count: U32::new(count),
         };
 
         let mut off = 0usize;
@@ -151,7 +156,7 @@ impl BatchPubFrame {
             let hdr_end = off + BATCH_PUB_ENTRY_HEADER_SIZE;
             let entry_hdr = BatchPubEntryHeader {
                 subject_len: U16::new(subject.len() as u16),
-                msg_id_len:  U16::new(msg_id.len() as u16),
+                msg_id_len: U16::new(msg_id.len() as u16),
                 payload_len: U32::new(payload.len() as u32),
             };
             frame.tail[off..hdr_end].copy_from_slice(entry_hdr.as_bytes());
@@ -221,8 +226,8 @@ impl<'a> BatchPubEntryView<'a> {
 // ── Iterator ──────────────────────────────────────────────────────────
 
 pub struct BatchPubIter<'a> {
-    buf:       &'a [u8],
-    offset:    usize,
+    buf: &'a [u8],
+    offset: usize,
     remaining: u32,
 }
 
@@ -246,7 +251,8 @@ impl<'a> Iterator for BatchPubIter<'a> {
             self.remaining = 0;
             return None;
         }
-        let header = BatchPubEntryHeader::ref_from_bytes(&rest[..BATCH_PUB_ENTRY_HEADER_SIZE]).ok()?;
+        let header =
+            BatchPubEntryHeader::ref_from_bytes(&rest[..BATCH_PUB_ENTRY_HEADER_SIZE]).ok()?;
         let s = header.subject_len.get() as usize;
         let m = header.msg_id_len.get() as usize;
         let p = header.payload_len.get() as usize;
@@ -257,7 +263,9 @@ impl<'a> Iterator for BatchPubIter<'a> {
             return None;
         }
         self.remaining -= 1;
-        let view = BatchPubEntryView { buf: &rest[..entry_total] };
+        let view = BatchPubEntryView {
+            buf: &rest[..entry_total],
+        };
         self.offset += entry_total;
         Some(view)
     }
@@ -297,13 +305,22 @@ mod tests {
 
         let frame = BatchPubFrame::ref_from_bytes(&buf).expect("layout");
         assert_eq!(frame.header.seq.get(), 99);
-        assert_eq!(frame.header.action.get(), crate::action::Action::PublishBatch.as_u16());
+        assert_eq!(
+            frame.header.action.get(),
+            crate::action::Action::PublishBatch.as_u16()
+        );
         assert_eq!(frame.body.stream_id.get(), 0xCAFE);
         assert_eq!(frame.count(), 3);
 
         let collected: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = frame
             .iter()
-            .map(|v| (v.subject().to_vec(), v.msg_id().to_vec(), v.payload().to_vec()))
+            .map(|v| {
+                (
+                    v.subject().to_vec(),
+                    v.msg_id().to_vec(),
+                    v.payload().to_vec(),
+                )
+            })
             .collect();
 
         assert_eq!(collected.len(), 3);
@@ -317,7 +334,7 @@ mod tests {
     fn msg_id_roundtrips_per_entry() {
         let entries: &[(&[u8], &[u8], &[u8])] = &[
             (b"orders.new", b"id-1", b"a"),
-            (b"orders.new", b"",     b"b"), // legacy entry — no dedup
+            (b"orders.new", b"", b"b"), // legacy entry — no dedup
             (b"orders.new", b"id-2", b"c"),
         ];
         let mut tail_bytes = 0usize;
@@ -380,27 +397,25 @@ mod tests {
         // subject_len = 0xFFFF; no real subject/payload bytes follow).
         let msg_len = (BATCH_PUB_BODY_FIXED + tail.len()) as u32;
         let frame_view = BatchPubFrame::mut_from_bytes(&mut buf).expect("layout");
-        frame_view.header = Header::new(
-            crate::action::Action::PublishBatch.as_u16(),
-            msg_len,
-            1,
-        );
+        frame_view.header = Header::new(crate::action::Action::PublishBatch.as_u16(), msg_len, 1);
         frame_view.body = BatchPubBody {
             stream_id: U32::new(0),
-            count:     U32::new(1),
+            count: U32::new(1),
         };
         // Write the lying entry header.
         let bad = BatchPubEntryHeader {
             subject_len: U16::new(0xFFFF),
-            msg_id_len:  U16::new(0),
+            msg_id_len: U16::new(0),
             payload_len: U32::new(0),
         };
-        frame_view.tail[..BATCH_PUB_ENTRY_HEADER_SIZE]
-            .copy_from_slice(bad.as_bytes());
+        frame_view.tail[..BATCH_PUB_ENTRY_HEADER_SIZE].copy_from_slice(bad.as_bytes());
 
         let frame = BatchPubFrame::ref_from_bytes(&buf).expect("layout");
         let collected: Vec<_> = frame.iter().collect();
-        assert!(collected.is_empty(), "iterator must reject oversize subject_len");
+        assert!(
+            collected.is_empty(),
+            "iterator must reject oversize subject_len"
+        );
     }
 
     #[test]

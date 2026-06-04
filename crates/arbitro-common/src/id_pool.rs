@@ -200,7 +200,11 @@ impl IdPool {
             // Duplicate in free list
             return Err(PoolError::DoubleFree);
         }
-        if snapshot.free_slots.iter().any(|&s| (s as usize) >= snapshot.generations.len()) {
+        if snapshot
+            .free_slots
+            .iter()
+            .any(|&s| (s as usize) >= snapshot.generations.len())
+        {
             return Err(PoolError::OutOfRange);
         }
         Ok(Self {
@@ -301,7 +305,7 @@ mod tests {
         assert!(pool.is_current(slot, gen));
 
         pool.free(slot).unwrap();
-        pool.alloc().unwrap();  // reuse — bumps gen to 1
+        pool.alloc().unwrap(); // reuse — bumps gen to 1
 
         // Old gen no longer current
         assert!(!pool.is_current(slot, gen));
@@ -361,7 +365,7 @@ mod tests {
         pool.alloc().unwrap();
         pool.alloc().unwrap();
         pool.free(1).unwrap();
-        pool.alloc().unwrap();  // reuse slot 1 → gen 1
+        pool.alloc().unwrap(); // reuse slot 1 → gen 1
         pool.free(0).unwrap();
 
         let snap = pool.snapshot();
@@ -466,6 +470,6 @@ mod tests {
         pool.generations[slot as usize] = u32::MAX;
         pool.free(slot).unwrap();
         let (_, gen) = pool.alloc().unwrap();
-        assert_eq!(gen, 0);  // wrapped
+        assert_eq!(gen, 0); // wrapped
     }
 }

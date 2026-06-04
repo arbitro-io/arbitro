@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
-use arbitro_client_tokio::{Client, ClientConfig, BatchEntry};
-use bytes::Bytes;
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── Settings ────────────────────────────────────────────────────
 
@@ -160,9 +160,12 @@ async fn start_server() -> String {
 }
 
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig { addr: addr.to_string(), ..ClientConfig::default() })
-        .await
-        .expect("client must connect")
+    Client::connect(ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    })
+    .await
+    .expect("client must connect")
 }
 
 /// Delete (if present) and recreate every stream in `names`.
@@ -387,7 +390,10 @@ async fn run_replay(
         let expected = msgs_per_stream;
         js.spawn(async move {
             let t_sub = Instant::now();
-            let mut handle = client.subscribe(stream_id, consumer_id, b"").await.expect("subscribe");
+            let mut handle = client
+                .subscribe(stream_id, consumer_id, b"")
+                .await
+                .expect("subscribe");
             let sub_ms = t_sub.elapsed().as_millis();
 
             let t_first = Instant::now();
@@ -784,7 +790,8 @@ fn main() {
         println!("\n[ replay_drain — {replay_msgs} msgs pre-loaded/stream, DeliverPolicy::All ]");
         print_header();
 
-        let _replay_conc = env_concurrency(REPLAY_CONCURRENCY); for &n in &_replay_conc {
+        let _replay_conc = env_concurrency(REPLAY_CONCURRENCY);
+        for &n in &_replay_conc {
             let total_msgs_per_iter = replay_msgs as u64 * n as u64;
             let label = format!("{n}conn_{n}stream/{total_msgs_per_iter}");
 
@@ -800,7 +807,9 @@ fn main() {
                 // mode topology and lets replay throughput scale with conns.
                 let reader_clients: Vec<Client> = {
                     let mut v = Vec::with_capacity(n);
-                    for _ in 0..n { v.push(connect(&addr).await); }
+                    for _ in 0..n {
+                        v.push(connect(&addr).await);
+                    }
                     v
                 };
 
@@ -811,7 +820,14 @@ fn main() {
                 for iter in 0..replay_iterations {
                     match tokio::time::timeout(
                         REPLAY_TIMEOUT,
-                        run_replay(&setup_client, &reader_clients, &rp_ids, n, replay_msgs, iter),
+                        run_replay(
+                            &setup_client,
+                            &reader_clients,
+                            &rp_ids,
+                            n,
+                            replay_msgs,
+                            iter,
+                        ),
                     )
                     .await
                     {
@@ -887,7 +903,8 @@ fn main() {
 
                 // Create consumers and subscribe before publishing.
                 // AckPolicy::None=0, DeliverPolicy::All=0, DeliverMode::Push=0
-                let mut handles: Vec<(usize, u32, arbitro_client_tokio::SubscriptionHandle)> = Vec::new();
+                let mut handles: Vec<(usize, u32, arbitro_client_tokio::SubscriptionHandle)> =
+                    Vec::new();
                 for (ci, client) in clients.iter().enumerate() {
                     for si in 0..n_consumers_per_client {
                         let name = format!("fanout_c{ci}_s{si}");
@@ -933,7 +950,7 @@ fn main() {
                         entries.push(BatchEntry {
                             subject: b"bench.msg".as_slice(),
                             msg_id: &[],
-                    payload: payload_bytes.clone(),
+                            payload: payload_bytes.clone(),
                         });
                     }
                     let batches = total.div_ceil(batch_size);

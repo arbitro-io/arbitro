@@ -71,7 +71,9 @@ impl ConsumerSubjects {
     /// new count (0 if the entry was missing).
     #[inline]
     pub fn dec(&mut self, hash: u32) -> u32 {
-        let Some(c) = self.inflight.get_mut(&hash) else { return 0 };
+        let Some(c) = self.inflight.get_mut(&hash) else {
+            return 0;
+        };
         if *c == 0 {
             return 0;
         }
@@ -88,7 +90,9 @@ impl ConsumerSubjects {
     /// Returns the new count.
     #[inline]
     pub fn dec_by(&mut self, hash: u32, n: u32) -> u32 {
-        let Some(c) = self.inflight.get_mut(&hash) else { return 0 };
+        let Some(c) = self.inflight.get_mut(&hash) else {
+            return 0;
+        };
         let delta = (*c).min(n);
         *c -= delta;
         self.total = self.total.saturating_sub(delta);

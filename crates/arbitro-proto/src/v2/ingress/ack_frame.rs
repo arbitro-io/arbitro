@@ -25,9 +25,9 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct AckBody {
-    pub consumer_id:  U32,
+    pub consumer_id: U32,
     pub subject_hash: U32,
-    pub ack_seq:      U64,
+    pub ack_seq: U64,
 }
 
 pub const ACK_BODY_SIZE: usize = core::mem::size_of::<AckBody>();
@@ -37,7 +37,7 @@ const _: () = assert!(ACK_BODY_SIZE == 16);
 #[repr(C)]
 pub struct AckFrame {
     pub header: Header,
-    pub body:   AckBody,
+    pub body: AckBody,
 }
 
 const _: () = assert!(core::mem::size_of::<AckFrame>() == HEADER_SIZE + ACK_BODY_SIZE);
@@ -48,11 +48,15 @@ impl AckFrame {
     #[inline(always)]
     pub fn new(seq: u64, consumer_id: u32, ack_seq: u64, subject_hash: u32) -> Self {
         Self {
-            header: Header::new(crate::action::Action::Ack.as_u16(), ACK_BODY_SIZE as u32, seq),
+            header: Header::new(
+                crate::action::Action::Ack.as_u16(),
+                ACK_BODY_SIZE as u32,
+                seq,
+            ),
             body: AckBody {
-                consumer_id:  U32::new(consumer_id),
+                consumer_id: U32::new(consumer_id),
                 subject_hash: U32::new(subject_hash),
-                ack_seq:      U64::new(ack_seq),
+                ack_seq: U64::new(ack_seq),
             },
         }
     }
@@ -64,7 +68,7 @@ impl AckFrame {
 #[repr(C)]
 pub struct BatchAckBody {
     pub consumer_id: U32,
-    pub count:       U32,
+    pub count: U32,
 }
 pub const BATCH_ACK_BODY_FIXED: usize = core::mem::size_of::<BatchAckBody>();
 const _: () = assert!(BATCH_ACK_BODY_FIXED == 8);
@@ -72,9 +76,9 @@ const _: () = assert!(BATCH_ACK_BODY_FIXED == 8);
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct BatchAckEntry {
-    pub seq:          U64,
+    pub seq: U64,
     pub subject_hash: U32,
-    pub _pad:         U32,
+    pub _pad: U32,
 }
 pub const BATCH_ACK_ENTRY_SIZE: usize = core::mem::size_of::<BatchAckEntry>();
 const _: () = assert!(BATCH_ACK_ENTRY_SIZE == 16);
@@ -84,8 +88,8 @@ const _: () = assert!(BATCH_ACK_ENTRY_SIZE == 16);
 #[repr(C)]
 pub struct BatchAckFrame {
     pub header: Header,
-    pub body:   BatchAckBody,
-    pub tail:   [u8],   // exactly count * BATCH_ACK_ENTRY_SIZE bytes
+    pub body: BatchAckBody,
+    pub tail: [u8], // exactly count * BATCH_ACK_ENTRY_SIZE bytes
 }
 
 impl BatchAckFrame {
@@ -132,7 +136,7 @@ impl BatchAckFrame {
         frame.header = Header::new(crate::action::Action::BatchAck.as_u16(), msg_len, seq);
         frame.body = BatchAckBody {
             consumer_id: U32::new(consumer_id),
-            count:       U32::new(count as u32),
+            count: U32::new(count as u32),
         };
         let entries_buf = &mut frame.tail[..count * BATCH_ACK_ENTRY_SIZE];
         let slots = <[BatchAckEntry]>::mut_from_bytes(entries_buf).expect("entries slice");
@@ -181,7 +185,7 @@ mod tests {
         // Overwrite the count field (BatchAckBody.count is offset 4
         // inside the body, which starts at HEADER_SIZE).
         let count_off = HEADER_SIZE + 4;
-        buf[count_off]     = 0xFF;
+        buf[count_off] = 0xFF;
         buf[count_off + 1] = 0xFF;
         buf[count_off + 2] = 0xFF;
         buf[count_off + 3] = 0xFF;

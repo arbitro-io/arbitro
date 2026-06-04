@@ -12,7 +12,7 @@ use std::sync::Arc;
 use arbitro_raft::{RaftError, StateMachine};
 use serde::{Deserialize, Serialize};
 
-use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig, wire_hash_32};
+use arbitro_engine_v2::catalog::{wire_hash_32, ConsumerConfig, StreamConfig};
 use arbitro_engine_v2::types::*;
 
 use crate::shard::router::ShardRouter;
@@ -91,8 +91,9 @@ impl ArbitroStateMachine {
     ) {
         let name_bytes = name.as_bytes();
         let wire_stream = wire_hash_32(name_bytes);
-        let (seq_stream, _created) =
-            router.names().get_or_create_stream_named(wire_stream, name_bytes);
+        let (seq_stream, _created) = router
+            .names()
+            .get_or_create_stream_named(wire_stream, name_bytes);
 
         // Sentinel checks — slot full or hash collision; nothing to do.
         use arbitro_common::name_registry::NameRegistry;
@@ -223,8 +224,9 @@ impl ArbitroStateMachine {
 
         let is_fanout = deliver_mode == 0;
 
-        let (seq_consumer, _created) =
-            router.names().get_or_create_consumer(seq_stream, name_bytes);
+        let (seq_consumer, _created) = router
+            .names()
+            .get_or_create_consumer(seq_stream, name_bytes);
         if seq_consumer.raw() == u32::MAX {
             tracing::warn!(name, "state_machine: consumer slot full");
             return;
@@ -238,31 +240,29 @@ impl ArbitroStateMachine {
             router.names().get_or_create_queue(seq_stream, group_bytes)
         };
         router.names().set_consumer_queue(seq_consumer, queue_id);
-        router
-            .names()
-            .set_consumer_stream(seq_consumer, seq_stream);
+        router.names().set_consumer_stream(seq_consumer, seq_stream);
         router
             .names()
             .set_consumer_deliver_policy(seq_consumer, deliver_policy, start_seq);
 
         match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(shard.create_consumer(
-            ConsumerConfig {
-                id: seq_consumer,
-                queue_id,
-                stream_id: seq_stream,
-                durable: true,
-                ack_policy: ack_pol,
-                max_inflight: if effective_max_inflight == 0 {
-                    u32::MAX
-                } else {
-                    effective_max_inflight as u32
+                ConsumerConfig {
+                    id: seq_consumer,
+                    queue_id,
+                    stream_id: seq_stream,
+                    durable: true,
+                    ack_policy: ack_pol,
+                    max_inflight: if effective_max_inflight == 0 {
+                        u32::MAX
+                    } else {
+                        effective_max_inflight as u32
+                    },
+                    ack_wait_ms,
+                    max_nack: 0,
                 },
-                ack_wait_ms,
-                max_nack: 0,
-            },
-            Vec::new(), // no subject limits on replicated path
-        ))
+                Vec::new(), // no subject limits on replicated path
+            ))
         }) {
             Ok(1) => {
                 router.invalidate_list_cache();
@@ -292,20 +292,19 @@ impl ArbitroStateMachine {
         let consumer_id = ConsumerId(consumer_id_raw);
 
         // Determine owning shard.
-        let candidate_shards: smallvec::SmallVec<[usize; 1]> = match router
-            .names()
-            .consumer_stream(consumer_id)
-        {
-            Some(stream) => {
-                let idx = stream.raw() as usize % router.shard_count();
-                smallvec::smallvec![idx]
-            }
-            None => (0..router.shard_count()).collect(),
-        };
+        let candidate_shards: smallvec::SmallVec<[usize; 1]> =
+            match router.names().consumer_stream(consumer_id) {
+                Some(stream) => {
+                    let idx = stream.raw() as usize % router.shard_count();
+                    smallvec::smallvec![idx]
+                }
+                None => (0..router.shard_count()).collect(),
+            };
 
         for i in candidate_shards {
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(router.shard(i).delete_consumer(consumer_id))
+                tokio::runtime::Handle::current()
+                    .block_on(router.shard(i).delete_consumer(consumer_id))
             });
             if let Ok(_) = result {
                 router.names().remove_consumer_by_id(consumer_id);
@@ -316,7 +315,10 @@ impl ArbitroStateMachine {
         }
         // Consumer not found on any shard — already deleted or never existed.
         let _ = stream_name; // suppress unused warning
-        tracing::trace!(name, "state_machine: delete_consumer — not found on any shard");
+        tracing::trace!(
+            name,
+            "state_machine: delete_consumer — not found on any shard"
+        );
     }
 }
 

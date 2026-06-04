@@ -1,8 +1,8 @@
 mod test_helper;
 use test_helper::TestServerBuilder;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arbitro_client_tokio::{ClientConfig, ReconnectPolicy};
@@ -138,7 +138,10 @@ async fn cron_survives_server_restart() {
     // Let it fire at least once (every 2s, wait 5s for margin).
     tokio::time::sleep(Duration::from_secs(5)).await;
     let before_restart = fire_count.load(Ordering::Relaxed);
-    assert!(before_restart >= 1, "expected ≥1 fires before restart, got {before_restart}");
+    assert!(
+        before_restart >= 1,
+        "expected ≥1 fires before restart, got {before_restart}"
+    );
 
     // Phase 2: kill server.
     server.shutdown().await;

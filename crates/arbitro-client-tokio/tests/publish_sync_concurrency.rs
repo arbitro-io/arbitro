@@ -10,9 +10,9 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use arbitro_client_tokio::{Client, ClientConfig};
 use arbitro_server::{ArbitroServer, Config};
+use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,13 +27,18 @@ async fn start_server() -> String {
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(128);
-    tokio::spawn(async move { let _ = ArbitroServer::new(cfg).run().await; });
+    tokio::spawn(async move {
+        let _ = ArbitroServer::new(cfg).run().await;
+    });
     tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
 async fn connect(addr: &str) -> Client {
-    let cfg = ClientConfig { addr: addr.to_string(), ..ClientConfig::default() };
+    let cfg = ClientConfig {
+        addr: addr.to_string(),
+        ..ClientConfig::default()
+    };
     Client::connect(cfg).await.expect("connect")
 }
 
@@ -54,13 +59,11 @@ async fn run_concurrent_publish_sync(conn_count: usize, stream_id: u32, root: &C
         let sid = stream_id;
         let h = tokio::spawn(async move {
             for i in 0u32..PER_CONN {
-                c.publish_sync(
-                    sid,
-                    b"conc.sync",
-                    Bytes::from(i.to_le_bytes().to_vec()),
-                )
-                .await
-                .unwrap_or_else(|e| panic!("publish_sync failed (conn_count={conn_count}, i={i}): {e}"));
+                c.publish_sync(sid, b"conc.sync", Bytes::from(i.to_le_bytes().to_vec()))
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("publish_sync failed (conn_count={conn_count}, i={i}): {e}")
+                    });
             }
         });
         handles.push(h);
@@ -83,8 +86,8 @@ async fn run_concurrent_publish_sync(conn_count: usize, stream_id: u32, root: &C
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_publish_sync_no_timeout_conn_1_2_4_8() {
-    let addr   = start_server().await;
-    let root   = connect(&addr).await;
+    let addr = start_server().await;
+    let root = connect(&addr).await;
 
     let resp = root
         .create_stream(b"conc-sync-gate", b">", 0, 0, 0, 1, 0, 0, 0, 0)

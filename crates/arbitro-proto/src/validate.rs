@@ -60,7 +60,8 @@ pub fn validate_subject(subject: &[u8]) -> Result<(), ValidateError> {
         return Err(ValidateError::TooLong);
     }
     for &b in subject {
-        if !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*' | b'>') {
+        if !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'*' | b'>')
+        {
             return Err(ValidateError::InvalidChar(b));
         }
     }
@@ -155,18 +156,30 @@ mod tests {
 
     #[test]
     fn name_rejects_dots() {
-        assert_eq!(validate_name(b"orders.created"), Err(ValidateError::InvalidChar(b'.')));
+        assert_eq!(
+            validate_name(b"orders.created"),
+            Err(ValidateError::InvalidChar(b'.'))
+        );
     }
 
     #[test]
     fn name_rejects_spaces() {
-        assert_eq!(validate_name(b"my stream"), Err(ValidateError::InvalidChar(b' ')));
+        assert_eq!(
+            validate_name(b"my stream"),
+            Err(ValidateError::InvalidChar(b' '))
+        );
     }
 
     #[test]
     fn name_rejects_wildcards() {
-        assert_eq!(validate_name(b"orders*"), Err(ValidateError::InvalidChar(b'*')));
-        assert_eq!(validate_name(b"orders>"), Err(ValidateError::InvalidChar(b'>')));
+        assert_eq!(
+            validate_name(b"orders*"),
+            Err(ValidateError::InvalidChar(b'*'))
+        );
+        assert_eq!(
+            validate_name(b"orders>"),
+            Err(ValidateError::InvalidChar(b'>'))
+        );
     }
 
     #[test]
@@ -198,25 +211,46 @@ mod tests {
 
     #[test]
     fn subject_rejects_mixed_wildcard() {
-        assert_eq!(validate_subject(b"orders.foo*"), Err(ValidateError::InvalidChar(b'*')));
-        assert_eq!(validate_subject(b"orders.foo>"), Err(ValidateError::InvalidChar(b'>')));
+        assert_eq!(
+            validate_subject(b"orders.foo*"),
+            Err(ValidateError::InvalidChar(b'*'))
+        );
+        assert_eq!(
+            validate_subject(b"orders.foo>"),
+            Err(ValidateError::InvalidChar(b'>'))
+        );
     }
 
     #[test]
     fn subject_rejects_gt_not_last() {
-        assert_eq!(validate_subject(b">.orders"), Err(ValidateError::InvalidChar(b'>')));
+        assert_eq!(
+            validate_subject(b">.orders"),
+            Err(ValidateError::InvalidChar(b'>'))
+        );
     }
 
     #[test]
     fn subject_rejects_empty_token() {
-        assert_eq!(validate_subject(b"orders..created"), Err(ValidateError::InvalidChar(b'.')));
-        assert_eq!(validate_subject(b".orders"), Err(ValidateError::InvalidChar(b'.')));
-        assert_eq!(validate_subject(b"orders."), Err(ValidateError::InvalidChar(b'.')));
+        assert_eq!(
+            validate_subject(b"orders..created"),
+            Err(ValidateError::InvalidChar(b'.'))
+        );
+        assert_eq!(
+            validate_subject(b".orders"),
+            Err(ValidateError::InvalidChar(b'.'))
+        );
+        assert_eq!(
+            validate_subject(b"orders."),
+            Err(ValidateError::InvalidChar(b'.'))
+        );
     }
 
     #[test]
     fn subject_rejects_spaces() {
-        assert_eq!(validate_subject(b"orders. created"), Err(ValidateError::InvalidChar(b' ')));
+        assert_eq!(
+            validate_subject(b"orders. created"),
+            Err(ValidateError::InvalidChar(b' '))
+        );
     }
 
     #[test]

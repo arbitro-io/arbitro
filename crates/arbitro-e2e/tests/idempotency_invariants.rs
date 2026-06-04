@@ -8,7 +8,12 @@ use bytes::Bytes;
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn is_duplicate(err: &ClientError) -> bool {
-    matches!(err, ClientError::Broker { code: ErrorCode::IdempotencyDuplicate })
+    matches!(
+        err,
+        ClientError::Broker {
+            code: ErrorCode::IdempotencyDuplicate
+        }
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -24,7 +29,9 @@ async fn stream_without_window_allows_duplicates() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"plain", b">", 0, 0, 0, 1, 0, 0, 0, /*idempotency_window_ms*/ 0)
+        .create_stream(
+            b"plain", b">", 0, 0, 0, 1, 0, 0, 0, /*idempotency_window_ms*/ 0,
+        )
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -49,7 +56,9 @@ async fn stream_with_window_rejects_duplicate_msg_id() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"dedup", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+        .create_stream(
+            b"dedup", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000,
+        )
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -127,14 +136,18 @@ async fn two_streams_isolated_one_with_one_without() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let dedup_id = TestServer::parse_id(&client
-        .create_stream(b"with_dedup", b"a.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
-        .await
-        .unwrap());
-    let plain_id = TestServer::parse_id(&client
-        .create_stream(b"no_dedup", b"b.>", 0, 0, 0, 1, 0, 0, 0, 0)
-        .await
-        .unwrap());
+    let dedup_id = TestServer::parse_id(
+        &client
+            .create_stream(b"with_dedup", b"a.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap(),
+    );
+    let plain_id = TestServer::parse_id(
+        &client
+            .create_stream(b"no_dedup", b"b.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap(),
+    );
 
     // First publish to dedup stream — accepted.
     client
@@ -159,7 +172,10 @@ async fn two_streams_isolated_one_with_one_without() {
         .publish_sync_with_id(dedup_id, b"a.x", b"shared-id", Bytes::from_static(b"v2"))
         .await
         .expect_err("dedup stream rejects duplicate");
-    assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    assert!(
+        is_duplicate(&err),
+        "expected IdempotencyDuplicate, got {err:?}"
+    );
     server.shutdown().await;
 }
 
@@ -208,10 +224,12 @@ async fn batch_with_all_unique_ids_succeeds() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = TestServer::parse_id(&client
-        .create_stream(b"batch_uniq", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
-        .await
-        .unwrap());
+    let stream_id = TestServer::parse_id(
+        &client
+            .create_stream(b"batch_uniq", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap(),
+    );
 
     let entries = [
         BatchEntry::with_msg_id(b"k", b"b-1", Bytes::from_static(b"v1")),
@@ -232,10 +250,12 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = TestServer::parse_id(&client
-        .create_stream(b"batch_dup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
-        .await
-        .unwrap());
+    let stream_id = TestServer::parse_id(
+        &client
+            .create_stream(b"batch_dup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap(),
+    );
 
     // Seed the dedup window with one id.
     client
@@ -252,7 +272,10 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
         .publish_batch_sync(stream_id, &entries)
         .await
         .expect_err("batch with a colliding id must be rejected");
-    assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    assert!(
+        is_duplicate(&err),
+        "expected IdempotencyDuplicate, got {err:?}"
+    );
 
     // After the rejection, the OTHER ids in the batch must NOT have
     // been recorded — we can publish them individually and they land.
@@ -274,10 +297,12 @@ async fn batch_with_internal_duplicate_is_rejected() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = TestServer::parse_id(&client
-        .create_stream(b"batch_internal", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
-        .await
-        .unwrap());
+    let stream_id = TestServer::parse_id(
+        &client
+            .create_stream(b"batch_internal", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap(),
+    );
 
     let entries = [
         BatchEntry::with_msg_id(b"k", b"twin", Bytes::from_static(b"v1")),
@@ -287,7 +312,10 @@ async fn batch_with_internal_duplicate_is_rejected() {
         .publish_batch_sync(stream_id, &entries)
         .await
         .expect_err("batch with internal twin id must be rejected");
-    assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    assert!(
+        is_duplicate(&err),
+        "expected IdempotencyDuplicate, got {err:?}"
+    );
     server.shutdown().await;
 }
 
@@ -308,10 +336,7 @@ async fn cross_restart_dedup_state_is_reset() {
 
     // ── First boot: publish with a msg_id, confirm dedup rejects it ──
     {
-        let mut server = TestServerBuilder::new()
-            .data_dir(dir_str)
-            .spawn()
-            .await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
 
         let resp = client
@@ -337,15 +362,16 @@ async fn cross_restart_dedup_state_is_reset() {
 
     // ── Second boot: same data_dir (metadata restored) ───────────────
     {
-        let mut server = TestServerBuilder::new()
-            .data_dir(dir_str)
-            .spawn()
-            .await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
 
         // The stream should exist (metadata restored from command log).
         let resp = client.list_streams(0, 1000).await.unwrap();
-        assert_eq!(TestServer::stream_count(&resp), 1, "stream must survive restart");
+        assert_eq!(
+            TestServer::stream_count(&resp),
+            1,
+            "stream must survive restart"
+        );
 
         let stream_id = TestServer::find_stream_id(&resp, b"persistent")
             .expect("must find stream by name after restart");
@@ -357,7 +383,7 @@ async fn cross_restart_dedup_state_is_reset() {
             .await
             .expect(
                 "cross-restart dedup state must be empty; the broker \
-                 does NOT persist the idempotency window to disk"
+                 does NOT persist the idempotency window to disk",
             );
 
         server.shutdown().await;
@@ -374,10 +400,12 @@ async fn batch_mixed_id_and_no_id_entries() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = TestServer::parse_id(&client
-        .create_stream(b"batch_mixed", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
-        .await
-        .unwrap());
+    let stream_id = TestServer::parse_id(
+        &client
+            .create_stream(b"batch_mixed", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .await
+            .unwrap(),
+    );
 
     // First batch — three id-bearing entries, two no-id entries.
     let first = [
@@ -412,6 +440,9 @@ async fn batch_mixed_id_and_no_id_entries() {
         .publish_batch_sync(stream_id, &third)
         .await
         .expect_err("batch with replayed id must be rejected");
-    assert!(is_duplicate(&err), "expected IdempotencyDuplicate, got {err:?}");
+    assert!(
+        is_duplicate(&err),
+        "expected IdempotencyDuplicate, got {err:?}"
+    );
     server.shutdown().await;
 }

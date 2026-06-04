@@ -17,10 +17,8 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 
 use arbitro_proto::wire::workflow::{
-    CreateWorkflowBody, StepDef, WorkflowConfig,
-    decode_workflow_step, decode_workflow_error,
-    encode_create_workflow, encode_delete_workflow,
-    encode_workflow_result,
+    decode_workflow_error, decode_workflow_step, encode_create_workflow, encode_delete_workflow,
+    encode_workflow_result, CreateWorkflowBody, StepDef, WorkflowConfig,
 };
 
 use crate::error::ClientError;
@@ -71,9 +69,8 @@ pub(crate) type StepHandler = Arc<
 >;
 
 /// Type-erased async workflow error handler.
-pub(crate) type ErrorHandler = Arc<
-    dyn Fn(WorkflowErrorContext) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub(crate) type ErrorHandler =
+    Arc<dyn Fn(WorkflowErrorContext) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 // ── WorkflowState ─────────────────────────────────────────────────────────
 
@@ -150,11 +147,7 @@ impl WorkflowState {
     }
 
     /// Get step names by index for a given workflow.
-    pub(crate) fn get_step_name(
-        &self,
-        workflow_name: &[u8],
-        step_index: u16,
-    ) -> Option<String> {
+    pub(crate) fn get_step_name(&self, workflow_name: &[u8], step_index: u16) -> Option<String> {
         self.handlers
             .lock()
             .unwrap()
@@ -351,10 +344,7 @@ impl<'a> WorkflowBuilder<'a> {
             .and_then(|r| r)?;
 
         // Register handlers locally.
-        let step_map: HashMap<String, StepHandler> = self
-            .step_handlers
-            .into_iter()
-            .collect();
+        let step_map: HashMap<String, StepHandler> = self.step_handlers.into_iter().collect();
 
         self.client.inner.workflow_state.register(
             self.name.clone(),
@@ -413,7 +403,10 @@ pub(crate) async fn dispatch_workflow_step(frame: Bytes, inner: &Inner) {
     let name_bytes = Bytes::copy_from_slice(view.name);
 
     // Look up the step name by index.
-    let step_name = match inner.workflow_state.get_step_name(view.name, view.step_index) {
+    let step_name = match inner
+        .workflow_state
+        .get_step_name(view.name, view.step_index)
+    {
         Some(n) => n,
         None => {
             send_workflow_result(inner, &name_bytes, view.instance_id, false, &[]);

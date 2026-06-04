@@ -35,7 +35,9 @@ async fn t20_random_bytes_after_hello_never_abort_broker() {
     let alive_stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     // Fuzz socket — raw TCP, no client API.
-    let mut sock = TcpStream::connect(&server.addr).await.expect("fuzz connect");
+    let mut sock = TcpStream::connect(&server.addr)
+        .await
+        .expect("fuzz connect");
 
     // Send the v2 HELLO frame (8 B = magic + 4 trailing zeros).
     let mut hello = Vec::with_capacity(8);
@@ -47,7 +49,9 @@ async fn t20_random_bytes_after_hello_never_abort_broker() {
     // is reproducible without bringing in a real RNG dep.
     let mut state: u64 = 0xC011_1510_DEAD_BEEFu64;
     let mut rand_byte = || -> u8 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 56) as u8
     };
 
@@ -83,7 +87,11 @@ async fn t20_random_bytes_after_hello_never_abort_broker() {
     // can still serve management calls. If the broker had panicked,
     // this would hang or error.
     sibling
-        .publish_sync(alive_stream_id, b"alive_check.ping", Bytes::from_static(b"OK"))
+        .publish_sync(
+            alive_stream_id,
+            b"alive_check.ping",
+            Bytes::from_static(b"OK"),
+        )
         .await
         .expect("broker must still accept publishes from sibling after fuzz");
 

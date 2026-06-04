@@ -4,8 +4,8 @@
 //! lock on the publish hot path.  Cloning pops a producer from the pool
 //! in `Inner`; dropping returns it.  `Inner` holds only cold / shared state.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use tokio_util::sync::CancellationToken;
@@ -14,10 +14,10 @@ use crate::config::ClientConfig;
 use crate::conn::session::spawn_connection;
 use crate::consume::SubscriptionHandle;
 use crate::error::ClientError;
-use crate::state::Inner;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::state::subscriptions::Subscriptions;
+use crate::state::Inner;
 use crate::transport::frame::{WriteFrame, WriteProducer, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
 
 /// One entry of a batch publish: `{ subject: &[u8], payload: Bytes }`.
@@ -31,13 +31,15 @@ pub use crate::transport::encode::BatchEntry;
 /// concurrent clones — 2 slots are reserved for the admin producer and
 /// the initial client handle).
 pub struct Client {
-    pub(crate) inner:    Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
     pub(crate) producer: Option<WriteProducer>,
 }
 
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client").field("addr", &self.inner.cfg.addr).finish()
+        f.debug_struct("Client")
+            .field("addr", &self.inner.cfg.addr)
+            .finish()
     }
 }
 
@@ -47,7 +49,10 @@ impl Clone for Client {
             .lock().unwrap()
             .pop()
             .expect("producer pool exhausted — reduce concurrent Client clones or increase MAX_WRITE_PRODUCERS");
-        Self { inner: Arc::clone(&self.inner), producer: Some(producer) }
+        Self {
+            inner: Arc::clone(&self.inner),
+            producer: Some(producer),
+        }
     }
 }
 
@@ -74,28 +79,28 @@ impl Client {
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
 
         // Reserve two dedicated slots up front.
-        let my_producer    = producers.remove(0);   // this Client handle
-        let admin_producer = producers.remove(0);   // ack-batcher + heartbeat + sub-replay
+        let my_producer = producers.remove(0); // this Client handle
+        let admin_producer = producers.remove(0); // ack-batcher + heartbeat + sub-replay
 
         // Ack-batcher and nack-batcher channels (tokio mpsc — Sender is Clone + Sync).
-        let (ack_tx, ack_rx)   = tokio::sync::mpsc::channel(4096);
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(4096);
         let (nack_tx, nack_rx) = tokio::sync::mpsc::channel(4096);
 
         let cancel = CancellationToken::new();
 
         let inner = Arc::new(Inner {
-            cfg:            cfg.clone(),
-            producer_pool:  Mutex::new(producers),          // 14 slots
-            pending:        Arc::new(Pending::new()),
-            seq_alloc:      SeqAllocator::new(),
-            cancel:         cancel.clone(),
-            subscriptions:  Arc::new(Subscriptions::new()),
+            cfg: cfg.clone(),
+            producer_pool: Mutex::new(producers), // 14 slots
+            pending: Arc::new(Pending::new()),
+            seq_alloc: SeqAllocator::new(),
+            cancel: cancel.clone(),
+            subscriptions: Arc::new(Subscriptions::new()),
             admin_producer: Mutex::new(admin_producer),
             ack_tx,
             nack_tx,
-            last_pong_ns:   AtomicU64::new(Inner::now_ns()),
-            metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
-            cron_state:     crate::cron::CronState::new(),
+            last_pong_ns: AtomicU64::new(Inner::now_ns()),
+            metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+            cron_state: crate::cron::CronState::new(),
             workflow_state: crate::workflow::WorkflowState::new(),
         });
 
@@ -141,8 +146,8 @@ impl Client {
     pub fn publish(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        payload: Bytes,
     ) -> Result<(), ClientError> {
         self.publish_with_id(stream_id, subject, &[], payload)
     }
@@ -153,15 +158,22 @@ impl Client {
     pub fn publish_with_id(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        msg_id:    &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        msg_id: &[u8],
+        payload: Bytes,
     ) -> Result<(), ClientError> {
         let r = crate::publish::publish_async(
-            self.producer(), &self.inner.seq_alloc, stream_id, subject, msg_id, payload,
+            self.producer(),
+            &self.inner.seq_alloc,
+            stream_id,
+            subject,
+            msg_id,
+            payload,
         );
         if r.is_ok() {
-            self.inner.metrics.publishes_sent
+            self.inner
+                .metrics
+                .publishes_sent
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         r
@@ -171,8 +183,8 @@ impl Client {
     pub fn publish_bytes(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        payload:   &[u8],
+        subject: &[u8],
+        payload: &[u8],
     ) -> Result<(), ClientError> {
         self.publish(stream_id, subject, Bytes::copy_from_slice(payload))
     }
@@ -182,8 +194,8 @@ impl Client {
     pub fn publish_sync(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         self.publish_sync_with_id(stream_id, subject, &[], payload)
     }
@@ -196,28 +208,36 @@ impl Client {
     pub fn publish_sync_with_id(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        msg_id:    &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        msg_id: &[u8],
+        payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_sync_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, msg_id, payload,
+            stream_id,
+            subject,
+            msg_id,
+            payload,
         )
     }
 
     pub fn publish_batch(
         &self,
         stream_id: u32,
-        entries:   &[BatchEntry<'_>],
+        entries: &[BatchEntry<'_>],
     ) -> Result<(), ClientError> {
         let r = crate::publish::publish_batch_async(
-            self.producer(), &self.inner.seq_alloc, stream_id, entries,
+            self.producer(),
+            &self.inner.seq_alloc,
+            stream_id,
+            entries,
         );
         if r.is_ok() {
-            self.inner.metrics.publish_batch_entries
+            self.inner
+                .metrics
+                .publish_batch_entries
                 .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         r
@@ -226,13 +246,14 @@ impl Client {
     pub fn publish_batch_sync(
         &self,
         stream_id: u32,
-        entries:   &[BatchEntry<'_>],
+        entries: &[BatchEntry<'_>],
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_batch_sync_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, entries,
+            stream_id,
+            entries,
         )
     }
 
@@ -245,15 +266,18 @@ impl Client {
     pub fn publish_delayed(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        payload:   Bytes,
-        delay_ms:  u64,
+        subject: &[u8],
+        payload: Bytes,
+        delay_ms: u64,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_delayed_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, payload, delay_ms,
+            stream_id,
+            subject,
+            payload,
+            delay_ms,
         )
     }
 
@@ -268,15 +292,19 @@ impl Client {
     pub fn publish_with_reply(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        reply_to:  &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        reply_to: &[u8],
+        payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_with_reply_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, reply_to, b"", payload,
+            stream_id,
+            subject,
+            reply_to,
+            b"",
+            payload,
         )
     }
 
@@ -287,16 +315,20 @@ impl Client {
     pub fn publish_with_reply_msg_id(
         &self,
         stream_id: u32,
-        subject:   &[u8],
-        reply_to:  &[u8],
-        msg_id:    &[u8],
-        payload:   Bytes,
+        subject: &[u8],
+        reply_to: &[u8],
+        msg_id: &[u8],
+        payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
         crate::publish::publish_with_reply_async(
             self.producer(),
             &self.inner.pending,
             &self.inner.seq_alloc,
-            stream_id, subject, reply_to, msg_id, payload,
+            stream_id,
+            subject,
+            reply_to,
+            msg_id,
+            payload,
         )
     }
 
@@ -309,16 +341,11 @@ impl Client {
     /// buffered.  Awaits the `RepOk` reply before returning.
     pub fn subscribe(
         &self,
-        stream_id:   u32,
+        stream_id: u32,
         consumer_id: u32,
-        filter:      &[u8],
+        filter: &[u8],
     ) -> impl std::future::Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
-        crate::consume::subscribe_async(
-            Arc::clone(&self.inner),
-            stream_id,
-            consumer_id,
-            filter,
-        )
+        crate::consume::subscribe_async(Arc::clone(&self.inner), stream_id, consumer_id, filter)
     }
 
     // ── manage ────────────────────────────────────────────────────────────────
@@ -333,51 +360,85 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_stream(
         &self,
-        name: &[u8], filter: &[u8],
-        max_msgs: u64, max_bytes: u64, max_age_secs: u64,
-        replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+        name: &[u8],
+        filter: &[u8],
+        max_msgs: u64,
+        max_bytes: u64,
+        max_age_secs: u64,
+        replicas: u8,
+        journal_kind: u8,
+        retention: u8,
+        discard: u8,
         idempotency_window_ms: u32,
     ) -> Result<Bytes, ClientError> {
         crate::manage::create_stream(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc,
-            name, filter, max_msgs, max_bytes, max_age_secs,
-            replicas, journal_kind, retention, discard,
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+            filter,
+            max_msgs,
+            max_bytes,
+            max_age_secs,
+            replicas,
+            journal_kind,
+            retention,
+            discard,
             idempotency_window_ms,
-        ).await
+        )
+        .await
     }
 
     pub async fn delete_stream(&self, name: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::delete_stream(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, name,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+        )
+        .await
     }
 
     pub async fn get_stream(&self, name: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::get_stream(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, name,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+        )
+        .await
     }
 
     pub async fn purge_stream(&self, name: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::purge_stream(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, name,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+        )
+        .await
     }
 
-    pub async fn drain_subject(
-        &self, name: &[u8], subject: &[u8],
-    ) -> Result<Bytes, ClientError> {
+    pub async fn drain_subject(&self, name: &[u8], subject: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::drain_subject(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, name, subject,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+            subject,
+        )
+        .await
     }
 
-    pub async fn list_streams(
-        &self, offset: u32, limit: u32,
-    ) -> Result<Bytes, ClientError> {
+    pub async fn list_streams(&self, offset: u32, limit: u32) -> Result<Bytes, ClientError> {
         crate::manage::list_streams(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, offset, limit,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            offset,
+            limit,
+        )
+        .await
     }
 
     /// Create a consumer with no per-subject inflight limits.
@@ -390,15 +451,31 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer(
         &self,
-        stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
-        max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
-        ack_wait_ms: u32, start_seq: u64,
+        stream_id: u32,
+        name: &[u8],
+        group: &[u8],
+        subject: &[u8],
+        max_inflight: u16,
+        ack_policy: u8,
+        deliver_policy: u8,
+        deliver_mode: u8,
+        ack_wait_ms: u32,
+        start_seq: u64,
     ) -> Result<Bytes, ClientError> {
         self.create_consumer_with_limits(
-            stream_id, name, group, subject, max_inflight,
-            ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+            stream_id,
+            name,
+            group,
+            subject,
+            max_inflight,
+            ack_policy,
+            deliver_policy,
+            deliver_mode,
+            ack_wait_ms,
+            start_seq,
             &[],
-        ).await
+        )
+        .await
     }
 
     /// Create a consumer with per-subject inflight limits.
@@ -410,40 +487,73 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer_with_limits(
         &self,
-        stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
-        max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
-        ack_wait_ms: u32, start_seq: u64,
+        stream_id: u32,
+        name: &[u8],
+        group: &[u8],
+        subject: &[u8],
+        max_inflight: u16,
+        ack_policy: u8,
+        deliver_policy: u8,
+        deliver_mode: u8,
+        ack_wait_ms: u32,
+        start_seq: u64,
         subject_limits: &[arbitro_proto::v2::manager::SubjectLimit<'_>],
     ) -> Result<Bytes, ClientError> {
         crate::manage::create_consumer(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc,
-            stream_id, name, group, subject, max_inflight,
-            ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id,
+            name,
+            group,
+            subject,
+            max_inflight,
+            ack_policy,
+            deliver_policy,
+            deliver_mode,
+            ack_wait_ms,
+            start_seq,
             subject_limits,
-        ).await
+        )
+        .await
     }
 
     pub async fn delete_consumer(&self, consumer_id: u32) -> Result<Bytes, ClientError> {
         crate::manage::delete_consumer(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, consumer_id,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            consumer_id,
+        )
+        .await
     }
 
-    pub async fn get_consumer(
-        &self, stream_id: u32, name: &[u8],
-    ) -> Result<Bytes, ClientError> {
+    pub async fn get_consumer(&self, stream_id: u32, name: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::get_consumer(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, stream_id, name,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id,
+            name,
+        )
+        .await
     }
 
     pub async fn list_consumers(
-        &self, stream_id: u32, offset: u32, limit: u32,
+        &self,
+        stream_id: u32,
+        offset: u32,
+        limit: u32,
     ) -> Result<Bytes, ClientError> {
         crate::manage::list_consumers(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc,
-            stream_id, offset, limit,
-        ).await
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id,
+            offset,
+            limit,
+        )
+        .await
     }
 
     // ── L13: convenience helpers mirroring the TS client ──────────────
@@ -464,11 +574,7 @@ impl Client {
     /// L13: `true` iff the broker has a consumer registered under
     /// `(stream_id, name)`. Same StreamNotFound/ConsumerNotFound mapping
     /// as `stream_exists`.
-    pub async fn consumer_exists(
-        &self,
-        stream_id: u32,
-        name: &[u8],
-    ) -> Result<bool, ClientError> {
+    pub async fn consumer_exists(&self, stream_id: u32, name: &[u8]) -> Result<bool, ClientError> {
         match self.get_consumer(stream_id, name).await {
             Ok(_) => Ok(true),
             Err(ClientError::Broker {
@@ -488,16 +594,32 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_stream(
         &self,
-        name: &[u8], filter: &[u8],
-        max_msgs: u64, max_bytes: u64, max_age_secs: u64,
-        replicas: u8, journal_kind: u8, retention: u8, discard: u8,
+        name: &[u8],
+        filter: &[u8],
+        max_msgs: u64,
+        max_bytes: u64,
+        max_age_secs: u64,
+        replicas: u8,
+        journal_kind: u8,
+        retention: u8,
+        discard: u8,
         idempotency_window_ms: u32,
     ) -> Result<bool, ClientError> {
-        match self.create_stream(
-            name, filter, max_msgs, max_bytes, max_age_secs,
-            replicas, journal_kind, retention, discard,
-            idempotency_window_ms,
-        ).await {
+        match self
+            .create_stream(
+                name,
+                filter,
+                max_msgs,
+                max_bytes,
+                max_age_secs,
+                replicas,
+                journal_kind,
+                retention,
+                discard,
+                idempotency_window_ms,
+            )
+            .await
+        {
             Ok(_) => Ok(true),
             Err(ClientError::Broker {
                 code: arbitro_proto::error::ErrorCode::StreamAlreadyExists,
@@ -512,14 +634,32 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_consumer(
         &self,
-        stream_id: u32, name: &[u8], group: &[u8], subject: &[u8],
-        max_inflight: u16, ack_policy: u8, deliver_policy: u8, deliver_mode: u8,
-        ack_wait_ms: u32, start_seq: u64,
+        stream_id: u32,
+        name: &[u8],
+        group: &[u8],
+        subject: &[u8],
+        max_inflight: u16,
+        ack_policy: u8,
+        deliver_policy: u8,
+        deliver_mode: u8,
+        ack_wait_ms: u32,
+        start_seq: u64,
     ) -> Result<bool, ClientError> {
-        match self.create_consumer(
-            stream_id, name, group, subject, max_inflight,
-            ack_policy, deliver_policy, deliver_mode, ack_wait_ms, start_seq,
-        ).await {
+        match self
+            .create_consumer(
+                stream_id,
+                name,
+                group,
+                subject,
+                max_inflight,
+                ack_policy,
+                deliver_policy,
+                deliver_mode,
+                ack_wait_ms,
+                start_seq,
+            )
+            .await
+        {
             Ok(_) => Ok(true),
             Err(ClientError::Broker {
                 code: arbitro_proto::error::ErrorCode::ConsumerAlreadyExists,
@@ -536,14 +676,20 @@ impl Client {
     /// per shard; cheap enough to poll from a dashboard.
     pub async fn get_pending(&self, consumer_id: u32) -> Result<u64, ClientError> {
         let resp = crate::manage::consumer_stats(
-            self.producer(), &self.inner.pending, &self.inner.seq_alloc, consumer_id,
-        ).await?;
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            consumer_id,
+        )
+        .await?;
         // RepOk body is 8 bytes — server packs the u64 count in place of ref_seq.
         if resp.len() < 8 {
-            return Err(ClientError::Proto(arbitro_proto::error::ProtoError::BufferTooShort {
-                need: 8,
-                have: resp.len() as u32,
-            }));
+            return Err(ClientError::Proto(
+                arbitro_proto::error::ProtoError::BufferTooShort {
+                    need: 8,
+                    have: resp.len() as u32,
+                },
+            ));
         }
         let count = u64::from_le_bytes(resp[..8].try_into().unwrap());
         Ok(count)

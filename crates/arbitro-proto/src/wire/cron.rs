@@ -113,7 +113,11 @@ pub fn decode_cron_fire(body: &[u8]) -> Option<CronFireView<'_>> {
     let fire_time_ms = u64::from_le_bytes(body[2..10].try_into().ok()?);
     let fire_count = u64::from_le_bytes(body[10..18].try_into().ok()?);
     let name = body.get(18..18 + name_len)?;
-    Some(CronFireView { name, fire_time_ms, fire_count })
+    Some(CronFireView {
+        name,
+        fire_time_ms,
+        fire_count,
+    })
 }
 
 // ── CronAck (client → broker) ───────────────────────────────────────────────

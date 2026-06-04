@@ -6,9 +6,9 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 
-use std::time::Duration;
-use bytes::Bytes;
 use arbitro_client_tokio::{BatchEntry, Client, ReconnectPolicy};
+use bytes::Bytes;
+use std::time::Duration;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 1. Programmatic shutdown — watch channel
@@ -23,7 +23,10 @@ async fn programmatic_shutdown_stops_accept() {
     let addr = server.addr.clone();
 
     // Server is alive — basic ops work.
-    client.create_stream(b"sd_accept", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"sd_accept", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     // Signal shutdown.
     server.shutdown().await;
@@ -35,8 +38,8 @@ async fn programmatic_shutdown_stops_accept() {
         Client::connect(arbitro_client_tokio::ClientConfig {
             addr: addr.clone(),
             reconnect: ReconnectPolicy {
-                base:         Duration::from_millis(50),
-                cap:          Duration::from_millis(200),
+                base: Duration::from_millis(50),
+                cap: Duration::from_millis(200),
                 max_attempts: Some(1),
             },
             ..arbitro_client_tokio::ClientConfig::default()
@@ -48,8 +51,8 @@ async fn programmatic_shutdown_stops_accept() {
     // Either way the server is no longer serving normally.
     match result {
         Err(_timeout) => {} // server not responding — correct
-        Ok(Err(_))    => {} // connection refused / error — correct
-        Ok(Ok(_))     => {
+        Ok(Err(_)) => {}    // connection refused / error — correct
+        Ok(Ok(_)) => {
             // Got a connection — server may still be in graceful drain window.
             // Acceptable as long as new operations fail or the connection is
             // soon closed. We don't assert hard failure here.
@@ -64,7 +67,10 @@ async fn shutdown_wakes_inflight_publish_sync() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"sd_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"sd_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let sid = TestServer::parse_id(&resp);
 
     // Queue up several publish_sync futures BEFORE killing the server.
@@ -81,7 +87,9 @@ async fn shutdown_wakes_inflight_publish_sync() {
     // All futures must resolve within 5 s — none should hang.
     let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
         let mut v = Vec::new();
-        for h in handles { v.push(h.await.unwrap()); }
+        for h in handles {
+            v.push(h.await.unwrap());
+        }
         v
     })
     .await
@@ -182,7 +190,10 @@ async fn sigterm_triggers_graceful_shutdown() {
 
     let resp2 = client2.list_streams(0, 1000).await.unwrap();
     let stream_count = TestServer::stream_count(&resp2);
-    assert_eq!(stream_count, 1, "stream must survive graceful shutdown + restart");
+    assert_eq!(
+        stream_count, 1,
+        "stream must survive graceful shutdown + restart"
+    );
     server2.shutdown().await;
 }
 
@@ -244,12 +255,19 @@ async fn sigterm_wakes_inflight_publish_sync() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"sd_sig_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"sd_sig_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let sid = TestServer::parse_id(&resp);
 
     let mut handles = Vec::new();
     for i in 0u64..20 {
-        let fut = client.publish_sync(sid, b"sd_sig_wake.ev", Bytes::copy_from_slice(&i.to_le_bytes()));
+        let fut = client.publish_sync(
+            sid,
+            b"sd_sig_wake.ev",
+            Bytes::copy_from_slice(&i.to_le_bytes()),
+        );
         handles.push(tokio::spawn(fut));
     }
 
@@ -258,7 +276,9 @@ async fn sigterm_wakes_inflight_publish_sync() {
 
     let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
         let mut v = Vec::new();
-        for h in handles { v.push(h.await.unwrap()); }
+        for h in handles {
+            v.push(h.await.unwrap());
+        }
         v
     })
     .await
@@ -276,7 +296,10 @@ async fn sigterm_wakes_inflight_publish_sync() {
 async fn double_shutdown_is_idempotent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    client.create_stream(b"sd_double", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    client
+        .create_stream(b"sd_double", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     server.shutdown().await;
     server.shutdown().await; // second call — must not panic
@@ -346,30 +369,42 @@ async fn shutdown_under_concurrent_publish_load() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let resp = client.create_stream(b"sd_load", b">", 0, 0, 0, 1, 0, 0, 0, 0).await.unwrap();
+    let resp = client
+        .create_stream(b"sd_load", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
     let sid = TestServer::parse_id(&resp);
 
     // Spawn 4 concurrent publish_sync producers.
-    let stop  = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ok_n  = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ok_n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let err_n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    let handles: Vec<_> = (0u64..4).map(|id| {
-        let client = client.clone();
-        let stop   = std::sync::Arc::clone(&stop);
-        let ok_n   = std::sync::Arc::clone(&ok_n);
-        let err_n  = std::sync::Arc::clone(&err_n);
-        tokio::spawn(async move {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let fut = client.publish_sync(sid, b"sd_load.ev",
-                    Bytes::copy_from_slice(&id.to_le_bytes()));
-                match tokio::time::timeout(Duration::from_secs(3), fut).await {
-                    Ok(Ok(_))  => { ok_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                    _          => { err_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    let handles: Vec<_> = (0u64..4)
+        .map(|id| {
+            let client = client.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            let ok_n = std::sync::Arc::clone(&ok_n);
+            let err_n = std::sync::Arc::clone(&err_n);
+            tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let fut = client.publish_sync(
+                        sid,
+                        b"sd_load.ev",
+                        Bytes::copy_from_slice(&id.to_le_bytes()),
+                    );
+                    match tokio::time::timeout(Duration::from_secs(3), fut).await {
+                        Ok(Ok(_)) => {
+                            ok_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => {
+                            err_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
-            }
+            })
         })
-    }).collect();
+        .collect();
 
     // Let producers run briefly, then shut down.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -378,11 +413,16 @@ async fn shutdown_under_concurrent_publish_load() {
 
     // All tasks must complete within 10 s.
     tokio::time::timeout(Duration::from_secs(10), async {
-        for h in handles { let _ = h.await; }
+        for h in handles {
+            let _ = h.await;
+        }
     })
     .await
     .expect("all producer tasks must exit within 10 s of shutdown");
 
     let published = ok_n.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(published > 0, "at least some messages should have been published before shutdown");
+    assert!(
+        published > 0,
+        "at least some messages should have been published before shutdown"
+    );
 }

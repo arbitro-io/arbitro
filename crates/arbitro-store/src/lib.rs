@@ -1,8 +1,8 @@
-mod store;
 mod memory;
-mod tolerant;
 mod segment;
+mod store;
+mod tolerant;
 
-pub use store::*;
 pub use memory::{EntryMeta, MemoryStore, RawEntry};
+pub use store::*;
 pub use tolerant::TolerantStore;

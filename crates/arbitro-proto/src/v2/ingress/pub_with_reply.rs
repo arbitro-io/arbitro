@@ -28,12 +28,12 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct PubWithReplyBody {
-    pub stream_id:   U32,
+    pub stream_id: U32,
     pub subject_len: U16,
-    pub reply_len:   U16,
+    pub reply_len: U16,
     /// M10: optional idempotency token length. `0` = no dedup (legacy).
-    pub msg_id_len:  U16,
-    pub _pad:        U16,
+    pub msg_id_len: U16,
+    pub _pad: U16,
 }
 
 pub const PUB_WITH_REPLY_BODY_FIXED: usize = core::mem::size_of::<PubWithReplyBody>();
@@ -43,8 +43,8 @@ const _: () = assert!(PUB_WITH_REPLY_BODY_FIXED == 12);
 #[repr(C)]
 pub struct PubWithReplyFrame {
     pub header: Header,
-    pub body:   PubWithReplyBody,
-    pub tail:   [u8],
+    pub body: PubWithReplyBody,
+    pub tail: [u8],
 }
 
 impl PubWithReplyFrame {
@@ -57,13 +57,16 @@ impl PubWithReplyFrame {
         let r = self.body.reply_len.get() as usize;
         let m = self.body.msg_id_len.get() as usize;
         let head_total = s
-            .checked_add(r).ok_or(crate::error::ErrorCode::InvalidLength)?
-            .checked_add(m).ok_or(crate::error::ErrorCode::InvalidLength)?;
+            .checked_add(r)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?
+            .checked_add(m)
+            .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if head_total > self.tail.len() {
             return Err(crate::error::ErrorCode::InvalidLength);
         }
         let msg = self.header.msg_len.get() as usize;
-        let lower = PUB_WITH_REPLY_BODY_FIXED.checked_add(head_total)
+        let lower = PUB_WITH_REPLY_BODY_FIXED
+            .checked_add(head_total)
             .ok_or(crate::error::ErrorCode::InvalidLength)?;
         if msg < lower {
             return Err(crate::error::ErrorCode::InvalidLength);
@@ -133,16 +136,19 @@ impl PubWithReplyFrame {
             + msg_id.len()
             + payload.len()) as u32;
         let frame = Self::mut_from_bytes(out).expect("PubWithReplyFrame layout");
-        frame.header =
-            Header::new(crate::action::Action::PublishWithReply.as_u16(), msg_len, seq)
-                .with_flags(flags)
-                .with_entry_flags(entry_flags);
+        frame.header = Header::new(
+            crate::action::Action::PublishWithReply.as_u16(),
+            msg_len,
+            seq,
+        )
+        .with_flags(flags)
+        .with_entry_flags(entry_flags);
         frame.body = PubWithReplyBody {
-            stream_id:   U32::new(stream_id),
+            stream_id: U32::new(stream_id),
             subject_len: U16::new(subject.len() as u16),
-            reply_len:   U16::new(reply_to.len() as u16),
-            msg_id_len:  U16::new(msg_id.len() as u16),
-            _pad:        U16::new(0),
+            reply_len: U16::new(reply_to.len() as u16),
+            msg_id_len: U16::new(msg_id.len() as u16),
+            _pad: U16::new(0),
         };
         let s = subject.len();
         let r = reply_to.len();
@@ -189,7 +195,8 @@ mod tests {
         let reply = b"_INBOX.token";
         let msg_id = b"client-uuid-42";
         let payload = b"hello".to_vec();
-        let size = PubWithReplyFrame::wire_size(subject.len(), reply.len(), msg_id.len(), payload.len());
+        let size =
+            PubWithReplyFrame::wire_size(subject.len(), reply.len(), msg_id.len(), payload.len());
         let mut buf = vec![0u8; size];
         PubWithReplyFrame::encode_into(&mut buf, 1, 1, 0, 0, subject, reply, msg_id, &payload);
         let f = PubWithReplyFrame::ref_from_bytes(&buf).unwrap();

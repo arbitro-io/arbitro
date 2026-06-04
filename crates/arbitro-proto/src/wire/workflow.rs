@@ -146,7 +146,12 @@ pub fn decode_workflow_step(body: &[u8]) -> Option<WorkflowStepView<'_>> {
     let step_index = u16::from_le_bytes([body[6], body[7]]);
     let name = body.get(8..8 + name_len)?;
     let context = body.get(8 + name_len..)?;
-    Some(WorkflowStepView { name, instance_id, step_index, context })
+    Some(WorkflowStepView {
+        name,
+        instance_id,
+        step_index,
+        context,
+    })
 }
 
 // ── WorkflowResult (client → broker) ──────────────────────────────────────
@@ -196,7 +201,12 @@ pub fn decode_workflow_result(body: &[u8]) -> Option<WorkflowResultView<'_>> {
     let ok = body[6] == 0;
     let name = body.get(7..7 + name_len)?;
     let context = body.get(7 + name_len..)?;
-    Some(WorkflowResultView { name, instance_id, ok, context })
+    Some(WorkflowResultView {
+        name,
+        instance_id,
+        ok,
+        context,
+    })
 }
 
 // ── CancelWorkflow ─────────────────────────────────────────────────────────
@@ -247,12 +257,7 @@ pub struct InstanceInfo {
 pub const WORKFLOW_ERROR_FIXED: usize = 2 + 4; // 6 bytes
 
 /// Encode a WorkflowError frame.
-pub fn encode_workflow_error(
-    seq: u64,
-    name: &[u8],
-    instance_id: u32,
-    error_json: &[u8],
-) -> Bytes {
+pub fn encode_workflow_error(seq: u64, name: &[u8], instance_id: u32, error_json: &[u8]) -> Bytes {
     let body_len = WORKFLOW_ERROR_FIXED + name.len() + error_json.len();
     let mut buf = BytesMut::with_capacity(HEADER_SIZE + body_len);
     let hdr = Header::new(Action::WorkflowError.as_u16(), body_len as u32, seq);
@@ -281,5 +286,9 @@ pub fn decode_workflow_error(body: &[u8]) -> Option<WorkflowErrorView<'_>> {
     let instance_id = u32::from_le_bytes(body[2..6].try_into().ok()?);
     let name = body.get(6..6 + name_len)?;
     let error_json = body.get(6 + name_len..)?;
-    Some(WorkflowErrorView { name, instance_id, error_json })
+    Some(WorkflowErrorView {
+        name,
+        instance_id,
+        error_json,
+    })
 }

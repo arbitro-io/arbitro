@@ -23,9 +23,9 @@
 mod test_helper;
 use test_helper::{TestServer, TestServerBuilder};
 
-use std::time::Duration;
-use bytes::Bytes;
 use arbitro_client_tokio::Client;
+use bytes::Bytes;
+use std::time::Duration;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -36,7 +36,6 @@ async fn create_stream(client: &Client, name: &[u8], filter: &[u8]) -> u32 {
         .expect("create_stream must succeed");
     TestServer::parse_id(&resp)
 }
-
 
 /// Full create_consumer call exposed so tests can tune every knob.
 #[allow(clippy::too_many_arguments)]
@@ -1246,19 +1245,21 @@ async fn t13_single_shard_saturation_no_silent_drops() {
     const TOTAL: usize = 1024;
     const INFLIGHT: u16 = 32;
     let consumer_id = create_consumer(
-        &client, stream_id, b"c1", b"", b"",
-        INFLIGHT,
-        1, /* Explicit */
+        &client, stream_id, b"c1", b"", b"", INFLIGHT, 1, /* Explicit */
         0, /* All */
-        30_000,
-        0,
-    ).await;
+        30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Fire-and-forget publishes — flood the publish channel.
     for i in 0u32..TOTAL as u32 {
         let p = format!("m-{i}");
-        let _ = client.publish(stream_id, b"sat1.event", Bytes::copy_from_slice(p.as_bytes()));
+        let _ = client.publish(
+            stream_id,
+            b"sat1.event",
+            Bytes::copy_from_slice(p.as_bytes()),
+        );
     }
 
     // Drain every message, acking inline so the inflight window stays
@@ -1310,16 +1311,32 @@ async fn evict_expired_does_not_stall_publish() {
 
     // max_age_secs = 1 → entries expire after 1 second.
     let resp = client
-        .create_stream(b"evict_test", b">", 0, 0, /*max_age_secs*/ 1, 1, 0, 0, 0, 0)
+        .create_stream(
+            b"evict_test",
+            b">",
+            0,
+            0,
+            /*max_age_secs*/ 1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     // Fill the stream with a burst of messages that will expire quickly.
     let batch: Vec<arbitro_client_tokio::BatchEntry<'_>> = (0..500)
-        .map(|_| arbitro_client_tokio::BatchEntry::new(b"evict_test.fill", Bytes::from_static(b"x")))
+        .map(|_| {
+            arbitro_client_tokio::BatchEntry::new(b"evict_test.fill", Bytes::from_static(b"x"))
+        })
         .collect();
-    client.publish_batch_sync(stream_id, &batch).await.expect("fill batch");
+    client
+        .publish_batch_sync(stream_id, &batch)
+        .await
+        .expect("fill batch");
 
     // Wait for all entries to expire (max_age = 1s).
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1362,10 +1379,8 @@ async fn partial_write_recovery_redelivers_unacked() {
     let stream_id = create_stream(&client, b"pw_recover", b">").await;
 
     // ack_wait_ms = 500ms — short enough for the test to be fast.
-    let consumer_id = create_consumer(
-        &client, stream_id, b"pw_sub", b"", b"", 10, 1, 0, 500, 0,
-    )
-    .await;
+    let consumer_id =
+        create_consumer(&client, stream_id, b"pw_sub", b"", b"", 10, 1, 0, 500, 0).await;
 
     // Publish 5 messages before subscribing.
     for i in 0u32..5 {
@@ -1382,7 +1397,11 @@ async fn partial_write_recovery_redelivers_unacked() {
     // First subscriber — receives but does NOT ack.
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
     let batch = drain_n(&mut handle, 5, Duration::from_secs(3)).await;
-    assert_eq!(batch.len(), 5, "first subscriber must receive all 5 messages");
+    assert_eq!(
+        batch.len(),
+        5,
+        "first subscriber must receive all 5 messages"
+    );
 
     // Simulate connection failure: drop the subscription handle and close
     // the client without acking. This triggers the writer feedback (M8)
@@ -1396,7 +1415,10 @@ async fn partial_write_recovery_redelivers_unacked() {
     // Reconnect and re-subscribe the SAME consumer. Messages should be
     // redelivered because they were never acked.
     let client2 = server.connect().await;
-    let mut handle2 = client2.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let mut handle2 = client2
+        .subscribe(stream_id, consumer_id, b"")
+        .await
+        .unwrap();
 
     let redelivered = drain_n(&mut handle2, 5, Duration::from_secs(5)).await;
     assert!(
@@ -1424,19 +1446,34 @@ async fn triple_fanout_two_explicit_one_none_all_receive() {
 
     // Consumer A: Explicit, group "workers"
     let a_id = create_consumer(
-        &client, stream_id, b"worker-a", b"workers", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"worker-a",
+        b"workers",
+        b"",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
     // Consumer B: Explicit, group "auditors" (different group → fanout)
     let b_id = create_consumer(
-        &client, stream_id, b"auditor-b", b"auditors", b"",
-        100, 1, 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"auditor-b",
+        b"auditors",
+        b"",
+        100,
+        1,
+        0,
+        30_000,
+        0,
+    )
+    .await;
     // Consumer C: None, group "tap" (fire-and-forget metrics)
-    let c_id = create_consumer(
-        &client, stream_id, b"tap-c", b"tap", b"",
-        100, 0, 0, 0, 0,
-    ).await;
+    let c_id = create_consumer(&client, stream_id, b"tap-c", b"tap", b"", 100, 0, 0, 0, 0).await;
 
     let mut sub_a = client.subscribe(stream_id, a_id, b"").await.unwrap();
     let mut sub_b = client.subscribe(stream_id, b_id, b"").await.unwrap();
@@ -1444,23 +1481,36 @@ async fn triple_fanout_two_explicit_one_none_all_receive() {
 
     const N: usize = 15;
     for i in 0..N {
-        client.publish_sync(
-            stream_id, b"triple.ev",
-            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
-        ).await.unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"triple.ev",
+                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     let c_msgs = drain_n(&mut sub_c, N, Duration::from_secs(5)).await;
-    assert_eq!(c_msgs.len(), N, "None consumer must get all {N} (got {})", c_msgs.len());
+    assert_eq!(
+        c_msgs.len(),
+        N,
+        "None consumer must get all {N} (got {})",
+        c_msgs.len()
+    );
 
     let a_msgs = drain_n(&mut sub_a, N, Duration::from_secs(5)).await;
     let a_count = a_msgs.len();
-    for m in a_msgs { m.ack(); }
+    for m in a_msgs {
+        m.ack();
+    }
     assert_eq!(a_count, N, "Explicit-A must get all {N} (got {a_count})");
 
     let b_msgs = drain_n(&mut sub_b, N, Duration::from_secs(5)).await;
     let b_count = b_msgs.len();
-    for m in b_msgs { m.ack(); }
+    for m in b_msgs {
+        m.ack();
+    }
     assert_eq!(b_count, N, "Explicit-B must get all {N} (got {b_count})");
 
     server.shutdown().await;
@@ -1481,31 +1531,54 @@ async fn mixed_ack_explicit_and_none_both_receive_all() {
 
     // Consumer A: Explicit ack (processing)
     let explicit_id = create_consumer(
-        &client, stream_id, b"processor", b"proc-group", b"",
-        100, 1, /* Explicit */ 0, 30_000, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"processor",
+        b"proc-group",
+        b"",
+        100,
+        1,
+        /* Explicit */ 0,
+        30_000,
+        0,
+    )
+    .await;
 
     // Consumer B: None (fire-and-forget metrics tap)
     let none_id = create_consumer(
-        &client, stream_id, b"metrics-tap", b"tap-group", b"",
-        100, 0, /* None */ 0, 0, 0,
-    ).await;
+        &client,
+        stream_id,
+        b"metrics-tap",
+        b"tap-group",
+        b"",
+        100,
+        0,
+        /* None */ 0,
+        0,
+        0,
+    )
+    .await;
 
     let mut sub_explicit = client.subscribe(stream_id, explicit_id, b"").await.unwrap();
     let mut sub_none = client.subscribe(stream_id, none_id, b"").await.unwrap();
 
     const N: usize = 20;
     for i in 0..N {
-        client.publish_sync(
-            stream_id, b"mixed.event",
-            Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
-        ).await.unwrap();
+        client
+            .publish_sync(
+                stream_id,
+                b"mixed.event",
+                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
     }
 
     // Fire-and-forget consumer drains without acking.
     let none_msgs = drain_n(&mut sub_none, N, Duration::from_secs(5)).await;
     assert_eq!(
-        none_msgs.len(), N,
+        none_msgs.len(),
+        N,
         "AckPolicy::None consumer must receive all {N} messages (got {})",
         none_msgs.len()
     );

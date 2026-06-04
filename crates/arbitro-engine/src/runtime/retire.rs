@@ -15,11 +15,7 @@ use crate::types::BindingId;
 
 /// Retire a single binding: release inflight credits for all pending
 /// entries, remove from catalog indices, emit event.
-pub fn retire_binding(
-    ctx: &mut EngineContext,
-    binding_id: BindingId,
-    events: &mut DeltaEvents,
-) {
+pub fn retire_binding(ctx: &mut EngineContext, binding_id: BindingId, events: &mut DeltaEvents) {
     // Catalog removes the binding from all maps/indices and returns it.
     let Some(binding) = ctx.catalog.retire_binding(binding_id, events) else {
         return;
@@ -66,10 +62,7 @@ pub fn retire_bindings_for_connection(
     connection_id: crate::types::ConnectionId,
     events: &mut DeltaEvents,
 ) {
-    let binding_ids: Vec<_> = ctx
-        .catalog
-        .bindings_for_connection(connection_id)
-        .to_vec();
+    let binding_ids: Vec<_> = ctx.catalog.bindings_for_connection(connection_id).to_vec();
     for bid in binding_ids {
         retire_binding(ctx, bid, events);
     }

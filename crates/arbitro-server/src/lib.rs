@@ -22,18 +22,18 @@
 //! * `config`, `server` — top-level configuration and the `ArbitroServer`
 //!   accept loop.
 
-pub mod common;
 #[cfg(feature = "cluster")]
 pub mod cluster;
+pub mod common;
 pub mod config;
 pub mod cron;
 pub mod delayed;
-pub mod workflow;
 pub mod lifecycle_trace;
 pub mod persistence;
 pub mod server;
 pub mod shard;
 pub mod transport;
+pub mod workflow;
 
 // ── Compat re-exports ─────────────────────────────────────────────────────
 // Keep the old `arbitro_server::{router,command,command_log}::*` paths alive

@@ -28,9 +28,9 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct NackBody {
-    pub consumer_id:  U32,
+    pub consumer_id: U32,
     pub subject_hash: U32,
-    pub nack_seq:     U64,
+    pub nack_seq: U64,
 }
 
 pub const NACK_BODY_SIZE: usize = core::mem::size_of::<NackBody>();
@@ -40,7 +40,7 @@ const _: () = assert!(NACK_BODY_SIZE == 16);
 #[repr(C)]
 pub struct NackFrame {
     pub header: Header,
-    pub body:   NackBody,
+    pub body: NackBody,
 }
 
 const _: () = assert!(core::mem::size_of::<NackFrame>() == HEADER_SIZE + NACK_BODY_SIZE);
@@ -51,11 +51,15 @@ impl NackFrame {
     #[inline(always)]
     pub fn new(seq: u64, consumer_id: u32, nack_seq: u64, subject_hash: u32) -> Self {
         Self {
-            header: Header::new(crate::action::Action::Nack.as_u16(), NACK_BODY_SIZE as u32, seq),
+            header: Header::new(
+                crate::action::Action::Nack.as_u16(),
+                NACK_BODY_SIZE as u32,
+                seq,
+            ),
             body: NackBody {
-                consumer_id:  U32::new(consumer_id),
+                consumer_id: U32::new(consumer_id),
                 subject_hash: U32::new(subject_hash),
-                nack_seq:     U64::new(nack_seq),
+                nack_seq: U64::new(nack_seq),
             },
         }
     }
@@ -67,7 +71,7 @@ impl NackFrame {
 #[repr(C)]
 pub struct BatchNackBody {
     pub consumer_id: U32,
-    pub count:       U32,
+    pub count: U32,
 }
 pub const BATCH_NACK_BODY_FIXED: usize = core::mem::size_of::<BatchNackBody>();
 const _: () = assert!(BATCH_NACK_BODY_FIXED == 8);
@@ -75,11 +79,11 @@ const _: () = assert!(BATCH_NACK_BODY_FIXED == 8);
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct BatchNackEntry {
-    pub seq:          U64,
+    pub seq: U64,
     pub subject_hash: U32,
     /// Delay in milliseconds before redelivery. 0 = immediate requeue.
     /// Old clients send 0 here (was `_pad`), so this is backward-compatible.
-    pub delay_ms:     U32,
+    pub delay_ms: U32,
 }
 pub const BATCH_NACK_ENTRY_SIZE: usize = core::mem::size_of::<BatchNackEntry>();
 const _: () = assert!(BATCH_NACK_ENTRY_SIZE == 16);
@@ -89,8 +93,8 @@ const _: () = assert!(BATCH_NACK_ENTRY_SIZE == 16);
 #[repr(C)]
 pub struct BatchNackFrame {
     pub header: Header,
-    pub body:   BatchNackBody,
-    pub tail:   [u8], // exactly count * BATCH_NACK_ENTRY_SIZE bytes
+    pub body: BatchNackBody,
+    pub tail: [u8], // exactly count * BATCH_NACK_ENTRY_SIZE bytes
 }
 
 impl BatchNackFrame {
@@ -135,7 +139,7 @@ impl BatchNackFrame {
         frame.header = Header::new(crate::action::Action::BatchNack.as_u16(), msg_len, seq);
         frame.body = BatchNackBody {
             consumer_id: U32::new(consumer_id),
-            count:       U32::new(count as u32),
+            count: U32::new(count as u32),
         };
         let entries_buf = &mut frame.tail[..count * BATCH_NACK_ENTRY_SIZE];
         let slots = <[BatchNackEntry]>::mut_from_bytes(entries_buf).expect("entries slice");
@@ -166,7 +170,10 @@ mod tests {
         assert_eq!(parsed.body.nack_seq.get(), 999);
         assert_eq!(parsed.body.subject_hash.get(), 0xDEADBEEF);
         // Action must be Nack = 0x0202
-        assert_eq!(parsed.header.action.get(), crate::action::Action::Nack.as_u16());
+        assert_eq!(
+            parsed.header.action.get(),
+            crate::action::Action::Nack.as_u16()
+        );
     }
 
     #[test]

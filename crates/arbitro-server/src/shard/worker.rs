@@ -31,7 +31,9 @@ use crate::shard::command::*;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::drain_events::{DrainEvent, DrainEventRing};
 use crate::shard::router::SharedStore;
-use crate::shard::shared::{DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
+use crate::shard::shared::{
+    DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap,
+};
 use crate::transport::ConnectionRegistry;
 
 // ── Per-stream retention config ──────────────────────────────────────────────
@@ -248,13 +250,13 @@ impl DrainWorker {
 /// subject inflight slots. Non-blocking; returns as soon as the ring is
 /// empty. Called at the top of every drain cycle.
 #[inline]
-fn drain_event_ring(
-    rx: &DrainEventRing,
-    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-) {
+fn drain_event_ring(rx: &DrainEventRing, consumer_subjects: &mut Vec<Option<ConsumerSubjects>>) {
     while let Some(evt) = rx.try_recv() {
         match evt {
-            DrainEvent::Ack { consumer_id, subject_hash } => {
+            DrainEvent::Ack {
+                consumer_id,
+                subject_hash,
+            } => {
                 let idx = consumer_id.raw() as usize;
                 if let Some(Some(cs)) = consumer_subjects.get_mut(idx) {
                     cs.dec(subject_hash);
@@ -291,7 +293,9 @@ pub(in crate::shard) fn consumer_subjects_slot(
     consumer_subjects: &[Option<ConsumerSubjects>],
     consumer_id: u32,
 ) -> Option<&ConsumerSubjects> {
-    consumer_subjects.get(consumer_id as usize).and_then(|s| s.as_ref())
+    consumer_subjects
+        .get(consumer_id as usize)
+        .and_then(|s| s.as_ref())
 }
 
 // ── Command worker ──────────────────────────────────────────────────────────
@@ -432,11 +436,13 @@ impl CommandWorker {
                 let mut i = 0;
                 while i < self.pending_consumer_remove.len() {
                     let cid = self.pending_consumer_remove[i];
-                    if self.drain_evt_tx.try_send(
-                        crate::shard::drain_events::DrainEvent::ConsumerRemoved {
+                    if self
+                        .drain_evt_tx
+                        .try_send(crate::shard::drain_events::DrainEvent::ConsumerRemoved {
                             consumer_id: cid,
-                        },
-                    ).is_ok() {
+                        })
+                        .is_ok()
+                    {
                         self.pending_consumer_remove.swap_remove(i);
                     } else {
                         i += 1;
@@ -657,10 +663,7 @@ impl CommandWorker {
 
         for entry in &self.wheel_buf {
             let consumer_id = ConsumerId(entry.consumer_id);
-            let is_nack_delay = matches!(
-                entry.kind,
-                arbitro_common::WheelEntryKind::NackDelay,
-            );
+            let is_nack_delay = matches!(entry.kind, arbitro_common::WheelEntryKind::NackDelay,);
 
             if is_nack_delay {
                 // Nack-delay: message was already nacked, just rewind cursor.
@@ -742,7 +745,9 @@ impl CommandWorker {
             return;
         }
         if !(self.wheel.is_some()
-            || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed))
+            || self
+                .has_idempotency
+                .load(std::sync::atomic::Ordering::Relaxed))
         {
             self.last_wheel_tick = Some(now);
             return;
@@ -797,7 +802,7 @@ impl CommandWorker {
             ShardCommand::Unsubscribe(cmd) => self.handle_unsubscribe(cmd),
             ShardCommand::CreateStream(cmd) => self.handle_create_stream(cmd),
             ShardCommand::DeleteStream(cmd) => self.handle_delete_stream(cmd),
-            ShardCommand::PurgeStream(cmd)  => self.handle_purge_stream(cmd),
+            ShardCommand::PurgeStream(cmd) => self.handle_purge_stream(cmd),
             ShardCommand::DrainSubject(cmd) => self.handle_drain_subject(cmd),
             ShardCommand::CreateConsumer(cmd) => self.handle_create_consumer(cmd),
             ShardCommand::DeleteConsumer(cmd) => self.handle_delete_consumer(cmd),
@@ -834,10 +839,14 @@ impl CommandWorker {
         // is silently dropped — see `drain_events.rs` overflow policy.
         if !delta.subject_hashes_acked.is_empty() {
             for &(cid, sh) in &delta.subject_hashes_acked {
-                if self.drain_evt_tx.try_send(DrainEvent::Ack {
-                    consumer_id: ConsumerId(cid),
-                    subject_hash: sh,
-                }).is_err() {
+                if self
+                    .drain_evt_tx
+                    .try_send(DrainEvent::Ack {
+                        consumer_id: ConsumerId(cid),
+                        subject_hash: sh,
+                    })
+                    .is_err()
+                {
                     self.silent_drops.inc_drain_evt();
                 }
             }
@@ -925,7 +934,9 @@ impl CommandWorker {
 
         // Build per-stream max_age_ms vec, indexed by StreamId.raw().
         // Drain looks up by stream_id.raw() — O(1) array access.
-        let max_stream_idx = self.stream_retention.keys()
+        let max_stream_idx = self
+            .stream_retention
+            .keys()
             .map(|s| s.0 as usize)
             .max()
             .unwrap_or(0);
