@@ -13,6 +13,12 @@ pub mod flags {
     /// Used by request/reply (PubWithReply). Drain extracts the prefix
     /// and passes `reply_to` through the delivery wire frame.
     pub const HAS_REPLY_TO: u8 = 0b0000_1000;
+    /// Payload uses the extended tail layout:
+    ///   `[payload_len:u32 LE][user_payload][headers_len:u32 LE][count:u16 LE][entries…]`
+    /// When `headers_len == 0` there are no entries (just the 4-byte zero).
+    /// `msg_id` is stored as a header with key `"msg-id"` — no separate field.
+    /// Records WITHOUT this flag use the legacy layout: payload = raw bytes.
+    pub const HAS_HEADERS: u8 = 0b0001_0000;
 }
 
 /// A single stored message view.

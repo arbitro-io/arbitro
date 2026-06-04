@@ -3,6 +3,7 @@ pub mod delivery;
 pub mod envelope;
 pub mod headers;
 pub mod manager;
+pub mod msg_headers;
 pub mod publish;
 pub mod stream;
 pub mod subscribe;
