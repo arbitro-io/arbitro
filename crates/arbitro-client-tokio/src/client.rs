@@ -96,6 +96,7 @@ impl Client {
             last_pong_ns:   AtomicU64::new(Inner::now_ns()),
             metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state:     crate::cron::CronState::new(),
+            workflow_state: crate::workflow::WorkflowState::new(),
         });
 
         // Spawn the ack-batcher and nack-batcher — both live for the Client lifetime.
@@ -585,5 +586,27 @@ impl Client {
     /// ```
     pub fn cron<'a>(&'a self, name: &[u8]) -> crate::cron::CronBuilder<'a> {
         crate::cron::CronBuilder::new(self, name)
+    }
+
+    // ── Workflow orchestration ─────────────────────────────────────
+
+    /// Start building a workflow registration.
+    ///
+    /// ```rust,no_run
+    /// # use arbitro_client_tokio::Client;
+    /// # async fn example(client: &Client) {
+    /// let wf = client.workflow(b"order-process")
+    ///     .trigger(b"orders.created")
+    ///     .step(b"validate", |ctx| async move {
+    ///         Ok(arbitro_client_tokio::workflow::StepResult { context: ctx.context })
+    ///     })
+    ///     .start()
+    ///     .await
+    ///     .unwrap();
+    /// wf.stop().await.unwrap();
+    /// # }
+    /// ```
+    pub fn workflow<'a>(&'a self, name: &[u8]) -> crate::workflow::WorkflowBuilder<'a> {
+        crate::workflow::WorkflowBuilder::new(self, name)
     }
 }

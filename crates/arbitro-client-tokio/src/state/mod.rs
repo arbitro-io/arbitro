@@ -55,6 +55,8 @@ pub(crate) struct Inner {
     pub(crate) metrics:        Arc<ClientMetrics>,
     /// Active cron job handlers — keyed by name, used by dispatch + reconnect.
     pub(crate) cron_state:     crate::cron::CronState,
+    /// Active workflow handlers — keyed by name, used by dispatch + reconnect.
+    pub(crate) workflow_state: crate::workflow::WorkflowState,
 }
 
 impl Inner {

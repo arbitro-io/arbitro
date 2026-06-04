@@ -67,6 +67,7 @@ pub async fn dispatch_frame_v2(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
     delayed_journal: &Option<crate::delayed::SharedDelayedJournal>,
     #[cfg(feature = "cluster")]
     cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
@@ -103,7 +104,7 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry),
+        Action::Publish          => v2_publish(conn_id, req_seq, &frame, server, registry, workflow_registry),
         Action::PublishBatch     => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
         Action::PublishWithReply => v2_publish_with_reply(conn_id, req_seq, &frame, server, registry),
         Action::Ack            => v2_ack(conn_id, &frame, server).await,
@@ -176,8 +177,18 @@ pub async fn dispatch_frame_v2(
         Action::CronAck        => v2_cron_ack(&frame, cron_registry),
         Action::CronFire       => { /* server→client only; ignore if received */ }
 
+        // ── Workflow orchestration ──────────────────────────────────
+        Action::CreateWorkflow  => v2_create_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
+        Action::DeleteWorkflow  => v2_delete_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
+        Action::ListWorkflows   => v2_list_workflows(conn_id, req_seq, registry, workflow_registry),
+        Action::WorkflowResult  => v2_workflow_result(&frame, workflow_registry, registry),
+        Action::CancelWorkflow  => v2_cancel_workflow(conn_id, req_seq, &frame, registry, workflow_registry),
+        Action::ListInstances   => v2_list_instances(conn_id, req_seq, &frame, registry, workflow_registry),
+        Action::WorkflowStep    => { /* server→client only; ignore if received */ }
+        Action::WorkflowError   => { /* server→client only; ignore if received */ }
+
         // ── System ──────────────────────────────────────────────────
-        Action::Disconnect     => { v2_disconnect(conn_id, server, registry, cron_registry).await; }
+        Action::Disconnect     => { v2_disconnect(conn_id, server, registry, cron_registry, workflow_registry).await; }
         Action::Ping           => v2_ping(conn_id, registry),
         // M17: count Pongs so the keepalive path is observable. The
         // counter lives on the connection registry — it's stable across
@@ -205,6 +216,8 @@ fn v2_publish(
     frame: &Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
+    #[allow(unused_variables)]
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
 ) {
     let f = match PubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
@@ -301,6 +314,12 @@ fn v2_publish(
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
     server.gate_for(seq_stream).release();
+
+    // Check if this publish triggers any workflows.
+    let triggers = workflow_registry.trigger(f.subject(), f.payload());
+    for (wf_conn_id, step_frame) in triggers {
+        registry.send_bytes(wf_conn_id, step_frame);
+    }
 }
 
 /// Hash an opaque `msg_id` for the idempotency tracker.
@@ -1534,6 +1553,7 @@ pub(crate) async fn v2_disconnect(
     server: &ShardRouter,
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
 ) {
     let shards = server.shard_count();
     let cid = ConnectionId(conn_id);
@@ -1555,6 +1575,9 @@ pub(crate) async fn v2_disconnect(
 
     // Remove this connection from all cron worker pools.
     cron_registry.remove_connection(conn_id);
+
+    // Remove this connection from all workflow worker pools.
+    workflow_registry.remove_connection(conn_id);
 
     tracing::debug!(target = "dispatch", conn = conn_id, "v2_disconnect: drains complete");
     registry.remove(conn_id);
@@ -1806,4 +1829,129 @@ async fn v2_delete_consumer_raft(
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
     }
+}
+
+// ── Workflow ──────────────────────────────────────────────────────────────
+
+fn v2_create_workflow(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+) {
+    let body_bytes = &frame[HEADER_SIZE..];
+    let body = match arbitro_proto::wire::workflow::decode_create_workflow(body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
+    };
+    let steps: Vec<(String, u32, u8)> = body
+        .steps
+        .iter()
+        .map(|s| (s.name.clone(), s.timeout_ms, s.max_retries))
+        .collect();
+    match workflow_registry.create(
+        Bytes::copy_from_slice(body.name.as_bytes()),
+        &body.trigger,
+        steps,
+        body.config.max_concurrent,
+        body.config.dedup_key,
+        body.config.timeout_ms,
+        conn_id,
+    ) {
+        Ok(()) => send_rep_ok_v2(registry, conn_id, req_seq, 0),
+        Err(msg) => {
+            tracing::warn!(conn_id, name = %body.name, error = %msg, "create_workflow failed");
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        }
+    }
+}
+
+fn v2_delete_workflow(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+) {
+    let name = &frame[HEADER_SIZE..];
+    if workflow_registry.delete(name) {
+        send_rep_ok_v2(registry, conn_id, req_seq, 0);
+    } else {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+    }
+}
+
+fn v2_list_workflows(
+    conn_id: u64,
+    req_seq: u64,
+    registry: &ConnectionRegistry,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+) {
+    let infos = workflow_registry.list();
+    let json = serde_json::to_vec(&infos).unwrap_or_default();
+    let total = HEADER_SIZE + json.len();
+    let mut buf = BytesMut::with_capacity(total);
+    let header = Header::new(Action::ListWorkflows.as_u16(), json.len() as u32, req_seq);
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&json);
+    registry.send_bytes(conn_id, buf.freeze());
+}
+
+fn v2_workflow_result(
+    frame: &Bytes,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+    registry: &ConnectionRegistry,
+) {
+    let body = &frame[HEADER_SIZE..];
+    if let Some(view) = arbitro_proto::wire::workflow::decode_workflow_result(body) {
+        if let Some((conn_id, next_frame)) =
+            workflow_registry.advance(view.instance_id, view.ok, view.context)
+        {
+            registry.send_bytes(conn_id, next_frame);
+        }
+    }
+}
+
+fn v2_cancel_workflow(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+) {
+    let body = &frame[HEADER_SIZE..];
+    match arbitro_proto::wire::workflow::decode_cancel_workflow(body) {
+        Some(instance_id) => {
+            if workflow_registry.cancel(instance_id) {
+                send_rep_ok_v2(registry, conn_id, req_seq, instance_id as u64);
+            } else {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            }
+        }
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+        }
+    }
+}
+
+fn v2_list_instances(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    registry: &ConnectionRegistry,
+    workflow_registry: &std::sync::Arc<crate::workflow::WorkflowRegistry>,
+) {
+    let name = &frame[HEADER_SIZE..];
+    let infos = workflow_registry.list_instances(name);
+    let json = serde_json::to_vec(&infos).unwrap_or_default();
+    let total = HEADER_SIZE + json.len();
+    let mut buf = BytesMut::with_capacity(total);
+    let header = Header::new(Action::ListInstances.as_u16(), json.len() as u32, req_seq);
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(&json);
+    registry.send_bytes(conn_id, buf.freeze());
 }

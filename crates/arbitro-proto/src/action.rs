@@ -92,6 +92,31 @@ pub enum Action {
     /// Client→broker: acknowledges cron fire execution.
     /// Body: name + status (0=ok, 1=error).
     CronAck       = 0x0705,
+
+    // 0x09xx — Workflow orchestration
+    /// Register a workflow. JSON body: name, trigger, steps[], config.
+    /// Reply: RepOk on success.
+    CreateWorkflow  = 0x0901,
+    /// Remove a workflow by name. Body: name bytes.
+    /// Reply: RepOk.
+    DeleteWorkflow  = 0x0902,
+    /// List active workflows. No body.
+    /// Reply: RepOk with JSON array of workflow definitions.
+    ListWorkflows   = 0x0903,
+    /// Broker→client: execute the next step of a workflow instance.
+    /// Body: name_len + instance_id + step_index + name + context_json.
+    WorkflowStep    = 0x0904,
+    /// Client→broker: result of a workflow step execution.
+    /// Body: name_len + instance_id + status + name + context_json.
+    WorkflowResult  = 0x0905,
+    /// Cancel a running workflow instance. Body: instance_id (4 bytes).
+    CancelWorkflow  = 0x0906,
+    /// List instances of a workflow. Body: name bytes.
+    /// Reply: RepOk with JSON array of instance states.
+    ListInstances   = 0x0907,
+    /// Broker→client: a workflow step errored and the onError handler
+    /// should be invoked. Body: name_len + instance_id + name + error_json.
+    WorkflowError   = 0x0908,
 }
 
 impl Action {
@@ -149,6 +174,15 @@ impl Action {
             0x0703 => Some(Self::ListCrons),
             0x0704 => Some(Self::CronFire),
             0x0705 => Some(Self::CronAck),
+
+            0x0901 => Some(Self::CreateWorkflow),
+            0x0902 => Some(Self::DeleteWorkflow),
+            0x0903 => Some(Self::ListWorkflows),
+            0x0904 => Some(Self::WorkflowStep),
+            0x0905 => Some(Self::WorkflowResult),
+            0x0906 => Some(Self::CancelWorkflow),
+            0x0907 => Some(Self::ListInstances),
+            0x0908 => Some(Self::WorkflowError),
 
             _ => None,
         }

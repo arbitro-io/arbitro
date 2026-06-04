@@ -39,6 +39,7 @@ pub mod consumer_builder;
 pub mod cron;
 pub mod error;
 pub mod metrics;
+pub mod workflow;
 
 pub(crate) mod conn;
 pub(crate) mod consume;
@@ -79,6 +80,7 @@ pub use arbitro_proto::v2::manager::SubjectLimit;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronHandle, CronContext};
+pub use workflow::{WorkflowBuilder, WorkflowHandle, WorkflowStepContext, WorkflowErrorContext};
 
 /// Consumer-config enums lifted from `arbitro-proto` so callers don't
 /// have to depend on the proto crate directly to set `ack_policy`,

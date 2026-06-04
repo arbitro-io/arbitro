@@ -7,6 +7,7 @@ pub mod system;
 pub mod headers;
 pub mod manager;
 pub mod cron;
+pub mod workflow;
 
 pub use envelope::*;
 pub use publish::*;
@@ -16,3 +17,4 @@ pub use stream::*;
 pub use system::*;
 pub use manager::*;
 pub use cron::*;
+pub use workflow::*;

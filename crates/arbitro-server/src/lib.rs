@@ -28,6 +28,7 @@ pub mod cluster;
 pub mod config;
 pub mod cron;
 pub mod delayed;
+pub mod workflow;
 pub mod lifecycle_trace;
 pub mod persistence;
 pub mod server;

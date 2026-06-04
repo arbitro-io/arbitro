@@ -114,6 +114,7 @@ mod tests {
             last_pong_ns:   std::sync::atomic::AtomicU64::new(0),
             metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state:     crate::cron::CronState::new(),
+            workflow_state: crate::workflow::WorkflowState::new(),
         });
 
         // Should return immediately because cancel is already fired.

@@ -148,6 +148,17 @@ async fn dispatch(inner: &Inner, frame: Bytes) {
         return;
     }
 
+    // ── Workflow step / error ────────────────────────────────────
+    if action == Action::WorkflowStep.as_u16() {
+        crate::workflow::dispatch_workflow_step(frame, inner).await;
+        return;
+    }
+
+    if action == Action::WorkflowError.as_u16() {
+        crate::workflow::dispatch_workflow_error(frame, inner).await;
+        return;
+    }
+
     // All other actions are silently dropped (system frames, etc.)
     let _ = action;
 }
@@ -189,6 +200,7 @@ mod tests {
             last_pong_ns:   AtomicU64::new(0),
             metrics:        Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state:     crate::cron::CronState::new(),
+            workflow_state: crate::workflow::WorkflowState::new(),
         })
     }
 
