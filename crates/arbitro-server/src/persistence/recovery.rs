@@ -364,3 +364,107 @@ impl MetadataApplier for ReplayApplier {
         }
     }
 }
+
+// ── Idempotency recovery ──────────────────────────────────────────────────
+
+/// Scan all stores for records with `HAS_HEADERS` flag, extract `msg-id`
+/// headers, and repopulate the per-stream `IdempotencyTracker`.
+///
+/// Only scans entries within each stream's `idempotency_window_ms` from
+/// the current time — older entries have already expired and should not
+/// block future publishes with the same id.
+pub async fn rebuild_idempotency(server: &ShardRouter) {
+    use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
+    use zerocopy::FromBytes;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let mut total_recovered = 0u64;
+
+    for shard_idx in 0..server.shard_count() {
+        let shard = server.shard(shard_idx);
+
+        // List streams on this shard.
+        let streams = match shard.list_streams().await {
+            Ok(r) => r.streams,
+            Err(_) => continue,
+        };
+
+        for (wire_id, _name) in &streams {
+            let stream_id = match server.names().stream_seq(*wire_id) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let window_ms = server.names().stream_idempotency_window_ms(stream_id);
+            if window_ms == 0 {
+                continue; // stream has no dedup — skip
+            }
+
+            let cutoff_ms = now_ms.saturating_sub(window_ms as u64);
+
+            let shared_store = server.store_for(stream_id);
+            let store = shared_store.lock();
+            let info = store.info();
+            if info.messages == 0 {
+                continue;
+            }
+
+            let shared_idemp = server.idempotency_for(stream_id);
+            let tracker_arc =
+                crate::shard::idempotency::idempotency_for_stream(shared_idemp, stream_id);
+            let mut tracker = tracker_arc.lock();
+
+            store.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+                // Skip entries older than the idempotency window.
+                if entry.timestamp < cutoff_ms {
+                    return;
+                }
+
+                // Only process entries with HAS_HEADERS flag.
+                if entry.flags & arbitro_store::flags::HAS_HEADERS == 0 {
+                    return;
+                }
+
+                // Parse the extended payload to extract msg-id header.
+                let ext = match ExtendedPayload::ref_from_bytes(entry.payload) {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                let hdr = match ext.headers_block() {
+                    Some(h) => h,
+                    None => return,
+                };
+                let msg_id = match hdr.get(HDR_MSG_ID) {
+                    Some(id) if !id.is_empty() => id,
+                    _ => return,
+                };
+
+                // Repopulate the tracker.
+                let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
+                // Remaining window = window_ms - (now - entry.timestamp).
+                let elapsed = now_ms.saturating_sub(entry.timestamp);
+                let remaining_ms = (window_ms as u64).saturating_sub(elapsed);
+                if remaining_ms > 0 {
+                    tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
+                    total_recovered += 1;
+                }
+            }).ok();
+
+            drop(tracker);
+            if total_recovered > 0 {
+                server.mark_idempotency_allocated(stream_id);
+            }
+        }
+    }
+
+    if total_recovered > 0 {
+        tracing::info!(
+            count = total_recovered,
+            "idempotency tracker rebuilt from journal"
+        );
+    }
+}

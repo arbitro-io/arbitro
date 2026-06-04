@@ -717,21 +717,39 @@ fn dispatch_recipients(
         // that lives in `scratch.deliveries` below, gated on
         // `!fire_and_forget`.
 
+        // Extract user payload from extended layout when HAS_HEADERS is set.
+        // Store format: [payload_len:u32 LE][user_payload][headers...].
+        // The consumer receives only the user payload — headers are broker-internal.
+        let raw_payload = if entry.flags & arbitro_store::flags::HAS_HEADERS != 0
+            && entry.payload.len() >= 4
+        {
+            let pay_len =
+                u32::from_le_bytes([entry.payload[0], entry.payload[1], entry.payload[2], entry.payload[3]])
+                    as usize;
+            if entry.payload.len() >= 4 + pay_len {
+                &entry.payload[4..4 + pay_len]
+            } else {
+                entry.payload
+            }
+        } else {
+            entry.payload
+        };
+
         // Extract reply_to from payload when HAS_REPLY_TO flag is set.
         // Store format: [reply_len:u16 LE][reply_to bytes][actual payload].
         let (reply_to, actual_payload): (&[u8], &[u8]) =
-            if entry.flags & arbitro_store::flags::HAS_REPLY_TO != 0 && entry.payload.len() >= 2 {
-                let reply_len = u16::from_le_bytes([entry.payload[0], entry.payload[1]]) as usize;
-                if entry.payload.len() >= 2 + reply_len {
+            if entry.flags & arbitro_store::flags::HAS_REPLY_TO != 0 && raw_payload.len() >= 2 {
+                let reply_len = u16::from_le_bytes([raw_payload[0], raw_payload[1]]) as usize;
+                if raw_payload.len() >= 2 + reply_len {
                     (
-                        &entry.payload[2..2 + reply_len],
-                        &entry.payload[2 + reply_len..],
+                        &raw_payload[2..2 + reply_len],
+                        &raw_payload[2 + reply_len..],
                     )
                 } else {
-                    (&[], entry.payload)
+                    (&[], raw_payload)
                 }
             } else {
-                (&[], entry.payload)
+                (&[], raw_payload)
             };
 
         let fire_and_forget = binding.fire_and_forget;

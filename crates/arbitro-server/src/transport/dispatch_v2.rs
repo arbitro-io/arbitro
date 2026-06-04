@@ -333,11 +333,29 @@ fn v2_publish(
         }
     }
 
+    // If the frame carries a msg_id, pack it as a header in the
+    // extended payload layout so it survives in the journal for
+    // idempotency recovery on restart.
+    let ext_buf: Vec<u8>;
+    let (store_payload, store_flags): (&[u8], u8) = if !msg_id.is_empty() {
+        let hdrs: &[(&[u8], &[u8])] = &[(
+            arbitro_proto::wire::msg_headers::HDR_MSG_ID,
+            msg_id,
+        )];
+        ext_buf = arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
+            f.payload(),
+            hdrs,
+        );
+        (&ext_buf, arbitro_store::flags::HAS_HEADERS)
+    } else {
+        (&[], 0) // placeholder, overwritten below
+    };
+
     let entries = [arbitro_store::EntryRef {
         stream_id: seq_stream.raw(),
         subject: f.subject(),
-        payload: f.payload(),
-        flags: 0,
+        payload: if store_flags != 0 { store_payload } else { f.payload() },
+        flags: store_flags,
         deliver_at_ms: 0,
     }];
 
@@ -376,7 +394,7 @@ fn v2_publish(
 /// we use for all the broker's HashMaps; using it here keeps the
 /// codebase consistent.
 #[inline]
-fn idempotency_hash(msg_id: &[u8]) -> u64 {
+pub(crate) fn idempotency_hash(msg_id: &[u8]) -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = arbitro_common::foldhash::fast::FixedState::default().build_hasher();
     h.write(msg_id);

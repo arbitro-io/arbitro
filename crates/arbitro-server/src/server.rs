@@ -129,6 +129,12 @@ impl ArbitroServer {
             applier.flush().await;
         }
 
+        // ── Rebuild idempotency tracker from journal ──────────────────
+        // Scan each store for records with HAS_HEADERS flag and extract
+        // "msg-id" headers to repopulate the IdempotencyTracker. This
+        // makes idempotency survive restarts.
+        crate::persistence::recovery::rebuild_idempotency(&self.server).await;
+
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         tracing::info!(addr = %self.config.listen_addr, "listening");
 
