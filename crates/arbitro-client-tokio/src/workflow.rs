@@ -290,6 +290,9 @@ impl WorkflowBuilder {
 
         tokio::spawn({
             let wf_name = Arc::clone(&wf_name);
+            // Pre-compute the UTF-8 name string once — avoids a
+            // String::from_utf8_lossy allocation on every message.
+            let wf_name_str: Arc<str> = String::from_utf8_lossy(&wf_name).into();
             let client = client.clone();
             async move {
                 loop {
@@ -311,7 +314,7 @@ impl WorkflowBuilder {
                             // ── Context overflow guard (incoming) ──
                             if context.len() > max_context_size {
                                 warn!(
-                                    workflow = %String::from_utf8_lossy(&wf_name),
+                                    workflow = %wf_name_str,
                                     instance_id,
                                     step_index,
                                     context_len = context.len(),
@@ -361,7 +364,7 @@ impl WorkflowBuilder {
                                     // ── Context overflow guard (outgoing) ──
                                     if result.context.len() > max_context_size {
                                         warn!(
-                                            workflow = %String::from_utf8_lossy(&wf_name),
+                                            workflow = %wf_name_str,
                                             instance_id,
                                             step_index,
                                             context_len = result.context.len(),
@@ -377,9 +380,7 @@ impl WorkflowBuilder {
                                         // Advance: publish next step with idempotent msg_id.
                                         let msg_id = format!("wf:{instance_id}:{next_step}:0");
                                         let subject = format!(
-                                            "_wf.{}.step.{}",
-                                            String::from_utf8_lossy(&wf_name),
-                                            next_step
+                                            "_wf.{wf_name_str}.step.{next_step}"
                                         );
                                         let task = encode_task(
                                             instance_id, next_step, 0, &result.context,
@@ -412,9 +413,7 @@ impl WorkflowBuilder {
                                     if attempt >= max_retries {
                                         // Publish to DLQ.
                                         let dlq_subject = format!(
-                                            "_wf.{}.dlq.{}",
-                                            String::from_utf8_lossy(&wf_name),
-                                            step_index,
+                                            "_wf.{wf_name_str}.dlq.{step_index}",
                                         );
                                         let mut dlq_payload = Vec::new();
                                         dlq_payload.extend_from_slice(&instance_id.to_le_bytes());
@@ -438,9 +437,7 @@ impl WorkflowBuilder {
                                             for comp_idx in (0..step_index).rev() {
                                                 let comp_step = COMPENSATION_BIT | comp_idx;
                                                 let comp_subject = format!(
-                                                    "_wf.{}.compensate.{}",
-                                                    String::from_utf8_lossy(&wf_name),
-                                                    comp_idx,
+                                                    "_wf.{wf_name_str}.compensate.{comp_idx}",
                                                 );
                                                 let comp_task = encode_task(
                                                     instance_id, comp_step, 0, context,
@@ -458,7 +455,7 @@ impl WorkflowBuilder {
                                         }
 
                                         warn!(
-                                            workflow = %String::from_utf8_lossy(&wf_name),
+                                            workflow = %wf_name_str,
                                             instance_id,
                                             step_index,
                                             attempt,
@@ -506,7 +503,11 @@ impl WorkflowBuilder {
                 .await?;
 
             let cancel_trigger = cancel.clone();
-            let trigger_wf_name = self.name.clone();
+            // Pre-compute subject prefix — avoids per-message from_utf8_lossy + format.
+            let trigger_subject: Arc<str> = format!(
+                "_wf.{}.step.0",
+                String::from_utf8_lossy(&self.name),
+            ).into();
             let trigger_client = self.client.clone();
 
             tokio::spawn(async move {
@@ -523,14 +524,10 @@ impl WorkflowBuilder {
                             let payload = msg.payload();
                             let instance_id = next_instance_id();
                             let msg_id = format!("wf:{instance_id}:0:0");
-                            let subject = format!(
-                                "_wf.{}.step.0",
-                                String::from_utf8_lossy(&trigger_wf_name),
-                            );
                             let task = encode_task(instance_id, 0, 0, &payload);
                             let _ = trigger_client.publish_with_id(
                                 task_stream_id,
-                                subject.as_bytes(),
+                                trigger_subject.as_bytes(),
                                 msg_id.as_bytes(),
                                 Bytes::from(task),
                             );
