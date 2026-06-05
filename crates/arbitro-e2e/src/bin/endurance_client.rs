@@ -141,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .expect("cons connect");
 
-                let consumer_name = format!("{}-{i}", group);
+                let consumer_name = format!("{group}-{i}");
                 let resp = client
                     .create_consumer(
                         stream_id,
@@ -194,8 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let elapsed = last_report.elapsed().as_secs_f64();
                 let rate = (p - last_pub) as f64 / elapsed;
                 println!(
-                    "  > Telemetry | Published: {} (avg {:.0} msg/s), Acked: {}",
-                    p, rate, a
+                    "  > Telemetry | Published: {p} (avg {rate:.0} msg/s), Acked: {a}"
                 );
                 last_pub = p;
                 last_report = Instant::now();

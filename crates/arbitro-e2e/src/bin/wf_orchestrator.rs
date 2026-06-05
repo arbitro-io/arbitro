@@ -157,7 +157,7 @@ async fn run() -> i32 {
     if ok { 0 } else { 1 }
 }
 
-fn count_completed_instances(log: &str, num_instances: u32) -> u32 {
+fn count_completed_instances(log: &str, _num_instances: u32) -> u32 {
     let mut step2_done: HashSet<u32> = HashSet::new();
     for line in log.lines() {
         let parts: Vec<&str> = line.split(':').collect();
@@ -196,7 +196,7 @@ fn verify_invariants(log: &str, num_instances: u32) -> (bool, String) {
     }
 
     report.push_str("=== MULTI-PROCESS WORKFLOW INVARIANTS ===\n\n");
-    report.push_str(&format!("Workers seen: {:?}\n", workers_seen));
+    report.push_str(&format!("Workers seen: {workers_seen:?}\n"));
     report.push_str(&format!("Total log lines: {}\n\n", log.lines().count()));
 
     // Invariant 1: Every instance completed all 3 steps
