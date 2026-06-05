@@ -384,14 +384,28 @@ impl WorkflowBuilder {
                                         let task = encode_task(
                                             instance_id, next_step, 0, &result.context,
                                         );
-                                        let _ = client.publish_sync_with_id(
+                                        // Fire-and-forget publish — does NOT await broker
+                                        // response. Avoids deadlock where the response
+                                        // is queued behind a delivery frame in the reader.
+                                        // Idempotent msg_id protects against duplicates on
+                                        // retry (nack → redeliver → re-publish is deduped).
+                                        match client.publish_with_id(
                                             task_stream_id,
                                             subject.as_bytes(),
                                             msg_id.as_bytes(),
                                             Bytes::from(task),
-                                        ).await;
+                                        ) {
+                                            Ok(_) => {}
+                                            Err(_e) => {
+                                                // Enqueue failed — nack for retry.
+                                                msg.nack();
+                                                continue;
+                                            }
+                                        }
+                                    } else {
+                                        // Last step — just ack.
+                                        msg.ack();
                                     }
-                                    msg.ack();
                                 }
                                 Err(err) => {
                                     // ── Max retries → DLQ + compensation ──
@@ -412,12 +426,12 @@ impl WorkflowBuilder {
                                         dlq_payload.extend_from_slice(err_bytes);
                                         dlq_payload.extend_from_slice(context);
 
-                                        let _ = client.publish_sync_with_id(
+                                        let _ = client.publish_with_id(
                                             dlq_stream_id,
                                             dlq_subject.as_bytes(),
                                             format!("wf:{instance_id}:dlq:{step_index}").as_bytes(),
                                             Bytes::from(dlq_payload),
-                                        ).await;
+                                        );
 
                                         // Trigger compensation in reverse for completed steps.
                                         if step_index > 0 {
@@ -434,12 +448,12 @@ impl WorkflowBuilder {
                                                 let comp_msg_id = format!(
                                                     "wf:{instance_id}:comp:{comp_idx}"
                                                 );
-                                                let _ = client.publish_sync_with_id(
+                                                let _ = client.publish_with_id(
                                                     task_stream_id,
                                                     comp_subject.as_bytes(),
                                                     comp_msg_id.as_bytes(),
                                                     Bytes::from(comp_task),
-                                                ).await;
+                                                );
                                             }
                                         }
 
@@ -514,12 +528,12 @@ impl WorkflowBuilder {
                                 String::from_utf8_lossy(&trigger_wf_name),
                             );
                             let task = encode_task(instance_id, 0, 0, &payload);
-                            let _ = trigger_client.publish_sync_with_id(
+                            let _ = trigger_client.publish_with_id(
                                 task_stream_id,
                                 subject.as_bytes(),
                                 msg_id.as_bytes(),
                                 Bytes::from(task),
-                            ).await;
+                            );
                             msg.ack();
                         }
                     }
@@ -624,38 +638,3 @@ async fn create_or_get_stream(
     }
 }
 
-/// Create a consumer, or get its ID if it already exists.
-async fn create_or_get_consumer(
-    client: &Client,
-    stream_id: u32,
-    name: &[u8],
-    subject: &[u8],
-    max_inflight: u16,
-    ack_wait_ms: u32,
-) -> Result<u32, ClientError> {
-    match client
-        .create_consumer(
-            stream_id,
-            name,
-            name,    // group = name
-            subject,
-            max_inflight,
-            1, // AckPolicy::Explicit
-            0, // DeliverPolicy::All
-            1, // DeliverMode::Queue
-            ack_wait_ms,
-            0, // start_seq
-        )
-        .await
-    {
-        Ok(resp) => Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32),
-        Err(ClientError::Broker {
-            code: arbitro_proto::error::ErrorCode::ConsumerAlreadyExists,
-        }) => {
-            // Consumer exists — get its ID via get_consumer.
-            let resp = client.get_consumer(stream_id, name).await?;
-            Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32)
-        }
-        Err(e) => Err(e),
-    }
-}
