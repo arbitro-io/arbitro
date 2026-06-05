@@ -52,15 +52,26 @@ pub struct ExtendedPayload {
 
 impl ExtendedPayload {
     /// User payload — the first `payload_len` bytes of `data`.
+    ///
+    /// Returns an empty slice if `payload_len` exceeds the available
+    /// data (malformed wire input).
     #[inline]
     pub fn payload(&self) -> &[u8] {
-        &self.data[..self.payload_len.get() as usize]
+        let len = self.payload_len.get() as usize;
+        if len > self.data.len() {
+            return &[];
+        }
+        &self.data[..len]
     }
 
     /// The `HeadersBlock` that follows the user payload.
     #[inline]
     pub fn headers_block(&self) -> Option<&HeadersBlock> {
-        HeadersBlock::ref_from_bytes(&self.data[self.payload_len.get() as usize..]).ok()
+        let off = self.payload_len.get() as usize;
+        if off > self.data.len() {
+            return None;
+        }
+        HeadersBlock::ref_from_bytes(&self.data[off..]).ok()
     }
 
     /// Total wire size for a given payload + headers.
@@ -123,13 +134,22 @@ pub struct HeaderEntry {
 impl HeaderEntry {
     #[inline]
     pub fn key(&self) -> &[u8] {
-        &self.data[..self.key_len as usize]
+        let k = self.key_len as usize;
+        if k > self.data.len() {
+            return &[];
+        }
+        &self.data[..k]
     }
 
     #[inline]
     pub fn val(&self) -> &[u8] {
         let k = self.key_len as usize;
-        &self.data[k..k + self.val_len.get() as usize]
+        let v = self.val_len.get() as usize;
+        let end = k + v;
+        if end > self.data.len() {
+            return &[];
+        }
+        &self.data[k..end]
     }
 
     /// Total wire size of this entry (3-byte prefix + key + val).

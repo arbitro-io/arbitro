@@ -106,8 +106,6 @@ pub(in crate::shard) struct DrainScratch {
     flush_results: Vec<(ConnectionId, FlushOutcome)>,
     /// F12 — persistent buffer for the slow-path notify sort.
     sorted_notify: Vec<PendingNotify>,
-    /// F12 — persistent grouped-entries buffer for notifications.
-    notify_entries: Vec<DeliveredEntry>,
 }
 
 impl DrainScratch {
@@ -133,7 +131,6 @@ impl DrainScratch {
             ),
             flush_results: Vec::with_capacity(16),
             sorted_notify: Vec::with_capacity(256),
-            notify_entries: Vec::with_capacity(256),
         }
     }
 }
@@ -407,7 +404,6 @@ pub(in crate::shard) fn drain_deliver(
             &scratch.deliveries,
             &flush_results,
             &mut scratch.sorted_notify,
-            &mut scratch.notify_entries,
             silent_drops,
         );
     }
@@ -803,7 +799,6 @@ fn notify_delivered_grouped(
     deliveries: &[PendingNotify],
     flush_results: &[(ConnectionId, FlushOutcome)],
     sorted_buf: &mut Vec<PendingNotify>,
-    entries_buf: &mut Vec<DeliveredEntry>,
     silent_drops: &crate::common::SilentDrops,
 ) {
     // F11: replace the per-cycle HashMap<conn, bool> with a linear scan
@@ -851,8 +846,8 @@ fn notify_delivered_grouped(
     }
 
     // F12 + F28: slow path — mixed bindings and/or partial frame success.
-    // Reuse the persistent `sorted_buf` and `entries_buf` so we don't
-    // allocate per cycle. F28: counting sort on `binding_idx` (bounded
+    // Reuse the persistent `sorted_buf` so we don't allocate per cycle.
+    // F28: counting sort on `binding_idx` (bounded
     // by bindings.len()) replaces the comparison sort — O(N + K) vs
     // O(N log N) where K = bindings.len().
     sorted_buf.clear();
@@ -866,8 +861,8 @@ fn notify_delivered_grouped(
     let k = bindings.len();
     // F28 counting sort: two-pass into bucket_starts scratch.
     // bucket_starts[i] = where bucket i begins in the placed array.
-    // We reuse entries_buf as raw scratch for placement; it is cleared
-    // and recapped to N before use.
+    // We no longer use entries_buf — placement is done in a local vec,
+    // and per-group entries are collected directly from the placed slice.
     let mut bucket_counts: Vec<u32> = vec![0u32; k + 1];
     for d in sorted_buf.iter() {
         let idx = d.binding_idx;
@@ -878,9 +873,8 @@ fn notify_delivered_grouped(
     for i in 1..=k {
         bucket_counts[i] += bucket_counts[i - 1];
     }
-    // Place into a scratch of PendingNotify; we reuse entries_buf only
-    // for the final per-group DeliveredEntry copy, so allocate a small
-    // local placement vec sized exactly N (single alloc/cycle in slow
+    // Place into a scratch of PendingNotify. Allocate a small local
+    // placement vec sized exactly N (single alloc/cycle in slow
     // path; the fast path above handles the steady state).
     // Sentinel value reused as default for placement scratch.
     let sentinel = sorted_buf[0];
@@ -895,21 +889,23 @@ fn notify_delivered_grouped(
     }
 
     // Walk groups via bucket_starts -> bucket_starts[next].
+    // Collect directly from the placed slice into an owned Vec for
+    // each group — avoids the old entries_buf.clone() which was
+    // duplicating every DeliveredEntry.
     for idx in 0..k {
         let start = bucket_counts[idx] as usize;
         let end = bucket_counts[idx + 1] as usize;
         if start == end {
             continue;
         }
-        entries_buf.clear();
-        for p in &placed[start..end] {
-            entries_buf.push(DeliveredEntry {
+        let entries: Vec<DeliveredEntry> = placed[start..end]
+            .iter()
+            .map(|p| DeliveredEntry {
                 seq: p.seq,
                 subject_hash: p.subject_hash,
                 _pad: 0,
-            });
-        }
-        let entries: Vec<DeliveredEntry> = entries_buf.clone();
+            })
+            .collect();
         let binding = &bindings[idx];
         if notify_tx
             .try_send(DrainNotification::Delivered {

@@ -418,6 +418,7 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
                 crate::shard::idempotency::idempotency_for_stream(shared_idemp, stream_id);
             let mut tracker = tracker_arc.lock();
 
+            let mut stream_recovered = 0u64;
             store.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
                 // Skip entries older than the idempotency window.
                 if entry.timestamp < cutoff_ms {
@@ -450,13 +451,14 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
                 let remaining_ms = (window_ms as u64).saturating_sub(elapsed);
                 if remaining_ms > 0 {
                     tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
-                    total_recovered += 1;
+                    stream_recovered += 1;
                 }
             }).ok();
 
             drop(tracker);
-            if total_recovered > 0 {
+            if stream_recovered > 0 {
                 server.mark_idempotency_allocated(stream_id);
+                total_recovered += stream_recovered;
             }
         }
     }

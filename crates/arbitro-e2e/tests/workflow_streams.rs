@@ -1,8 +1,9 @@
 mod test_helper;
 use test_helper::{TestServer, TestServerBuilder};
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arbitro_client_tokio::workflow::{StepContext, StepResult};
@@ -601,4 +602,140 @@ async fn workflow_survives_broker_restart() {
         handle2.stop();
         server.shutdown().await;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 7: 6 workers distribute workflow instances via consumer group
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_6_workers_distribute_in_process() {
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    // Shared log: (worker_id, instance_id, step_index)
+    let log: Arc<Mutex<Vec<(u32, u32, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+    let entry_count = Arc::new(AtomicU32::new(0));
+
+    // Connect 6 separate clients, each registering the same workflow.
+    let mut handles = Vec::new();
+    let mut clients = Vec::new();
+
+    for worker_id in 0u32..6 {
+        let client = server.connect().await;
+
+        let log0 = log.clone();
+        let log1 = log.clone();
+        let log2 = log.clone();
+        let cnt0 = entry_count.clone();
+        let cnt1 = entry_count.clone();
+        let cnt2 = entry_count.clone();
+
+        let handle = client
+            .workflow(b"distrib")
+            .trigger(b"jobs.>")
+            .ack_wait_ms(5000)
+            .step(b"step-0", move |ctx: StepContext| {
+                let l = log0.clone();
+                let c = cnt0.clone();
+                async move {
+                    l.lock().unwrap().push((worker_id, ctx.instance_id, 0));
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(StepResult {
+                        context: ctx.context.clone(),
+                    })
+                }
+            })
+            .step(b"step-1", move |ctx: StepContext| {
+                let l = log1.clone();
+                let c = cnt1.clone();
+                async move {
+                    l.lock().unwrap().push((worker_id, ctx.instance_id, 1));
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(StepResult {
+                        context: ctx.context.clone(),
+                    })
+                }
+            })
+            .step(b"step-2", move |ctx: StepContext| {
+                let l = log2.clone();
+                let c = cnt2.clone();
+                async move {
+                    l.lock().unwrap().push((worker_id, ctx.instance_id, 2));
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(StepResult {
+                        context: ctx.context.clone(),
+                    })
+                }
+            })
+            .start()
+            .await
+            .expect("workflow start");
+
+        handles.push(handle);
+        clients.push(client);
+    }
+
+    // Use the first client's handle to trigger 12 instances.
+    for i in 0u32..12 {
+        let payload = format!("job-{i}");
+        handles[0]
+            .trigger(&clients[0], payload.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("trigger instance {i} failed: {e:?}"));
+    }
+
+    // Wait for all 36 log entries (12 instances × 3 steps).
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while entry_count.load(Ordering::SeqCst) < 36 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("not all 36 step executions completed within 15 seconds");
+
+    let entries = log.lock().unwrap().clone();
+
+    // Assert: no duplicate (instance_id, step_index) pairs.
+    let mut seen_pairs: HashSet<(u32, u16)> = HashSet::new();
+    for &(_, inst, step) in &entries {
+        assert!(
+            seen_pairs.insert((inst, step)),
+            "duplicate execution: instance_id={inst}, step_index={step}"
+        );
+    }
+
+    // Assert: every instance completed all 3 steps.
+    let mut instance_steps: std::collections::HashMap<u32, HashSet<u16>> =
+        std::collections::HashMap::new();
+    for &(_, inst, step) in &entries {
+        instance_steps.entry(inst).or_default().insert(step);
+    }
+    assert_eq!(
+        instance_steps.len(),
+        12,
+        "expected 12 distinct instances, got {}",
+        instance_steps.len()
+    );
+    for (inst, steps) in &instance_steps {
+        assert_eq!(
+            steps.len(),
+            3,
+            "instance {inst} has {} steps instead of 3: {:?}",
+            steps.len(),
+            steps
+        );
+    }
+
+    // Assert: multiple workers participated.
+    let unique_workers: HashSet<u32> = entries.iter().map(|&(w, _, _)| w).collect();
+    assert!(
+        unique_workers.len() > 1,
+        "expected more than 1 worker to participate, but only {:?} did",
+        unique_workers
+    );
+
+    for h in &handles {
+        h.stop();
+    }
+    server.shutdown().await;
 }

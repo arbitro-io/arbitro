@@ -313,15 +313,25 @@ fn v2_publish(
     // If the frame carries a msg_id, pack it as a header in the
     // extended payload layout so it survives in the journal for
     // idempotency recovery on restart.
-    let ext_buf: Vec<u8>;
+    //
+    // SmallVec inline buffer avoids a heap allocation for typical
+    // msg_id sizes (up to ~230 B payload+id fits inline in 256 B).
+    let mut ext_buf: smallvec::SmallVec<[u8; 256]> = smallvec::SmallVec::new();
     let (store_payload, store_flags): (&[u8], u8) = if !msg_id.is_empty() {
-        let hdrs: &[(&[u8], &[u8])] = &[(
+        let hdrs: [(&[u8], &[u8]); 1] = [(
             arbitro_proto::wire::msg_headers::HDR_MSG_ID,
             msg_id,
         )];
-        ext_buf = arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
+        let section = arbitro_proto::wire::msg_headers::HeadersBlock::section_size(&hdrs);
+        let wire_size = arbitro_proto::wire::msg_headers::ExtendedPayload::wire_size(
+            f.payload().len(),
+            section,
+        );
+        ext_buf.resize(wire_size, 0);
+        arbitro_proto::wire::msg_headers::encode_extended_payload(
+            &mut ext_buf,
             f.payload(),
-            hdrs,
+            &hdrs,
         );
         (&ext_buf, arbitro_store::flags::HAS_HEADERS)
     } else {
