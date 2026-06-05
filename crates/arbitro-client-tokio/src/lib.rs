@@ -39,7 +39,6 @@ pub mod consumer_builder;
 pub mod cron;
 pub mod error;
 pub mod metrics;
-pub mod workflow;
 
 pub(crate) mod conn;
 pub(crate) mod consume;
@@ -80,7 +79,6 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronContext, CronHandle};
-pub use workflow::{WorkflowBuilder, WorkflowErrorContext, WorkflowHandle, WorkflowStepContext};
 
 /// Consumer-config enums lifted from `arbitro-proto` so callers don't
 /// have to depend on the proto crate directly to set `ack_policy`,

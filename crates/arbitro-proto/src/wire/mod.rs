@@ -8,8 +8,6 @@ pub mod publish;
 pub mod stream;
 pub mod subscribe;
 pub mod system;
-pub mod workflow;
-
 pub use cron::*;
 pub use delivery::*;
 pub use envelope::*;
@@ -18,4 +16,3 @@ pub use publish::*;
 pub use stream::*;
 pub use subscribe::*;
 pub use system::*;
-pub use workflow::*;

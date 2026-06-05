@@ -374,6 +374,7 @@ impl MetadataApplier for ReplayApplier {
 /// the current time — older entries have already expired and should not
 /// block future publishes with the same id.
 pub async fn rebuild_idempotency(server: &ShardRouter) {
+    use arbitro_engine_v2::types::StreamId;
     use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
     use zerocopy::FromBytes;
 
@@ -393,11 +394,10 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
             Err(_) => continue,
         };
 
-        for (wire_id, _name) in &streams {
-            let stream_id = match server.names().stream_seq(*wire_id) {
-                Some(id) => id,
-                None => continue,
-            };
+        for (raw_id, _name) in &streams {
+            // list_streams returns (StreamId.raw(), name) — already the
+            // sequential engine ID, not a wire hash.
+            let stream_id = StreamId(*raw_id);
 
             let window_ms = server.names().stream_idempotency_window_ms(stream_id);
             if window_ms == 0 {

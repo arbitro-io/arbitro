@@ -33,7 +33,6 @@ pub mod persistence;
 pub mod server;
 pub mod shard;
 pub mod transport;
-pub mod workflow;
 
 // ── Compat re-exports ─────────────────────────────────────────────────────
 // Keep the old `arbitro_server::{router,command,command_log}::*` paths alive

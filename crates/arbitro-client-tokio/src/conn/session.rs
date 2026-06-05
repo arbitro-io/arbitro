@@ -88,8 +88,6 @@ pub(crate) async fn spawn_connection(
     replay_subscriptions(&inner);
     // Re-register any active cron jobs after reconnect.
     crate::cron::replay_crons(&inner);
-    // Re-register any active workflows after reconnect.
-    crate::workflow::replay_workflows(&inner);
 
     let cancel = inner.cancel.clone();
     tokio::spawn(async move {
@@ -139,10 +137,9 @@ pub(crate) async fn spawn_connection(
                             warn!(?e, "handshake write failed");
                             continue;
                         }
-                        // Replay subscriptions + crons + workflows before the new session starts.
+                        // Replay subscriptions + crons before the new session starts.
                         replay_subscriptions(&inner);
                         crate::cron::replay_crons(&inner);
-                        crate::workflow::replay_workflows(&inner);
                         rh = Some(r);
                         wh = Some(w);
                         back.reset();

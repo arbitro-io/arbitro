@@ -216,15 +216,6 @@ impl ArbitroServer {
             crate::cron::cron_loop(cron_reg_clone, cron_connections, cron_shutdown).await;
         });
 
-        // Workflow engine — ticks every 100ms checking step timeouts.
-        let workflow_registry = std::sync::Arc::new(crate::workflow::WorkflowRegistry::new());
-        let wf_reg_clone = std::sync::Arc::clone(&workflow_registry);
-        let wf_connections = self.registry.clone();
-        let wf_shutdown = shutdown_rx.clone();
-        let _workflow_handle = tokio::spawn(async move {
-            crate::workflow::workflow_engine_loop(wf_reg_clone, wf_connections, wf_shutdown).await;
-        });
-
         // Delayed publish journal — append-only file + min-heap maturation.
         let delayed_journal: Option<crate::delayed::SharedDelayedJournal> = if let Some(dir) =
             self.config.data_dir.as_deref()
@@ -521,7 +512,6 @@ impl ArbitroServer {
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
                                 let cron = cron_registry.clone();
-                                let wf = workflow_registry.clone();
                                 let delayed = delayed_journal.clone();
                                 #[cfg(feature = "cluster")]
                                 let cluster = cluster_state.clone();
@@ -529,7 +519,6 @@ impl ArbitroServer {
                                     read_loop(
                                         conn_id, reader, srv, reg, sd, auth,
                                         max_frame_size, max_ops_per_sec, cron,
-                                        wf,
                                         delayed,
                                         #[cfg(feature = "cluster")]
                                         cluster,
@@ -676,7 +665,6 @@ async fn read_loop(
     max_frame_size: usize,
     max_ops_per_sec: u32,
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
-    workflow_registry: std::sync::Arc<crate::workflow::WorkflowRegistry>,
     delayed_journal: Option<crate::delayed::SharedDelayedJournal>,
     #[cfg(feature = "cluster")] cluster_state: std::sync::Arc<crate::cluster::ClusterState>,
 ) {
@@ -800,7 +788,6 @@ async fn read_loop(
                     &server,
                     &registry,
                     &cron_registry,
-                    &workflow_registry,
                     &delayed_journal,
                     #[cfg(feature = "cluster")]
                     &cluster_state,

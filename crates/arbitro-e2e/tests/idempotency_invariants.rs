@@ -323,14 +323,12 @@ async fn batch_with_internal_duplicate_is_rejected() {
 // Cross-restart contract
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// T9. The idempotency dedup state is in-memory only. After a server
-/// restart, previously-recorded msg_ids are lost — re-publishing the
-/// same msg_id must succeed. This documents the explicit contract:
-/// **dedup does NOT survive restarts** (no disk persistence for the
-/// dedup window). Clients that need cross-restart exactly-once must
-/// implement their own producer-side dedup above the wire protocol.
+/// T9. Idempotency dedup state is rebuilt from the journal on restart.
+/// The msg_id is stored as a header in the extended payload layout
+/// (HAS_HEADERS flag) and recovered by scanning the store on boot.
+/// Re-publishing the same msg_id after restart must be REJECTED.
 #[tokio::test(flavor = "multi_thread")]
-async fn cross_restart_dedup_state_is_reset() {
+async fn cross_restart_dedup_survives() {
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
 
@@ -360,7 +358,7 @@ async fn cross_restart_dedup_state_is_reset() {
         server.shutdown().await;
     }
 
-    // ── Second boot: same data_dir (metadata restored) ───────────────
+    // ── Second boot: same data_dir (metadata + journal restored) ─────
     {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
@@ -376,15 +374,30 @@ async fn cross_restart_dedup_state_is_reset() {
         let stream_id = TestServer::find_stream_id(&resp, b"persistent")
             .expect("must find stream by name after restart");
 
-        // The same msg_id that was rejected in the first session must
-        // now be ACCEPTED — dedup state is ephemeral.
-        client
+        // The same msg_id must be REJECTED — dedup state was rebuilt
+        // from the journal on startup.
+        let err = client
             .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v2"))
             .await
-            .expect(
-                "cross-restart dedup state must be empty; the broker \
-                 does NOT persist the idempotency window to disk",
+            .expect_err(
+                "cross-restart dedup must reject duplicate; the broker \
+                 rebuilds the idempotency tracker from the journal",
             );
+        assert!(
+            is_duplicate(&err),
+            "expected IdempotencyDuplicate after restart, got {err:?}"
+        );
+
+        // A NEW msg_id must still be accepted.
+        client
+            .publish_sync_with_id(
+                stream_id,
+                b"k",
+                b"fresh-id",
+                Bytes::from_static(b"v3"),
+            )
+            .await
+            .expect("new msg_id must be accepted after restart");
 
         server.shutdown().await;
     }
@@ -445,4 +458,225 @@ async fn batch_mixed_id_and_no_id_entries() {
         "expected IdempotencyDuplicate, got {err:?}"
     );
     server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Consumer delivery — headers stripping & cross-restart with consumer
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// When a message is published with a msg_id (idempotency enabled), the
+/// broker stores the id as an internal header in the extended payload layout
+/// (HAS_HEADERS flag). The consumer must receive ONLY the user payload —
+/// the internal headers/metadata must be stripped before delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn delivery_with_headers_strips_metadata() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"strip_hdr", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    let resp = client
+        .create_consumer(
+            stream_id,
+            b"strip_c",
+            b"",
+            b"",
+            100u16,
+            1u8,  // AckPolicy::Explicit
+            0u8,  // DeliverPolicy::All
+            0u8,  // DeliverMode::default
+            5000u32, // ack_wait_ms
+            0u64,
+        )
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    // Publish with a msg_id — triggers HAS_HEADERS extended payload internally.
+    client
+        .publish_sync_with_id(
+            stream_id,
+            b"k.a",
+            b"test-msg-id",
+            Bytes::from_static(b"hello world"),
+        )
+        .await
+        .expect("publish with msg_id");
+
+    // Consumer must receive only the user payload, not the extended blob.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv())
+        .await
+        .expect("message should arrive within 3s")
+        .expect("subscription open");
+
+    assert_eq!(
+        msg.payload().as_ref(),
+        b"hello world",
+        "consumer must receive only the user payload without HAS_HEADERS metadata"
+    );
+    msg.ack();
+    server.shutdown().await;
+}
+
+/// Cross-restart with a consumer: after reboot the idempotency state is
+/// rebuilt from the journal, duplicate msg_ids are still rejected, new ones
+/// succeed, and the consumer only receives the new message (no replay of
+/// already-acked messages from the previous boot).
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_restart_idempotency_with_consumer() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    // ── First boot: publish, consume, ack ────────────────────────────────
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        let resp = client
+            .create_stream(b"restart_c", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+            .await
+            .unwrap();
+        let stream_id = TestServer::parse_id(&resp);
+
+        let resp = client
+            .create_consumer(
+                stream_id,
+                b"worker",
+                b"",
+                b"",
+                100u16,
+                1u8,  // AckPolicy::Explicit
+                0u8,  // DeliverPolicy::All
+                0u8,  // DeliverMode::default
+                5000u32, // ack_wait_ms
+                0u64,
+            )
+            .await
+            .unwrap();
+        let consumer_id = TestServer::parse_id(&resp);
+        let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+        // Publish with msg_id "dedup-1".
+        client
+            .publish_sync_with_id(
+                stream_id,
+                b"k.ev",
+                b"dedup-1",
+                Bytes::from_static(b"first-payload"),
+            )
+            .await
+            .expect("first publish");
+
+        // Consume and ack.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv())
+            .await
+            .expect("delivery within 3s")
+            .expect("subscription open");
+        assert_eq!(msg.payload().as_ref(), b"first-payload");
+        msg.ack();
+
+        // Small delay to let ack propagate to the engine.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        drop(handle);
+        server.shutdown().await;
+    }
+
+    // ── Second boot: same data_dir ───────────────────────────────────────
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        // Verify the stream survived restart.
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        assert_eq!(
+            TestServer::stream_count(&resp),
+            1,
+            "stream must survive restart"
+        );
+        let stream_id = TestServer::find_stream_id(&resp, b"restart_c")
+            .expect("must find stream by name after restart");
+
+        // Re-publishing "dedup-1" must be REJECTED — idempotency state rebuilt.
+        let err = client
+            .publish_sync_with_id(
+                stream_id,
+                b"k.ev",
+                b"dedup-1",
+                Bytes::from_static(b"replay-attempt"),
+            )
+            .await
+            .expect_err("duplicate msg_id must be rejected after restart");
+        assert!(
+            is_duplicate(&err),
+            "expected IdempotencyDuplicate after restart, got {err:?}"
+        );
+
+        // Publish a NEW msg_id "dedup-2" — must succeed.
+        client
+            .publish_sync_with_id(
+                stream_id,
+                b"k.ev",
+                b"dedup-2",
+                Bytes::from_static(b"second-payload"),
+            )
+            .await
+            .expect("new msg_id must be accepted after restart");
+
+        // Re-create consumer (same name returns same id) and subscribe.
+        let resp = client
+            .create_consumer(
+                stream_id,
+                b"worker",
+                b"",
+                b"",
+                100u16,
+                1u8,  // AckPolicy::Explicit
+                0u8,  // DeliverPolicy::All
+                0u8,  // DeliverMode::default
+                5000u32, // ack_wait_ms
+                0u64,
+            )
+            .await
+            .unwrap();
+        let consumer_id = TestServer::parse_id(&resp);
+        let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+        // Drain all delivered messages. Both "first-payload" (from boot 1)
+        // and "second-payload" (just published) live in the store. The
+        // consumer will deliver them; crucially, "second-payload" must
+        // appear — proving the new msg_id landed — and neither payload
+        // must contain HAS_HEADERS metadata (the broker strips it).
+        let mut payloads = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv()).await {
+                Ok(Some(msg)) => {
+                    payloads.push(msg.payload().to_vec());
+                    msg.ack();
+                }
+                _ => break,
+            }
+        }
+
+        // The new message ("dedup-2") MUST have been delivered.
+        assert!(
+            payloads.iter().any(|p| p == b"second-payload"),
+            "consumer must receive the new message (dedup-2); got: {:?}",
+            payloads.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>()
+        );
+        // The rejected duplicate "dedup-1" must NOT have produced a second
+        // copy of "replay-attempt" in the store — only the original
+        // "first-payload" may appear (once).
+        assert!(
+            !payloads.iter().any(|p| p == b"replay-attempt"),
+            "the rejected duplicate must not appear in the store"
+        );
+
+        server.shutdown().await;
+    }
 }
