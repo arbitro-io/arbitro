@@ -257,6 +257,69 @@ client.publish_delayed(stream_id, b"orders.reminder", payload, 5000).await?;
 await client.publishDelayed("ORDERS", "orders.reminder", payload, 5000);
 ```
 
+## Workflow Orchestration
+
+Workflows are **entirely client-side**. The broker provides streams, consumer groups, and idempotent publish -- zero workflow-specific code runs in the broker. This means any language client can implement workflows using the same primitives.
+
+### Architecture
+
+1. `WorkflowBuilder` creates an internal stream `_wf_{name}_tasks` with a 5-minute idempotency window and a DLQ stream `_wf_{name}_dlq`.
+2. Each worker joins a shared consumer group (`_wf_{name}_workers`) so tasks are distributed round-robin across processes.
+3. Step transitions publish the next task with an idempotent `msg_id` (`wf:{instance}:{step}:{attempt}`), preventing duplicates on retry/redeliver.
+4. `ack_wait_ms` on the consumer enables automatic failover -- if a worker dies mid-step, the broker redelivers to another worker after the timeout.
+5. Persistent idempotency: `msg_id` is stored in the journal via the `HAS_HEADERS` flag on the store entry. On broker restart, the recovery scan rebuilds the idempotency set from `ExtendedPayload` / `HeadersBlock` / `HeaderEntry` (all zerocopy `repr(C)` structs), so duplicate protection survives crashes.
+
+### Example (Rust)
+
+```rust
+let wf = client.workflow(b"order-process")
+    .trigger(b"orders.created")
+    .trigger_stream(orders_stream_id) // auto-subscribe for trigger
+    .step(b"validate", |ctx| async move {
+        let order = validate(ctx.context)?;
+        Ok(StepResult { context: order })
+    })
+    .compensate(b"validate", |ctx| async move {
+        rollback_validation(ctx.context).await;
+        Ok(StepResult { context: ctx.context })
+    })
+    .step(b"charge", |ctx| async move {
+        let receipt = charge(ctx.context).await?;
+        Ok(StepResult { context: receipt })
+    })
+    .compensate(b"charge", |ctx| async move {
+        refund(ctx.context).await;
+        Ok(StepResult { context: ctx.context })
+    })
+    .step(b"ship", |ctx| async move {
+        let tracking = ship(ctx.context).await?;
+        Ok(StepResult { context: tracking })
+    })
+    .max_retries(3)
+    .max_context_size(256 * 1024)
+    .ack_wait_ms(30_000)
+    .max_inflight(10)
+    .start().await?;
+
+// Trigger manually (auto-trigger also works via trigger_stream)
+let instance_id = wf.trigger(&client, b"initial context").await?;
+
+// Stop processing
+wf.stop();
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Auto-trigger** | `.trigger_stream(id)` subscribes to an external stream and creates workflow instances on match. |
+| **Saga / Compensation** | `.compensate()` registers rollback handlers per step. On permanent failure, compensations run in reverse for all completed steps. |
+| **Dead Letter Queue** | After `max_retries` exhausted, task + error go to `_wf_{name}_dlq` stream. |
+| **Context guard** | `max_context_size` (default 256 KB) rejects oversized payloads -- incoming are acked+discarded, outgoing are nacked. |
+| **Multi-worker distribution** | Consumer group with round-robin delivery. Each process gets its own consumer in the shared group. |
+| **Idempotent transitions** | `publish_with_id` deduplicates step publishes. Survives broker restart via `HAS_HEADERS` journal recovery. |
+| **Zerocopy headers** | `ExtendedPayload`, `HeadersBlock`, `HeaderEntry` are `repr(C)` zerocopy structs -- no parsing cost on the recovery path. |
+
 ## Roadmap
 
 ### Phase 1 — Core Engine (done)
