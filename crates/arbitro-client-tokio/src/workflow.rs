@@ -226,41 +226,41 @@ impl WorkflowBuilder {
         // Names use underscores (validate_name rejects dots); subjects use dots.
         let task_stream_name = format!("_wf_{name_str}_tasks");
         let task_subject = format!("_wf.{name_str}.>");
-        let consumer_name = format!("_wf_{name_str}_workers");
+        let group_name = format!("_wf_{name_str}_workers");
+        // Each worker gets a unique consumer name within the shared group.
+        // This allows multiple processes to subscribe independently while
+        // the consumer group handles round-robin delivery.
+        let worker_uid = next_instance_id(); // unique per process
+        let consumer_name = format!("_wf_{name_str}_w{worker_uid}");
 
-        // Create internal task stream with idempotency.
-        let resp = self
-            .client
-            .create_stream(
-                task_stream_name.as_bytes(),
-                task_subject.as_bytes(),
-                0, 0, 0, 1, 0, 0, 0,
-                300_000, // idempotency_window_ms = 5 min
-            )
-            .await?;
-        let task_stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+        // Create internal task stream with idempotency (idempotent — ignores AlreadyExists).
+        let task_stream_id = create_or_get_stream(
+            &self.client,
+            task_stream_name.as_bytes(),
+            task_subject.as_bytes(),
+            300_000, // idempotency_window_ms = 5 min
+        )
+        .await?;
 
-        // Create DLQ stream.
+        // Create DLQ stream (idempotent).
         let dlq_stream_name = format!("_wf_{name_str}_dlq");
         let dlq_subject = format!("_wf.{name_str}.dlq.>");
-        let dlq_resp = self
-            .client
-            .create_stream(
-                dlq_stream_name.as_bytes(),
-                dlq_subject.as_bytes(),
-                0, 0, 0, 1, 0, 0, 0,
-                0, // no idempotency needed for DLQ
-            )
-            .await?;
-        let dlq_stream_id = u64::from_le_bytes(dlq_resp[..8].try_into().unwrap()) as u32;
+        let dlq_stream_id = create_or_get_stream(
+            &self.client,
+            dlq_stream_name.as_bytes(),
+            dlq_subject.as_bytes(),
+            0, // no idempotency needed for DLQ
+        )
+        .await?;
 
-        // Create consumer with ack_wait for failover.
+        // Each worker creates its own consumer in the shared group.
+        // Consumer group round-robin ensures each task goes to one worker.
         let consumer_resp = self
             .client
             .create_consumer(
                 task_stream_id,
                 consumer_name.as_bytes(),
-                consumer_name.as_bytes(), // group = consumer name
+                group_name.as_bytes(), // shared group for round-robin
                 task_subject.as_bytes(),
                 self.max_inflight,
                 1, // AckPolicy::Explicit
@@ -596,5 +596,66 @@ impl std::fmt::Debug for WorkflowHandle {
         f.debug_struct("WorkflowHandle")
             .field("name", &String::from_utf8_lossy(&self.name))
             .finish()
+    }
+}
+
+// ── Idempotent create helpers ─────────────────────────────────────────────
+
+/// Create a stream, or get its ID if it already exists.
+async fn create_or_get_stream(
+    client: &Client,
+    name: &[u8],
+    subject: &[u8],
+    idempotency_window_ms: u32,
+) -> Result<u32, ClientError> {
+    match client
+        .create_stream(name, subject, 0, 0, 0, 1, 0, 0, 0, idempotency_window_ms)
+        .await
+    {
+        Ok(resp) => Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32),
+        Err(ClientError::Broker {
+            code: arbitro_proto::error::ErrorCode::StreamAlreadyExists,
+        }) => {
+            // Stream exists — get its ID via get_stream.
+            let resp = client.get_stream(name).await?;
+            Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Create a consumer, or get its ID if it already exists.
+async fn create_or_get_consumer(
+    client: &Client,
+    stream_id: u32,
+    name: &[u8],
+    subject: &[u8],
+    max_inflight: u16,
+    ack_wait_ms: u32,
+) -> Result<u32, ClientError> {
+    match client
+        .create_consumer(
+            stream_id,
+            name,
+            name,    // group = name
+            subject,
+            max_inflight,
+            1, // AckPolicy::Explicit
+            0, // DeliverPolicy::All
+            1, // DeliverMode::Queue
+            ack_wait_ms,
+            0, // start_seq
+        )
+        .await
+    {
+        Ok(resp) => Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32),
+        Err(ClientError::Broker {
+            code: arbitro_proto::error::ErrorCode::ConsumerAlreadyExists,
+        }) => {
+            // Consumer exists — get its ID via get_consumer.
+            let resp = client.get_consumer(stream_id, name).await?;
+            Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32)
+        }
+        Err(e) => Err(e),
     }
 }
