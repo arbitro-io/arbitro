@@ -67,7 +67,7 @@ async fn run() -> i32 {
         let child = Command::new(&worker_bin)
             .args([&broker_addr, &id.to_string(), &log_dir_str])
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit()) // show worker logs
             .spawn()
             .expect("spawn worker");
         workers.push(child);

@@ -47,6 +47,7 @@ async fn main() {
     let log_path_arc = Arc::new(log_path);
 
     // Register a 3-step workflow
+    eprintln!("worker {worker_id} connected, registering workflow...");
     let wf = client
         .workflow(b"multiproc")
         .trigger(b"jobs.start")
