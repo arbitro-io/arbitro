@@ -165,9 +165,10 @@ impl WorkflowBuilder {
         }
 
         let name_str = String::from_utf8_lossy(&self.name);
-        let task_stream_name = format!("_wf.{name_str}.tasks");
+        // Names use underscores (validate_name rejects dots); subjects use dots.
+        let task_stream_name = format!("_wf_{name_str}_tasks");
         let task_subject = format!("_wf.{name_str}.>");
-        let consumer_name = format!("_wf.{name_str}.workers");
+        let consumer_name = format!("_wf_{name_str}_workers");
 
         // Create internal task stream with idempotency.
         let resp = self
