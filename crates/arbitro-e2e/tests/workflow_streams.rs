@@ -1,5 +1,5 @@
 mod test_helper;
-use test_helper::TestServerBuilder;
+use test_helper::{TestServer, TestServerBuilder};
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -377,4 +377,228 @@ async fn workflow_worker_disconnect_redelivers() {
 
     handle2.stop();
     server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 5: Step timeout redelivers (ack_wait expiry)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_step_timeout_redelivers() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let completed = Arc::new(AtomicBool::new(false));
+
+    let attempts_clone = attempts.clone();
+    let completed_flag = completed.clone();
+
+    let handle = client
+        .workflow(b"timeout-test")
+        .trigger(b"timeout.start")
+        .ack_wait_ms(1000) // 1 second timeout
+        .step(b"maybe-slow", move |_ctx: StepContext| {
+            let att = attempts_clone.clone();
+            let flag = completed_flag.clone();
+            async move {
+                let n = att.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    // First attempt: sleep longer than ack_wait (5s > 1s).
+                    // The broker will auto-nack after 1s and redeliver.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Even if we return Ok here, the message was already
+                    // redelivered — the ack will be a no-op or ignored.
+                    Ok(StepResult {
+                        context: b"late".to_vec(),
+                    })
+                } else {
+                    // Subsequent attempt: succeed immediately.
+                    flag.store(true, Ordering::Release);
+                    Ok(StepResult {
+                        context: b"done".to_vec(),
+                    })
+                }
+            }
+        })
+        .start()
+        .await
+        .expect("workflow start");
+
+    handle
+        .trigger(&client, b"payload")
+        .await
+        .expect("trigger workflow");
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !completed.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("workflow did not complete within 10 seconds");
+
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "step must have been attempted at least twice (first timed out, redelivered), got {}",
+        attempts.load(Ordering::SeqCst),
+    );
+
+    handle.stop();
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 6: Workflow survives broker restart
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_survives_broker_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    // Reserve a fixed address so the second boot can bind the same port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+
+    let step0_started = Arc::new(AtomicBool::new(false));
+    let step1_completed = Arc::new(AtomicBool::new(false));
+
+    // ── First boot ───────────────────────────────────────────────────────
+    {
+        let mut server = TestServerBuilder::new()
+            .data_dir(dir_str)
+            .spawn_on(&addr)
+            .await;
+        let client = server.connect().await;
+
+        // Create a user-facing stream (to prove metadata survives).
+        client
+            .create_stream(b"user_data", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .expect("create user_data stream");
+
+        let s0_flag = step0_started.clone();
+        let s1_flag = step1_completed.clone();
+
+        let handle = client
+            .workflow(b"survive-restart")
+            .trigger(b"survive.start")
+            .ack_wait_ms(5000)
+            .step(b"first", move |ctx: StepContext| {
+                let flag = s0_flag.clone();
+                async move {
+                    flag.store(true, Ordering::Release);
+                    let mut out = ctx.context.clone();
+                    out.extend_from_slice(b"|step0");
+                    Ok(StepResult { context: out })
+                }
+            })
+            .step(b"second", move |ctx: StepContext| {
+                let flag = s1_flag.clone();
+                async move {
+                    flag.store(true, Ordering::Release);
+                    let mut out = ctx.context.clone();
+                    out.extend_from_slice(b"|step1");
+                    Ok(StepResult { context: out })
+                }
+            })
+            .start()
+            .await
+            .expect("workflow start (boot 1)");
+
+        // Trigger an instance and wait for both steps to complete.
+        handle
+            .trigger(&client, b"boot1")
+            .await
+            .expect("trigger workflow");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !step1_completed.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("first-boot workflow did not complete within 10 seconds");
+
+        assert!(
+            step0_started.load(Ordering::Acquire),
+            "step 0 must have run on first boot"
+        );
+        assert!(
+            step1_completed.load(Ordering::Acquire),
+            "step 1 must have completed on first boot"
+        );
+
+        handle.stop();
+        client.close();
+        server.shutdown().await;
+    }
+
+    // ── Second boot (same data_dir) ──────────────────────────────────────
+    // The _wf_* streams and consumer should be restored from metadata.
+    {
+        let mut server = TestServerBuilder::new()
+            .data_dir(dir_str)
+            .spawn_on(&addr)
+            .await;
+        let client = server.connect().await;
+
+        // Verify the user_data stream survived.
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let names = TestServer::stream_names(&resp);
+        assert!(
+            names.iter().any(|n| n == b"user_data"),
+            "user_data stream must survive restart"
+        );
+
+        let completed2 = Arc::new(AtomicBool::new(false));
+        let completed2_flag = completed2.clone();
+
+        // Re-register the same workflow on the new client.
+        let handle2 = client
+            .workflow(b"survive-restart")
+            .trigger(b"survive.start")
+            .ack_wait_ms(5000)
+            .step(b"first", |ctx: StepContext| async move {
+                let mut out = ctx.context.clone();
+                out.extend_from_slice(b"|step0");
+                Ok(StepResult { context: out })
+            })
+            .step(b"second", move |ctx: StepContext| {
+                let flag = completed2_flag.clone();
+                async move {
+                    flag.store(true, Ordering::Release);
+                    let mut out = ctx.context.clone();
+                    out.extend_from_slice(b"|step1");
+                    Ok(StepResult { context: out })
+                }
+            })
+            .start()
+            .await
+            .expect("workflow start (boot 2)");
+
+        // Trigger a NEW instance on the restarted server.
+        handle2
+            .trigger(&client, b"boot2")
+            .await
+            .expect("trigger workflow (boot 2)");
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !completed2.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("second-boot workflow did not complete within 10 seconds");
+
+        assert!(
+            completed2.load(Ordering::Acquire),
+            "new workflow instance must complete on restarted broker"
+        );
+
+        handle2.stop();
+        server.shutdown().await;
+    }
 }
