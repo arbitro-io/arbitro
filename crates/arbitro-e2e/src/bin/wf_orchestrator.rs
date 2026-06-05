@@ -73,9 +73,10 @@ async fn run() -> i32 {
         workers.push(child);
     }
 
-    // Wait for workers to connect and register
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    eprintln!("6 workers launched");
+    // Wait for workers to connect, create stream, create consumer, subscribe.
+    // Each worker does 3 sequential round-trips. Give them enough time.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    eprintln!("6 workers launched, waiting for all subscriptions to stabilize...");
 
     // ── Connect a trigger client ──────────────────────────────────────
     let client = arbitro_client_tokio::Client::connect(
