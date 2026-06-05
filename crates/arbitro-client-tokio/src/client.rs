@@ -733,4 +733,11 @@ impl Client {
         crate::cron::CronBuilder::new(self, name)
     }
 
+    // ── Workflow orchestration ─────────────────────────────────────────
+
+    /// Start building a workflow pipeline. Uses streams + consumer groups
+    /// internally — the broker has no workflow-specific code.
+    pub fn workflow(&self, name: &[u8]) -> crate::workflow::WorkflowBuilder {
+        crate::workflow::WorkflowBuilder::new(self.clone(), name)
+    }
 }
