@@ -79,6 +79,11 @@ pub struct ShardRouter {
     /// dashboards / health checks. Lock contention is irrelevant —
     /// these RPCs are not on any hot path.
     list_cache: Arc<parking_lot::Mutex<ListCache>>,
+    /// Optional replication sender — set when clustered. Shard workers
+    /// send `ReplicationBatch`es through this channel; the replication
+    /// loop forwards them to followers via the cluster transport.
+    #[cfg(feature = "cluster")]
+    replication_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>>,
 }
 
 /// F37 — list_streams / list_consumers TTL cache. 1-second freshness
@@ -165,6 +170,12 @@ impl ShardRouter {
         let names = Arc::new(NameRegistry::new());
         // H10: one SilentDrops shared by every shard + the registry.
         let silent_drops = Arc::new(crate::common::SilentDrops::new());
+        // Cluster replication sender — shared between the router and all
+        // shard workers. Starts as None; `set_replication_tx` fills it
+        // during cluster boot. Workers check it lazily on flush.
+        #[cfg(feature = "cluster")]
+        let replication_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>> =
+            Arc::new(parking_lot::Mutex::new(None));
 
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
@@ -275,6 +286,8 @@ impl ShardRouter {
                 dlq_nack_counts: std::collections::HashMap::with_hasher(
                     foldhash::fast::FixedState::default(),
                 ),
+                #[cfg(feature = "cluster")]
+                replication_tx: Arc::clone(&replication_tx),
             };
 
             // M15: supervise the command-worker task — if it panics
@@ -356,6 +369,8 @@ impl ShardRouter {
             // F37: empty cache; first list_streams / list_consumers
             // populates it.
             list_cache: Arc::new(parking_lot::Mutex::new(ListCache::default())),
+            #[cfg(feature = "cluster")]
+            replication_tx,
         }
     }
 
@@ -443,6 +458,20 @@ impl ShardRouter {
     #[inline]
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Set the replication sender. Called once during cluster boot in
+    /// `server.rs` after the `replication_loop` task is spawned. The
+    /// sender is stored inside the shared `Arc<Mutex<Option<...>>>`
+    /// that every shard worker already holds a clone of, so workers
+    /// see it immediately on their next flush without any explicit
+    /// propagation.
+    #[cfg(feature = "cluster")]
+    pub fn set_replication_tx(
+        &self,
+        tx: mpsc::Sender<crate::cluster::replication::ReplicationBatch>,
+    ) {
+        *self.replication_tx.lock() = Some(tx);
     }
 
     pub async fn shutdown(&self) {

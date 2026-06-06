@@ -114,6 +114,43 @@ impl CommandWorker {
                     }
                     self.gate.release();
 
+                    // ── Async replication: fire-and-forget to followers ───
+                    #[cfg(feature = "cluster")]
+                    {
+                        let replicas = self.names.stream_replicas(stream_id);
+                        if replicas > 1 {
+                            if let Some(tx) = self.replication_tx.lock().as_ref() {
+                                // Serialize entries for replication:
+                                // each entry = [total_len:u32][subject_len:u16][subject][payload]
+                                let mut entries_bytes = Vec::new();
+                                for e in &store_entries {
+                                    let subj_len = e.subject.len() as u16;
+                                    let total_len = 2 + e.subject.len() + e.payload.len();
+                                    entries_bytes.extend_from_slice(
+                                        &(total_len as u32).to_le_bytes(),
+                                    );
+                                    entries_bytes
+                                        .extend_from_slice(&subj_len.to_le_bytes());
+                                    entries_bytes.extend_from_slice(&e.subject);
+                                    entries_bytes.extend_from_slice(&e.payload);
+                                }
+                                let batch =
+                                    crate::cluster::replication::ReplicationBatch {
+                                        stream_id: stream_id.raw(),
+                                        first_seq,
+                                        entry_count: store_entries.len() as u32,
+                                        timestamp_ms: now_ms,
+                                        entries_bytes,
+                                    };
+                                // Non-blocking: drop the batch if the channel
+                                // is full — async replication is best-effort
+                                // for v1. The ISR tracker will eject lagging
+                                // followers once quorum wait is added.
+                                let _ = tx.try_send(batch);
+                            }
+                        }
+                    }
+
                     // Enforce max_msgs / max_bytes capacity limits (FIFO eviction).
                     // Checked after append so callers always get a sequence number.
                     if let Some(ret) = self.stream_retention.get(&stream_id) {

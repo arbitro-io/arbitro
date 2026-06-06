@@ -407,6 +407,13 @@ pub struct CommandWorker {
     /// entirely (no entries can be expired). Invalidated on truncation
     /// and when streams are deleted.
     pub(super) stream_oldest_ts: HashMap<StreamId, u64, foldhash::fast::FixedState>,
+    /// Optional replication sender — shared with the `ShardRouter`. The
+    /// router's `set_replication_tx` fills the `Option` inside the Mutex
+    /// during cluster boot; the shard worker reads it lazily on the first
+    /// flush that needs replication. The `Arc<Mutex<Option<Sender>>>` is
+    /// the same instance stored in the router, so no manual propagation.
+    #[cfg(feature = "cluster")]
+    pub(super) replication_tx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>>,
 }
 
 impl CommandWorker {

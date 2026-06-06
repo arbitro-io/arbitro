@@ -365,9 +365,18 @@ impl ArbitroServer {
                     .cluster_listen
                     .parse()
                     .expect("invalid cluster_listen addr");
-                let transport = TcpRaftTransport::new(bind_addr, peer_addrs)
+                let transport = TcpRaftTransport::new(bind_addr, peer_addrs.clone())
                     .await
                     .expect("failed to create raft transport");
+
+                // Extract the replication receiver BEFORE moving the
+                // transport into the Raft node. This channel receives
+                // data-plane replication frames (kind >= 20) that are
+                // split off from Raft consensus frames in
+                // `read_raft_frames`.
+                let repl_rx = transport
+                    .take_replication_rx()
+                    .expect("replication rx already taken");
 
                 let raft_node = RaftNode::new(node_config, storage_for_raft, transport)
                     .expect("failed to create raft node");
@@ -401,6 +410,55 @@ impl ArbitroServer {
                 tokio::spawn(async move {
                     apply_loop::apply_loop(storage_inner, sm, apply_shutdown).await;
                 });
+
+                // ── Data-plane replication ────────────────────────────
+                // Leader side: shard workers → mpsc → replication_loop → TCP → followers.
+                // Follower side: TCP → repl_rx → follower_replication_loop → local store.
+                {
+                    use crate::cluster::replication::{
+                        follower_replication_loop, replication_loop,
+                    };
+
+                    // Leader replication channel: shard workers push batches here.
+                    let (repl_tx, repl_loop_rx) =
+                        tokio::sync::mpsc::channel::<crate::cluster::replication::ReplicationBatch>(
+                            4096,
+                        );
+                    self.server.set_replication_tx(repl_tx);
+
+                    // Spawn leader-side replication loop.
+                    let repl_peer_addrs = peer_addrs.clone();
+                    let repl_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        replication_loop(
+                            repl_loop_rx,
+                            node_id.0,
+                            repl_peer_addrs,
+                            repl_shutdown,
+                        )
+                        .await;
+                    });
+
+                    // Spawn follower-side replication loop.
+                    let follower_server = self.server.clone();
+                    let follower_peer_addrs = peer_addrs;
+                    let follower_shutdown = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        follower_replication_loop(
+                            repl_rx,
+                            follower_server,
+                            node_id.0,
+                            follower_peer_addrs,
+                            follower_shutdown,
+                        )
+                        .await;
+                    });
+
+                    tracing::info!(
+                        node_id = node_id.0,
+                        "data-plane replication tasks started"
+                    );
+                }
 
                 tracing::info!(node_id = node_id.0, "raft node started");
                 cluster_state = std::sync::Arc::new(crate::cluster::ClusterState::Clustered {

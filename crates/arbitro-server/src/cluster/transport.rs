@@ -22,11 +22,27 @@ use tokio::sync::Mutex;
 /// Offset of `body_len: U32` inside `RaftFrameHeader`.
 const BODY_LEN_OFFSET: usize = 16;
 
+/// Minimum kind value for data-plane replication frames. Frames with
+/// `kind >= REPLICATION_KIND_MIN` are routed to the dedicated replication
+/// channel instead of the Raft consensus channel.
+const REPLICATION_KIND_MIN: u8 = 20;
+
+/// Offset of the `kind` byte inside `RaftFrameHeader`.
+const KIND_OFFSET: usize = 5;
+
 pub struct TcpRaftTransport {
     peers: HashMap<PeerId, SocketAddr>,
     connections: Arc<Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<TcpStream>>>>>,
     incoming_rx: Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     _incoming_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Replication frames (kind >= 20) arrive here. Raft consensus frames
+    /// (kind 1-11) go to `incoming_rx`; replication frames are split off
+    /// in `read_raft_frames` so the Raft node never sees them.
+    ///
+    /// `Option` so `take_replication_rx()` can extract it before the
+    /// transport is moved into `RaftNode::new()`.
+    repl_incoming_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    _repl_incoming_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 impl TcpRaftTransport {
@@ -39,10 +55,12 @@ impl TcpRaftTransport {
             .map_err(|e| RaftError::Transport(format!("bind {bind_addr}: {e}")))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let (repl_tx, repl_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
         let accept_tx = tx.clone();
+        let accept_repl_tx = repl_tx.clone();
         tokio::spawn(async move {
-            Self::accept_loop(listener, accept_tx).await;
+            Self::accept_loop(listener, accept_tx, accept_repl_tx).await;
         });
 
         Ok(Self {
@@ -50,17 +68,36 @@ impl TcpRaftTransport {
             connections: Arc::new(Mutex::new(HashMap::new())),
             incoming_rx: Mutex::new(rx),
             _incoming_tx: tx,
+            repl_incoming_rx: parking_lot::Mutex::new(Some(repl_rx)),
+            _repl_incoming_tx: repl_tx,
         })
     }
 
-    async fn accept_loop(listener: TcpListener, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    /// Take the replication receiver out of the transport. Must be called
+    /// BEFORE the transport is moved into `RaftNode::new()`. Returns the
+    /// receiver end of the replication channel; the caller (typically
+    /// `server.rs`) passes it to the `follower_replication_loop`.
+    ///
+    /// Returns `None` if already taken.
+    pub fn take_replication_rx(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+        self.repl_incoming_rx.lock().take()
+    }
+
+    async fn accept_loop(
+        listener: TcpListener,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        repl_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let frame_tx = tx.clone();
+            let frame_repl_tx = repl_tx.clone();
             tokio::spawn(async move {
-                Self::read_raft_frames(stream, frame_tx).await;
+                Self::read_raft_frames(stream, frame_tx, frame_repl_tx).await;
             });
         }
     }
@@ -69,7 +106,15 @@ impl TcpRaftTransport {
     ///
     /// Protocol: [32-byte RaftFrameHeader][body of body_len bytes]
     /// body_len is at offset 16 in the header (U32 LE).
-    async fn read_raft_frames(mut stream: TcpStream, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+    ///
+    /// Frames with `kind >= REPLICATION_KIND_MIN` (20) are routed to the
+    /// replication channel (`repl_tx`); all others go to the Raft
+    /// consensus channel (`tx`).
+    async fn read_raft_frames(
+        mut stream: TcpStream,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        repl_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
         let mut buf = Vec::with_capacity(65536);
         loop {
             // Ensure we have at least the 32-byte header.
@@ -100,10 +145,17 @@ impl TcpRaftTransport {
                 buf.extend_from_slice(&tmp[..n]);
             }
 
-            // Extract frame and send.
+            // Extract frame and route by kind.
             let frame = buf[..total].to_vec();
             buf.drain(..total);
-            if tx.send(frame).await.is_err() {
+
+            let kind = frame.get(KIND_OFFSET).copied().unwrap_or(0);
+            let target_tx = if kind >= REPLICATION_KIND_MIN {
+                &repl_tx
+            } else {
+                &tx
+            };
+            if target_tx.send(frame).await.is_err() {
                 return;
             }
         }
