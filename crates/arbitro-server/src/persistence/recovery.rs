@@ -214,6 +214,9 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_stream_idempotency(stream_id, sv.idempotency_window_ms());
+                self.server
+                    .names()
+                    .set_stream_replicas(stream_id, sv.replicas());
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
                     config: StreamConfig {

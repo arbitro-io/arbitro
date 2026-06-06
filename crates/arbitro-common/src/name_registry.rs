@@ -113,6 +113,9 @@ struct HotSnapshot {
     /// for the publish hot path. Indexed by `StreamId.0`. A value of `0`
     /// means the stream has dedup disabled.
     streams_idempotency_window_ms: Vec<u32>,
+    /// Per-stream replication factor. Indexed by `StreamId.0`.
+    /// 1 = no replication (default).
+    streams_replicas: Vec<u8>,
     /// Per-consumer stream binding — needed on every ack/nack frame to
     /// recover the stream id (v2 ack body has no stream_id field).
     /// Indexed by `ConsumerId.0`; gaps stay as `u32::MAX` (sentinel).
@@ -128,12 +131,14 @@ impl HotSnapshot {
         let streams_by_wire = inner.streams_by_wire.clone();
         let streams_seq_to_wire = inner.streams_seq_to_wire.clone();
         let streams_idempotency_window_ms = inner.streams_idempotency_window_ms.clone();
+        let streams_replicas = inner.streams_replicas.clone();
         let consumer_stream = inner.consumer_stream.clone();
         let stream_quotas = inner.stream_quotas.clone();
         Self {
             streams_by_wire,
             streams_seq_to_wire,
             streams_idempotency_window_ms,
+            streams_replicas,
             consumer_stream,
             stream_quotas,
         }
@@ -151,6 +156,9 @@ struct Inner {
     /// Per-stream idempotency window in milliseconds. Indexed by
     /// `StreamId.0`. Authoritative copy.
     streams_idempotency_window_ms: Vec<u32>,
+    /// Per-stream replication factor. Indexed by `StreamId.0`.
+    /// Authoritative copy. 1 = no replication (default).
+    streams_replicas: Vec<u8>,
     /// M7: original stream name stored alongside the wire_id so we can
     /// detect `wire_hash_32` collisions (two distinct names hashing to the
     /// same u32). Keyed by wire_id; bytes match the original CreateStream
@@ -214,6 +222,7 @@ impl Inner {
             ),
             streams_seq_to_wire: Vec::with_capacity(PREALLOC),
             streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
+            streams_replicas: Vec::with_capacity(PREALLOC),
             streams_name_by_wire: HashMap::with_capacity_and_hasher(
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
@@ -328,6 +337,10 @@ impl NameRegistry {
                     .resize((id.0 as usize) + 1, 0);
             }
             g.streams_idempotency_window_ms[id.0 as usize] = 0;
+            if (id.0 as usize) >= g.streams_replicas.len() {
+                g.streams_replicas.resize((id.0 as usize) + 1, 1);
+            }
+            g.streams_replicas[id.0 as usize] = 1;
             (id, true)
         })
     }
@@ -381,6 +394,10 @@ impl NameRegistry {
                     .resize((id.0 as usize) + 1, 0);
             }
             g.streams_idempotency_window_ms[id.0 as usize] = 0;
+            if (id.0 as usize) >= g.streams_replicas.len() {
+                g.streams_replicas.resize((id.0 as usize) + 1, 1);
+            }
+            g.streams_replicas[id.0 as usize] = 1;
             (id, true)
         })
     }
@@ -420,6 +437,9 @@ impl NameRegistry {
             if let Some(slot) = g.streams_idempotency_window_ms.get_mut(removed.0 as usize) {
                 *slot = 0;
             }
+            if let Some(slot) = g.streams_replicas.get_mut(removed.0 as usize) {
+                *slot = 0;
+            }
             Some(removed)
         })
     }
@@ -455,6 +475,30 @@ impl NameRegistry {
             .get(seq.0 as usize)
             .copied()
             .unwrap_or(0)
+    }
+
+    // ── Stream replicas ───────────────────────────────────────────────────
+
+    /// Set the replication factor for a stream. 1 = no replication (default).
+    pub fn set_stream_replicas(&self, seq: StreamId, replicas: u8) {
+        self.with_inner_swap(|g| {
+            let idx = seq.0 as usize;
+            if idx >= g.streams_replicas.len() {
+                g.streams_replicas.resize(idx + 1, 1); // default 1 = no repl
+            }
+            g.streams_replicas[idx] = replicas.max(1); // min 1
+        });
+    }
+
+    /// Get the replication factor for a stream. Returns 1 when unknown.
+    #[inline]
+    pub fn stream_replicas(&self, seq: StreamId) -> u8 {
+        self.hot
+            .load()
+            .streams_replicas
+            .get(seq.0 as usize)
+            .copied()
+            .unwrap_or(1)
     }
 
     // ── Stream quotas ──────────────────────────────────────────────────────

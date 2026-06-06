@@ -974,6 +974,9 @@ async fn v2_create_stream(
             server
                 .names()
                 .set_stream_idempotency(seq_stream, idempotency_window_ms);
+            server
+                .names()
+                .set_stream_replicas(seq_stream, body.replicas);
 
             // Store stream quota limits so the publish hot path can
             // pre-check and reject with StreamFull for DiscardPolicy::New.
