@@ -7,6 +7,7 @@
 //! shard path for maximum throughput (Kafka-style async replication).
 
 pub mod apply_loop;
+pub mod replication;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;

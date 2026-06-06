@@ -126,7 +126,7 @@ impl RaftTransport for TcpRaftTransport {
         async move {
             let addr = *peers
                 .get(&peer)
-                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {peer:?}")))?;
 
             let stream = {
                 let mut conns = connections.lock().await;
@@ -172,7 +172,7 @@ impl RaftTransport for TcpRaftTransport {
         async move {
             let addr = *peers
                 .get(&peer)
-                .ok_or_else(|| RaftError::Transport(format!("unknown peer {:?}", peer)))?;
+                .ok_or_else(|| RaftError::Transport(format!("unknown peer {peer:?}")))?;
 
             let stream = {
                 let mut conns = connections.lock().await;
@@ -196,50 +196,46 @@ impl RaftTransport for TcpRaftTransport {
         }
     }
 
-    fn recv_frame(
+    async fn recv_frame(
         &self,
         out: &mut [u8],
-    ) -> impl std::future::Future<Output = Result<usize, RaftError>> + Send {
-        async move {
-            let mut rx = self.incoming_rx.lock().await;
-            let frame = rx
-                .recv()
-                .await
-                .ok_or_else(|| RaftError::Transport("incoming channel closed".into()))?;
-            let len = frame.len();
-            if out.len() < len {
-                return Err(RaftError::Transport(format!(
-                    "recv buffer too small: need {len}, have {}",
-                    out.len()
-                )));
-            }
-            out[..len].copy_from_slice(&frame);
-            Ok(len)
+    ) -> Result<usize, RaftError> {
+        let mut rx = self.incoming_rx.lock().await;
+        let frame = rx
+            .recv()
+            .await
+            .ok_or_else(|| RaftError::Transport("incoming channel closed".into()))?;
+        let len = frame.len();
+        if out.len() < len {
+            return Err(RaftError::Transport(format!(
+                "recv buffer too small: need {len}, have {}",
+                out.len()
+            )));
         }
+        out[..len].copy_from_slice(&frame);
+        Ok(len)
     }
 
-    fn recv_frame_timeout(
+    async fn recv_frame_timeout(
         &self,
         timeout: Duration,
         out: &mut [u8],
-    ) -> impl std::future::Future<Output = Result<Option<usize>, RaftError>> + Send {
-        async move {
-            let mut rx = self.incoming_rx.lock().await;
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Ok(Some(frame)) => {
-                    let len = frame.len();
-                    if out.len() < len {
-                        return Err(RaftError::Transport(format!(
-                            "recv buffer too small: need {len}, have {}",
-                            out.len()
-                        )));
-                    }
-                    out[..len].copy_from_slice(&frame);
-                    Ok(Some(len))
+    ) -> Result<Option<usize>, RaftError> {
+        let mut rx = self.incoming_rx.lock().await;
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(frame)) => {
+                let len = frame.len();
+                if out.len() < len {
+                    return Err(RaftError::Transport(format!(
+                        "recv buffer too small: need {len}, have {}",
+                        out.len()
+                    )));
                 }
-                Ok(None) => Err(RaftError::Transport("incoming channel closed".into())),
-                Err(_) => Ok(None),
+                out[..len].copy_from_slice(&frame);
+                Ok(Some(len))
             }
+            Ok(None) => Err(RaftError::Transport("incoming channel closed".into())),
+            Err(_) => Ok(None),
         }
     }
 }

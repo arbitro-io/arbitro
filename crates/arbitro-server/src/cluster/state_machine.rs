@@ -58,6 +58,7 @@ pub enum ClusterCommand {
 /// Holds an `Arc<ShardRouter>` so it can create/delete streams and
 /// consumers when Raft entries are committed.  The `applied` log is kept
 /// for snapshot/restore.
+#[derive(Default)]
 pub struct ArbitroStateMachine {
     applied: Vec<ClusterCommand>,
     router: Option<Arc<ShardRouter>>,
@@ -67,10 +68,7 @@ impl ArbitroStateMachine {
     /// Create a state machine without a router (used during early init
     /// before the `ShardRouter` is available).
     pub fn new() -> Self {
-        Self {
-            applied: Vec::new(),
-            router: None,
-        }
+        Self::default()
     }
 
     /// Wire the shard router so `apply()` actually executes commands.
