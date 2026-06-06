@@ -403,8 +403,6 @@ Replication is transparent to clients. The `replicas` count is set once at `crea
 - [x] Follower catch-up — journal delta read + batch send on reconnect
 - [x] High watermark — per-stream seq confirmed by all ISR
 - [ ] Quorum wait before RepOk (v2 — ISR infra ready)
-- [ ] Adaptive subject prioritization
-- [ ] Cross-shard subject aggregation for global limits
 - [ ] Membership changes (add/remove nodes at runtime)
 
 ## Next Session Context
