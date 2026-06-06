@@ -589,6 +589,144 @@ pub async fn follower_replication_loop(
     }
 }
 
+// ── ISR tick loop ────────────────────────────────────────────────────────
+
+/// Periodic ISR tick loop. Runs every 1 second, calls `IsrTracker::tick()`
+/// to eject followers that haven't acked within the lag timeout, and logs
+/// each ejection.
+///
+/// The `isr_tracker` is shared via `Arc<parking_lot::Mutex<IsrTracker>>`
+/// so that the replication_loop can call `record_ack` on ack receipt
+/// (to be wired in a follow-up).
+pub async fn isr_tick_loop(
+    isr_tracker: std::sync::Arc<parking_lot::Mutex<IsrTracker>>,
+    node_id: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    // Skip the first immediate tick.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                tracing::debug!(node_id, "ISR tick loop shutting down");
+                return;
+            }
+            _ = interval.tick() => {
+                let ejected = isr_tracker.lock().tick();
+                for (stream_id, peer_id) in &ejected {
+                    tracing::warn!(
+                        node_id,
+                        stream_id = stream_id.0,
+                        peer = peer_id.0,
+                        "ISR: ejected stale follower"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── Catch-up request handler ─────────────────────────────────────────────
+
+/// Handle a catch-up request from a follower. Reads entries from the
+/// local journal starting at `from_seq` and builds `ReplicateEntries`
+/// frame(s) that can be sent to the requesting peer.
+///
+/// Returns the built frame bytes. The caller is responsible for sending
+/// them over the transport connection to the peer (transport wiring is
+/// a follow-up — for now this is a skeleton that reads and builds).
+pub fn handle_catch_up_request(
+    request: &CatchUpRequest,
+    server: &crate::shard::router::ShardRouter,
+    _peer: PeerId,
+    my_peer_id: u64,
+) -> Vec<Vec<u8>> {
+    let stream_id_raw = request.stream_id.get();
+    let from_seq = request.from_seq.get();
+    let stream_id = StreamId(stream_id_raw);
+    let store = server.store_for(stream_id);
+
+    let info = store.lock().info();
+    if info.messages == 0 || from_seq > info.last_seq {
+        // Nothing to catch up — the follower is already up to date
+        // or the store is empty.
+        return Vec::new();
+    }
+
+    // Read entries from from_seq to last_seq (inclusive) and build
+    // ReplicationBatch frames. We batch up to 1000 entries per frame
+    // to avoid oversized frames.
+    const MAX_ENTRIES_PER_FRAME: usize = 1000;
+
+    let mut frames = Vec::new();
+    let mut entries_bytes = Vec::new();
+    let mut entry_count = 0u32;
+    let mut batch_first_seq = from_seq;
+
+    let end_seq = info.last_seq + 1; // for_each uses [start, end)
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Lock the store once and iterate.
+    let guard = store.lock();
+    let _ = guard.for_each(from_seq, end_seq, &mut |entry| {
+        // Encode entry: [total_len:u32][subject_len:u16][subject][payload]
+        let subj_len = entry.subject.len();
+        let total_len = 2 + subj_len + entry.payload.len();
+        entries_bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
+        entries_bytes.extend_from_slice(&(subj_len as u16).to_le_bytes());
+        entries_bytes.extend_from_slice(entry.subject);
+        entries_bytes.extend_from_slice(entry.payload);
+        entry_count += 1;
+
+        // Flush a frame when we hit the batch limit.
+        if entry_count as usize >= MAX_ENTRIES_PER_FRAME {
+            let batch = ReplicationBatch {
+                stream_id: stream_id_raw,
+                first_seq: batch_first_seq,
+                entry_count,
+                timestamp_ms: now_ms,
+                entries_bytes: std::mem::take(&mut entries_bytes),
+            };
+            frames.push(build_replicate_entries_frame(&batch, my_peer_id));
+            batch_first_seq = entry.seq + 1;
+            entry_count = 0;
+        }
+    });
+    drop(guard);
+
+    // Flush remaining entries.
+    if entry_count > 0 {
+        let batch = ReplicationBatch {
+            stream_id: stream_id_raw,
+            first_seq: batch_first_seq,
+            entry_count,
+            timestamp_ms: now_ms,
+            entries_bytes,
+        };
+        frames.push(build_replicate_entries_frame(&batch, my_peer_id));
+    }
+
+    // TODO: Send frames to the requesting peer over the transport
+    // connection. For now the caller receives the built frames and
+    // can wire the sending once the transport API is available.
+
+    tracing::debug!(
+        stream_id = stream_id_raw,
+        from_seq,
+        frames = frames.len(),
+        peer = _peer.0,
+        "catch-up: built frames for follower"
+    );
+
+    frames
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

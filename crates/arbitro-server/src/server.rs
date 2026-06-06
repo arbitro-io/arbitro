@@ -416,7 +416,7 @@ impl ArbitroServer {
                 // Follower side: TCP → repl_rx → follower_replication_loop → local store.
                 {
                     use crate::cluster::replication::{
-                        follower_replication_loop, replication_loop,
+                        follower_replication_loop, replication_loop, IsrTracker,
                     };
 
                     // Leader replication channel: shard workers push batches here.
@@ -450,6 +450,26 @@ impl ArbitroServer {
                             node_id.0,
                             follower_peer_addrs,
                             follower_shutdown,
+                        )
+                        .await;
+                    });
+
+                    // Spawn ISR tick loop — ejects stale followers every second.
+                    // The tracker is wrapped in Arc<Mutex<>> so it can later be
+                    // shared with the replication_loop (for record_ack on ack
+                    // receipt). For now it runs standalone with a fresh tracker.
+                    let isr_tracker = std::sync::Arc::new(
+                        parking_lot::Mutex::new(
+                            IsrTracker::new(std::time::Duration::from_secs(10)),
+                        ),
+                    );
+                    let isr_shutdown = shutdown_rx.clone();
+                    let isr_node_id = node_id.0;
+                    tokio::spawn(async move {
+                        crate::cluster::replication::isr_tick_loop(
+                            isr_tracker,
+                            isr_node_id,
+                            isr_shutdown,
                         )
                         .await;
                     });
