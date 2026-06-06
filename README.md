@@ -320,6 +320,27 @@ wf.stop();
 | **Idempotent transitions** | `publish_with_id` deduplicates step publishes. Survives broker restart via `HAS_HEADERS` journal recovery. |
 | **Zerocopy headers** | `ExtendedPayload`, `HeadersBlock`, `HeaderEntry` are `repr(C)` zerocopy structs -- no parsing cost on the recovery path. |
 
+## Message Replication
+
+Arbitro supports async message replication with per-stream configuration, modeled after Kafka's ISR mechanism.
+
+**How it works:** the leader appends each publish to its local journal, then sends `ReplicateEntries` batches to followers over a dedicated TCP connection. Followers append to their own journals and reply with `ReplicateAck`. The leader tracks an in-sync replica set (ISR) per stream and ejects followers that fall more than 10 seconds behind. On reconnect, followers catch up via a journal delta read.
+
+**Per-stream config:** replication is controlled by the `replicas` parameter at stream creation time. `replicas=1` (default) means no replication; `replicas=3` replicates to two followers.
+
+```rust
+// Rust — create a stream with 3 replicas
+client.create_stream(b"orders", b"orders.>", 0, 0, 0, 3, 0, 0, 0, 0).await?;
+```
+
+**Wire format:** `ReplicateEntriesHeader` is 28 bytes followed by the entry batch; `ReplicateAckBody` is 16 bytes. The dedicated replication TCP connection is separate from the client-facing port.
+
+**High watermark:** each stream tracks the sequence number confirmed by all ISR members, enabling future consumer-visible committed-offset semantics.
+
+**Current status:** replication is async best-effort — `RepOk` is returned to the publisher immediately without waiting for follower acknowledgement. Zero data loss when all nodes are healthy. Quorum wait (write acknowledged only after ISR confirms) is planned for v2; the ISR infrastructure is already in place.
+
+Replication is transparent to clients. The `replicas` count is set once at `create_stream` time; publish, subscribe, ack, and nack work identically regardless of the replica count.
+
 ## Roadmap
 
 ### Phase 1 — Core Engine (done)
@@ -375,8 +396,13 @@ wf.stop();
 - [x] Rust client: `publish_delayed(stream_id, subject, payload, delay_ms)`
 - [x] TypeScript client: `publishDelayed(streamName, subject, data, delayMs)`
 
-### Phase 7 — Scale (planned)
-- [ ] Async message replication (Kafka ISR-style, per-stream configurable)
+### Phase 7 — Scale & Replication (in progress)
+- [x] Async message replication — leader pushes batches to followers via dedicated TCP, fire-and-forget (no quorum wait yet)
+- [x] Per-stream `replicas` config — `CreateStream(replicas: 3)` enables replication
+- [x] ISR tracking — in-sync replica set per stream, lag-based ejection (10s timeout)
+- [x] Follower catch-up — journal delta read + batch send on reconnect
+- [x] High watermark — per-stream seq confirmed by all ISR
+- [ ] Quorum wait before RepOk (v2 — ISR infra ready)
 - [ ] Adaptive subject prioritization
 - [ ] Cross-shard subject aggregation for global limits
 - [ ] Membership changes (add/remove nodes at runtime)

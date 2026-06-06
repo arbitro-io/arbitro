@@ -97,6 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `ack_wait_ms` enables failover: if a worker dies, the broker redelivers to another group member.
 - `msg_id` is persisted in the journal via `HAS_HEADERS` and rebuilt on broker restart.
 
+## Replication
+
+Replication is transparent to the client -- `replicas` is set at `create_stream` time. The client publishes normally; the broker handles replication internally.
+
 ## License
 
 MIT
