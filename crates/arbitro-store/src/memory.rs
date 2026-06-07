@@ -542,6 +542,20 @@ impl Store for MemoryStore {
         removed
     }
 
+    fn tombstone_at(&mut self, seq: u64) -> bool {
+        match self.seq_to_idx(seq) {
+            Some(idx) => {
+                let flags = &mut self.index[idx].flags;
+                if *flags & crate::store::flags::TOMBSTONE != 0 {
+                    return false; // already tombstoned
+                }
+                *flags |= crate::store::flags::TOMBSTONE;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn info(&self) -> StoreInfo {
         StoreInfo {
             messages: self.index.len() as u64,
@@ -936,5 +950,69 @@ mod tests {
         let mut seen = 0;
         s.for_each(1, 7, &mut |_| seen += 1).unwrap();
         assert_eq!(seen, 6);
+    }
+
+    #[test]
+    fn tombstone_at_marks_entry() {
+        let mut s = MemoryStore::new();
+        for i in 0..5u8 {
+            s.append(
+                EntryRef {
+                    subject: b"orders",
+                    payload: &[i],
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
+                0,
+            )
+            .unwrap();
+        }
+
+        // Tombstone seq 3
+        assert!(s.tombstone_at(3));
+        // Idempotent — second call returns false
+        assert!(!s.tombstone_at(3));
+        // Non-existent seq
+        assert!(!s.tombstone_at(999));
+
+        // Read still returns the entry (tombstone is metadata)
+        let e = s.read(3).unwrap().unwrap();
+        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+
+        // Non-tombstoned entries are clean
+        let e2 = s.read(2).unwrap().unwrap();
+        assert_eq!(e2.flags & crate::store::flags::TOMBSTONE, 0);
+    }
+
+    #[test]
+    fn tombstone_across_sealed_segments() {
+        let mut s = MemoryStore::with_segment_size(MIN_SEGMENT_SIZE, 16);
+        let payload = vec![0u8; 1024];
+        // Append enough to trigger rotation (5 entries ~5KB > 4096)
+        for _ in 0..6 {
+            s.append(
+                EntryRef {
+                    subject: b"x",
+                    payload: &payload,
+                    stream_id: 0,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
+                0,
+            )
+            .unwrap();
+        }
+        assert!(!s.sealed.is_empty());
+
+        // Tombstone entry in the first (sealed) segment
+        assert!(s.tombstone_at(1));
+        let e = s.read(1).unwrap().unwrap();
+        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+
+        // Tombstone entry in the active segment
+        assert!(s.tombstone_at(6));
+        let e = s.read(6).unwrap().unwrap();
+        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
     }
 }

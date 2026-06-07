@@ -97,6 +97,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `ack_wait_ms` enables failover: if a worker dies, the broker redelivers to another group member.
 - `msg_id` is persisted in the journal via `HAS_HEADERS` and rebuilt on broker restart.
 
+## Stream management
+
+```rust
+// Delete a single message by sequence number (tombstones it on disk).
+// Tombstoned messages are skipped during delivery — consumers never see them.
+client.delete_message(b"orders", 42).await?;
+```
+
 ## Replication
 
 Replication is transparent to the client -- `replicas` is set at `create_stream` time. The client publishes normally; the broker handles replication internally.

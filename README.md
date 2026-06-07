@@ -147,7 +147,7 @@ via the `ConsumerStats` action — see the Rust/TypeScript clients for
 | `/metrics` (HTTP) | `ARBITRO_METRICS_LISTEN=0.0.0.0:9091` | Prometheus text-format counters + gauges: `arbitro_publish_total`, `arbitro_deliver_total`, `arbitro_ack_total`, `arbitro_nack_total`, `arbitro_streams`, `arbitro_consumers`, `arbitro_connections`, `arbitro_ack_pending`, `arbitro_silent_drops_*`. |
 | `SIGUSR1` (Unix) | `kill -USR1 <pid>` | Writes `/tmp/arbitro-dump-<pid>.json` with a flat diagnostic snapshot (gauges, silent drops, per-stream messages/bytes). |
 | `SIGHUP` (Unix) | `kill -HUP <pid>` | Re-reads the log filter from `ARBITRO_LOG` (live log-level reload, no restart). |
-| `arbitroctl` (CLI) | `cargo install --git ... arbitroctl` | `list-streams`, `list-consumers`, `create-stream`, `delete-stream`, `purge-stream`, `drain-subject`, `consumer-pending`. Talks to `ARBITRO_ADDR` (default `127.0.0.1:9898`). |
+| `arbitroctl` (CLI) | `cargo install --git ... arbitroctl` | `list-streams`, `list-consumers`, `create-stream`, `delete-stream`, `purge-stream`, `drain-subject`, `delete-message`, `consumer-pending`. Talks to `ARBITRO_ADDR` (default `127.0.0.1:9898`). |
 
 For backup procedures, see [`docs/BACKUP.md`](./docs/BACKUP.md).
 

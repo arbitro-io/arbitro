@@ -863,6 +863,24 @@ impl CommandWorker {
         let _ = cmd.reply.send(deleted);
     }
 
+    pub(in crate::shard) fn handle_delete_message(&mut self, cmd: DeleteMessageCmd) {
+        let found = self.store.lock().tombstone_at(cmd.seq);
+        let _ = cmd.reply.send(found);
+    }
+
+    /// AckTerm = normal ack + tombstone the entry (prevents redelivery to ALL consumers).
+    pub(in crate::shard) fn handle_ack_term(&mut self, cmd: AckCmd) {
+        // Tombstone each entry in the store.
+        {
+            let mut store = self.store.lock();
+            for entry in &cmd.entries {
+                store.tombstone_at(entry.seq);
+            }
+        }
+        // Proceed with normal ack logic (release pending + inflight).
+        self.handle_ack(cmd);
+    }
+
     // ── Background eviction — max_age ───────────────────────────────────
 
     /// Evict entries older than `max_age_ms` from streams that have

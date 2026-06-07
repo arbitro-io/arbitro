@@ -20,9 +20,9 @@ use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::transport::encode::{
     encode_consumer_stats_v2, encode_create_consumer_v2, encode_create_stream_v2,
-    encode_delete_consumer_v2, encode_delete_stream_v2, encode_drain_subject_v2,
-    encode_get_consumer_v2, encode_get_stream_v2, encode_list_consumers_v2, encode_list_streams_v2,
-    encode_purge_stream_v2,
+    encode_delete_consumer_v2, encode_delete_message_v2, encode_delete_stream_v2,
+    encode_drain_subject_v2, encode_get_consumer_v2, encode_get_stream_v2,
+    encode_list_consumers_v2, encode_list_streams_v2, encode_purge_stream_v2,
 };
 use crate::transport::frame::WriteFrame;
 use crate::transport::frame::WriteProducer;
@@ -120,6 +120,17 @@ pub(crate) async fn drain_subject(
         encode_drain_subject_v2(seq, name, subject),
     )
     .await
+}
+
+pub(crate) async fn delete_message(
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    name: &[u8],
+    msg_seq: u64,
+) -> Result<Bytes, ClientError> {
+    let seq = seq_alloc.next();
+    request(tx, pending, seq, encode_delete_message_v2(seq, name, msg_seq)).await
 }
 
 pub(crate) async fn list_streams(

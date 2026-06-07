@@ -129,6 +129,24 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
+    /// Ack + tombstone — permanently kill the message for all consumers.
+    pub async fn ack_term(
+        &self,
+        consumer_id: ConsumerId,
+        conn_id: u64,
+        entries: Vec<AckEntry>,
+    ) -> Result<AckReply, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::AckTerm(AckCmd {
+            consumer_id,
+            conn_id,
+            entries,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
     pub async fn nack(
         &self,
         consumer_id: ConsumerId,
@@ -229,6 +247,14 @@ impl ShardHandle {
             reply: tx,
         }))
         .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Tombstone a single message by sequence. Returns true if found.
+    pub async fn delete_message(&self, seq: u64) -> Result<bool, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::DeleteMessage(DeleteMessageCmd { seq, reply: tx }))
+            .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 

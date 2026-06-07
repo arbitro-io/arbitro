@@ -36,6 +36,9 @@ pub enum Action {
     // collapsed into Ack / BatchAck (both wait for store fsync before
     // replying). Reserved; do not reuse the slots.
     BatchNack = 0x020A,
+    /// Terminate delivery of a message — consumer permanently rejects it.
+    /// Same wire shape as Ack. Broker tombstones the entry (never redelivered).
+    AckTerm = 0x020B,
 
     // 0x03xx — Subscription
     Subscribe = 0x0301,
@@ -48,6 +51,9 @@ pub enum Action {
     ListStreams = 0x0404,
     PurgeStream = 0x0405,
     DrainSubject = 0x0406,
+    /// Tombstone a single message by sequence. Body: JSON { name, seq }.
+    /// Reply: RepOk (ref_seq = 1 if found, 0 if not found).
+    DeleteMessage = 0x0407,
 
     // 0x05xx — Consumer management
     CreateConsumer = 0x0501,
@@ -119,6 +125,7 @@ impl Action {
             0x0207 => Some(Self::FanoutBatch),
             // 0x0208, 0x0209 reserved (deleted AckSync/BatchAckSync) — TODO §5.1.
             0x020A => Some(Self::BatchNack),
+            0x020B => Some(Self::AckTerm),
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
@@ -129,6 +136,7 @@ impl Action {
             0x0404 => Some(Self::ListStreams),
             0x0405 => Some(Self::PurgeStream),
             0x0406 => Some(Self::DrainSubject),
+            0x0407 => Some(Self::DeleteMessage),
 
             0x0501 => Some(Self::CreateConsumer),
             0x0502 => Some(Self::DeleteConsumer),

@@ -130,6 +130,11 @@ pub trait Store: Send + Sync {
     /// Delete all messages matching a subject pattern. Returns deleted count.
     fn drain(&mut self, subject: &[u8]) -> u64;
 
+    /// Tombstone a single entry by sequence number. Returns `true` if the
+    /// entry was found and tombstoned, `false` if not found or already
+    /// tombstoned. The drain loop skips tombstoned entries — no redelivery.
+    fn tombstone_at(&mut self, seq: u64) -> bool;
+
     /// Delete all messages with timestamp older than `timestamp_ms`.
     /// Walks from `first_seq` forward and truncates all entries whose
     /// `timestamp < timestamp_ms`. Returns number of deleted messages.

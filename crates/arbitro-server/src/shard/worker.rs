@@ -811,6 +811,8 @@ impl CommandWorker {
             ShardCommand::DeleteStream(cmd) => self.handle_delete_stream(cmd),
             ShardCommand::PurgeStream(cmd) => self.handle_purge_stream(cmd),
             ShardCommand::DrainSubject(cmd) => self.handle_drain_subject(cmd),
+            ShardCommand::DeleteMessage(cmd) => self.handle_delete_message(cmd),
+            ShardCommand::AckTerm(cmd) => self.handle_ack_term(cmd),
             ShardCommand::CreateConsumer(cmd) => self.handle_create_consumer(cmd),
             ShardCommand::DeleteConsumer(cmd) => self.handle_delete_consumer(cmd),
             ShardCommand::OpenConnection(cmd) => self.handle_open_connection(cmd),

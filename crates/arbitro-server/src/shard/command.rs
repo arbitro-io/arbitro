@@ -23,6 +23,8 @@ pub enum ShardCommand {
     PublishAccumulate(PublishCmd),
     Ack(AckCmd),
     Nack(NackCmd),
+    /// Terminate — ack + tombstone (never redeliver to any consumer).
+    AckTerm(AckCmd),
 
     // Subscription management
     Subscribe(SubscribeCmd),
@@ -50,6 +52,7 @@ pub enum ShardCommand {
     // Stream content management
     PurgeStream(PurgeStreamCmd),
     DrainSubject(DrainSubjectCmd),
+    DeleteMessage(DeleteMessageCmd),
 
     // Query
     ListStreams(ListStreamsCmd),
@@ -258,6 +261,12 @@ pub struct DrainSubjectCmd {
     pub stream_id: StreamId,
     pub subject: Vec<u8>,
     pub reply: oneshot::Sender<u64>,
+}
+
+/// Tombstone a single message by sequence. Returns true if found.
+pub struct DeleteMessageCmd {
+    pub seq: u64,
+    pub reply: oneshot::Sender<bool>,
 }
 
 // ── Admin ───────────────────────────────────────────────────────────────────

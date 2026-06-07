@@ -429,6 +429,23 @@ impl Client {
         .await
     }
 
+    /// Tombstone a single message by sequence number.
+    ///
+    /// The broker marks the entry as deleted so it will never be delivered
+    /// to any consumer. Returns `Ok` with `ref_seq = 1` if found and
+    /// tombstoned, `ref_seq = 0` if the sequence was not found or already
+    /// tombstoned.
+    pub async fn delete_message(&self, name: &[u8], seq: u64) -> Result<Bytes, ClientError> {
+        crate::manage::delete_message(
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            name,
+            seq,
+        )
+        .await
+    }
+
     pub async fn list_streams(&self, offset: u32, limit: u32) -> Result<Bytes, ClientError> {
         crate::manage::list_streams(
             self.producer(),

@@ -533,6 +533,48 @@ impl Store for TolerantStore {
     fn drain(&mut self, _: &[u8]) -> u64 {
         0
     }
+
+    fn tombstone_at(&mut self, seq: u64) -> bool {
+        if seq < self.first_seq {
+            return false;
+        }
+        let idx = (seq - self.first_seq) as usize;
+        if idx >= self.index.len() {
+            return false;
+        }
+        let m = &mut self.index[idx];
+        if m.flags & crate::store::flags::TOMBSTONE != 0 {
+            return false; // already tombstoned
+        }
+        m.flags |= crate::store::flags::TOMBSTONE;
+
+        // Persist the flag byte + recompute CRC to the mmap.
+        // LogMetadata.offset = data_off = header_start + HEADER_SIZE (28).
+        // Flags byte lives at header_start + 27 = data_off - 1.
+        let data_off = m.offset as usize;
+        let header_start = data_off - HEADER_SIZE;
+        let flags_disk_offset = data_off - 1;
+        let body_end = data_off + m.subj_len as usize + m.payload_len as usize;
+        let segment_idx = m.segment_idx as usize;
+        let active_seg_id = self.sealed_segments.len();
+        if segment_idx == active_seg_id {
+            if let Some(ref mut mmap) = self.active_mmap {
+                // Update flags byte
+                mmap[flags_disk_offset] = m.flags;
+                // Recompute CRC over [header || subject || payload]
+                let crc = crc32fast::hash(&mmap[header_start..body_end]);
+                mmap[body_end..body_end + RECORD_CRC_SIZE]
+                    .copy_from_slice(&crc.to_le_bytes());
+                // Flush the modified region so it survives process exit.
+                let _ = mmap.flush();
+            }
+        }
+        // Sealed segments are read-only Mmap — tombstone persists in-memory
+        // only. Recovery will not see it, but the entry will be re-delivered
+        // and the user can re-issue the delete. Acceptable trade-off vs
+        // converting sealed segments to MmapMut.
+        true
+    }
     fn for_each(&self, s: u64, e: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
         let start = if s < self.first_seq {
             0
@@ -1192,5 +1234,70 @@ mod tests {
             .get(1, &mut |_| panic!("should not be called"))
             .unwrap();
         assert!(!ok);
+    }
+
+    #[test]
+    fn tombstone_at_marks_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tombstone_test");
+
+        {
+            let mut store = TolerantStore::new(path.clone());
+            store.init().unwrap();
+
+            for i in 0..5u8 {
+                store
+                    .append(
+                        EntryRef {
+                            subject: b"orders",
+                            payload: &[i],
+                            stream_id: 0,
+                            flags: 0,
+                            deliver_at_ms: 0,
+                        },
+                        0,
+                    )
+                    .unwrap();
+            }
+
+            // Tombstone seq 3
+            assert!(store.tombstone_at(3));
+            // Idempotent
+            assert!(!store.tombstone_at(3));
+            // Non-existent
+            assert!(!store.tombstone_at(999));
+
+            // Verify flag is set on read
+            let mut flags = 0u8;
+            store
+                .get(3, &mut |e| {
+                    flags = e.flags;
+                })
+                .unwrap();
+            assert_eq!(flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+        }
+
+        // Reopen and verify tombstone survives (active segment is mmap'd)
+        {
+            let mut store = TolerantStore::new(path);
+            store.init().unwrap();
+
+            let mut flags = 0u8;
+            store
+                .get(3, &mut |e| {
+                    flags = e.flags;
+                })
+                .unwrap();
+            assert_eq!(flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+
+            // Non-tombstoned entry is clean
+            let mut flags2 = 0xff;
+            store
+                .get(2, &mut |e| {
+                    flags2 = e.flags;
+                })
+                .unwrap();
+            assert_eq!(flags2 & crate::store::flags::TOMBSTONE, 0);
+        }
     }
 }

@@ -11,9 +11,9 @@ use zerocopy::IntoBytes;
 
 use arbitro_proto::v2::cold::{
     ColdBody, ConsumerStats, CreateConsumer as CreateConsumerCold,
-    CreateStream as CreateStreamCold, DeleteConsumer, DeleteStream, DrainSubject, GetConsumer,
-    GetStream, ListConsumers, ListStreams, PurgeStream, SubjectLimit as ColdSubjectLimit,
-    Unsubscribe,
+    CreateStream as CreateStreamCold, DeleteConsumer, DeleteMessage, DeleteStream, DrainSubject,
+    GetConsumer, GetStream, ListConsumers, ListStreams, PurgeStream,
+    SubjectLimit as ColdSubjectLimit, Unsubscribe,
 };
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
@@ -206,6 +206,15 @@ pub(crate) fn encode_drain_subject_v2(seq: u64, name: &[u8], subject: &[u8]) -> 
     DrainSubject {
         name: name.to_vec(),
         subject: subject.to_vec(),
+    }
+    .encode(seq)
+}
+
+/// DeleteMessage request frame — tombstone a single message by sequence.
+pub(crate) fn encode_delete_message_v2(seq: u64, name: &[u8], msg_seq: u64) -> Bytes {
+    DeleteMessage {
+        name: name.to_vec(),
+        seq: msg_seq,
     }
     .encode(seq)
 }

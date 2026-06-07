@@ -118,6 +118,7 @@ pub async fn dispatch_frame_v2(
             v2_publish_with_reply(conn_id, req_seq, &frame, server, registry)
         }
         Action::Ack => v2_ack(conn_id, &frame, server).await,
+        Action::AckTerm => v2_ack_term(conn_id, &frame, server).await,
         Action::BatchAck => v2_batch_ack(conn_id, &frame, server).await,
         Action::Nack => v2_nack(conn_id, &frame, server).await,
         Action::BatchNack => v2_batch_nack(conn_id, &frame, server).await,
@@ -150,6 +151,9 @@ pub async fn dispatch_frame_v2(
         Action::GetStream => v2_get_stream(conn_id, req_seq, &frame, server, registry).await,
         Action::PurgeStream => v2_purge_stream(conn_id, req_seq, &frame, server, registry).await,
         Action::DrainSubject => v2_drain_subject(conn_id, req_seq, &frame, server, registry).await,
+        Action::DeleteMessage => {
+            v2_delete_message(conn_id, req_seq, &frame, server, registry).await
+        }
         Action::ListStreams => v2_list_streams(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Consumer management ─────────────────────────────────────
@@ -1173,6 +1177,60 @@ async fn v2_drain_subject(
         Ok(deleted) => send_rep_ok_v2(registry, conn_id, req_seq, deleted),
         Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
+}
+
+async fn v2_delete_message(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, DeleteMessage};
+    let body = match DeleteMessage::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+            return;
+        }
+    };
+    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(&body.name);
+    let seq_stream = match server.names().stream_seq(wire_stream) {
+        Some(s) => s,
+        None => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            return;
+        }
+    };
+    let shard = server.shard_for(seq_stream);
+    match shard.delete_message(body.seq).await {
+        Ok(found) => send_rep_ok_v2(registry, conn_id, req_seq, u64::from(found)),
+        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+    }
+}
+
+/// AckTerm — same wire shape as Ack, routes to `shard.ack_term()`.
+async fn v2_ack_term(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
+    let f = match AckFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    let seq_stream = match server.names().consumer_stream(consumer_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let shard = server.shard_for(seq_stream);
+    let _ = shard
+        .ack_term(
+            consumer_id,
+            conn_id,
+            vec![AckEntry {
+                stream_id: seq_stream,
+                seq: f.body.ack_seq.get(),
+            }],
+        )
+        .await;
 }
 
 async fn v2_list_streams(

@@ -152,6 +152,12 @@ cold_body! {
         pub subject: Vec<u8>,
     },
 
+    // ── DeleteMessage (tombstone single entry by seq) ───────────────
+    Action::DeleteMessage => pub struct DeleteMessage {
+        pub name: Vec<u8>,
+        pub seq:  u64,
+    },
+
     // ── Listing (pagination cursor) ──────────────────────────────────
     //
     // `stream_id == 0` on ListConsumers means "every stream". Default
