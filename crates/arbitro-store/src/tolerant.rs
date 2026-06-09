@@ -908,7 +908,7 @@ mod tests {
         let count = 1000u64;
         let mut expected_bytes = 0u64;
         for i in 0..count {
-            let payload = format!("payload-{}", i);
+            let payload = format!("payload-{i}");
             store
                 .append(make_entry(b"test.subject", payload.as_bytes()), i)
                 .unwrap();

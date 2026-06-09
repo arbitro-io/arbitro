@@ -143,14 +143,14 @@ mod tests {
 
     #[test]
     fn field_offsets_natural() {
-        let h = Header::new(0xBEEF, 0x01020304, 0x0A0B0C0D_0E0F_1011);
+        let h = Header::new(0xBEEF, 0x01020304, 0x0A0B_0C0D_0E0F_1011);
         let bytes = h.as_bytes();
 
         assert_eq!(&bytes[0..2], &0xBEEFu16.to_le_bytes());
         assert_eq!(bytes[2], 0); // flags
         assert_eq!(bytes[3], 0); // entry_flags
         assert_eq!(&bytes[4..8], &0x01020304u32.to_le_bytes());
-        assert_eq!(&bytes[8..16], &0x0A0B0C0D_0E0F_1011u64.to_le_bytes());
+        assert_eq!(&bytes[8..16], &0x0A0B_0C0D_0E0F_1011_u64.to_le_bytes());
     }
 
     #[test]

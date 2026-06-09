@@ -1,3 +1,4 @@
+#![allow(clippy::uninit_vec)] // Bench intentionally uses set_len() for zero-overhead alloc measurement
 //! encode_publish — measure the cost of building a publish batch body
 //! (`[4 count][12 entry][subject][payload]`) using different encoding
 //! strategies. Goal: find the cheapest path with no measurable cost
@@ -374,10 +375,7 @@ fn bench_one(name: &str, payload_size: usize, iters: usize, runs: usize) {
         let min = samples[0] as f64 / iters as f64;
         let mean = samples.iter().sum::<u128>() as f64 / runs as f64 / iters as f64;
         let ops_per_sec = 1.0e9 / min;
-        println!(
-            "{:<18} {:>10.2} {:>14.2} {:>14.0}",
-            label, min, mean, ops_per_sec
-        );
+        println!("{label:<18} {min:>10.2} {mean:>14.2} {ops_per_sec:>14.0}");
     }
 
     // ── Variants 8 + 9: zero-alloc per call. Outer loop reuses one buffer.

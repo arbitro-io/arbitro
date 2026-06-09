@@ -3,7 +3,7 @@ resolver = "2"
 members  = ["crates/arbitro-client-tokio", "crates/arbitro-common", "crates/arbitro-engine", "crates/arbitro-proto", "crates/arbitro-server", "crates/arbitro-store", "crates/arbitro-e2e"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 

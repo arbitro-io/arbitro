@@ -413,15 +413,15 @@ fn main() {
 
     println!();
     println!("decode_tcp (TOKIO) — PubFrame v2 read strategies over loopback TCP");
-    println!("  N_FRAMES        = {}", N_FRAMES);
-    println!("  SUBJECT_LEN     = {}", SUBJECT_LEN);
-    println!("  PAYLOAD_LEN     = {}", PAYLOAD_LEN);
-    println!("  frame size      = {} B", TOTAL_FRAME_SIZE);
+    println!("  N_FRAMES        = {N_FRAMES}");
+    println!("  SUBJECT_LEN     = {SUBJECT_LEN}");
+    println!("  PAYLOAD_LEN     = {PAYLOAD_LEN}");
+    println!("  frame size      = {TOTAL_FRAME_SIZE} B");
     println!(
         "  total blob      = {} KiB",
         N_FRAMES * TOTAL_FRAME_SIZE / 1024
     );
-    println!("  iterations      = {} (+{} warmup)", ITERATIONS, WARMUP);
+    println!("  iterations      = {ITERATIONS} (+{WARMUP} warmup)");
     println!("  runtime         = tokio multi_thread (2 workers)");
     println!();
 
@@ -435,10 +435,10 @@ fn main() {
 
     let blob = build_blob();
 
-    measure(&rt, "naive_two_read", &blob, |s| run_naive(s));
-    measure(&rt, "bufreader_inplace", &blob, |s| run_bufreader(s));
-    measure(&rt, "prealloc_split", &blob, |s| run_prealloc_split(s));
-    measure(&rt, "read_buf_split_to", &blob, |s| run_read_buf_split(s));
+    measure(&rt, "naive_two_read", &blob, run_naive);
+    measure(&rt, "bufreader_inplace", &blob, run_bufreader);
+    measure(&rt, "prealloc_split", &blob, run_prealloc_split);
+    measure(&rt, "read_buf_split_to", &blob, run_read_buf_split);
 
     println!();
     println!("Notes:");
