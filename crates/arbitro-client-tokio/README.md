@@ -37,7 +37,7 @@ Client-side workflow pipelines over Arbitro streams. The broker has no workflow-
 | `dlq_stream_id` | `(&self) -> u32` | Dead letter queue stream ID. |
 | `name` | `(&self) -> &[u8]` | Workflow name. |
 
-### Complete Example
+### Basic Example
 
 ```rust
 use arbitro_client_tokio::{Client, StepResult, StepContext};
@@ -85,6 +85,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wf.stop();
     Ok(())
 }
+```
+
+### Suspend / Resume / Cancel
+
+```rust
+let wf = client.workflow(b"payment-auth")
+    .trigger(b"payments.initiated")
+    .step(b"prepare", |ctx: StepContext| async move {
+        let prepared = prepare_payment(&ctx.context).await?;
+        Ok(StepResult { context: prepared })
+    })
+    .suspend_step(b"wait-auth", |ctx: StepContext| async move {
+        send_auth_link(&ctx.context).await?;
+        Ok(StepResult::suspend())  // parks the instance until resume
+    })
+    .on_timeout(|ctx: StepContext| async move {
+        notify_timeout(&ctx.context).await;
+        Ok(StepResult { context: ctx.context })
+    })
+    .step(b"finalize", |ctx: StepContext| async move {
+        Ok(StepResult { context: finalize_payment(&ctx.context).await? })
+    })
+    .start().await?;
+
+// Trigger with explicit ID (dedup-safe)
+wf.trigger_with_id(&client, b"payment-abc-123", b"payload").await?;
+
+// Resume a suspended instance (e.g. after user completes auth)
+wf.resume(&client, b"payment-abc-123", b"auth-result").await?;
+
+// Cancel a running or suspended instance
+wf.cancel(&client, b"payment-abc-123").await?;
+```
+
+### Source (External Stream Triggers)
+
+```rust
+let wf = client.workflow(b"event-driven")
+    .source(b"external-events")          // subscribe to an existing stream
+    .step(b"process", |ctx: StepContext| async move {
+        Ok(StepResult { context: process_event(&ctx.context).await? })
+    })
+    .start().await?;
 ```
 
 ## Stream Management
