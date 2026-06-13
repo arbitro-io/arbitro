@@ -35,7 +35,7 @@ async fn main() -> std::io::Result<()> {
         println!("  ARBITRO_METRICS_INTERVAL  Metrics log interval seconds (default: 5)");
         println!("  ARBITRO_MAX_FEED_PER_CYCLE  Messages per drain cycle (default: 256)");
         println!("  ARBITRO_DRAIN_BATCH_SIZE  Entries per RepBatch frame (default: 256)");
-        println!("  ARBITRO_DATA_DIR          Persistence directory (unset = in-memory)");
+        println!("  ARBITRO_DATA_DIR          Persistence directory (default: ./data)");
         println!("  ARBITRO_TLS_CERT          TLS certificate PEM path");
         println!("  ARBITRO_TLS_KEY           TLS private key PEM path");
         println!("  ARBITRO_AUTH_TOKEN        Auth token for Hello frame");

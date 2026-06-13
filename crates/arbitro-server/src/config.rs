@@ -33,7 +33,7 @@ pub struct Config {
     /// Batching reduces frames from N to N/batch_size, cutting try_send
     /// calls and TCP writes proportionally.
     pub drain_batch_size: u16,
-    /// Data directory for persistence (None = in-memory only).
+    /// Data directory for persistence (default: "./data").
     pub data_dir: Option<String>,
     /// TLS certificate PEM file path (None = plaintext TCP).
     pub tls_cert: Option<String>,
@@ -91,7 +91,7 @@ impl Config {
             keepalive_interval: Duration::from_secs(env_parse("ARBITRO_KEEPALIVE_INTERVAL", 30)),
             shutdown_timeout: Duration::from_secs(env_parse("ARBITRO_SHUTDOWN_TIMEOUT", 10)),
             metrics_interval: Duration::from_secs(env_parse("ARBITRO_METRICS_INTERVAL", 5)),
-            data_dir: std::env::var("ARBITRO_DATA_DIR").ok(),
+            data_dir: Some(std::env::var("ARBITRO_DATA_DIR").unwrap_or_else(|_| "./data".into())),
             tls_cert: std::env::var("ARBITRO_TLS_CERT").ok(),
             tls_key: std::env::var("ARBITRO_TLS_KEY").ok(),
             auth_token: std::env::var("ARBITRO_AUTH_TOKEN").ok(),

@@ -40,7 +40,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arbitro-client-tokio"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "arbitro-engine",
  "arbitro-kit",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-common"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "arbitro-engine",
  "arbitro-kit",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-e2e"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "arbitro-client-tokio",
  "arbitro-common",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-engine"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "bytes",
  "criterion",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-proto"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "bytes",
  "foldhash",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-server"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "arbitro-client-tokio",
  "arbitro-common",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "arbitro-store"
-version = "0.5.3"
+version = "0.5.5"
 dependencies = [
  "arbitro-engine",
  "arbitro-proto",
