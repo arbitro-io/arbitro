@@ -2253,6 +2253,14 @@ async fn workflow_distrib_suspend_done() {
 }
 
 // ── T25: 4 workers, normal + suspend(Done) + compensation ─────────
+//    (existing — unchanged)
+// ── T26: 4 workers, actual suspend → cross-worker resume via state stream ─
+//    Each instance suspends on step 1.  Resume events are round-robined to
+//    whichever worker the consumer group picks — likely different from the one
+//    that parked.  The state stream ensures every worker has the full suspended
+//    map, so the resume handler finds the entry and advances.
+// ── T27: 4 workers, suspend → cross-worker cancel via state stream ───
+//    (added below after T25)
 //    Verifies: StepKind::Suspend with Done distributes correctly and
 //    the context pipeline is intact across workers.
 
@@ -2348,6 +2356,214 @@ async fn workflow_distrib_suspend_done_context_pipeline() {
         assert!(entry.is_some(), "instance {id} not found in results");
         assert_eq!(entry.unwrap().1, expected, "context mismatch for {id}");
     }
+
+    for h in &handles { h.stop(); }
+    server.shutdown().await;
+}
+
+// ── T26: 4 workers, actual suspend → cross-worker resume via state stream ─
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_distrib_suspend_resume() {
+    use arbitro_client_tokio::workflow::{StepOutcome, ResumeContext};
+
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    let finished: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let done_count = Arc::new(AtomicU32::new(0));
+
+    let mut handles = Vec::new();
+    let mut clients = Vec::new();
+
+    for _worker_id in 0u32..4 {
+        let client = server.connect().await;
+        let fin = finished.clone();
+        let cnt = done_count.clone();
+
+        let handle = client
+            .workflow(b"distrib-sr")
+            .trigger(b"distrib-sr.>")
+            .ack_wait_ms(5000)
+            .step(b"prep", |ctx: StepContext| async move {
+                let mut out = ctx.context.clone();
+                out.extend_from_slice(b"|prepared");
+                Ok(StepResult { context: out })
+            })
+            .suspend_step(
+                b"wait",
+                10_000,
+                |ctx: StepContext| async move {
+                    Ok(StepOutcome::Suspend {
+                        state: ctx.context.clone(),
+                        timeout_ms: 0,
+                    })
+                },
+                |rctx: ResumeContext| async move {
+                    let mut out = rctx.state.clone();
+                    out.extend_from_slice(b"|resumed:");
+                    out.extend_from_slice(&rctx.event);
+                    Ok(StepResult { context: out })
+                },
+            )
+            .step(b"finalize", move |ctx: StepContext| {
+                let f = fin.clone();
+                let c = cnt.clone();
+                async move {
+                    let mut out = ctx.context.clone();
+                    out.extend_from_slice(b"|done");
+                    f.lock().unwrap().push((
+                        ctx.instance_id.clone(),
+                        String::from_utf8_lossy(&out).into_owned(),
+                    ));
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(StepResult { context: out })
+                }
+            })
+            .start()
+            .await
+            .expect("workflow start");
+
+        handles.push(handle);
+        clients.push(client);
+    }
+
+    let count = 8u32;
+
+    for i in 0..count {
+        let id = format!("dsr_{i}");
+        handles[0]
+            .trigger_with_id(&clients[0], &id, format!("p{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Wait for state stream fanout to propagate park events.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Resume — consumer group delivers to random workers.
+    for i in 0..count {
+        let id = format!("dsr_{i}");
+        handles[0]
+            .resume(&clients[0], &id, format!("ev{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while done_count.load(Ordering::SeqCst) < count {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("not all instances completed after cross-worker resume");
+
+    let got = finished.lock().unwrap().clone();
+    assert_eq!(got.len(), count as usize);
+
+    for i in 0..count {
+        let id = format!("dsr_{i}");
+        let expected = format!("p{i}|prepared|resumed:ev{i}|done");
+        let entry = got.iter().find(|(iid, _)| *iid == id);
+        assert!(entry.is_some(), "instance {id} not found in results");
+        assert_eq!(entry.unwrap().1, expected, "context mismatch for {id}");
+    }
+
+    for h in &handles { h.stop(); }
+    server.shutdown().await;
+}
+
+// ── T27: 4 workers, suspend → cross-worker cancel via state stream ───
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_distrib_suspend_cancel() {
+    use arbitro_client_tokio::workflow::{StepOutcome, ResumeContext};
+
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    let resumed = Arc::new(AtomicU32::new(0));
+
+    let mut handles = Vec::new();
+    let mut clients = Vec::new();
+
+    for _worker_id in 0u32..4 {
+        let client = server.connect().await;
+        let r = resumed.clone();
+
+        let handle = client
+            .workflow(b"distrib-sc")
+            .trigger(b"distrib-sc.>")
+            .ack_wait_ms(5000)
+            .step(b"prep", |ctx: StepContext| async move {
+                Ok(StepResult { context: ctx.context })
+            })
+            .suspend_step(
+                b"wait",
+                30_000,
+                |ctx: StepContext| async move {
+                    Ok(StepOutcome::Suspend {
+                        state: ctx.context.clone(),
+                        timeout_ms: 0,
+                    })
+                },
+                move |_rctx: ResumeContext| {
+                    let r2 = r.clone();
+                    async move {
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        Ok(StepResult { context: Vec::new() })
+                    }
+                },
+            )
+            .step(b"never", |ctx: StepContext| async move {
+                Ok(StepResult { context: ctx.context })
+            })
+            .start()
+            .await
+            .expect("workflow start");
+
+        handles.push(handle);
+        clients.push(client);
+    }
+
+    let count = 8u32;
+
+    for i in 0..count {
+        let id = format!("dsc_{i}");
+        handles[0]
+            .trigger_with_id(&clients[0], &id, format!("c{i}").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Wait for suspend + state stream propagation.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cancel all — round-robined across workers.
+    for i in 0..count {
+        let id = format!("dsc_{i}");
+        handles[0]
+            .cancel(&clients[0], &id)
+            .await
+            .unwrap();
+    }
+
+    // Wait for cancel processing + state stream remove propagation.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Resume all — should be no-ops (instances already cancelled).
+    for i in 0..count {
+        let id = format!("dsc_{i}");
+        handles[0]
+            .resume(&clients[0], &id, b"late")
+            .await
+            .unwrap();
+    }
+
+    // Verify no resumes fired.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        resumed.load(Ordering::SeqCst), 0,
+        "resume should not fire after cancel"
+    );
 
     for h in &handles { h.stop(); }
     server.shutdown().await;

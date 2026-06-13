@@ -17,6 +17,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -165,6 +166,32 @@ fn decode_task(payload: &[u8]) -> Option<(String, u16, u8, &[u8])> {
     let step_index = u16::from_le_bytes([payload[off], payload[off + 1]]);
     let attempt = payload[off + 2];
     Some((instance_id, step_index, attempt, &payload[header..]))
+}
+
+// ── Park / Remove encoding (state stream) ───────────────────────────────
+// Format: [step_index:2LE][state_len:4LE][state bytes][context bytes]
+
+fn encode_park(step_index: u16, state: &[u8], context: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + 4 + state.len() + context.len());
+    buf.extend_from_slice(&step_index.to_le_bytes());
+    buf.extend_from_slice(&(state.len() as u32).to_le_bytes());
+    buf.extend_from_slice(state);
+    buf.extend_from_slice(context);
+    buf
+}
+
+fn decode_park(payload: &[u8]) -> Option<(u16, Vec<u8>, Vec<u8>)> {
+    if payload.len() < 6 {
+        return None;
+    }
+    let step_index = u16::from_le_bytes([payload[0], payload[1]]);
+    let state_len = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
+    if payload.len() < 6 + state_len {
+        return None;
+    }
+    let state = payload[6..6 + state_len].to_vec();
+    let context = payload[6 + state_len..].to_vec();
+    Some((step_index, state, context))
 }
 
 // ── Instance ID generator ─────────────────────────────────────────────────
@@ -400,6 +427,45 @@ impl WorkflowBuilder {
         )
         .await?;
 
+        // Create state stream for cross-worker suspend registry.
+        // Park and remove events are replayed by each worker to build a
+        // complete local map of all suspended instances across all workers.
+        let state_stream_name = format!("_wf_{name_str}_state");
+        let state_subject = format!("_wf.{name_str}.__state.>");
+        let state_stream_id = create_or_get_stream(
+            &self.client,
+            state_stream_name.as_bytes(),
+            state_subject.as_bytes(),
+            300_000, // idempotency for park msg_ids
+        )
+        .await?;
+
+        // Fanout consumer on state stream — unique per worker (no group).
+        // DeliverPolicy::All replays all park/remove events to build the map.
+        let state_consumer_name = format!("_wf_{name_str}_state_w{worker_uid}");
+        let state_consumer_resp = self
+            .client
+            .create_consumer(
+                state_stream_id,
+                state_consumer_name.as_bytes(),
+                b"", // no group → fanout
+                state_subject.as_bytes(),
+                100,  // max_inflight
+                1,    // AckPolicy::Explicit
+                0,    // DeliverPolicy::All
+                0,    // DeliverMode::Fanout
+                30_000, // ack_wait_ms
+                0,    // start_seq
+            )
+            .await?;
+        let state_consumer_id =
+            u64::from_le_bytes(state_consumer_resp[..8].try_into().unwrap()) as u32;
+
+        let mut state_sub = self
+            .client
+            .subscribe(state_stream_id, state_consumer_id, state_subject.as_bytes())
+            .await?;
+
         // Each worker creates its own consumer in the shared group.
         // Consumer group round-robin ensures each task goes to one worker.
         let consumer_resp = self
@@ -435,10 +501,67 @@ impl WorkflowBuilder {
         let max_context_size = self.max_context_size;
         let max_retries = self.max_retries;
 
-        // Suspended-instance registry: shared between the dispatch loop
-        // (writes on suspend, reads on timeout) and resume/timeout subjects.
+        // Suspended-instance registry: shared between the dispatch loop,
+        // the state sync task, and resume/timeout subjects.
         let suspended: Arc<TokioMutex<HashMap<String, SuspendedEntry>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
+
+        // Tracks message seqs that were nacked once for cross-worker retry.
+        // If the same seq is nacked again, we ack as stale instead of looping.
+        let nacked_seqs: Arc<TokioMutex<HashSet<u64>>> =
+            Arc::new(TokioMutex::new(HashSet::new()));
+
+        // ── State sync background task ──
+        // Consumes park/remove events from the state stream and updates the
+        // local suspended map.  Each worker has its own fanout consumer, so
+        // every worker builds a complete replica of ALL suspended instances.
+        {
+            let suspended = Arc::clone(&suspended);
+            let cancel_state = cancel.clone();
+            let wf_name_str: Arc<str> = String::from_utf8_lossy(&self.name).into();
+            let park_prefix: Vec<u8> =
+                format!("_wf.{wf_name_str}.__state.park.").into_bytes();
+            let remove_prefix: Vec<u8> =
+                format!("_wf.{wf_name_str}.__state.remove.").into_bytes();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_state.cancelled() => break,
+                        msg = state_sub.recv() => {
+                            let msg = match msg {
+                                Some(m) => m,
+                                None => break,
+                            };
+                            let subject = msg.subject();
+                            if subject.starts_with(&park_prefix) {
+                                let iid = String::from_utf8_lossy(
+                                    &subject[park_prefix.len()..],
+                                ).into_owned();
+                                if let Some((step_index, state, context)) =
+                                    decode_park(&msg.payload())
+                                {
+                                    let mut map = suspended.lock().await;
+                                    // Only insert if not already present (local
+                                    // insert in the dispatch loop may have won).
+                                    map.entry(iid).or_insert(SuspendedEntry {
+                                        step_index,
+                                        state,
+                                        context,
+                                    });
+                                }
+                            } else if subject.starts_with(&remove_prefix) {
+                                let iid = String::from_utf8_lossy(
+                                    &subject[remove_prefix.len()..],
+                                ).into_owned();
+                                suspended.lock().await.remove(&iid);
+                            }
+                            msg.ack();
+                        }
+                    }
+                }
+            });
+        }
 
         tokio::spawn({
             let wf_name = Arc::clone(&wf_name);
@@ -447,6 +570,7 @@ impl WorkflowBuilder {
             let wf_name_str: Arc<str> = String::from_utf8_lossy(&wf_name).into();
             let client = client.clone();
             let suspended = Arc::clone(&suspended);
+            let nacked_seqs = Arc::clone(&nacked_seqs);
             // Pre-compute resume/timeout/cancel subject prefixes for fast matching.
             let resume_prefix: Vec<u8> = format!("_wf.{wf_name_str}.resume.").into_bytes();
             let timeout_prefix: Vec<u8> = format!("_wf.{wf_name_str}.timeout.").into_bytes();
@@ -494,6 +618,17 @@ impl WorkflowBuilder {
                                                             mid.as_bytes(), Bytes::from(task),
                                                         );
                                                     }
+                                                    // Publish remove to state stream.
+                                                    let rm_subj = format!(
+                                                        "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                    );
+                                                    let rm_mid = format!("wf:{iid}:remove");
+                                                    let _ = client.publish_with_id(
+                                                        state_stream_id,
+                                                        rm_subj.as_bytes(),
+                                                        rm_mid.as_bytes(),
+                                                        Bytes::new(),
+                                                    );
                                                     msg.ack();
                                                 }
                                                 Err(_) => { msg.nack(); }
@@ -501,8 +636,19 @@ impl WorkflowBuilder {
                                         } else { msg.ack(); }
                                     } else { msg.ack(); }
                                 } else {
-                                    // Already resumed or timed out — discard.
-                                    msg.ack();
+                                    // Entry not found locally.  May be on
+                                    // another worker propagating via the state
+                                    // stream.  Nack with delay for one retry;
+                                    // if already retried, ack as stale.
+                                    let mut ns = nacked_seqs.lock().await;
+                                    if ns.insert(msg.seq) {
+                                        drop(ns);
+                                        msg.nack_delay(100);
+                                    } else {
+                                        ns.remove(&msg.seq);
+                                        drop(ns);
+                                        msg.ack();
+                                    }
                                 }
                                 continue;
                             }
@@ -536,19 +682,50 @@ impl WorkflowBuilder {
                                                                 mid.as_bytes(), Bytes::from(task),
                                                             );
                                                         }
+                                                        // Publish remove to state stream.
+                                                        let rm_subj = format!(
+                                                            "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                        );
+                                                        let rm_mid = format!("wf:{iid}:remove");
+                                                        let _ = client.publish_with_id(
+                                                            state_stream_id,
+                                                            rm_subj.as_bytes(),
+                                                            rm_mid.as_bytes(),
+                                                            Bytes::new(),
+                                                        );
                                                         msg.ack();
                                                     }
                                                     Err(_) => { msg.nack(); }
                                                 }
                                             } else {
-                                                // No timeout handler — just discard the suspended entry.
+                                                // No timeout handler — discard and remove
+                                                // from state stream.
+                                                let rm_subj = format!(
+                                                    "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                );
+                                                let rm_mid = format!("wf:{iid}:remove");
+                                                let _ = client.publish_with_id(
+                                                    state_stream_id,
+                                                    rm_subj.as_bytes(),
+                                                    rm_mid.as_bytes(),
+                                                    Bytes::new(),
+                                                );
                                                 msg.ack();
                                             }
                                         } else { msg.ack(); }
                                     } else { msg.ack(); }
                                 } else {
-                                    // Already resumed — timeout is stale.
-                                    msg.ack();
+                                    // Not found locally — cross-worker retry.
+                                    let mut ns = nacked_seqs.lock().await;
+                                    if ns.insert(msg.seq) {
+                                        drop(ns);
+                                        msg.nack_delay(100);
+                                    } else {
+                                        ns.remove(&msg.seq);
+                                        drop(ns);
+                                        // Already resumed — timeout is stale.
+                                        msg.ack();
+                                    }
                                 }
                                 continue;
                             }
@@ -558,10 +735,19 @@ impl WorkflowBuilder {
                                 let iid = String::from_utf8_lossy(
                                     &subject_bytes[cancel_prefix.len()..],
                                 ).into_owned();
-                                // Remove from suspended registry if present.
-                                // If the instance is currently running (not in map),
-                                // cancellation is best-effort — ack and move on.
+                                // Remove from local map and publish remove to
+                                // state stream so ALL workers drop the entry.
                                 let _ = suspended.lock().await.remove(&iid);
+                                let rm_subj = format!(
+                                    "_wf.{wf_name_str}.__state.remove.{iid}"
+                                );
+                                let rm_mid = format!("wf:{iid}:remove");
+                                let _ = client.publish_with_id(
+                                    state_stream_id,
+                                    rm_subj.as_bytes(),
+                                    rm_mid.as_bytes(),
+                                    Bytes::new(),
+                                );
                                 msg.ack();
                                 continue;
                             }
@@ -678,12 +864,30 @@ impl WorkflowBuilder {
                                     }
                                 }
                                 Ok(StepOutcome::Suspend { state, timeout_ms: handler_timeout }) => {
-                                    // Persist in-memory and release the worker slot.
+                                    // Local cache — fast path for same-worker resume.
                                     suspended.lock().await.insert(instance_id.clone(), SuspendedEntry {
                                         step_index,
                                         state: state.clone(),
                                         context: context.to_vec(),
                                     });
+
+                                    // Publish park event to state stream for
+                                    // cross-worker visibility via fanout.
+                                    let park_subj = format!(
+                                        "_wf.{wf_name_str}.__state.park.{instance_id}"
+                                    );
+                                    let park_mid = format!(
+                                        "wf:{instance_id}:park:{step_index}"
+                                    );
+                                    let park_payload = encode_park(
+                                        step_index, &state, context,
+                                    );
+                                    let _ = client.publish_with_id(
+                                        state_stream_id,
+                                        park_subj.as_bytes(),
+                                        park_mid.as_bytes(),
+                                        Bytes::from(park_payload),
+                                    );
 
                                     // Merge timeouts: handler can override the step default.
                                     let effective_timeout = if handler_timeout > 0 {
@@ -924,6 +1128,7 @@ impl WorkflowBuilder {
             name: self.name,
             task_stream_id,
             dlq_stream_id,
+            state_stream_id,
             cancel,
             resume_seq: AtomicU32::new(0),
         })
@@ -937,6 +1142,8 @@ pub struct WorkflowHandle {
     name: Vec<u8>,
     task_stream_id: u32,
     dlq_stream_id: u32,
+    #[allow(dead_code)]
+    state_stream_id: u32,
     cancel: CancellationToken,
     resume_seq: AtomicU32,
 }
