@@ -31,12 +31,18 @@ RUN rustup target add x86_64-unknown-linux-musl
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/arbitro/target \
     cargo build --release --target x86_64-unknown-linux-musl -p arbitro-server && \
-    cp target/x86_64-unknown-linux-musl/release/arbitro-server /tmp/arbitro-server
+    cp target/x86_64-unknown-linux-musl/release/arbitro-server /tmp/arbitro-server && \
+    mkdir /tmp/empty-data
 
 # Runtime stage — `scratch` is empty. Statically linked binary needs
 # nothing else. Final image ≈ binary size (~2 MB) + a few KB metadata.
 FROM scratch
 COPY --from=builder /tmp/arbitro-server /arbitro-server
+# Pre-create /data owned by nonroot so the default ARBITRO_DATA_DIR works
+# without volume mounts or root. `scratch` has no mkdir, so we COPY an
+# empty dir created in the builder stage.
+COPY --from=builder --chown=65532:65532 /tmp/empty-data /data
+ENV ARBITRO_DATA_DIR=/data
 EXPOSE 9898
 # M26: run as non-root. `scratch` has no /etc/passwd so we use a
 # numeric UID/GID — 65532 is the conventional "nonroot" value used by
