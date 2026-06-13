@@ -13,9 +13,9 @@ Client-side workflow pipelines over Arbitro streams. The broker has no workflow-
 | `trigger` | `(subject: &[u8]) -> Self` | Subject pattern that triggers new instances. |
 | `trigger_stream` | `(stream_id: u32) -> Self` | Auto-subscribe to this stream for the trigger subject. |
 | `trigger_with_id` | `(client, id: &[u8], context: &[u8]) -> Result` | Trigger with an explicit instance ID (dedup-safe). |
-| `source` | `(stream_name: &[u8]) -> Self` | External stream as event source for triggers. |
+| `source` | `(stream_name: &[u8], subject: &[u8]) -> Self` | External stream as event source for triggers. |
 | `step` | `(name: &[u8], handler) -> Self` | Append a processing step. |
-| `suspend_step` | `(name: &[u8], handler) -> Self` | Step that can suspend (park) and wait for external resume. |
+| `suspend_step` | `(name: &[u8], timeout_ms: u64, run, on_resume) -> Self` | Step that can suspend (park) and wait for external resume. |
 | `on_timeout` | `(handler) -> Self` | Timeout handler for the preceding suspend step. |
 | `compensate` | `(name: &[u8], handler) -> Self` | Rollback handler for the most recently added step. Runs in reverse on permanent failure. |
 | `max_retries` | `(n: u8) -> Self` | Attempts before DLQ (default: 3). |
@@ -90,19 +90,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Suspend / Resume / Cancel
 
 ```rust
+use arbitro_client_tokio::{StepOutcome, ResumeContext, TimeoutContext};
+
 let wf = client.workflow(b"payment-auth")
     .trigger(b"payments.initiated")
     .step(b"prepare", |ctx: StepContext| async move {
         let prepared = prepare_payment(&ctx.context).await?;
         Ok(StepResult { context: prepared })
     })
-    .suspend_step(b"wait-auth", |ctx: StepContext| async move {
-        send_auth_link(&ctx.context).await?;
-        Ok(StepResult::suspend())  // parks the instance until resume
-    })
-    .on_timeout(|ctx: StepContext| async move {
-        notify_timeout(&ctx.context).await;
-        Ok(StepResult { context: ctx.context })
+    // suspend_step(name, timeout_ms, run_handler, on_resume_handler)
+    .suspend_step(b"wait-auth", 30_000,
+        // run: called when step starts — return Suspend to park
+        |ctx: StepContext| async move {
+            let state = send_auth_link(&ctx.context).await?;
+            Ok(StepOutcome::Suspend { state, timeout_ms: 30_000 })
+        },
+        // on_resume: called when wf.resume() arrives with an event
+        |resume: ResumeContext| async move {
+            let result = process_payment(&resume.state, &resume.event).await?;
+            Ok(StepResult { context: result })
+        },
+    )
+    // on_timeout: called if 30s pass without resume
+    .on_timeout(|timeout: TimeoutContext| async move {
+        let cancelled = cancel_auth(&timeout.state).await?;
+        Ok(StepResult { context: cancelled })
     })
     .step(b"finalize", |ctx: StepContext| async move {
         Ok(StepResult { context: finalize_payment(&ctx.context).await? })
@@ -110,20 +122,20 @@ let wf = client.workflow(b"payment-auth")
     .start().await?;
 
 // Trigger with explicit ID (dedup-safe)
-wf.trigger_with_id(&client, b"payment-abc-123", b"payload").await?;
+wf.trigger_with_id(&client, "payment-abc-123", b"payload").await?;
 
-// Resume a suspended instance (e.g. after user completes auth)
-wf.resume(&client, b"payment-abc-123", b"auth-result").await?;
+// ... later, Stripe webhook confirms payment ...
+wf.resume(&client, "payment-abc-123", b"stripe-event").await?;
 
-// Cancel a running or suspended instance
-wf.cancel(&client, b"payment-abc-123").await?;
+// Or cancel a suspended instance
+wf.cancel(&client, "payment-abc-123").await?;
 ```
 
 ### Source (External Stream Triggers)
 
 ```rust
 let wf = client.workflow(b"event-driven")
-    .source(b"external-events")          // subscribe to an existing stream
+    .source(b"external-events", b"events.>")  // stream_name + subject
     .step(b"process", |ctx: StepContext| async move {
         Ok(StepResult { context: process_event(&ctx.context).await? })
     })
