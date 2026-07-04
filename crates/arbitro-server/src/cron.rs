@@ -26,6 +26,18 @@ use arbitro_proto::wire::cron::{encode_cron_fire, CronInfo};
 
 use chrono::Utc;
 
+/// SEC-7: hard cap on distinct cron names in the registry, to bound
+/// memory in the face of a client hammering CreateCron with unique names.
+const MAX_CRON_SLOTS: usize = 10_000;
+/// SEC-7: hard cap on worker connections registered against a single
+/// cron slot.
+const MAX_WORKERS_PER_SLOT: usize = 1_000;
+
+/// ROB-20: default handler timeout applied when the client requests
+/// `timeout_ms == 0` (no timeout). Without this, a stuck worker holds
+/// `running = true` forever and starves the slot's fire cycle.
+const DEFAULT_TIMEOUT_MS: u32 = 3_600_000; // 1 hour
+
 // ── CronSlot ────────────────────────────────────────────────────────────────
 
 /// A single cron schedule with its worker pool.
@@ -67,6 +79,14 @@ impl CronSlot {
         overlap: bool,
         conn_id: u64,
     ) -> Self {
+        // ROB-20: timeout_ms == 0 means "no timeout" on the wire, but
+        // that lets a stuck worker wedge the slot forever. Enforce a
+        // sane default instead.
+        let timeout_ms = if timeout_ms == 0 {
+            DEFAULT_TIMEOUT_MS
+        } else {
+            timeout_ms
+        };
         let mut slot = Self {
             cron,
             every,
@@ -188,10 +208,25 @@ impl CronRegistry {
         if let Some(slot) = map.get_mut(&name) {
             // Name exists — add connection as another worker.
             if !slot.connections.contains(&conn_id) {
+                // SEC-7: bound the worker pool per slot.
+                if slot.connections.len() >= MAX_WORKERS_PER_SLOT {
+                    return Err(format!(
+                        "cron '{}' already has the maximum of {} workers",
+                        String::from_utf8_lossy(&name),
+                        MAX_WORKERS_PER_SLOT
+                    ));
+                }
                 slot.connections.push(conn_id);
                 debug!(name = %String::from_utf8_lossy(&name), conn_id, "cron worker added");
             }
         } else {
+            // SEC-7: bound the total number of distinct cron slots.
+            if map.len() >= MAX_CRON_SLOTS {
+                return Err(format!(
+                    "cron registry is at the maximum of {} slots",
+                    MAX_CRON_SLOTS
+                ));
+            }
             info!(name = %String::from_utf8_lossy(&name), every, "cron created");
             map.insert(
                 name,
@@ -281,9 +316,18 @@ impl CronRegistry {
                 continue;
             }
 
-            // Overlap guard.
+            // Overlap guard. ROB-20: a full interval has now elapsed
+            // without an ack for the in-flight fire — force-clear
+            // `running` so the slot can't wedge forever regardless of
+            // what the worker does with the earlier fire.
             if slot.running && !slot.overlap {
-                debug!(name = %String::from_utf8_lossy(name), "cron fire skipped (overlap)");
+                warn!(
+                    name = %String::from_utf8_lossy(name),
+                    "cron fire skipped (overlap) — next interval elapsed, clearing running state"
+                );
+                slot.running = false;
+                slot.running_since = None;
+                slot.running_conn = None;
                 slot.schedule_next();
                 continue;
             }

@@ -42,6 +42,10 @@ async fn main() -> std::io::Result<()> {
         println!("  ARBITRO_MAX_OPS_PER_SEC  Max frames/sec per connection (0 = unlimited)");
         println!("  ARBITRO_FSYNC_POLICY     Metadata fsync: \"every\" (default) or \"none\"");
         println!("  ARBITRO_LOG               tracing filter directive (SIGHUP reloads)");
+        println!("  ARBITRO_LOG_FORMAT        Log format: \"json\" or \"text\" (default)");
+        println!("  ARBITRO_MAX_STREAMS_PER_CONN   Max streams per connection (default: 1000)");
+        println!("  ARBITRO_MAX_CONSUMERS_PER_CONN Max consumers per connection (default: 1000)");
+        println!("  ARBITRO_MAX_CRONS_PER_CONN     Max crons per connection (default: 1000)");
         return Ok(());
     }
 
@@ -54,10 +58,22 @@ async fn main() -> std::io::Result<()> {
     let (filter, reload_handle) = tracing_subscriber::reload::Layer::new(initial);
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // FEAT-16: ARBITRO_LOG_FORMAT selects "json" for structured logs
+    // (log aggregators) or "text"/absent for the human-readable format.
+    let log_json = std::env::var("ARBITRO_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if log_json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     #[cfg(unix)]
     {

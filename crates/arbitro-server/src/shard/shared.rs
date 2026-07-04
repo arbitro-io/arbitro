@@ -269,6 +269,10 @@ pub struct DrainSnapshot {
     /// 0 = no age limit for that stream. Populated by CommandWorker from
     /// `stream_retention` on snapshot rebuild.
     pub stream_max_age_ms: Vec<u64>,
+    /// Per-stream birth seq. Indexed by StreamId.raw(). Drain skips entries
+    /// with seq < this value for the given stream (entries from a previous
+    /// incarnation of a recycled stream_id). 0 = no filter.
+    pub stream_created_at_seq: Vec<u64>,
 }
 
 /// Per-connection writer handle, deduplicated from bindings (one entry
@@ -289,6 +293,7 @@ impl DrainSnapshot {
             writers_by_conn: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::new(),
             stream_max_age_ms: Vec::new(),
+            stream_created_at_seq: Vec::new(),
         }
     }
 }

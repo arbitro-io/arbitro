@@ -45,7 +45,9 @@ async fn client_reconnects_after_server_restart() {
     // Start the first server.
     let server1 = spawn_server(&addr).await;
 
-    // Connect with aggressive reconnect so the test doesn't take long.
+    // Aggressive reconnect + keepalive so the test finishes fast.
+    // Short keepalive detects dead server within ~1s even when the
+    // per-connection handler task outlives the aborted server task.
     let cfg = ClientConfig {
         addr: addr.clone(),
         reconnect: ReconnectPolicy {
@@ -54,8 +56,8 @@ async fn client_reconnects_after_server_restart() {
             max_attempts: None,
         },
         keep_alive: KeepAlive {
-            interval: Duration::from_secs(60),
-            timeout: Duration::from_secs(120),
+            interval: Duration::from_millis(200),
+            timeout: Duration::from_secs(1),
         },
         ..ClientConfig::default()
     };
@@ -76,8 +78,8 @@ async fn client_reconnects_after_server_restart() {
     let _server2 = spawn_server(&addr).await;
 
     // The reconnect loop should re-connect within a few backoff intervals.
-    // Give it up to 3 seconds.
-    let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+    // 10s budget: Windows debug builds are slow and port reuse can lag.
+    let reconnected = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client.list_streams(0, 10).await {
                 Ok(_) => return, // reconnected and command works
@@ -89,7 +91,7 @@ async fn client_reconnects_after_server_restart() {
 
     assert!(
         reconnected.is_ok(),
-        "client did not reconnect within 3 s after server restart"
+        "client did not reconnect within 10 s after server restart"
     );
 
     client.close();

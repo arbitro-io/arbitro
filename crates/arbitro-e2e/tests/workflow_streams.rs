@@ -339,6 +339,7 @@ async fn workflow_worker_disconnect_redelivers() {
     // Close client1 — the in-flight message should NOT be acked.
     handle1.stop();
     client1.close();
+    drop(client1);
 
     // Wait for the ack_wait timeout to expire so the server redelivers.
     tokio::time::sleep(Duration::from_millis(1500)).await;

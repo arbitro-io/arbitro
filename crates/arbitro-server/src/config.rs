@@ -61,6 +61,12 @@ pub struct Config {
     pub cluster_node_id: u64,
     /// Address this node listens on for Raft traffic (default: "0.0.0.0:9900").
     pub cluster_listen: String,
+    /// Max streams a single connection may create (0 = unlimited, default: 1000).
+    pub max_streams_per_conn: u32,
+    /// Max consumers a single connection may create (0 = unlimited, default: 1000).
+    pub max_consumers_per_conn: u32,
+    /// Max crons a single connection may create (0 = unlimited, default: 1000).
+    pub max_crons_per_conn: u32,
 }
 
 /// Fsync policy for metadata persistence.
@@ -104,6 +110,9 @@ impl Config {
             cluster_peers: parse_cluster_peers(),
             cluster_node_id: env_parse("ARBITRO_CLUSTER_NODE_ID", 1),
             cluster_listen: env_or("ARBITRO_CLUSTER_LISTEN", "0.0.0.0:9900"),
+            max_streams_per_conn: env_parse("ARBITRO_MAX_STREAMS_PER_CONN", 1000),
+            max_consumers_per_conn: env_parse("ARBITRO_MAX_CONSUMERS_PER_CONN", 1000),
+            max_crons_per_conn: env_parse("ARBITRO_MAX_CRONS_PER_CONN", 1000),
         }
     }
 
@@ -214,6 +223,21 @@ impl Config {
         self.fsync_policy = policy;
         self
     }
+
+    pub fn max_streams_per_conn(mut self, max: u32) -> Self {
+        self.max_streams_per_conn = max;
+        self
+    }
+
+    pub fn max_consumers_per_conn(mut self, max: u32) -> Self {
+        self.max_consumers_per_conn = max;
+        self
+    }
+
+    pub fn max_crons_per_conn(mut self, max: u32) -> Self {
+        self.max_crons_per_conn = max;
+        self
+    }
 }
 
 impl Default for Config {
@@ -242,6 +266,9 @@ impl Default for Config {
             cluster_peers: Vec::new(),
             cluster_node_id: 1,
             cluster_listen: "0.0.0.0:9900".into(),
+            max_streams_per_conn: 1000,
+            max_consumers_per_conn: 1000,
+            max_crons_per_conn: 1000,
         }
     }
 }
@@ -251,10 +278,16 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(raw) => match raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(var = key, value = %raw, "unparseable env var, using default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 /// Parse `ARBITRO_CLUSTER_PEERS` env var.

@@ -2,12 +2,13 @@
 //! Strictly follows Hardware Sympathy: Zero allocations on the hot path.
 
 use memmap2::{Mmap, MmapMut};
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
 use crate::segment::{self, SegmentMetadata, MAX_SEGMENT_BYTES};
-use crate::store::{Entry, EntryRef, Store, StoreError, StoreInfo};
-use arbitro_engine_v2::catalog::wire_hash_32;
+use crate::store::{entry_matches, Entry, EntryRef, FsyncPolicy, RetentionLimits, Store, StoreError, StoreInfo};
+use arbitro_engine_v2::common::wire_hash_32;
 
 #[derive(Debug, Clone, Copy)]
 struct LogMetadata {
@@ -34,6 +35,16 @@ pub struct TolerantStore {
     first_seq: u64,
     total_bytes: u64,
     current_segment_offset: u32,
+    /// FEAT-2: durability policy applied after append writes.
+    fsync_policy: FsyncPolicy,
+    /// Appends since the last explicit flush — used by `EveryNWrites`.
+    writes_since_flush: u32,
+    /// FEAT-1: retention limits enforced by `append`/`append_batch`.
+    limits: RetentionLimits,
+    /// ROB-17: sequence numbers tombstoned in the *active* segment that
+    /// have not yet been persisted to the sidecar file, plus the full
+    /// tombstoned set for quick membership checks across all segments.
+    tombstoned: HashSet<u64>,
 }
 
 const MAGIC: u8 = 0xAF;
@@ -71,6 +82,121 @@ impl TolerantStore {
             first_seq: 1,
             total_bytes: 0,
             current_segment_offset: 0,
+            fsync_policy: FsyncPolicy::None,
+            writes_since_flush: 0,
+            limits: RetentionLimits::UNLIMITED,
+            tombstoned: HashSet::new(),
+        }
+    }
+
+    /// FEAT-2: configure the fsync/msync policy applied after appends.
+    pub fn set_fsync_policy(&mut self, policy: FsyncPolicy) {
+        self.fsync_policy = policy;
+    }
+
+    /// FEAT-1: configure max_msgs/max_bytes/max_age retention limits.
+    /// Enforced by `append`/`append_batch`, which call `truncate_front`
+    /// when a limit would be exceeded.
+    pub fn set_retention_limits(&mut self, limits: RetentionLimits) {
+        self.limits = limits;
+    }
+
+    /// FEAT-6: sidecar path holding the serialized index for a sealed
+    /// segment, so recovery can load it instead of re-scanning + CRC
+    /// checking every byte.
+    fn idx_path(base: &std::path::Path, segment_first_seq: u64) -> PathBuf {
+        base.join(format!("{segment_first_seq:020}.idx"))
+    }
+
+    /// ROB-17: sidecar path holding tombstoned sequence numbers for a
+    /// segment (one file per segment, named after the segment's first_seq).
+    fn tombstone_path(base: &std::path::Path, segment_first_seq: u64) -> PathBuf {
+        base.join(format!("{segment_first_seq:020}.tombstones"))
+    }
+
+    /// FEAT-6: write the just-sealed segment's index entries as a flat
+    /// binary sidecar so recovery can skip the scan+CRC pass entirely.
+    /// Format: repeated fixed-size records matching `LogMetadata`
+    /// (all fields little-endian).
+    fn write_idx_sidecar(&self, segment_first_seq: u64, entries: &[LogMetadata]) {
+        let path = Self::idx_path(&self.base_path, segment_first_seq);
+        let mut buf = Vec::with_capacity(entries.len() * 41);
+        for m in entries {
+            buf.extend_from_slice(&m.seq.to_le_bytes());
+            buf.extend_from_slice(&m.ts.to_le_bytes());
+            buf.extend_from_slice(&m.subj_len.to_le_bytes());
+            buf.extend_from_slice(&m.payload_len.to_le_bytes());
+            buf.extend_from_slice(&m.offset.to_le_bytes());
+            buf.extend_from_slice(&m.subject_hash.to_le_bytes());
+            buf.extend_from_slice(&m.stream_id.to_le_bytes());
+            buf.push(m.flags);
+        }
+        if let Err(e) = fs::write(&path, &buf) {
+            tracing::warn!(error = %e, path = %path.display(), "tolerant store: failed to write .idx sidecar");
+        }
+    }
+
+    /// FEAT-6: load a previously written `.idx` sidecar for the segment
+    /// starting at `segment_first_seq`. Returns `None` if missing or
+    /// malformed (falls back to the scan path).
+    fn load_idx_sidecar(path: &std::path::Path, segment_idx: u32) -> Option<Vec<LogMetadata>> {
+        const REC: usize = 8 + 8 + 2 + 4 + 4 + 4 + 4 + 1;
+        let bytes = fs::read(path).ok()?;
+        if bytes.is_empty() || bytes.len() % REC != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(bytes.len() / REC);
+        for chunk in bytes.chunks_exact(REC) {
+            let seq = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let ts = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            let subj_len = u16::from_le_bytes(chunk[16..18].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(chunk[18..22].try_into().unwrap());
+            let offset = u32::from_le_bytes(chunk[22..26].try_into().unwrap());
+            let subject_hash = u32::from_le_bytes(chunk[26..30].try_into().unwrap());
+            let stream_id = u32::from_le_bytes(chunk[30..34].try_into().unwrap());
+            let flags = chunk[34];
+            out.push(LogMetadata {
+                seq,
+                ts,
+                subj_len,
+                payload_len,
+                offset,
+                segment_idx,
+                subject_hash,
+                stream_id,
+                flags,
+            });
+        }
+        Some(out)
+    }
+
+    /// ROB-17: persist the full tombstoned-sequence set for a segment.
+    /// Called on each `tombstone_at` — O(tombstones-in-segment) so it
+    /// stays cheap for typical low tombstone rates.
+    fn save_tombstones_for_segment(&self, segment_first_seq: u64, seqs: &[u64]) {
+        let path = Self::tombstone_path(&self.base_path, segment_first_seq);
+        let mut buf = Vec::with_capacity(seqs.len() * 8);
+        for s in seqs {
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        if let Err(e) = fs::write(&path, &buf) {
+            tracing::warn!(error = %e, path = %path.display(), "tolerant store: failed to write .tombstones sidecar");
+        }
+    }
+
+    /// ROB-17: load tombstoned sequence numbers from a segment's sidecar,
+    /// if present, and apply them to the in-memory index + `tombstoned` set.
+    fn load_tombstones_for_segment(&mut self, segment_first_seq: u64) {
+        let path = Self::tombstone_path(&self.base_path, segment_first_seq);
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        if bytes.is_empty() || bytes.len() % 8 != 0 {
+            return;
+        }
+        for chunk in bytes.chunks_exact(8) {
+            let seq = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.tombstoned.insert(seq);
         }
     }
 
@@ -90,14 +216,34 @@ impl TolerantStore {
             // Drop mmap BEFORE seal_segment reopens the file (Windows file locking).
             drop(mmap);
             let path = segment::segment_path(&self.base_path, self.active_segment_id);
-            let sealed = segment::seal_segment(&path, self.current_segment_offset)
-                .map_err(|_| StoreError::Full)?;
+            let sealed = segment::seal_segment(&path, self.current_segment_offset)?;
+
+            // ROB-10: record metadata for the segment just sealed so
+            // `truncate_front` can find + delete it later.
+            let sealed_idx = self.sealed_segments.len() as u32;
+            let seg_entries: Vec<LogMetadata> = self
+                .index
+                .iter()
+                .filter(|m| m.segment_idx == sealed_idx)
+                .copied()
+                .collect();
+            let first_seq = seg_entries.first().map(|m| m.seq).unwrap_or(self.active_segment_id);
+            let last_seq = seg_entries.last().map(|m| m.seq).unwrap_or(self.active_segment_id);
+            self.segments.push(SegmentMetadata {
+                path: path.clone(),
+                first_seq,
+                last_seq,
+            });
+
+            // FEAT-6: write the sidecar index for the now-sealed segment.
+            self.write_idx_sidecar(first_seq, &seg_entries);
+
             self.sealed_segments.push(sealed);
         }
 
         self.active_segment_id = self.next_seq;
         let path = segment::segment_path(&self.base_path, self.active_segment_id);
-        let mmap = segment::create_active_segment(&path).map_err(|_| StoreError::NotFound)?;
+        let mmap = segment::create_active_segment(&path)?;
 
         self.active_mmap = Some(mmap);
         self.current_segment_offset = 0;
@@ -110,8 +256,7 @@ impl TolerantStore {
             return Ok(());
         }
 
-        let mut paths: Vec<_> = fs::read_dir(&self.base_path)
-            .map_err(|_| StoreError::NotFound)?
+        let mut paths: Vec<_> = fs::read_dir(&self.base_path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
@@ -124,15 +269,50 @@ impl TolerantStore {
         Ok(())
     }
 
+    /// Parse the `first_seq` a segment file was named with, e.g.
+    /// `00000000000000000001.log` → `1`. Used to look up the `.idx`
+    /// and `.tombstones` sidecars before falling back to a full scan.
+    fn segment_first_seq_from_path(path: &std::path::Path) -> Option<u64> {
+        path.file_stem()?.to_str()?.parse().ok()
+    }
+
     fn load_segment(&mut self, path: &std::path::Path) -> Result<(), StoreError> {
-        let file = fs::File::open(path).map_err(|_| StoreError::NotFound)?;
+        let file = fs::File::open(path)?;
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         if len < HEADER_SIZE as u64 {
             return Ok(());
         }
 
-        let mmap = unsafe { Mmap::map(&file).map_err(|_| StoreError::NotFound)? };
+        let mmap = unsafe { Mmap::map(&file)? };
         let segment_idx = self.sealed_segments.len() as u32;
+
+        // FEAT-6: if a sidecar `.idx` exists for this segment, trust it
+        // instead of re-scanning + CRC-checking every byte. The sidecar
+        // is only written on clean seal (rotate/shutdown), so its mere
+        // presence implies the segment was not torn.
+        if let Some(named_first_seq) = Self::segment_first_seq_from_path(path) {
+            let idx_path = Self::idx_path(&self.base_path, named_first_seq);
+            if let Some(entries) = Self::load_idx_sidecar(&idx_path, segment_idx) {
+                if let (Some(first_m), Some(last_m)) = (entries.first(), entries.last()) {
+                    let first = first_m.seq;
+                    let last = last_m.seq;
+                    for m in &entries {
+                        self.total_bytes += (m.subj_len as u64) + (m.payload_len as u64);
+                        self.next_seq = m.seq + 1;
+                    }
+                    self.index.extend(entries);
+                    self.segments.push(SegmentMetadata {
+                        path: path.to_path_buf(),
+                        first_seq: first,
+                        last_seq: last,
+                    });
+                    self.sealed_segments.push(mmap);
+                    self.load_tombstones_for_segment(first);
+                    return Ok(());
+                }
+            }
+        }
+
         let mut offset = 0usize;
         let mut first = 0;
         let mut last = 0;
@@ -211,10 +391,12 @@ impl TolerantStore {
 
         if first != 0 {
             self.segments.push(SegmentMetadata {
+                path: path.to_path_buf(),
                 first_seq: first,
                 last_seq: last,
             });
             self.sealed_segments.push(mmap);
+            self.load_tombstones_for_segment(first);
         }
         Ok(())
     }
@@ -279,15 +461,259 @@ impl TolerantStore {
         self.next_seq += 1;
         self.total_bytes += entry_total;
         self.current_segment_offset += total_needed as u32;
+
+        // FEAT-2: apply the configured fsync policy after the write.
+        self.writes_since_flush += 1;
+        let should_flush = match self.fsync_policy {
+            FsyncPolicy::None => false,
+            FsyncPolicy::EveryWrite => true,
+            FsyncPolicy::EveryNWrites(n) => n > 0 && self.writes_since_flush >= n,
+        };
+        if should_flush {
+            if let Some(mmap) = self.active_mmap.as_ref() {
+                if let Err(e) = mmap.flush() {
+                    tracing::error!(error = %e, "tolerant store: fsync policy flush failed");
+                }
+            }
+            self.writes_since_flush = 0;
+        }
+
         seq
+    }
+
+    /// ROB-9: resolve `seq` to an index position. The direct
+    /// `seq - first_seq` computation is only valid when the index has no
+    /// gaps (e.g. from partial recovery or future compaction removing
+    /// entries); verify it and fall back to binary search on mismatch.
+    #[inline]
+    fn seq_to_idx(&self, seq: u64) -> Option<usize> {
+        if seq < self.first_seq {
+            return None;
+        }
+        let est_idx = (seq - self.first_seq) as usize;
+        if est_idx < self.index.len() && self.index[est_idx].seq == seq {
+            return Some(est_idx);
+        }
+        self.index.binary_search_by_key(&seq, |m| m.seq).ok()
+    }
+
+    /// ROB-9: lower-bound variant for range scans (`read_range`,
+    /// `for_each`) — same verify-then-fallback strategy as `seq_to_idx`
+    /// but returns an insertion point instead of requiring an exact hit.
+    #[inline]
+    fn find_lower_bound(&self, seq: u64) -> usize {
+        if seq <= self.first_seq {
+            return 0;
+        }
+        let est_idx = (seq - self.first_seq) as usize;
+        if est_idx < self.index.len() && self.index[est_idx].seq == seq {
+            est_idx
+        } else {
+            self.index
+                .binary_search_by_key(&seq, |m| m.seq)
+                .unwrap_or_else(|i| i)
+        }
+    }
+
+    /// FEAT-1: enforce retention limits by truncating the front of the
+    /// log until the store is back within `max_msgs`/`max_bytes`. Called
+    /// before accepting new entries in `append`/`append_batch`.
+    fn enforce_limits(&mut self, incoming_msgs: u64, incoming_bytes: u64) {
+        if self.limits == RetentionLimits::UNLIMITED {
+            return;
+        }
+        if self.limits.max_msgs > 0 {
+            let projected = self.index.len() as u64 + incoming_msgs;
+            if projected > self.limits.max_msgs {
+                let overflow = projected - self.limits.max_msgs;
+                let target = self.first_seq + overflow;
+                self.truncate_front(target);
+            }
+        }
+        if self.limits.max_bytes > 0 {
+            let projected = self.total_bytes + incoming_bytes;
+            if projected > self.limits.max_bytes {
+                // Walk forward from first_seq, dropping entries until
+                // projected bytes fit under the limit.
+                let mut to_drop_bytes = projected - self.limits.max_bytes;
+                let mut target = self.first_seq;
+                for m in &self.index {
+                    if to_drop_bytes == 0 {
+                        break;
+                    }
+                    let sz = (m.subj_len as u64) + (m.payload_len as u64);
+                    to_drop_bytes = to_drop_bytes.saturating_sub(sz);
+                    target = m.seq + 1;
+                }
+                self.truncate_front(target);
+            }
+        }
+        if self.limits.max_age_ms > 0 {
+            // Best-effort: caller-supplied timestamps are the only clock
+            // this store has. Skipped here — enforced via `purge_before`
+            // by callers that track wall-clock time, since `enforce_limits`
+            // has no access to "now".
+        }
+    }
+
+    /// FEAT-7: like `get`, but recomputes the CRC32 over the on-disk
+    /// record and returns `StoreError::Io` (data corruption) on mismatch
+    /// instead of silently handing back the (possibly corrupt) bytes.
+    pub fn get_verified(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
+        let Some(idx) = self.seq_to_idx(seq) else {
+            return Ok(false);
+        };
+        let m = &self.index[idx];
+        let data = if m.segment_idx == self.sealed_segments.len() as u32 {
+            self.active_mmap
+                .as_ref()
+                .map(|m| &m[..])
+                .ok_or(StoreError::NotFound)?
+        } else {
+            &self.sealed_segments[m.segment_idx as usize][..]
+        };
+
+        let header_start = (m.offset as usize) - HEADER_SIZE;
+        let sub_end = (m.offset as usize) + (m.subj_len as usize);
+        let body_end = sub_end + (m.payload_len as usize);
+        let crc_end = body_end + RECORD_CRC_SIZE;
+        if crc_end > data.len() {
+            return Err(StoreError::Io(std::io::ErrorKind::UnexpectedEof));
+        }
+        let expected_crc = u32::from_le_bytes(data[body_end..crc_end].try_into().unwrap());
+        let actual_crc = crc32fast::hash(&data[header_start..body_end]);
+        if expected_crc != actual_crc {
+            return Err(StoreError::Io(std::io::ErrorKind::InvalidData));
+        }
+
+        f(&Entry {
+            seq: m.seq,
+            stream_id: m.stream_id,
+            timestamp: m.ts,
+            subject: &data[m.offset as usize..sub_end],
+            payload: &data[sub_end..body_end],
+            flags: m.flags,
+        });
+        Ok(true)
+    }
+
+    /// FEAT-8: rewrite all sealed segments, dropping tombstoned entries.
+    /// Returns the number of entries reclaimed. Rebuilds the on-disk
+    /// segment files and their `.idx`/`.tombstones` sidecars; the active
+    /// (unsealed) segment is left untouched since it is still being
+    /// written to.
+    pub fn compact(&mut self) -> Result<u64, StoreError> {
+        if self.segments.is_empty() {
+            return Ok(0);
+        }
+
+        let active_seg_id = self.sealed_segments.len() as u32;
+        let mut reclaimed = 0u64;
+        let mut new_index: Vec<LogMetadata> = Vec::with_capacity(self.index.len());
+        let mut new_sealed_segments: Vec<Mmap> = Vec::with_capacity(self.sealed_segments.len());
+        let mut new_segments: Vec<SegmentMetadata> = Vec::with_capacity(self.segments.len());
+
+        for (seg_idx, seg_meta) in self.segments.iter().enumerate() {
+            let seg_idx = seg_idx as u32;
+            let entries: Vec<&LogMetadata> = self
+                .index
+                .iter()
+                .filter(|m| m.segment_idx == seg_idx)
+                .collect();
+
+            let tmp_path = seg_meta.path.with_extension("log.compact");
+            let mmap = segment::create_active_segment(&tmp_path)?;
+            let mut mmap = mmap;
+            let mut write_offset = 0u32;
+            let new_seg_idx = new_sealed_segments.len() as u32;
+            let mut kept: Vec<LogMetadata> = Vec::with_capacity(entries.len());
+
+            for m in &entries {
+                if m.flags & crate::store::flags::TOMBSTONE != 0 {
+                    reclaimed += 1;
+                    continue;
+                }
+                let src = &self.sealed_segments[seg_idx as usize][..];
+                let header_start = (m.offset as usize) - HEADER_SIZE;
+                let body_end = (m.offset as usize) + (m.subj_len as usize) + (m.payload_len as usize);
+                let record_end = body_end + RECORD_CRC_SIZE;
+                let record = &src[header_start..record_end];
+
+                let start = write_offset as usize;
+                mmap[start..start + record.len()].copy_from_slice(record);
+
+                kept.push(LogMetadata {
+                    seq: m.seq,
+                    ts: m.ts,
+                    subj_len: m.subj_len,
+                    payload_len: m.payload_len,
+                    offset: (start + HEADER_SIZE) as u32,
+                    segment_idx: new_seg_idx,
+                    subject_hash: m.subject_hash,
+                    stream_id: m.stream_id,
+                    flags: m.flags,
+                });
+                write_offset += record.len() as u32;
+            }
+
+            if let Err(e) = mmap.flush() {
+                tracing::warn!(error = %e, "tolerant store: compact flush failed");
+            }
+            drop(mmap);
+
+            if kept.is_empty() {
+                let _ = fs::remove_file(&tmp_path);
+                continue;
+            }
+
+            let sealed = segment::seal_segment(&tmp_path, write_offset)?;
+            // Atomically replace the original segment file with the
+            // compacted one.
+            if let Err(e) = fs::rename(&tmp_path, &seg_meta.path) {
+                tracing::warn!(error = %e, "tolerant store: compact rename failed");
+            }
+
+            let first_seq = kept.first().map(|m| m.seq).unwrap_or(seg_meta.first_seq);
+            let last_seq = kept.last().map(|m| m.seq).unwrap_or(seg_meta.last_seq);
+            self.write_idx_sidecar(first_seq, &kept);
+
+            new_segments.push(SegmentMetadata {
+                path: seg_meta.path.clone(),
+                first_seq,
+                last_seq,
+            });
+            new_sealed_segments.push(sealed);
+            new_index.extend(kept);
+        }
+
+        // Active (unsealed) segment entries pass through untouched.
+        for m in self.index.iter().filter(|m| m.segment_idx == active_seg_id) {
+            let mut m = *m;
+            m.segment_idx = new_sealed_segments.len() as u32;
+            new_index.push(m);
+        }
+
+        self.sealed_segments = new_sealed_segments;
+        self.segments = new_segments;
+        self.index = new_index;
+        self.total_bytes = self
+            .index
+            .iter()
+            .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
+            .sum();
+        if let Some(f) = self.index.first() {
+            self.first_seq = f.seq;
+        }
+
+        Ok(reclaimed)
     }
 }
 
 impl Store for TolerantStore {
     fn init(&mut self) -> Result<(), StoreError> {
-        // Pre-allocate indices to 1M entries for zero-alloc hot path
-        // WHY: Realloc on hot path violates Hardware Sympathy.
-        self.index = Vec::with_capacity(1_000_000);
+        // PERF-3: start small — the previous 1M-entry pre-allocation
+        // reserved ~41 MB per store up front regardless of actual usage.
+        self.index = Vec::with_capacity(1024);
         self.scan_segments()?;
         if self.active_mmap.is_none() {
             self.rotate()?;
@@ -299,9 +725,24 @@ impl Store for TolerantStore {
     }
 
     fn append(&mut self, entry: EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError> {
+        // ROB-11: header's subj_len field is a u16 — reject anything
+        // that can't round-trip through it before touching the mmap.
+        if entry.subject.len() > u16::MAX as usize {
+            return Err(StoreError::InvalidSubjectLength);
+        }
+
         let entry_total = (entry.subject.len() + entry.payload.len()) as u64;
         // +RECORD_CRC_SIZE for the trailing CRC32 (B5).
         let total_needed = (HEADER_SIZE as u64) + entry_total + RECORD_CRC_SIZE as u64;
+
+        // CRASH-2: an entry that can never fit in a freshly rotated
+        // segment must be rejected up front, not after an infinite
+        // rotate loop / mmap bounds panic.
+        if total_needed > MAX_SEGMENT_BYTES {
+            return Err(StoreError::EntryTooLarge);
+        }
+
+        self.enforce_limits(1, entry_total);
 
         if (self.current_segment_offset as u64) + total_needed >= MAX_SEGMENT_BYTES {
             self.rotate()?;
@@ -311,13 +752,9 @@ impl Store for TolerantStore {
     }
 
     fn get(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
-        if seq < self.first_seq {
+        let Some(idx) = self.seq_to_idx(seq) else {
             return Ok(false);
-        }
-        let idx = (seq - self.first_seq) as usize;
-        if idx >= self.index.len() {
-            return Ok(false);
-        }
+        };
         let m = &self.index[idx];
         let data = if m.segment_idx == self.sealed_segments.len() as u32 {
             self.active_mmap
@@ -341,6 +778,11 @@ impl Store for TolerantStore {
     }
 
     fn truncate_front(&mut self, target: u64) -> u64 {
+        // ROB-16: never target beyond what has actually been written —
+        // a caller-supplied `target > next_seq` would otherwise drop
+        // every existing entry and desynchronize `first_seq`.
+        let target = target.min(self.next_seq);
+
         if self.index.is_empty() || target <= self.first_seq {
             return 0;
         }
@@ -353,10 +795,31 @@ impl Store for TolerantStore {
 
         let mut dropped = 0;
         while !self.segments.is_empty() && self.segments[0].last_seq < target {
-            let path = segment::segment_path(&self.base_path, self.segments[0].first_seq);
-            let _ = fs::remove_file(path);
+            let seg_first_seq = self.segments[0].first_seq;
+            let path = segment::segment_path(&self.base_path, seg_first_seq);
+
+            // ROB-15: drop the mmap handle BEFORE removing the file —
+            // on Windows an open mapping holds the file open and the
+            // delete silently fails (or, worse, succeeds and leaves a
+            // dangling handle). Log failures instead of discarding them.
             self.sealed_segments.remove(0);
             self.segments.remove(0);
+
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!(error = %e, path = %path.display(), "tolerant store: failed to remove old segment during truncate_front");
+            }
+            let idx_path = Self::idx_path(&self.base_path, seg_first_seq);
+            if idx_path.exists() {
+                if let Err(e) = fs::remove_file(&idx_path) {
+                    tracing::warn!(error = %e, path = %idx_path.display(), "tolerant store: failed to remove .idx sidecar during truncate_front");
+                }
+            }
+            let tomb_path = Self::tombstone_path(&self.base_path, seg_first_seq);
+            if tomb_path.exists() {
+                if let Err(e) = fs::remove_file(&tomb_path) {
+                    tracing::warn!(error = %e, path = %tomb_path.display(), "tolerant store: failed to remove .tombstones sidecar during truncate_front");
+                }
+            }
             dropped += 1;
         }
 
@@ -367,6 +830,11 @@ impl Store for TolerantStore {
             .iter()
             .map(|m| (m.subj_len as u64) + (m.payload_len as u64))
             .sum();
+
+        // Drop tombstone bookkeeping for evicted sequences.
+        for m in &self.index[..idx] {
+            self.tombstoned.remove(&m.seq);
+        }
 
         self.index.drain(0..idx);
         if dropped > 0 {
@@ -391,7 +859,20 @@ impl Store for TolerantStore {
             // On Windows, mmap holds an exclusive file handle.
             drop(mmap);
             let path = segment::segment_path(&self.base_path, self.active_segment_id);
-            let _ = segment::seal_segment(&path, self.current_segment_offset);
+            let _ = segment::seal_segment(&path, self.current_segment_offset)?;
+
+            // FEAT-6: write the sidecar index for the final sealed segment
+            // so a future clean restart can skip the scan+CRC pass.
+            let sealed_idx = self.sealed_segments.len() as u32;
+            let seg_entries: Vec<LogMetadata> = self
+                .index
+                .iter()
+                .filter(|m| m.segment_idx == sealed_idx)
+                .copied()
+                .collect();
+            if let Some(first) = seg_entries.first().map(|m| m.seq) {
+                self.write_idx_sidecar(first, &seg_entries);
+            }
         }
         Ok(())
     }
@@ -404,8 +885,18 @@ impl Store for TolerantStore {
         self.active_mmap = None;
         self.total_bytes = 0;
         self.current_segment_offset = 0;
+        self.tombstoned.clear();
+        self.writes_since_flush = 0;
         let _ = fs::remove_dir_all(&self.base_path);
         let _ = fs::create_dir_all(&self.base_path);
+
+        // CRASH-1: purge tore down the active segment along with
+        // everything else — without rotating, the very next append()
+        // would panic on `active_mmap.as_mut().expect(...)`.
+        if let Err(e) = self.rotate() {
+            tracing::error!(error = %e, "tolerant store: rotate after purge failed — store has no active segment");
+        }
+
         count
     }
 
@@ -423,6 +914,29 @@ impl Store for TolerantStore {
             return Ok(self.next_seq);
         }
 
+        // ROB-11 / CRASH-2: validate every entry up front so a batch
+        // never partially applies before hitting a bad entry.
+        let mut total_needed: u64 = 0;
+        for e in entries {
+            if e.subject.len() > u16::MAX as usize {
+                return Err(StoreError::InvalidSubjectLength);
+            }
+            let needed = (HEADER_SIZE as u64)
+                + (e.subject.len() as u64)
+                + (e.payload.len() as u64)
+                + RECORD_CRC_SIZE as u64; // B5
+            if needed > MAX_SEGMENT_BYTES {
+                return Err(StoreError::EntryTooLarge);
+            }
+            total_needed += needed;
+        }
+
+        let incoming_bytes: u64 = entries
+            .iter()
+            .map(|e| (e.subject.len() as u64) + (e.payload.len() as u64))
+            .sum();
+        self.enforce_limits(entries.len() as u64, incoming_bytes);
+
         // Reserve in the index Vec once — without this, the loop below
         // pays for up to log2(N) reallocations of the index, each of
         // which copies the whole existing index into a new buffer.
@@ -437,16 +951,6 @@ impl Store for TolerantStore {
         // integer compare so the win is small in absolute terms, but
         // it also lets the compiler keep all the per-entry work in
         // tight loop without a branch that's almost never taken.
-        let total_needed: u64 = entries
-            .iter()
-            .map(|e| {
-                (HEADER_SIZE as u64)
-                    + (e.subject.len() as u64)
-                    + (e.payload.len() as u64)
-                    + RECORD_CRC_SIZE as u64
-            }) // B5
-            .sum();
-
         if (self.current_segment_offset as u64) + total_needed < MAX_SEGMENT_BYTES {
             // Whole batch fits — single rotate check, no per-entry check.
             for e in entries {
@@ -460,20 +964,21 @@ impl Store for TolerantStore {
             // the `rotate` boundary depends on each entry's actual
             // size, not an upfront tally.
             for e in entries {
-                self.append(*e, ts)?;
+                let entry_total = (e.subject.len() + e.payload.len()) as u64;
+                let needed = (HEADER_SIZE as u64) + entry_total + RECORD_CRC_SIZE as u64;
+                if (self.current_segment_offset as u64) + needed >= MAX_SEGMENT_BYTES {
+                    self.rotate()?;
+                }
+                self.append_no_rotate(*e, ts);
             }
         }
         Ok(first)
     }
 
     fn read(&self, seq: u64) -> Result<Option<Entry<'_>>, StoreError> {
-        if seq < self.first_seq {
+        let Some(idx) = self.seq_to_idx(seq) else {
             return Ok(None);
-        }
-        let idx = (seq - self.first_seq) as usize;
-        if idx >= self.index.len() {
-            return Ok(None);
-        }
+        };
         let m = &self.index[idx];
         let data = if m.segment_idx == self.sealed_segments.len() as u32 {
             self.active_mmap
@@ -494,16 +999,8 @@ impl Store for TolerantStore {
         }))
     }
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
-        let s = if start < self.first_seq {
-            0
-        } else {
-            (start - self.first_seq) as usize
-        };
-        let e = if end < self.first_seq {
-            0
-        } else {
-            (end - self.first_seq) as usize
-        };
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end);
         let e = e.min(self.index.len());
         let s = s.min(e);
 
@@ -530,18 +1027,59 @@ impl Store for TolerantStore {
         }
         Ok(result)
     }
-    fn drain(&mut self, _: &[u8]) -> u64 {
-        0
+    fn drain(&mut self, subject: &[u8]) -> u64 {
+        // ROB-18: find every live (non-tombstoned) entry whose subject
+        // matches, then tombstone each one. `tombstone_at` owns the
+        // CRC-fixup and `.tombstones` sidecar persistence (ROB-17), so
+        // this just collects the matching seqs first (read-only pass)
+        // and mutates in a second pass.
+        let active_seg_id = self.sealed_segments.len() as u32;
+        let mut to_tombstone = Vec::new();
+        for m in &self.index {
+            if m.flags & crate::store::flags::TOMBSTONE != 0 {
+                continue;
+            }
+            let data: &[u8] = if m.segment_idx == active_seg_id {
+                match self.active_mmap.as_ref() {
+                    Some(mm) => &mm[..],
+                    None => continue,
+                }
+            } else {
+                match self.sealed_segments.get(m.segment_idx as usize) {
+                    Some(s) => &s[..],
+                    None => continue,
+                }
+            };
+            let sub_end = (m.offset as usize) + (m.subj_len as usize);
+            let subj = &data[m.offset as usize..sub_end];
+            if entry_matches(
+                &Entry {
+                    seq: m.seq,
+                    stream_id: m.stream_id,
+                    timestamp: m.ts,
+                    subject: subj,
+                    payload: &[][..],
+                    flags: m.flags,
+                },
+                subject,
+            ) {
+                to_tombstone.push(m.seq);
+            }
+        }
+
+        let mut count = 0u64;
+        for seq in to_tombstone {
+            if self.tombstone_at(seq) {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn tombstone_at(&mut self, seq: u64) -> bool {
-        if seq < self.first_seq {
+        let Some(idx) = self.seq_to_idx(seq) else {
             return false;
-        }
-        let idx = (seq - self.first_seq) as usize;
-        if idx >= self.index.len() {
-            return false;
-        }
+        };
         let m = &mut self.index[idx];
         if m.flags & crate::store::flags::TOMBSTONE != 0 {
             return false; // already tombstoned
@@ -569,23 +1107,46 @@ impl Store for TolerantStore {
                 let _ = mmap.flush();
             }
         }
-        // Sealed segments are read-only Mmap — tombstone persists in-memory
-        // only. Recovery will not see it, but the entry will be re-delivered
-        // and the user can re-issue the delete. Acceptable trade-off vs
-        // converting sealed segments to MmapMut.
+        // Sealed segments are read-only Mmap — the flag byte can't be
+        // patched in place. ROB-17: persist the tombstoned seq to a
+        // per-segment `.tombstones` sidecar instead, loaded back on init.
+        self.tombstoned.insert(seq);
+        let seg_first_seq = self
+            .segments
+            .get(segment_idx)
+            .map(|s| s.first_seq)
+            .unwrap_or(self.active_segment_id);
+        let seqs_for_segment: Vec<u64> = self
+            .index
+            .iter()
+            .filter(|m| m.segment_idx as usize == segment_idx && self.tombstoned.contains(&m.seq))
+            .map(|m| m.seq)
+            .collect();
+        self.save_tombstones_for_segment(seg_first_seq, &seqs_for_segment);
         true
     }
+    fn tombstone_stream(&mut self, stream_id: u32) -> u64 {
+        let seqs: Vec<u64> = self
+            .index
+            .iter()
+            .filter(|m| {
+                m.stream_id == stream_id
+                    && m.flags & crate::store::flags::TOMBSTONE == 0
+            })
+            .map(|m| m.seq)
+            .collect();
+        let mut count = 0u64;
+        for seq in seqs {
+            if self.tombstone_at(seq) {
+                count += 1;
+            }
+        }
+        count
+    }
+
     fn for_each(&self, s: u64, e: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
-        let start = if s < self.first_seq {
-            0
-        } else {
-            (s - self.first_seq) as usize
-        };
-        let end = if e < self.first_seq {
-            0
-        } else {
-            (e - self.first_seq) as usize
-        };
+        let start = self.find_lower_bound(s);
+        let end = self.find_lower_bound(e);
         let end = end.min(self.index.len());
         let start = start.min(end);
 
@@ -1140,6 +1701,14 @@ mod tests {
             let payload_off = 41 + 28 + 4;
             file.seek(SeekFrom::Start(payload_off as u64)).unwrap();
             file.write_all(b"X").unwrap(); // flip first byte of payload
+        }
+
+        // Delete the .idx sidecar so recovery falls back to the CRC scan
+        // path instead of trusting the pre-corruption index.
+        for entry in std::fs::read_dir(&store_path).unwrap().flatten() {
+            if entry.path().extension().is_some_and(|x| x == "idx") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
         }
 
         // Reopen: recovery must stop at the corrupt second entry and

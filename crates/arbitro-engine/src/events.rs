@@ -37,6 +37,10 @@ pub struct DeltaEvents {
     /// it, a same-named recreate on a fresh stream silently aliases to
     /// the old (now-defunct) ConsumerId.
     pub consumers_removed: Vec<ConsumerId>,
+    /// Seqs of pending entries released by binding retirement (disconnect).
+    /// The shard worker rewinds the drain cursor to min(seqs) so these
+    /// entries get redelivered to other group members.
+    pub pending_seqs_released: Vec<u64>,
 }
 
 impl DeltaEvents {
@@ -49,6 +53,8 @@ impl DeltaEvents {
         self.bindings_retired.extend(other.bindings_retired);
         self.subject_hashes_acked.extend(other.subject_hashes_acked);
         self.consumers_removed.extend(other.consumers_removed);
+        self.pending_seqs_released
+            .extend(other.pending_seqs_released);
     }
 
     /// True if no events were emitted.
@@ -59,6 +65,7 @@ impl DeltaEvents {
             && self.bindings_retired.is_empty()
             && self.subject_hashes_acked.is_empty()
             && self.consumers_removed.is_empty()
+            && self.pending_seqs_released.is_empty()
     }
 }
 

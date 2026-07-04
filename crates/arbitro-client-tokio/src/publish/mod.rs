@@ -2,7 +2,11 @@
 
 use std::future::Future;
 
+use arbitro_proto::v2::header::entry_flag;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
+use arbitro_proto::wire::msg_headers::{
+    encode_extended_payload_vec, HDR_MSG_ID,
+};
 use bytes::Bytes;
 
 use crate::error::ClientError;
@@ -229,4 +233,110 @@ pub(crate) fn publish_batch_sync_async(
             .map_err(|_| ClientError::ChannelClosed)
             .and_then(|r| r)
     }
+}
+
+// ── Publish with headers ─────────────────────────────────────────────────
+
+/// Encode a PubFrame whose payload is a pre-encoded ExtendedPayload (user
+/// payload + headers TLV). Sets `entry_flags = HAS_HEADERS` so the broker
+/// stores it directly without re-wrapping.
+///
+/// If `headers` contains an entry with key `HDR_MSG_ID`, its value is also
+/// placed in the frame's dedicated `msg_id` field for runtime idempotency.
+#[inline]
+fn encode_pub_frame_with_headers(
+    seq: u64,
+    stream_id: u32,
+    subject: &[u8],
+    headers: &[(&[u8], &[u8])],
+    payload: &[u8],
+) -> WriteFrame {
+    let msg_id: &[u8] = headers
+        .iter()
+        .find(|(k, _)| *k == HDR_MSG_ID)
+        .map(|(_, v)| *v)
+        .unwrap_or(&[]);
+
+    let ext_payload = encode_extended_payload_vec(payload, headers);
+
+    let size = PubFrame::wire_size(subject.len(), msg_id.len(), ext_payload.len());
+    if size <= INLINE_CAP {
+        let mut data = [0u8; INLINE_CAP];
+        PubFrame::encode_into(
+            &mut data[..size],
+            seq,
+            stream_id,
+            0,
+            entry_flag::HAS_HEADERS,
+            subject,
+            msg_id,
+            &ext_payload,
+        );
+        WriteFrame::Inline(data, size as u16)
+    } else {
+        let mut buf = vec![0u8; size];
+        PubFrame::encode_into(
+            &mut buf,
+            seq,
+            stream_id,
+            0,
+            entry_flag::HAS_HEADERS,
+            subject,
+            msg_id,
+            &ext_payload,
+        );
+        WriteFrame::Mono(Bytes::from(buf))
+    }
+}
+
+/// Sync publish with arbitrary headers. Awaits broker confirmation.
+pub(crate) fn publish_with_headers_sync_async(
+    tx: &WriteProducer,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    subject: &[u8],
+    headers: &[(&[u8], &[u8])],
+    payload: Bytes,
+) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
+    let seq = seq_alloc.next();
+    let frame = encode_pub_frame_with_headers(seq, stream_id, subject, headers, &payload);
+    let rx = pending.register(seq);
+    let enqueue_result = enqueue(tx, frame);
+    async move {
+        enqueue_result?;
+        rx.recv_async()
+            .await
+            .map_err(|_| ClientError::ChannelClosed)
+            .and_then(|r| r)
+    }
+}
+
+/// Encode a plain PubFrame for reply delivery (used by Message::reply).
+#[inline]
+pub(crate) fn encode_pub_frame_for_reply(
+    seq: u64,
+    stream_id: u32,
+    subject: &[u8],
+    payload: &[u8],
+) -> WriteFrame {
+    encode_pub_frame(seq, stream_id, subject, &[], payload)
+}
+
+/// Fire-and-forget publish with arbitrary headers.
+#[inline]
+#[allow(dead_code)]
+pub(crate) fn publish_with_headers_async(
+    tx: &WriteProducer,
+    seq_alloc: &SeqAllocator,
+    stream_id: u32,
+    subject: &[u8],
+    headers: &[(&[u8], &[u8])],
+    payload: Bytes,
+) -> Result<(), ClientError> {
+    let seq = seq_alloc.next();
+    enqueue(
+        tx,
+        encode_pub_frame_with_headers(seq, stream_id, subject, headers, &payload),
+    )
 }

@@ -314,33 +314,39 @@ fn v2_publish(
         }
     }
 
-    // If the frame carries a msg_id, pack it as a header in the
-    // extended payload layout so it survives in the journal for
-    // idempotency recovery on restart.
+    // ── Headers / ExtendedPayload resolution ────────────────────────────
     //
-    // SmallVec inline buffer avoids a heap allocation for typical
-    // msg_id sizes (up to ~230 B payload+id fits inline in 256 B).
+    // Three cases, checked in priority order:
+    //  1. Client already sent pre-encoded ExtendedPayload (entry_flags has
+    //     HAS_HEADERS) → store payload as-is. msg_id for dedup was already
+    //     extracted from the frame field above.
+    //  2. Frame carries a msg_id but no client-side headers → server wraps
+    //     payload + msg_id header into ExtendedPayload for journal recovery.
+    //  3. Neither → store raw payload, no flags.
     let mut ext_buf: smallvec::SmallVec<[u8; 256]> = smallvec::SmallVec::new();
-    let (store_payload, store_flags): (&[u8], u8) = if !msg_id.is_empty() {
-        let hdrs: [(&[u8], &[u8]); 1] = [(
-            arbitro_proto::wire::msg_headers::HDR_MSG_ID,
-            msg_id,
-        )];
-        let section = arbitro_proto::wire::msg_headers::HeadersBlock::section_size(&hdrs);
-        let wire_size = arbitro_proto::wire::msg_headers::ExtendedPayload::wire_size(
-            f.payload().len(),
-            section,
-        );
-        ext_buf.resize(wire_size, 0);
-        arbitro_proto::wire::msg_headers::encode_extended_payload(
-            &mut ext_buf,
-            f.payload(),
-            &hdrs,
-        );
-        (&ext_buf, arbitro_store::flags::HAS_HEADERS)
-    } else {
-        (&[], 0) // placeholder, overwritten below
-    };
+    let (store_payload, store_flags): (&[u8], u8) =
+        if f.header.entry_flags & arbitro_proto::v2::header::entry_flag::HAS_HEADERS != 0 {
+            (f.payload(), arbitro_store::flags::HAS_HEADERS)
+        } else if !msg_id.is_empty() {
+            let hdrs: [(&[u8], &[u8]); 1] = [(
+                arbitro_proto::wire::msg_headers::HDR_MSG_ID,
+                msg_id,
+            )];
+            let section = arbitro_proto::wire::msg_headers::HeadersBlock::section_size(&hdrs);
+            let wire_size = arbitro_proto::wire::msg_headers::ExtendedPayload::wire_size(
+                f.payload().len(),
+                section,
+            );
+            ext_buf.resize(wire_size, 0);
+            arbitro_proto::wire::msg_headers::encode_extended_payload(
+                &mut ext_buf,
+                f.payload(),
+                &hdrs,
+            );
+            (&ext_buf, arbitro_store::flags::HAS_HEADERS)
+        } else {
+            (&[], 0)
+        };
 
     let entries = [arbitro_store::EntryRef {
         stream_id: seq_stream.raw(),
@@ -646,12 +652,25 @@ fn v2_publish_delayed(
     let deliver_at_ms = now_ms + delay_ms;
 
     let mut j = journal.lock();
-    match j.append(deliver_at_ms, seq_stream.raw(), f.subject(), f.payload(), 0) {
+    match j.append(
+        now_ms,
+        deliver_at_ms,
+        seq_stream.raw(),
+        f.subject(),
+        f.payload(),
+        0,
+    ) {
         Ok(()) => {
             // Reply with RepOk (ref_seq = 0 since there's no store sequence yet).
             send_rep_ok_v2(registry, conn_id, req_seq, 0);
         }
-        Err(e) => {
+        Err(crate::delayed::DelayedAppendError::DelayTooLarge) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        }
+        Err(crate::delayed::DelayedAppendError::TooManyPending) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+        }
+        Err(crate::delayed::DelayedAppendError::Io(e)) => {
             tracing::error!(error = %e, "delayed journal append failed");
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
         }
@@ -911,6 +930,11 @@ async fn v2_create_stream(
     registry: &ConnectionRegistry,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
+    // SEC-6: bound how many streams a single connection may create.
+    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Stream) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+        return;
+    }
     let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {
@@ -932,7 +956,7 @@ async fn v2_create_stream(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     // M7: collision-detecting variant. Two distinct names hashing to the
     // same u32 are rejected with StreamAlreadyExists rather than silently
     // merged. See `name_registry::STREAM_COLLISION_SENTINEL`.
@@ -1044,7 +1068,7 @@ async fn v2_delete_stream(
         }
     };
     let name = body.name.as_slice();
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => {
@@ -1109,7 +1133,7 @@ async fn v2_get_stream(
         }
     };
     let name = body.name.as_slice();
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     match server.names().stream_seq(wire_stream) {
         Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64),
         None => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
@@ -1132,7 +1156,7 @@ async fn v2_purge_stream(
         }
     };
     let name = body.name.as_slice();
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => {
@@ -1164,7 +1188,7 @@ async fn v2_drain_subject(
     };
     let name = body.name.as_slice();
     let subject = body.subject;
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => {
@@ -1194,7 +1218,7 @@ async fn v2_delete_message(
             return;
         }
     };
-    let wire_stream = arbitro_engine_v2::catalog::wire_hash_32(&body.name);
+    let wire_stream = arbitro_engine_v2::common::wire_hash_32(&body.name);
     let seq_stream = match server.names().stream_seq(wire_stream) {
         Some(s) => s,
         None => {
@@ -1296,6 +1320,11 @@ async fn v2_create_consumer(
     registry: &ConnectionRegistry,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
+    // SEC-6: bound how many consumers a single connection may create.
+    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Consumer) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
+        return;
+    }
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {
@@ -1495,37 +1524,51 @@ async fn v2_delete_consumer(
             None => (0..server.shard_count()).collect(),
         };
 
+    // ROB-21: `delete_consumer` returns `Ok(false)` when the shard has no
+    // matching consumer — that is a lookup miss, not a success. Only
+    // `Ok(true)` means an entry was actually removed; only then do we
+    // cascade the NameRegistry cleanup, log the command, and reply RepOk.
     for i in candidate_shards {
-        if let Ok(_) = server.shard(i).delete_consumer(consumer_id).await {
-            // Mirror the cascade that `v2_delete_stream` does for streams:
-            // drop the wire-name → id mapping (plus the consumer's reverse
-            // queue / stream / deliver-policy indexes) from NameRegistry.
-            // Without this, `GetConsumer` keeps returning `Ok` for a
-            // consumer the engine has already removed, and the registry
-            // leaks one entry per deleted consumer (the maps grow forever
-            // under a create→delete→recreate workload).
-            server.names().remove_consumer_by_id(consumer_id);
-            // F37: invalidate list_consumers cache.
-            server.invalidate_list_cache();
+        match server.shard(i).delete_consumer(consumer_id).await {
+            Ok(true) => {
+                // Mirror the cascade that `v2_delete_stream` does for streams:
+                // drop the wire-name → id mapping (plus the consumer's reverse
+                // queue / stream / deliver-policy indexes) from NameRegistry.
+                // Without this, `GetConsumer` keeps returning `Ok` for a
+                // consumer the engine has already removed, and the registry
+                // leaks one entry per deleted consumer (the maps grow forever
+                // under a create→delete→recreate workload).
+                server.names().remove_consumer_by_id(consumer_id);
+                // F37: invalidate list_consumers cache.
+                server.invalidate_list_cache();
 
-            if let Some(log) = server.command_log() {
-                // Metadata log keeps the legacy zerocopy body
-                // (DeleteConsumerAction: consumer_id u32 + _pad u32)
-                // so the recovery applier (DeleteConsumerView) is
-                // unchanged. Rebuild from the parsed consumer_id.
-                let mut body = Vec::with_capacity(8);
-                body.extend_from_slice(&consumer_id.0.to_le_bytes());
-                body.extend_from_slice(&[0u8; 4]);
-                let cmd = build_delete_consumer(&body);
-                if let Err(e) = log.record(&cmd) {
-                    tracing::warn!(error = %e, "command log: delete_consumer record failed");
+                if let Some(log) = server.command_log() {
+                    // Metadata log keeps the legacy zerocopy body
+                    // (DeleteConsumerAction: consumer_id u32 + _pad u32)
+                    // so the recovery applier (DeleteConsumerView) is
+                    // unchanged. Rebuild from the parsed consumer_id.
+                    let mut body = Vec::with_capacity(8);
+                    body.extend_from_slice(&consumer_id.0.to_le_bytes());
+                    body.extend_from_slice(&[0u8; 4]);
+                    let cmd = build_delete_consumer(&body);
+                    if let Err(e) = log.record(&cmd) {
+                        tracing::warn!(error = %e, "command log: delete_consumer record failed");
+                    }
                 }
+                send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
+                return;
             }
-            send_rep_ok_v2(registry, conn_id, req_seq, req_seq);
-            return;
+            Ok(false) => {
+                // Not found on this shard — keep trying the remaining
+                // candidates (relevant in the fan-out fallback case).
+            }
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+                return;
+            }
         }
     }
-    send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+    send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
 }
 
 /// M11: pause delivery to a consumer. Routes to the owning shard via the
@@ -1722,25 +1765,27 @@ async fn v2_list_consumers(
             server.store_list_consumers(acc)
         };
 
-    // Apply stream filter when the client requested it.
-    let filtered: Vec<(u32, u32, u32, bool)> = match seq_filter {
-        None => all_consumers.as_ref().clone(),
-        Some(seq) => all_consumers
-            .iter()
-            .copied()
-            .filter(|(_, sid, _, _)| *sid == seq)
-            .collect(),
+    // CQ-17: no filter is the common case (ListConsumers with stream_id
+    // 0). Iterate the cached `Arc<Vec>` by reference and encode directly
+    // instead of cloning the whole vector just to iterate it again.
+    let iter: Box<dyn Iterator<Item = &(u32, u32, u32, bool)>> = match seq_filter {
+        None => Box::new(all_consumers.iter()),
+        Some(seq) => Box::new(all_consumers.iter().filter(move |(_, sid, _, _)| *sid == seq)),
+    };
+    let filtered_count = match seq_filter {
+        None => all_consumers.len(),
+        Some(seq) => all_consumers.iter().filter(|(_, sid, _, _)| *sid == seq).count(),
     };
 
     let entry_size = 13;
-    let body_len = 4 + filtered.len() * entry_size;
+    let body_len = 4 + filtered_count * entry_size;
     let total = HEADER_SIZE + body_len;
     let mut buf = BytesMut::with_capacity(total);
 
     let header = Header::new(Action::ListConsumers.as_u16(), body_len as u32, req_seq);
     buf.extend_from_slice(header.as_bytes());
-    buf.extend_from_slice(&(filtered.len() as u32).to_le_bytes());
-    for (consumer_id, stream_id, queue_id, paused) in &filtered {
+    buf.extend_from_slice(&(filtered_count as u32).to_le_bytes());
+    for (consumer_id, stream_id, queue_id, paused) in iter {
         buf.extend_from_slice(&consumer_id.to_le_bytes());
         buf.extend_from_slice(&stream_id.to_le_bytes());
         buf.extend_from_slice(&queue_id.to_le_bytes());
@@ -1816,6 +1861,11 @@ fn v2_create_cron(
     registry: &ConnectionRegistry,
     cron_registry: &std::sync::Arc<crate::cron::CronRegistry>,
 ) {
+    // SEC-6: bound how many crons a single connection may create.
+    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Cron) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError);
+        return;
+    }
     let body_bytes = &frame[HEADER_SIZE..];
     let body = match arbitro_proto::wire::cron::decode_create_cron(body_bytes) {
         Ok(b) => b,
@@ -1895,6 +1945,11 @@ async fn v2_create_stream_raft(
     cluster: &std::sync::Arc<crate::cluster::ClusterState>,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
+    // SEC-6: bound how many streams a single connection may create.
+    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Stream) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+        return;
+    }
     let body = match CreateStreamCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {
@@ -1986,6 +2041,11 @@ async fn v2_create_consumer_raft(
     cluster: &std::sync::Arc<crate::cluster::ClusterState>,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
+    // SEC-6: bound how many consumers a single connection may create.
+    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Consumer) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
+        return;
+    }
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {

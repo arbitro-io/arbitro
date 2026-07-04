@@ -3,7 +3,7 @@
 //!
 //! Level 7 — depends on context, catalog, inflight.
 //!
-//! Walks the binding's `Vec<Pending>`, decrements consumer/queue
+//! Walks the binding's `pending` map, decrements consumer/queue
 //! inflight counters, emits each pending `(consumer, subject_hash)` so
 //! the server can release its drain-side `ConsumerSubjects` slot,
 //! removes the binding from catalog indices, emits `bindings_retired`
@@ -24,10 +24,11 @@ pub fn retire_binding(ctx: &mut EngineContext, binding_id: BindingId, events: &m
     // Release inflight for every pending entry on this binding.
     let consumer_raw = binding.consumer_id.raw();
     let queue_raw = binding.queue_id.raw();
-    for pending in &binding.pending {
+    for pending in binding.pending.values() {
         events
             .subject_hashes_acked
             .push((consumer_raw, pending.subject_hash));
+        events.pending_seqs_released.push(pending.seq);
         ctx.inflight.dec_pending(consumer_raw, queue_raw);
     }
 }

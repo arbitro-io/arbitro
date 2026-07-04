@@ -10,7 +10,7 @@
 //! Wildcard patterns (*, >) are expanded at insert time using
 //! pattern matching logic.
 
-use crate::common::SubjectTrie;
+use crate::common::{wire_hash_32, SubjectTrie};
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
 
@@ -94,6 +94,13 @@ pub struct MatchTable {
     /// with publish traffic — see struct docs.
     exact: HashMap<u32, Vec<MatchEntry>, foldhash::fast::FixedState>,
 
+    /// SEC-5: literal subject bytes for each exact-hash bucket, keyed the
+    /// same as `exact`. A 32-bit hash collision between two different
+    /// literal subjects would otherwise silently deliver B's messages to
+    /// A's subscribers. `lookup_verified` uses this to confirm the actual
+    /// subject bytes match before trusting a hash hit.
+    exact_subjects: HashMap<u32, Box<[u8]>, foldhash::fast::FixedState>,
+
     /// F32: parallel HashSet keyed by subject_hash that mirrors `exact`
     /// for O(1) dedup on `add_exact` — the Vec is still the source of
     /// truth for ordered iteration at lookup time.
@@ -138,6 +145,7 @@ impl MatchTable {
     pub fn new() -> Self {
         Self {
             exact: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            exact_subjects: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             exact_dedup: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             catch_all: Vec::new(),
             catch_all_dedup: HashSet::with_hasher(foldhash::fast::FixedState::default()),
@@ -161,7 +169,11 @@ impl MatchTable {
 
     /// Add a subscription for an exact subject hash.
     /// F32: HashSet-backed O(1) dedup; Vec remains source of truth.
-    pub fn add_exact(&mut self, subject_hash: u32, entry: MatchEntry) {
+    ///
+    /// `subject` is the literal subject the hash was computed from — kept
+    /// alongside the bucket so `lookup_verified` can detect a 32-bit hash
+    /// collision between two unrelated subjects (SEC-5).
+    pub fn add_exact(&mut self, subject_hash: u32, subject: &[u8], entry: MatchEntry) {
         let set = self
             .exact_dedup
             .entry(subject_hash)
@@ -169,14 +181,22 @@ impl MatchTable {
         if set.insert(entry) {
             self.exact.entry(subject_hash).or_default().push(entry);
         }
+        self.exact_subjects
+            .entry(subject_hash)
+            .or_insert_with(|| Box::from(subject));
     }
 
     /// Add a subscription with a wildcard pattern.
     /// The pattern will be evaluated against new subjects as they appear
     /// via the caller-owned scratch cache in `resolve_patterns_readonly`.
+    ///
+    /// PERF-6: inserts incrementally into the existing trie rather than
+    /// rebuilding from scratch — O(depth) per insertion instead of O(N).
     pub fn add_pattern(&mut self, pattern: Vec<u8>, entry: MatchEntry) {
+        let idx = self.pattern_entries.len() as u32;
+        self.pattern_entries.push(entry);
+        self.pattern_trie.insert(&pattern, idx);
         self.patterns.push((pattern, entry));
-        self.rebuild_pattern_trie();
     }
 
     /// Remove all entries for a subscription.
@@ -194,6 +214,10 @@ impl MatchTable {
             set.retain(|e| e.subscription_id != subscription_id);
             !set.is_empty()
         });
+        // Keep exact_subjects in sync — drop the stored literal for any
+        // hash bucket that no longer has entries.
+        self.exact_subjects
+            .retain(|h, _| self.exact.contains_key(h));
 
         let had_patterns = self
             .patterns
@@ -206,21 +230,47 @@ impl MatchTable {
         }
     }
 
-    /// F32: rebuild dedup sets from current Vec sources of truth. Called
-    /// after bind/unbind mutates `connection_id` in place (which is part
-    /// of MatchEntry's Hash/Eq), invalidating set membership.
-    fn rebuild_dedup_sets(&mut self) {
-        self.catch_all_dedup.clear();
+    /// PERF-5: incrementally update dedup sets when a subscription's
+    /// connection_id changes (bind/unbind). Instead of rebuilding ALL
+    /// sets, we remove the old entry (pre-mutation hash) and insert the
+    /// new entry (post-mutation hash) only for the affected subscription.
+    ///
+    /// Called AFTER the Vec entries have already been mutated to the new
+    /// connection_id, so `*e` already carries the post-mutation value.
+    fn update_dedup_for_subscription(
+        &mut self,
+        subscription_id: SubscriptionId,
+        old_connection_id: ConnectionId,
+    ) {
+        // catch_all
         for e in &self.catch_all {
-            self.catch_all_dedup.insert(*e);
-        }
-        self.exact_dedup.clear();
-        for (h, entries) in &self.exact {
-            let mut set = HashSet::with_hasher(foldhash::fast::FixedState::default());
-            for e in entries {
-                set.insert(*e);
+            if e.subscription_id == subscription_id {
+                // Remove old (with old connection_id)
+                let old = MatchEntry {
+                    connection_id: old_connection_id,
+                    ..*e
+                };
+                self.catch_all_dedup.remove(&old);
+                // Insert new (with current/new connection_id)
+                self.catch_all_dedup.insert(*e);
             }
-            self.exact_dedup.insert(*h, set);
+        }
+
+        // exact
+        for (h, entries) in &self.exact {
+            let h = *h;
+            for e in entries {
+                if e.subscription_id == subscription_id {
+                    if let Some(set) = self.exact_dedup.get_mut(&h) {
+                        let old = MatchEntry {
+                            connection_id: old_connection_id,
+                            ..*e
+                        };
+                        set.remove(&old);
+                        set.insert(*e);
+                    }
+                }
+            }
         }
     }
 
@@ -228,6 +278,10 @@ impl MatchTable {
     ///
     /// Returns exact matches + catch-all entries.
     /// For new subjects with patterns, resolves and caches.
+    ///
+    /// Trusts the hash — callers that have the literal subject bytes
+    /// available should prefer `lookup_verified` (SEC-5) to guard against
+    /// a 32-bit hash collision misdelivering to the wrong subscribers.
     #[inline]
     pub fn lookup(&self, subject_hash: u32) -> MatchResult<'_> {
         let exact = self
@@ -242,6 +296,32 @@ impl MatchTable {
         }
     }
 
+    /// Lookup matched consumers for a subject, verifying the literal
+    /// subject bytes against the hash bucket (SEC-5).
+    ///
+    /// `exact` subscriptions are keyed by a 32-bit hash; two distinct
+    /// literal subjects can theoretically collide onto the same hash. If
+    /// the bucket's stored subject doesn't match `subject`, the exact
+    /// match is treated as a miss (the collision is "handled" by
+    /// continuing with catch-all matches instead of delivering to the
+    /// wrong subscribers) rather than trusted blindly.
+    #[inline]
+    pub fn lookup_verified<'a>(&'a self, subject_hash: u32, subject: &[u8]) -> MatchResult<'a> {
+        let exact = match self.exact_subjects.get(&subject_hash) {
+            Some(stored) if &**stored == subject => self
+                .exact
+                .get(&subject_hash)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            _ => &[],
+        };
+
+        MatchResult {
+            exact,
+            catch_all: &self.catch_all,
+        }
+    }
+
     /// Resolve patterns for a subject without mutating self.
     /// Used by the drain thread which reads a snapshot; results are
     /// collected into `out` — caller owns the cache.
@@ -249,19 +329,47 @@ impl MatchTable {
     /// The match table itself never caches resolved subjects — that
     /// would unbound-grow with publish traffic. Caller-owned scratch
     /// (cleared per drain cycle) is the only cache.
+    ///
+    /// PERF-9: uses a HashSet for O(1) dedup when the number of
+    /// existing entries in `out` exceeds a threshold, avoiding O(N^2)
+    /// `Vec::contains` scans.
     pub fn resolve_patterns_readonly(
         &self,
         _subject_hash: u32,
         subject: &[u8],
         out: &mut Vec<MatchEntry>,
     ) {
+        /// Threshold above which we build a HashSet for dedup instead of
+        /// using linear `Vec::contains`. Below this, the linear scan is
+        /// typically faster due to cache locality and no hashing overhead.
+        const DEDUP_THRESHOLD: usize = 4;
+
         let pattern_entries = &self.pattern_entries;
-        self.pattern_trie.find_matches(subject, |idx| {
-            let entry = &pattern_entries[idx as usize];
-            if !out.contains(entry) {
-                out.push(*entry);
+
+        if out.len() >= DEDUP_THRESHOLD {
+            // Build a HashSet from existing entries for O(1) membership.
+            let mut seen: HashSet<MatchEntry, foldhash::fast::FixedState> =
+                HashSet::with_capacity_and_hasher(
+                    out.len() + 8,
+                    foldhash::fast::FixedState::default(),
+                );
+            for e in out.iter() {
+                seen.insert(*e);
             }
-        });
+            self.pattern_trie.find_matches(subject, |idx| {
+                let entry = &pattern_entries[idx as usize];
+                if seen.insert(*entry) {
+                    out.push(*entry);
+                }
+            });
+        } else {
+            self.pattern_trie.find_matches(subject, |idx| {
+                let entry = &pattern_entries[idx as usize];
+                if !out.contains(entry) {
+                    out.push(*entry);
+                }
+            });
+        }
     }
 
     // ── Subject limits ────────────────────────────────────────────────────
@@ -277,7 +385,7 @@ impl MatchTable {
             self.rebuild_limit_trie();
         } else {
             // Literal — resolve immediately
-            let hash = crate::catalog::wire_hash_32(pattern);
+            let hash = wire_hash_32(pattern);
             self.max_subject_inflights.insert(hash, max_inflight);
         }
     }
@@ -288,7 +396,7 @@ impl MatchTable {
             self.limit_patterns.retain(|(p, _)| p != pattern);
             self.rebuild_limit_trie();
         } else {
-            let hash = crate::catalog::wire_hash_32(pattern);
+            let hash = wire_hash_32(pattern);
             self.max_subject_inflights.remove(&hash);
         }
     }
@@ -334,11 +442,22 @@ impl MatchTable {
 
     /// Set the connection_id on all match entries for a subscription.
     /// Called at bind time. O(S + C + P) where S = subjects, C = catch_all, P = patterns.
+    ///
+    /// PERF-5: incrementally updates dedup sets instead of rebuilding all.
     pub fn bind_subscription(
         &mut self,
         subscription_id: SubscriptionId,
         connection_id: ConnectionId,
     ) {
+        // Capture the old connection_id before mutation (needed for dedup
+        // set update — connection_id participates in Hash/Eq).
+        let old_connection_id = self
+            .catch_all
+            .iter()
+            .chain(self.exact.values().flat_map(|v| v.iter()))
+            .find(|e| e.subscription_id == subscription_id)
+            .map(|e| e.connection_id);
+
         for entries in self.exact.values_mut() {
             for e in entries.iter_mut() {
                 if e.subscription_id == subscription_id {
@@ -362,10 +481,13 @@ impl MatchTable {
                 e.connection_id = connection_id;
             }
         }
-        // F32: connection_id is part of Hash/Eq — rebuild dedup sets so
-        // future `add_exact` / `add_catch_all` calls see the correct
-        // post-mutation hashes.
-        self.rebuild_dedup_sets();
+        // PERF-5: incrementally update dedup sets — only touch entries for
+        // this subscription instead of rebuilding every set.
+        if let Some(old_cid) = old_connection_id {
+            if old_cid != connection_id {
+                self.update_dedup_for_subscription(subscription_id, old_cid);
+            }
+        }
     }
 
     /// Clear the connection_id on all match entries for a subscription.
@@ -560,12 +682,12 @@ mod tests {
             binding_idx: BINDING_IDX_UNBOUND,
             ..entry(1, 10, 100)
         };
-        mt.add_exact(0xBEEF, e0);
+        mt.add_exact(0xBEEF, b"beef", e0);
         let e1 = MatchEntry {
             binding_idx: 42,
             ..entry(1, 10, 100)
         };
-        mt.add_exact(0xBEEF, e1);
+        mt.add_exact(0xBEEF, b"beef", e1);
 
         let r = mt.lookup(0xBEEF);
         assert_eq!(
@@ -586,7 +708,7 @@ mod tests {
             connection_id: ConnectionId(5),
             ..entry(1, 10, 100)
         };
-        mt.add_exact(0xBEEF, e_exact);
+        mt.add_exact(0xBEEF, b"beef", e_exact);
         mt.add_catch_all(e_catch);
 
         mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
@@ -608,8 +730,8 @@ mod tests {
             connection_id: ConnectionId(6),
             ..entry(2, 20, 200)
         };
-        mt.add_exact(0xBEEF, e1);
-        mt.add_exact(0xBEEF, e2);
+        mt.add_exact(0xBEEF, b"beef", e1);
+        mt.add_exact(0xBEEF, b"beef", e2);
 
         // Stamp only (consumer 1, conn 5)
         mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
@@ -645,8 +767,8 @@ mod tests {
         let mut e_sub_b = e_sub_b;
         e_sub_a.connection_id = ConnectionId(5);
         e_sub_b.connection_id = ConnectionId(5);
-        mt.add_exact(0xBEEF, e_sub_a);
-        mt.add_exact(0xDEAD, e_sub_b);
+        mt.add_exact(0xBEEF, b"beef", e_sub_a);
+        mt.add_exact(0xDEAD, b"dead", e_sub_b);
 
         mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 42);
 
@@ -657,8 +779,8 @@ mod tests {
     #[test]
     fn exact_match() {
         let mut mt = MatchTable::new();
-        mt.add_exact(0xBEEF, entry(1, 10, 100));
-        mt.add_exact(0xDEAD, entry(2, 20, 200));
+        mt.add_exact(0xBEEF, b"beef", entry(1, 10, 100));
+        mt.add_exact(0xDEAD, b"dead", entry(2, 20, 200));
 
         let r = mt.lookup(0xBEEF);
         assert_eq!(r.count(), 1);
@@ -672,7 +794,7 @@ mod tests {
     fn catch_all() {
         let mut mt = MatchTable::new();
         mt.add_catch_all(entry(1, 10, 100));
-        mt.add_exact(0xBEEF, entry(2, 20, 200));
+        mt.add_exact(0xBEEF, b"beef", entry(2, 20, 200));
 
         let r = mt.lookup(0xBEEF);
         assert_eq!(r.count(), 2); // exact + catch-all
@@ -706,8 +828,8 @@ mod tests {
     fn remove_subscription() {
         let mut mt = MatchTable::new();
         let sub_id = SubscriptionId(100);
-        mt.add_exact(0xBEEF, entry(1, 10, 100));
-        mt.add_exact(0xBEEF, entry(2, 20, 200));
+        mt.add_exact(0xBEEF, b"beef", entry(1, 10, 100));
+        mt.add_exact(0xBEEF, b"beef", entry(2, 20, 200));
         mt.add_catch_all(entry(3, 30, 100));
 
         mt.remove_subscription(sub_id);
@@ -722,8 +844,8 @@ mod tests {
     fn no_duplicate_entries() {
         let mut mt = MatchTable::new();
         let e = entry(1, 10, 100);
-        mt.add_exact(0xBEEF, e);
-        mt.add_exact(0xBEEF, e); // duplicate
+        mt.add_exact(0xBEEF, b"beef", e);
+        mt.add_exact(0xBEEF, b"beef", e); // duplicate
 
         assert_eq!(mt.lookup(0xBEEF).exact.len(), 1);
     }

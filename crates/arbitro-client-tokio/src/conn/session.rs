@@ -183,9 +183,14 @@ fn replay_subscriptions(inner: &Inner) {
 
 /// Run writer + reader + heartbeat concurrently under a child token.
 /// Returns when the first of the three finishes (error or clean exit).
+///
+/// After the select resolves, if the parent cancel (`inner.cancel`) was
+/// the trigger, we send a Disconnect frame so the server releases
+/// bindings immediately (the select may drop the writer future before
+/// it could flush the frame, so we do it here where `w` is still owned).
 async fn run_session<W, R>(
     consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    w: W,
+    mut w: W,
     r: R,
     inner: Arc<Inner>,
     cancel: CancellationToken,
@@ -203,8 +208,8 @@ where
 
     let reader_h = tokio::spawn(reader_task(r, inner_r, cancel_r));
 
-    tokio::select! {
-        r = writer_task(consumer, w, cancel.clone()) => {
+    let result = tokio::select! {
+        r = writer_task(consumer, &mut w, cancel.clone()) => {
             cancel.cancel();
             r
         }
@@ -219,7 +224,16 @@ where
             cancel.cancel();
             r
         }
+    };
+
+    // If the client initiated close, send Disconnect so the server
+    // retires bindings immediately rather than waiting for keepalive.
+    if inner.cancel.is_cancelled() {
+        let _ = w.write_all(&crate::transport::writer::disconnect_frame()).await;
     }
+    let _ = w.shutdown().await;
+
+    result
 }
 
 // ── TLS: danger_accept_invalid_certs verifier ─────────────────────────

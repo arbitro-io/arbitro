@@ -213,21 +213,6 @@ pub const MAX_CREDITS_PER_PENDING: usize = 3;
 
 const _: () = assert!(std::mem::size_of::<CreditEntry>() == 8);
 
-// ── DrainMode ────────────────────────────────────────────────────────────────
-
-/// Policy for handling in-flight messages during drain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DrainMode {
-    /// Release resources and requeue messages for redelivery.
-    ReleaseAndRequeue,
-    /// Release resources and drop messages permanently.
-    ReleaseAndDrop,
-    /// Release resources and schedule retry at a specific time.
-    ReleaseAndRetryScheduled { retry_at: Timestamp },
-    /// Release resources and immediately requeue for retry.
-    ReleaseAndRetryNow,
-}
-
 // ── AckPolicy ────────────────────────────────────────────────────────────────
 
 /// Acknowledgment policy for a consumer.

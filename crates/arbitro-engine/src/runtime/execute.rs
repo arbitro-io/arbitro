@@ -46,18 +46,24 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // cache pollution and realloc spikes. retire_binding is
                 // a correct no-op when pending is empty and inflight = 0.
                 if !fire_and_forget {
-                    for _ in entries.iter() {
-                        ctx.inflight.inc_pending(consumer_raw, queue_raw);
-                    }
                     if let Some(binding) = ctx.catalog.binding_mut(binding_id) {
                         for entry in entries.iter() {
-                            binding.pending.push(Pending {
-                                seq: entry.seq,
-                                subject_hash: entry.subject_hash,
-                                _pad: 0,
-                            });
-                            // F15: keep pending_seqs in sync with pending.
-                            binding.pending_seqs.insert(entry.seq);
+                            // ROB-12: skip if this seq is already pending on
+                            // this binding — avoids a duplicate entry (and a
+                            // duplicate inflight increment) on redelivery.
+                            if binding.pending.contains_key(&entry.seq) {
+                                continue;
+                            }
+                            binding.pending.insert(
+                                entry.seq,
+                                Pending {
+                                    seq: entry.seq,
+                                    subject_hash: entry.subject_hash,
+                                    deliveries: 1,
+                                    _pad: 0,
+                                },
+                            );
+                            ctx.inflight.inc_pending(consumer_raw, queue_raw);
                         }
                     }
                 }
@@ -81,9 +87,9 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
                     for ack in entries.iter() {
-                        if let Some(pos) = binding.pending.iter().position(|p| p.seq == ack.seq) {
-                            let pending = binding.pending.swap_remove(pos);
-                            binding.pending_seqs.remove(&pending.seq);
+                        // PERF-1: O(1) HashMap::remove instead of a linear
+                        // scan + swap_remove on a Vec.
+                        if let Some(pending) = binding.pending.remove(&ack.seq) {
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
@@ -115,9 +121,9 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 if let Some(binding) = ctx.catalog.binding_mut(bid) {
                     let queue_raw = binding.queue_id.raw();
                     for ack in entries.iter() {
-                        if let Some(pos) = binding.pending.iter().position(|p| p.seq == ack.seq) {
-                            let pending = binding.pending.swap_remove(pos);
-                            binding.pending_seqs.remove(&pending.seq);
+                        // PERF-1: O(1) HashMap::remove instead of a linear
+                        // scan + swap_remove on a Vec.
+                        if let Some(pending) = binding.pending.remove(&ack.seq) {
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
@@ -138,7 +144,13 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
         }
 
         Command::Tombstone { reason, .. } => match reason {
-            DropReason::Expired | DropReason::Tombstoned | DropReason::NoSubscribers => {
+            DropReason::Expired => {
+                m.entries_expired.fetch_add(1, Ordering::Relaxed);
+            }
+            DropReason::Tombstoned => {
+                m.entries_tombstoned.fetch_add(1, Ordering::Relaxed);
+            }
+            DropReason::NoSubscribers => {
                 m.publish_no_match.fetch_add(1, Ordering::Relaxed);
             }
         },

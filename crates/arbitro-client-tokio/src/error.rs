@@ -52,6 +52,10 @@ pub enum ClientError {
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 
+    /// Message has no reply_to address or it is not in the encoded format.
+    #[error("no reply address")]
+    NoReplyAddress,
+
     /// TLS handshake or configuration error (only with `tls` feature).
     #[cfg(feature = "tls")]
     #[error("tls: {0}")]

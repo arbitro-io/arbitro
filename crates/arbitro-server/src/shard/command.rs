@@ -63,6 +63,10 @@ pub enum ShardCommand {
 
     // System
     Shutdown,
+
+    /// Load the stream_lifecycle.bin sidecar after replay completes.
+    /// Patches `created_at_seq` in stream_retention and rebuilds snapshot.
+    LoadStreamLifecycle,
 }
 
 // ── Hot path commands ───────────────────────────────────────────────────────

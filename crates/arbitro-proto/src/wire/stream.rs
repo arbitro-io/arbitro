@@ -93,9 +93,25 @@ impl<'a> CreateStreamView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks `buf.len() >= CREATE_STREAM_FIXED_SIZE`
+    /// before wrapping it. Prefer this over `new()` for untrusted input
+    /// (e.g. metadata-log replay).
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < CREATE_STREAM_FIXED_SIZE {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     fn fixed(&self) -> &CreateStreamFixed {
         CreateStreamFixed::ref_from_bytes(&self.buf[..CREATE_STREAM_FIXED_SIZE]).unwrap()
+    }
+
+    #[inline(always)]
+    fn try_fixed(&self) -> Option<&CreateStreamFixed> {
+        CreateStreamFixed::ref_from_bytes(self.buf.get(..CREATE_STREAM_FIXED_SIZE)?).ok()
     }
 
     #[inline(always)]
@@ -104,12 +120,31 @@ impl<'a> CreateStreamView<'a> {
         &self.buf[CREATE_STREAM_FIXED_SIZE..CREATE_STREAM_FIXED_SIZE + nl]
     }
 
+    /// Checked variant of `name()`: returns `None` instead of panicking
+    /// when `name_len` doesn't fit in the buffer.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let nl = self.try_fixed()?.name_len.get() as usize;
+        self.buf
+            .get(CREATE_STREAM_FIXED_SIZE..CREATE_STREAM_FIXED_SIZE.checked_add(nl)?)
+    }
+
     #[inline(always)]
     pub fn filter(&self) -> &'a [u8] {
         let nl = self.fixed().name_len.get() as usize;
         let fl = self.fixed().filter_len.get() as usize;
         let start = CREATE_STREAM_FIXED_SIZE + nl;
         &self.buf[start..start + fl]
+    }
+
+    /// Checked variant of `filter()`.
+    #[inline(always)]
+    pub fn try_filter(&self) -> Option<&'a [u8]> {
+        let f = self.try_fixed()?;
+        let nl = f.name_len.get() as usize;
+        let fl = f.filter_len.get() as usize;
+        let start = CREATE_STREAM_FIXED_SIZE.checked_add(nl)?;
+        self.buf.get(start..start.checked_add(fl)?)
     }
 
     #[inline(always)]
@@ -169,11 +204,31 @@ impl<'a> DeleteStreamView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks `buf.len() >= DELETE_STREAM_FIXED_SIZE`
+    /// before wrapping it.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < DELETE_STREAM_FIXED_SIZE {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
         let f = DeleteStreamFixed::ref_from_bytes(&self.buf[..DELETE_STREAM_FIXED_SIZE]).unwrap();
         let nl = f.name_len.get() as usize;
         &self.buf[DELETE_STREAM_FIXED_SIZE..DELETE_STREAM_FIXED_SIZE + nl]
+    }
+
+    /// Checked variant of `name()`: returns `None` instead of panicking
+    /// on a truncated buffer.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let f = DeleteStreamFixed::ref_from_bytes(self.buf.get(..DELETE_STREAM_FIXED_SIZE)?).ok()?;
+        let nl = f.name_len.get() as usize;
+        self.buf
+            .get(DELETE_STREAM_FIXED_SIZE..DELETE_STREAM_FIXED_SIZE.checked_add(nl)?)
     }
 }
 
@@ -187,6 +242,16 @@ impl<'a> GetStreamView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks the buffer is large enough to hold
+    /// a `GetStreamFixed` before wrapping it.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < core::mem::size_of::<GetStreamFixed>() {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
         let f = GetStreamFixed::ref_from_bytes(&self.buf[..core::mem::size_of::<GetStreamFixed>()])
@@ -194,6 +259,16 @@ impl<'a> GetStreamView<'a> {
         let nl = f.name_len.get() as usize;
         &self.buf
             [core::mem::size_of::<GetStreamFixed>()..core::mem::size_of::<GetStreamFixed>() + nl]
+    }
+
+    /// Checked variant of `name()`: returns `None` instead of panicking
+    /// on a truncated buffer.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let fixed_size = core::mem::size_of::<GetStreamFixed>();
+        let f = GetStreamFixed::ref_from_bytes(self.buf.get(..fixed_size)?).ok()?;
+        let nl = f.name_len.get() as usize;
+        self.buf.get(fixed_size..fixed_size.checked_add(nl)?)
     }
 }
 
@@ -207,11 +282,31 @@ impl<'a> PurgeStreamView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks `buf.len() >= PURGE_STREAM_FIXED_SIZE`
+    /// before wrapping it.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < PURGE_STREAM_FIXED_SIZE {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     pub fn name(&self) -> &'a [u8] {
         let f = PurgeStreamFixed::ref_from_bytes(&self.buf[..PURGE_STREAM_FIXED_SIZE]).unwrap();
         let nl = f.name_len.get() as usize;
         &self.buf[PURGE_STREAM_FIXED_SIZE..PURGE_STREAM_FIXED_SIZE + nl]
+    }
+
+    /// Checked variant of `name()`: returns `None` instead of panicking
+    /// on a truncated buffer.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let f = PurgeStreamFixed::ref_from_bytes(self.buf.get(..PURGE_STREAM_FIXED_SIZE)?).ok()?;
+        let nl = f.name_len.get() as usize;
+        self.buf
+            .get(PURGE_STREAM_FIXED_SIZE..PURGE_STREAM_FIXED_SIZE.checked_add(nl)?)
     }
 }
 
@@ -225,9 +320,24 @@ impl<'a> DrainSubjectView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks `buf.len() >= DRAIN_SUBJECT_FIXED_SIZE`
+    /// before wrapping it.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < DRAIN_SUBJECT_FIXED_SIZE {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     fn fixed(&self) -> &DrainSubjectFixed {
         DrainSubjectFixed::ref_from_bytes(&self.buf[..DRAIN_SUBJECT_FIXED_SIZE]).unwrap()
+    }
+
+    #[inline(always)]
+    fn try_fixed(&self) -> Option<&DrainSubjectFixed> {
+        DrainSubjectFixed::ref_from_bytes(self.buf.get(..DRAIN_SUBJECT_FIXED_SIZE)?).ok()
     }
 
     #[inline(always)]
@@ -236,11 +346,85 @@ impl<'a> DrainSubjectView<'a> {
         &self.buf[DRAIN_SUBJECT_FIXED_SIZE..DRAIN_SUBJECT_FIXED_SIZE + nl]
     }
 
+    /// Checked variant of `name()`.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let nl = self.try_fixed()?.name_len.get() as usize;
+        self.buf
+            .get(DRAIN_SUBJECT_FIXED_SIZE..DRAIN_SUBJECT_FIXED_SIZE.checked_add(nl)?)
+    }
+
     #[inline(always)]
     pub fn subject(&self) -> &'a [u8] {
         let nl = self.fixed().name_len.get() as usize;
         let sl = self.fixed().subj_len.get() as usize;
         let start = DRAIN_SUBJECT_FIXED_SIZE + nl;
         &self.buf[start..start + sl]
+    }
+
+    /// Checked variant of `subject()`.
+    #[inline(always)]
+    pub fn try_subject(&self) -> Option<&'a [u8]> {
+        let f = self.try_fixed()?;
+        let nl = f.name_len.get() as usize;
+        let sl = f.subj_len.get() as usize;
+        let start = DRAIN_SUBJECT_FIXED_SIZE.checked_add(nl)?;
+        self.buf.get(start..start.checked_add(sl)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_stream_view_try_new_rejects_short_buffer() {
+        let short = [0u8; CREATE_STREAM_FIXED_SIZE - 1];
+        assert!(CreateStreamView::try_new(&short).is_none());
+        assert!(CreateStreamView::try_new(&[0u8; CREATE_STREAM_FIXED_SIZE]).is_some());
+    }
+
+    #[test]
+    fn create_stream_view_try_name_rejects_truncated_trailer() {
+        let fixed = CreateStreamFixed {
+            name_len: U16::new(50),
+            filter_len: U16::new(0),
+            max_msgs: U64::new(0),
+            max_bytes: U64::new(0),
+            max_age_secs: U64::new(0),
+            replicas: 1,
+            journal_kind: 0,
+            retention: 0,
+            discard: 0,
+            idempotency_window_ms: U32::new(0),
+            _pad: U32::new(0),
+        };
+        let buf = fixed.as_bytes().to_vec(); // no trailer bytes
+        let view = CreateStreamView::try_new(&buf).unwrap();
+        assert!(view.try_name().is_none());
+    }
+
+    #[test]
+    fn delete_stream_view_try_new_rejects_short_buffer() {
+        assert!(DeleteStreamView::try_new(&[0u8; DELETE_STREAM_FIXED_SIZE - 1]).is_none());
+    }
+
+    #[test]
+    fn get_stream_view_try_new_rejects_short_buffer() {
+        let fixed_size = core::mem::size_of::<GetStreamFixed>();
+        assert!(GetStreamView::try_new(&vec![0u8; fixed_size - 1]).is_none());
+    }
+
+    #[test]
+    fn purge_stream_view_try_new_rejects_short_buffer() {
+        assert!(PurgeStreamView::try_new(&[0u8; PURGE_STREAM_FIXED_SIZE - 1]).is_none());
+    }
+
+    #[test]
+    fn drain_subject_view_try_new_rejects_short_buffer() {
+        assert!(DrainSubjectView::try_new(&[0u8; DRAIN_SUBJECT_FIXED_SIZE - 1]).is_none());
+        let view = DrainSubjectView::try_new(&[0u8; DRAIN_SUBJECT_FIXED_SIZE]).unwrap();
+        assert_eq!(view.try_name(), Some(&[][..]));
+        assert_eq!(view.try_subject(), Some(&[][..]));
     }
 }

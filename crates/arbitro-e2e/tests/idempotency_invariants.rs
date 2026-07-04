@@ -680,3 +680,104 @@ async fn cross_restart_idempotency_with_consumer() {
         server.shutdown().await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Client-side publish_with_headers — pre-encoded ExtendedPayload path
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The new `publish_with_headers` API pre-encodes the ExtendedPayload on the
+/// client and sets `entry_flags = HAS_HEADERS`. The server must store it
+/// as-is, and the drain must strip headers so consumers see only the user
+/// payload.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_with_headers_roundtrip() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"hdrs", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    let resp = client
+        .create_consumer(
+            stream_id, b"c_hdrs", b"", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
+        )
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    let headers: &[(&[u8], &[u8])] = &[
+        (b"trace-id", b"abc-123"),
+        (b"source", b"checkout-svc"),
+    ];
+    client
+        .publish_with_headers(
+            stream_id,
+            b"orders.created",
+            headers,
+            Bytes::from_static(b"order-payload"),
+        )
+        .await
+        .expect("publish_with_headers");
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv())
+        .await
+        .expect("message should arrive within 3s")
+        .expect("subscription open");
+
+    assert_eq!(
+        msg.payload().as_ref(),
+        b"order-payload",
+        "consumer must receive only the user payload, headers stripped"
+    );
+    msg.ack();
+    server.shutdown().await;
+}
+
+/// publish_with_headers with a `msg-id` header entry enables idempotency
+/// dedup. A second publish with the same msg-id must be rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_with_headers_dedup() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"hdrs_dedup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    let headers: &[(&[u8], &[u8])] = &[
+        (b"msg-id", b"unique-order-42"),
+        (b"priority", b"high"),
+    ];
+
+    client
+        .publish_with_headers(
+            stream_id,
+            b"orders.new",
+            headers,
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .expect("first publish");
+
+    let err = client
+        .publish_with_headers(
+            stream_id,
+            b"orders.new",
+            headers,
+            Bytes::from_static(b"duplicate"),
+        )
+        .await
+        .expect_err("duplicate must fail");
+
+    assert!(
+        is_duplicate(&err),
+        "expected IdempotencyDuplicate, got: {err:?}"
+    );
+    server.shutdown().await;
+}

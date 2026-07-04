@@ -9,6 +9,78 @@
 //! - Linear scan for literal children (fast for branching < ~20).
 
 use super::subject::next_token;
+use smallvec::SmallVec;
+use std::fmt;
+
+/// Inline stack capacity before `find_matches` spills to the heap. Covers
+/// all but pathologically deep/branchy subject trees without allocating.
+const STACK_INLINE_CAP: usize = 16;
+
+/// Error returned when a subject pattern fails validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternError {
+    /// Pattern is empty (zero bytes).
+    Empty,
+    /// Consecutive dots produce an empty token (e.g. `orders..created`).
+    EmptyToken,
+    /// Tokens appear after `>`, which must be the last token
+    /// (e.g. `orders.>.eu`).
+    TokensAfterGt,
+}
+
+impl fmt::Display for PatternError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PatternError::Empty => write!(f, "pattern is empty"),
+            PatternError::EmptyToken => {
+                write!(f, "pattern contains empty token (consecutive dots)")
+            }
+            PatternError::TokensAfterGt => {
+                write!(f, "`>` must be the last token in a pattern")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PatternError {}
+
+/// Validate a subject pattern before insertion into the trie.
+///
+/// Rules enforced:
+/// 1. Pattern must not be empty.
+/// 2. No empty tokens (consecutive dots like `orders..created`).
+/// 3. `>` must be the last token — trailing tokens are rejected
+///    (e.g. `orders.>.eu` is invalid because `>` is greedy).
+/// 4. `*` is allowed in any position (single-level wildcard).
+pub fn validate_pattern(pattern: &[u8]) -> Result<(), PatternError> {
+    if pattern.is_empty() {
+        return Err(PatternError::Empty);
+    }
+
+    // Leading or trailing dot means an empty first/last token.
+    if pattern[0] == b'.' || pattern[pattern.len() - 1] == b'.' {
+        return Err(PatternError::EmptyToken);
+    }
+
+    let mut p = pattern;
+    while !p.is_empty() {
+        let (token, rest) = next_token(p);
+
+        // Empty token means consecutive dots (e.g. `orders..created`).
+        if token.is_empty() {
+            return Err(PatternError::EmptyToken);
+        }
+
+        // `>` must be the final token — no more tokens after it.
+        if token == b">" && !rest.is_empty() {
+            return Err(PatternError::TokensAfterGt);
+        }
+
+        p = rest;
+    }
+
+    Ok(())
+}
 
 /// Node in the subject trie. Stored contiguously in arena.
 #[derive(Default, Clone)]
@@ -83,18 +155,19 @@ impl SubjectTrie {
 
     /// Match a subject against the trie. Calls `on_match` for each hit.
     ///
-    /// Hot path — iterative, stack-allocated, zero heap during traversal.
+    /// Hot path — iterative, stack-allocated for the common case. Spills
+    /// to the heap only for pathologically deep/branchy subjects
+    /// (> `STACK_INLINE_CAP` simultaneous frontier nodes) instead of
+    /// silently dropping matches like a fixed-size array would (ROB-14).
     #[inline]
     pub fn find_matches<F>(&self, subject: &[u8], mut on_match: F)
     where
         F: FnMut(u32),
     {
-        let mut stack = [(0u32, subject); 16];
-        let mut sp = 1;
+        let mut stack: SmallVec<[(u32, &[u8]); STACK_INLINE_CAP]> = SmallVec::new();
+        stack.push((0u32, subject));
 
-        while sp > 0 {
-            sp -= 1;
-            let (node_idx, sub) = stack[sp];
+        while let Some((node_idx, sub)) = stack.pop() {
             let node = &self.nodes[node_idx as usize];
 
             // `>` at this level matches everything remaining
@@ -116,18 +189,12 @@ impl SubjectTrie {
 
             // Exact literal child
             if let Some((_, idx)) = node.literals.iter().find(|(t, _)| &**t == token) {
-                if sp < 16 {
-                    stack[sp] = (*idx, rest);
-                    sp += 1;
-                }
+                stack.push((*idx, rest));
             }
 
             // `*` wildcard child
             if let Some(idx) = node.wildcard_star {
-                if sp < 16 {
-                    stack[sp] = (idx, rest);
-                    sp += 1;
-                }
+                stack.push((idx, rest));
             }
         }
     }
@@ -201,5 +268,48 @@ mod tests {
         t.insert(b"message.>", 2);
         t.insert(b"*.meta.>", 3);
         assert_eq!(collect(&t, b"message.meta.premium.user_42"), vec![1, 2, 3]);
+    }
+
+    // ── validate_pattern tests ──────────────────────────────────────────
+
+    #[test]
+    fn validate_empty_pattern() {
+        assert_eq!(validate_pattern(b""), Err(PatternError::Empty));
+    }
+
+    #[test]
+    fn validate_empty_token_consecutive_dots() {
+        assert_eq!(validate_pattern(b"orders..created"), Err(PatternError::EmptyToken));
+    }
+
+    #[test]
+    fn validate_empty_token_leading_dot() {
+        assert_eq!(validate_pattern(b".orders"), Err(PatternError::EmptyToken));
+    }
+
+    #[test]
+    fn validate_empty_token_trailing_dot() {
+        assert_eq!(validate_pattern(b"orders."), Err(PatternError::EmptyToken));
+    }
+
+    #[test]
+    fn validate_tokens_after_gt() {
+        assert_eq!(validate_pattern(b"orders.>.eu"), Err(PatternError::TokensAfterGt));
+    }
+
+    #[test]
+    fn validate_gt_not_last() {
+        assert_eq!(validate_pattern(b">.foo"), Err(PatternError::TokensAfterGt));
+    }
+
+    #[test]
+    fn validate_valid_patterns() {
+        assert!(validate_pattern(b"orders.created").is_ok());
+        assert!(validate_pattern(b"orders.*").is_ok());
+        assert!(validate_pattern(b"orders.>").is_ok());
+        assert!(validate_pattern(b">").is_ok());
+        assert!(validate_pattern(b"*.orders.>").is_ok());
+        assert!(validate_pattern(b"orders.*.created").is_ok());
+        assert!(validate_pattern(b"a.b.c.d").is_ok());
     }
 }

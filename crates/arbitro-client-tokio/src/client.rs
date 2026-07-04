@@ -331,6 +331,32 @@ impl Client {
         )
     }
 
+    // ── publish with headers ────────────────────────────────────────────────
+
+    /// Publish a message with arbitrary key-value headers. Awaits broker
+    /// confirmation (RepOk). Headers are persisted alongside the payload
+    /// and stripped on delivery — consumers receive only the user payload.
+    ///
+    /// If a header with key `b"msg-id"` is present, it is used for
+    /// broker-side idempotency dedup (equivalent to `publish_sync_with_id`).
+    pub fn publish_with_headers(
+        &self,
+        stream_id: u32,
+        subject: &[u8],
+        headers: &[(&[u8], &[u8])],
+        payload: Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        crate::publish::publish_with_headers_sync_async(
+            self.producer(),
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            stream_id,
+            subject,
+            headers,
+            payload,
+        )
+    }
+
     // ── subscribe ─────────────────────────────────────────────────────────────
 
     /// Subscribe to messages delivered to `consumer_id`.

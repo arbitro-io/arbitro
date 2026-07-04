@@ -617,19 +617,30 @@ impl CommandWorker {
     pub(in crate::shard) fn handle_create_stream(&mut self, cmd: CreateStreamCmd) {
         let stream_id = cmd.config.id;
         let ok = self.engine.create_stream(cmd.config).is_ok();
-        if ok {
-            // Persist per-stream retention config (even if all zeros).
-            // Zero-valued limits are no-ops; storing them is harmless and
-            // avoids a branch at set time.
+        // ensure_stream is idempotent (Ok for both new and existing).
+        // Only initialize stream_retention on truly new streams —
+        // re-computing created_at_seq for an existing stream would
+        // filter out entries already written to that stream.
+        if ok && !self.stream_retention.contains_key(&stream_id) {
+            let created_at_seq = if self.replay_mode {
+                0
+            } else {
+                self.store.lock().info().last_seq.wrapping_add(1)
+            };
+
             self.stream_retention.insert(
                 stream_id,
                 crate::shard::worker::StreamRetention {
                     max_msgs: cmd.max_msgs,
                     max_bytes: cmd.max_bytes,
                     max_age_ms: cmd.max_age_ms,
+                    created_at_seq,
                 },
             );
             self.rebuild_and_swap_snapshot();
+            if !self.replay_mode {
+                self.save_stream_lifecycle();
+            }
         }
         let _ = cmd.reply.send(ok);
     }
@@ -648,7 +659,14 @@ impl CommandWorker {
         let events = self.engine.delete_stream(cmd.stream_id);
         self.apply_delta_and_sync(&events);
         self.stream_retention.remove(&cmd.stream_id);
+        self.idempotency_tracker.write().remove(&cmd.stream_id.raw());
+        // NOTE: tombstone_stream removed — created_at_seq filtering in the
+        // drain is O(1) and replaces the O(N) tombstone walk. The Store
+        // trait method is kept for future compaction use.
         self.rebuild_and_swap_snapshot();
+        if !self.replay_mode {
+            self.save_stream_lifecycle();
+        }
         let _ = cmd.reply.send(true);
     }
 
@@ -731,7 +749,7 @@ impl CommandWorker {
             .filter(|b| b.connection_id == cmd.connection_id)
             .map(|b| b.stream_id)
             .collect();
-        for stream_id in conn_bindings {
+        for stream_id in &conn_bindings {
             self.counters.dec_demand(stream_id.raw());
         }
 
@@ -785,8 +803,11 @@ impl CommandWorker {
             self.counters.inc_demand(stream_id.raw());
 
             // Rewind cursor BEFORE snapshot.
+            // Direct set handles the common case (drain sleeping).
+            // signal_rewind guards against a running drain overwriting
+            // cursor in drain_deliver before it sees the new snapshot.
             self.counters.set_cursor(0);
-            self.counters.clear_rewind();
+            self.counters.signal_rewind(1);
         }
 
         // Retire any bindings from delta.

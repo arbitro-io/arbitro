@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::match_table::MatchEntry;
-use arbitro_engine_v2::catalog::wire_hash_32;
+use arbitro_engine_v2::common::wire_hash_32;
 use arbitro_engine_v2::command::DeliveredEntry;
 use arbitro_engine_v2::types::*;
 use arbitro_store::Store;
@@ -509,8 +509,16 @@ fn process_drain_entry(
         return;
     }
 
-    // Demand check — atomic read.
+    // Skip entries from previous incarnations of a recycled stream_id.
+    // created_at_seq == 0 means "no filter" (backward compat).
     let stream_raw = stream_id.raw();
+    if let Some(&birth_seq) = snap.stream_created_at_seq.get(stream_raw as usize) {
+        if birth_seq > 0 && entry.seq < birth_seq {
+            return;
+        }
+    }
+
+    // Demand check — atomic read.
     if !counters.has_demand(stream_raw) {
         return;
     }

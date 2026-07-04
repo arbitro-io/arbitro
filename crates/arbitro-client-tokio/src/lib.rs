@@ -39,6 +39,7 @@ pub mod consumer_builder;
 pub mod cron;
 pub mod error;
 pub mod metrics;
+pub mod service;
 pub mod workflow;
 
 pub(crate) mod conn;
@@ -67,7 +68,7 @@ pub mod transport_internal {
 pub use arbitro_proto::v2::manager::SubjectLimit;
 pub use client::{BatchEntry, Client};
 pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
-pub use consume::message::Message;
+pub use consume::message::{decode_reply_to, encode_reply_to, Message, REPLY_TO_MAGIC};
 pub use consume::SubscriptionHandle;
 pub use error::{ClientError, RequestResult};
 pub use metrics::{ClientMetrics, ClientMetricsSnapshot};
@@ -80,6 +81,7 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronContext, CronHandle};
+pub use service::{Service, ServiceBuilder, ServiceHandle};
 pub use workflow::{
     ResumeContext, StepContext, StepOutcome, StepResult, TimeoutContext, WorkflowBuilder,
     WorkflowHandle,

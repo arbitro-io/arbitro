@@ -95,7 +95,8 @@ impl std::fmt::Display for ConsumerConfigError {
 impl std::error::Error for ConsumerConfigError {}
 
 impl ConsumerConfig {
-    /// Start building. `stream_name` is hashed to `stream_id` via FNV-1a.
+    /// Start building. `stream_name` is hashed to `stream_id` via
+    /// foldhash (fixed seed).
     #[allow(clippy::new_ret_no_self)]
     pub fn new(name: &[u8], stream_name: &[u8]) -> ConsumerConfigBuilder {
         ConsumerConfigBuilder {
@@ -116,6 +117,12 @@ impl ConsumerConfig {
 
     /// Build a ConsumerConfig directly from wire fields (cold path).
     /// Used by the engine when parsing CreateConsumer frames.
+    ///
+    /// Rejects unknown `ack_policy` / `deliver_policy` / `deliver_mode`
+    /// wire values with `ErrorCode::InvalidConsumerConfig` instead of
+    /// silently coercing them to a default — a client that sent an
+    /// invalid enum byte (e.g. a version mismatch) must see an error,
+    /// not a consumer created with different semantics than requested.
     #[allow(clippy::too_many_arguments)]
     pub fn from_wire(
         stream_id: u32,
@@ -129,8 +136,14 @@ impl ConsumerConfig {
         ack_wait_ms: u32,
         start_seq: u64,
         max_subject_inflights: Box<[MaxSubjectInflight]>,
-    ) -> ConsumerConfig {
-        ConsumerConfig {
+    ) -> Result<ConsumerConfig, crate::error::ErrorCode> {
+        let ack_policy = AckPolicy::from_u8(ack_policy)
+            .ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
+        let deliver_policy = DeliverPolicy::from_u8(deliver_policy)
+            .ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
+        let deliver_mode = DeliverMode::from_u8(deliver_mode)
+            .ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
+        Ok(ConsumerConfig {
             name: Box::from(name),
             consumer_id: 0, // server-assigned
             stream_id,
@@ -142,12 +155,12 @@ impl ConsumerConfig {
             },
             max_subject_inflights,
             max_inflight,
-            ack_policy: AckPolicy::from_u8(ack_policy).unwrap_or(AckPolicy::None),
-            deliver_policy: DeliverPolicy::from_u8(deliver_policy).unwrap_or(DeliverPolicy::All),
-            deliver_mode: DeliverMode::from_u8(deliver_mode).unwrap_or(DeliverMode::Fanout),
+            ack_policy,
+            deliver_policy,
+            deliver_mode,
             ack_wait_ms,
             start_seq,
-        }
+        })
     }
 }
 
@@ -428,5 +441,57 @@ mod builder_invariants {
             .build()
             .unwrap();
         assert_eq!(&*cfg.group, b"custom_group");
+    }
+}
+
+#[cfg(test)]
+mod from_wire {
+    use super::*;
+    use crate::error::ErrorCode;
+
+    #[test]
+    fn valid_enum_values_build_ok() {
+        let cfg = ConsumerConfig::from_wire(
+            7,
+            b"worker1",
+            b"grp",
+            b"orders.>",
+            100,
+            AckPolicy::Explicit as u8,
+            DeliverPolicy::All as u8,
+            DeliverMode::Fanout as u8,
+            30_000,
+            0,
+            Box::from([]),
+        )
+        .expect("valid wire values must build");
+        assert_eq!(cfg.stream_id, 7);
+        assert_eq!(cfg.ack_policy, AckPolicy::Explicit);
+        assert_eq!(cfg.deliver_policy, DeliverPolicy::All);
+        assert_eq!(cfg.deliver_mode, DeliverMode::Fanout);
+    }
+
+    #[test]
+    fn unknown_ack_policy_is_rejected() {
+        let err =
+            ConsumerConfig::from_wire(7, b"w", b"g", b"s", 0, 0xFF, 0, 0, 0, 0, Box::from([]))
+                .unwrap_err();
+        assert_eq!(err, ErrorCode::InvalidConsumerConfig);
+    }
+
+    #[test]
+    fn unknown_deliver_policy_is_rejected() {
+        let err =
+            ConsumerConfig::from_wire(7, b"w", b"g", b"s", 0, 0, 0xFF, 0, 0, 0, Box::from([]))
+                .unwrap_err();
+        assert_eq!(err, ErrorCode::InvalidConsumerConfig);
+    }
+
+    #[test]
+    fn unknown_deliver_mode_is_rejected() {
+        let err =
+            ConsumerConfig::from_wire(7, b"w", b"g", b"s", 0, 0, 0, 0xFF, 0, 0, Box::from([]))
+                .unwrap_err();
+        assert_eq!(err, ErrorCode::InvalidConsumerConfig);
     }
 }

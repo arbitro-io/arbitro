@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024; // 64MB
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SegmentMetadata {
+    pub path: PathBuf,
     pub first_seq: u64,
     pub last_seq: u64,
 }

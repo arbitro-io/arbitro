@@ -183,12 +183,14 @@ impl ShardRouter {
             let shard_metrics = engine.metrics_arc();
             let gate = Arc::new(Gate::new());
 
-            let store: Box<dyn arbitro_store::Store> = match &config.data_dir {
-                Some(dir) => {
-                    let path = std::path::Path::new(dir)
-                        .join("shards")
-                        .join(id.to_string());
-                    Box::new(arbitro_store::TolerantStore::new(path))
+            let shard_data_path: Option<std::path::PathBuf> = config.data_dir.as_ref().map(|dir| {
+                std::path::Path::new(dir)
+                    .join("shards")
+                    .join(id.to_string())
+            });
+            let store: Box<dyn arbitro_store::Store> = match &shard_data_path {
+                Some(path) => {
+                    Box::new(arbitro_store::TolerantStore::new(path.clone()))
                 }
                 None => Box::new(MemoryStore::new()),
             };
@@ -286,6 +288,9 @@ impl ShardRouter {
                 dlq_nack_counts: std::collections::HashMap::with_hasher(
                     foldhash::fast::FixedState::default(),
                 ),
+                data_path: shard_data_path,
+                replay_mode: true,
+                deferred_rewind_seq: None,
                 #[cfg(feature = "cluster")]
                 replication_tx: Arc::clone(&replication_tx),
             };

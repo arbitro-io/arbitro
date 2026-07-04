@@ -59,10 +59,29 @@ pub struct PubFrame {
 }
 
 impl PubFrame {
+    /// Parse and validate a PUB frame in one step. This is the only
+    /// supported way to obtain a `PubFrame` you can safely call
+    /// `subject() / msg_id() / payload()` on — it combines layout
+    /// parsing (`ref_from_bytes`) with the B4 length check so callers
+    /// can't accidentally skip validation.
+    ///
+    /// Returns the wire error code the dispatcher should send back if
+    /// the frame is malformed or too short.
+    #[inline]
+    pub fn parse(buf: &[u8]) -> Result<&Self, crate::error::ErrorCode> {
+        let frame =
+            Self::ref_from_bytes(buf).map_err(|_| crate::error::ErrorCode::BufferTooShort)?;
+        frame.validate()?;
+        Ok(frame)
+    }
+
     /// **B4 safety**: verify `subject_len + msg_id_len <= tail.len()`
     /// so the slice arithmetic in `subject() / msg_id() / payload()`
     /// cannot underflow on a malicious header. Returns the wire error
     /// code the dispatcher should send back if the frame is rejected.
+    ///
+    /// Prefer [`PubFrame::parse`], which combines this with
+    /// `ref_from_bytes` so validation can't be skipped by accident.
     #[inline]
     pub fn validate(&self) -> Result<(), crate::error::ErrorCode> {
         let s = self.body.subject_len.get() as usize;
@@ -289,5 +308,39 @@ mod tests {
         );
         let f = PubFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(f.header.entry_flags, 0b0000_0011);
+    }
+
+    #[test]
+    fn parse_accepts_well_formed_frame() {
+        let subject = b"orders.new";
+        let payload = b"hello";
+        let size = PubFrame::wire_size(subject.len(), 0, payload.len());
+        let mut buf = vec![0u8; size];
+        PubFrame::encode_into(&mut buf, 1, 7, 0, 0, subject, &[], payload);
+
+        let f = PubFrame::parse(&buf).expect("well-formed frame must parse");
+        assert_eq!(f.subject(), subject);
+        assert_eq!(f.payload(), payload);
+    }
+
+    #[test]
+    fn parse_rejects_oversized_subject_plus_msg_id() {
+        let payload = [0u8; 4];
+        let size = PubFrame::wire_size(0, 0, payload.len());
+        let mut buf = vec![0u8; size];
+        PubFrame::encode_into(&mut buf, 1, 0, 0, 0, &[], &[], &payload);
+        let off = HEADER_SIZE + 4;
+        buf[off] = 0xFF;
+        buf[off + 1] = 0xFF; // subject_len = 65535
+        assert!(
+            PubFrame::parse(&buf).is_err(),
+            "parse() must reject a frame whose lengths overrun the tail"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_buffer_shorter_than_layout() {
+        let buf = [0u8; HEADER_SIZE]; // no body at all
+        assert!(PubFrame::parse(&buf).is_err());
     }
 }

@@ -1,7 +1,40 @@
 //! Delivered message type and fire-and-forget acknowledgement / nack.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
+
+use crate::error::ClientError;
+use crate::state::Inner;
+
+/// Magic byte prefix for encoded reply_to addresses that carry a stream_id.
+/// Format: `[0xFF][stream_id: 4B LE][subject bytes]`
+pub const REPLY_TO_MAGIC: u8 = 0xFF;
+
+/// Minimum length of an encoded reply_to with stream_id.
+pub const REPLY_TO_MIN_LEN: usize = 5; // 1 magic + 4 stream_id
+
+/// Encode a reply_to address with embedded stream_id.
+#[inline]
+pub fn encode_reply_to(stream_id: u32, subject: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(REPLY_TO_MIN_LEN + subject.len());
+    buf.push(REPLY_TO_MAGIC);
+    buf.extend_from_slice(&stream_id.to_le_bytes());
+    buf.extend_from_slice(subject);
+    buf
+}
+
+/// Parse an encoded reply_to: returns (stream_id, subject) or None if not encoded.
+#[inline]
+pub fn decode_reply_to(reply_to: &[u8]) -> Option<(u32, &[u8])> {
+    if reply_to.len() >= REPLY_TO_MIN_LEN && reply_to[0] == REPLY_TO_MAGIC {
+        let stream_id = u32::from_le_bytes([reply_to[1], reply_to[2], reply_to[3], reply_to[4]]);
+        Some((stream_id, &reply_to[REPLY_TO_MIN_LEN..]))
+    } else {
+        None
+    }
+}
 
 /// Internal command enqueued by `Message::ack()` and drained by the
 /// ack-batcher task.  Never exposed publicly.
@@ -39,6 +72,7 @@ pub struct Message {
     payload: Bytes,
     ack_tx: mpsc::Sender<AckCmd>,
     nack_tx: mpsc::Sender<NackCmd>,
+    inner: Arc<Inner>,
 }
 
 impl std::fmt::Debug for Message {
@@ -65,6 +99,7 @@ impl Message {
         payload: Bytes,
         ack_tx: mpsc::Sender<AckCmd>,
         nack_tx: mpsc::Sender<NackCmd>,
+        inner: Arc<Inner>,
     ) -> Self {
         Self {
             seq,
@@ -76,6 +111,7 @@ impl Message {
             payload,
             ack_tx,
             nack_tx,
+            inner,
         }
     }
 
@@ -85,13 +121,13 @@ impl Message {
         &self.subject
     }
 
-    /// Reply-to subject for request/reply RPC. Empty when not an RPC message.
+    /// Reply-to address bytes (raw, including stream_id prefix if encoded).
     #[inline]
-    pub fn reply_to(&self) -> &[u8] {
+    pub fn reply_to_raw(&self) -> &[u8] {
         &self.reply_to
     }
 
-    /// Returns `true` if this message has a reply_to subject (is an RPC request).
+    /// Returns `true` if this message has a reply_to address.
     #[inline]
     pub fn has_reply_to(&self) -> bool {
         !self.reply_to.is_empty()
@@ -103,12 +139,40 @@ impl Message {
         self.payload.clone()
     }
 
+    /// Borrow the payload bytes without cloning the Bytes handle.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Reply to the sender of this message.
+    ///
+    /// The reply_to field must be encoded with stream_id (0xFF prefix format)
+    /// for this to work. Returns `ClientError::NoReplyAddress` if reply_to
+    /// is empty or not in the encoded format.
+    ///
+    /// This is a fire-and-forget publish via the admin producer — it does
+    /// not wait for broker confirmation.
+    pub fn reply(&self, payload: &[u8]) -> Result<(), ClientError> {
+        let (target_stream_id, subject) = decode_reply_to(&self.reply_to)
+            .ok_or(ClientError::NoReplyAddress)?;
+
+        let seq = self.inner.seq_alloc.next();
+        let frame = crate::publish::encode_pub_frame_for_reply(seq, target_stream_id, subject, payload);
+        self.inner
+            .admin_producer
+            .lock()
+            .unwrap()
+            .try_send(frame)
+            .map_err(|_| ClientError::ChannelClosed)
+    }
+
     /// Fire-and-forget acknowledgement.
     ///
     /// Enqueues an `AckCmd` into the ack-batcher task.  Silently drops if
     /// the internal channel is full or the client has disconnected.
     #[inline]
-    pub fn ack(self) {
+    pub fn ack(&self) {
         let _ = self.ack_tx.try_send(AckCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
@@ -122,7 +186,7 @@ impl Message {
     /// requeue the message for redelivery to this consumer. Silently drops
     /// if the internal channel is full or the client has disconnected.
     #[inline]
-    pub fn nack(self) {
+    pub fn nack(&self) {
         let _ = self.nack_tx.try_send(NackCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
@@ -137,7 +201,7 @@ impl Message {
     /// message available for redelivery. Maximum delay = 120 seconds
     /// (clamped by the server's timing wheel resolution).
     #[inline]
-    pub fn nack_delay(self, delay_ms: u32) {
+    pub fn nack_delay(&self, delay_ms: u32) {
         let _ = self.nack_tx.try_send(NackCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,

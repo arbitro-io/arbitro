@@ -2,6 +2,129 @@
 
 Rust client for the [Arbitro](https://github.com/arbitro-io/arbitro) message broker.
 
+## Publish
+
+```rust
+use arbitro_client_tokio::Client;
+use bytes::Bytes;
+
+let client = Client::connect(b"127.0.0.1:9898").await?;
+
+let stream_id = client
+    .create_stream(b"ORDERS", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
+    .await?;
+
+// Fire-and-forget
+client.publish(stream_id, b"orders.new", Bytes::from_static(b"payload"))?;
+
+// Sync — waits for broker confirmation (RepOk with first_seq)
+let reply = client.publish_sync(stream_id, b"orders.new", payload.into()).await?;
+
+// With dedup (idempotency)
+client.publish_with_id(stream_id, b"orders.new", b"order-abc-123", payload.into())?;
+
+// Batch
+client.publish_batch(stream_id, &[
+    BatchEntry { subject: b"orders.a", payload: &payload, msg_id: b"" },
+    BatchEntry { subject: b"orders.b", payload: &payload, msg_id: b"dedup-key" },
+])?;
+
+// Delayed — delivered after N ms
+let reply = client.publish_delayed(stream_id, b"orders.reminder", payload.into(), 5000).await?;
+
+```
+
+## Publish with Headers
+
+Attach arbitrary key-value metadata to messages. Headers are persisted alongside the payload and stripped on delivery -- consumers always receive only the user payload.
+
+```rust
+// Custom headers (tracing, routing metadata)
+client.publish_with_headers(
+    stream_id,
+    b"orders.created",
+    &[(b"trace-id", b"abc-123"), (b"source", b"checkout-svc")],
+    payload.into(),
+).await?;
+
+// Headers with dedup (msg-id is a well-known header key)
+client.publish_with_headers(
+    stream_id,
+    b"orders.created",
+    &[(b"msg-id", b"order-abc-123"), (b"priority", b"high")],
+    payload.into(),
+).await?;
+```
+
+Headers use a zero-copy TLV wire format (defined in `arbitro-proto::wire::msg_headers`). The broker stores them with the entry using the `HAS_HEADERS` flag and strips them at delivery time so consumers see only the user payload.
+
+## Subscribe
+
+```rust
+use arbitro_client_tokio::ConsumerBuilder;
+use arbitro_client_tokio::AckPolicy;
+
+let consumer = ConsumerBuilder::new(b"worker")
+    .filter(b"orders.>")
+    .max_inflight(100)
+    .ack_policy(AckPolicy::Explicit)
+    .create(&client, stream_id).await?;
+
+let mut sub = client.subscribe(stream_id, consumer, b"").await?;
+while let Some(msg) = sub.recv().await {
+    process(&msg.payload);
+    msg.ack();
+}
+```
+
+## Service (Request/Reply RPC)
+
+Build named services with automatic stream/consumer creation, handler dispatch, and correlated request/reply.
+
+```rust
+use arbitro_client_tokio::{Client, ServiceBuilder};
+
+let client = Client::connect(b"127.0.0.1:9898").await?;
+
+// Build a service — creates backing stream + consumer automatically
+let svc = client.service(b"calculator")
+    .max_inflight(1024)
+    .build().await?;
+
+// Register method handlers
+svc.handle(b"add", |msg| async move {
+    let result = format!("sum={}", compute_add(msg.payload()));
+    msg.reply(result.as_bytes());
+    msg.ack();
+});
+
+svc.handle(b"multiply", |msg| async move {
+    let result = format!("product={}", compute_mul(msg.payload()));
+    msg.reply(result.as_bytes());
+    msg.ack();
+});
+
+// Send a request to another service (or self)
+let response = svc.request(b"calculator", b"add", b"2+3", 5000).await?;
+assert_eq!(response, b"sum=5");
+
+// Fire-and-forget to another service
+svc.send(b"audit", b"log", b"event-data").await?;
+
+// Cross-service RPC (service B calling service A)
+let svc_b = client.service(b"gateway").build().await?;
+let resp = svc_b.request(b"calculator", b"multiply", b"3*4", 5000).await?;
+```
+
+The service pattern uses:
+- Stream name: `_svc-<name>` (dashes for `validate_name` compliance)
+- Consumer name: `_svc-<name>-worker`
+- Subject filter: `_svc.<name>.>` (dots in subjects)
+- Reply correlation: `_svc.<name>._r.<corr_id>`
+- Reply-to encoding: `[0xFF][stream_id LE u32][reply subject bytes]`
+
+`msg.reply()` always works -- no need to check `has_reply_to()`.
+
 ## Workflow Orchestration
 
 Client-side workflow pipelines over Arbitro streams. The broker has no workflow-specific code -- everything uses streams, consumer groups, and idempotent publish.
@@ -98,20 +221,16 @@ let wf = client.workflow(b"payment-auth")
         let prepared = prepare_payment(&ctx.context).await?;
         Ok(StepResult { context: prepared })
     })
-    // suspend_step(name, timeout_ms, run_handler, on_resume_handler)
     .suspend_step(b"wait-auth", 30_000,
-        // run: called when step starts — return Suspend to park
         |ctx: StepContext| async move {
             let state = send_auth_link(&ctx.context).await?;
             Ok(StepOutcome::Suspend { state, timeout_ms: 30_000 })
         },
-        // on_resume: called when wf.resume() arrives with an event
         |resume: ResumeContext| async move {
             let result = process_payment(&resume.state, &resume.event).await?;
             Ok(StepResult { context: result })
         },
     )
-    // on_timeout: called if 30s pass without resume
     .on_timeout(|timeout: TimeoutContext| async move {
         let cancelled = cancel_auth(&timeout.state).await?;
         Ok(StepResult { context: cancelled })
@@ -135,7 +254,7 @@ wf.cancel(&client, "payment-abc-123").await?;
 
 ```rust
 let wf = client.workflow(b"event-driven")
-    .source(b"external-events", b"events.>")  // stream_name + subject
+    .source(b"external-events", b"events.>")
     .step(b"process", |ctx: StepContext| async move {
         Ok(StepResult { context: process_event(&ctx.context).await? })
     })

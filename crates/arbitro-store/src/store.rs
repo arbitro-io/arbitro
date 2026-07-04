@@ -62,10 +62,67 @@ pub struct StoreInfo {
 /// Store errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreError {
-    /// Stream has reached max_msgs or max_bytes.
+    /// Stream has reached max_msgs, max_bytes, or max_age limits.
     Full,
     /// Sequence not found.
     NotFound,
+    /// Underlying I/O operation failed.
+    Io(std::io::ErrorKind),
+    /// Entry (header + subject + payload + CRC) exceeds the segment capacity,
+    /// so it could never fit even in a freshly rotated segment.
+    EntryTooLarge,
+    /// Subject length exceeds `u16::MAX`, the on-disk header field width.
+    InvalidSubjectLength,
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(e: std::io::Error) -> Self {
+        StoreError::Io(e.kind())
+    }
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Full => write!(f, "store is full"),
+            StoreError::NotFound => write!(f, "sequence not found"),
+            StoreError::Io(kind) => write!(f, "I/O error: {kind}"),
+            StoreError::EntryTooLarge => write!(f, "entry exceeds segment capacity"),
+            StoreError::InvalidSubjectLength => write!(f, "subject length exceeds u16::MAX"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// Fsync/msync durability policy for `TolerantStore` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FsyncPolicy {
+    /// Never explicitly flush; rely on the OS page cache and the flush
+    /// that happens on segment rotation/shutdown.
+    #[default]
+    None,
+    /// Flush after every single append.
+    EveryWrite,
+    /// Flush after every `N` appends.
+    EveryNWrites(u32),
+}
+
+/// Retention limits enforced by `append()` before accepting new entries.
+/// A limit of `0` (or `None` for `max_age_ms`) means unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionLimits {
+    pub max_msgs: u64,
+    pub max_bytes: u64,
+    pub max_age_ms: u64,
+}
+
+impl RetentionLimits {
+    pub const UNLIMITED: RetentionLimits = RetentionLimits {
+        max_msgs: 0,
+        max_bytes: 0,
+        max_age_ms: 0,
+    };
 }
 
 /// The journal contract. All backends implement this.
@@ -134,6 +191,12 @@ pub trait Store: Send + Sync {
     /// entry was found and tombstoned, `false` if not found or already
     /// tombstoned. The drain loop skips tombstoned entries — no redelivery.
     fn tombstone_at(&mut self, seq: u64) -> bool;
+
+    /// Tombstone all entries belonging to `stream_id`. Returns the number of
+    /// entries tombstoned. Used when a stream is deleted with `purge_disk=true`
+    /// to prevent old data from leaking into a future stream that recycles the
+    /// same id slot.
+    fn tombstone_stream(&mut self, stream_id: u32) -> u64;
 
     /// Delete all messages with timestamp older than `timestamp_ms`.
     /// Walks from `first_seq` forward and truncates all entries whose

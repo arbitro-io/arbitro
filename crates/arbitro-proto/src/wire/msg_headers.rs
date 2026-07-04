@@ -82,6 +82,8 @@ impl ExtendedPayload {
 }
 
 /// Headers block: `[headers_len:4][count:2][entries...]`.
+/// `headers_len` is the size of the whole block, itself included
+/// (`4 + 2 + entries_len`) — matches `HeadersBlock::section_size`.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 pub struct HeadersBlock {
@@ -210,7 +212,7 @@ pub fn encode_extended_payload<'a>(
         .sum();
 
     let hdr = HeadersBlock::mut_from_bytes(&mut ext.data[h_off..]).expect("headers block size");
-    hdr.headers_len = U32::new((2 + entries_len) as u32);
+    hdr.headers_len = U32::new((6 + entries_len) as u32);
     hdr.count = U16::new(entries.len() as u16);
 
     let mut o = 0;
@@ -265,6 +267,29 @@ mod tests {
         assert_eq!(hdr.get(b"wf-step").unwrap(), &[2]);
         assert_eq!(hdr.get(b"msg-id").unwrap(), b"abc-123");
         assert_eq!(hdr.get(b"missing"), None);
+    }
+
+    #[test]
+    fn headers_len_matches_section_size_roundtrip() {
+        let entries: &[(&[u8], &[u8])] = &[
+            (b"wf-id", b"order-process"),
+            (b"wf-step", &[2]),
+        ];
+        let expected_section = HeadersBlock::section_size(entries);
+        let buf = encode_extended_payload_vec(b"payload", entries);
+
+        let ext = ExtendedPayload::ref_from_bytes(&buf).unwrap();
+        let hdr = ext.headers_block().unwrap();
+
+        // headers_len is self-inclusive: it equals the exact section size
+        // used by callers to size the buffer, not just the entries tail.
+        assert_eq!(hdr.headers_len.get() as usize, expected_section);
+
+        // Degenerate case: no entries still costs the 4B self-length + 2B count.
+        let empty_buf = encode_extended_payload_vec(b"payload", &[]);
+        let empty_ext = ExtendedPayload::ref_from_bytes(&empty_buf).unwrap();
+        let empty_hdr = empty_ext.headers_block().unwrap();
+        assert_eq!(empty_hdr.headers_len.get(), 6);
     }
 
     #[test]

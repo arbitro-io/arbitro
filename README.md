@@ -30,6 +30,7 @@ One rule isolates an unbounded number of subjects. A saturated `orders.freemium.
 - **Reactive Model** -- callback + pull subscription modes.
 - **Parallel Architecture** -- publish never blocks on delivery.
 - **Ack Timeout & Nack Delay** -- per-consumer timing wheel auto-nacks stale deliveries and supports delayed requeue.
+- **Message Headers** -- zero-copy TLV key-value metadata attached to messages, transparent to consumers.
 
 ## Quick Start
 
@@ -113,9 +114,73 @@ via the `ConsumerStats` action -- see the Rust/TypeScript clients for
 | `SIGHUP` (Unix) | `kill -HUP <pid>` | Re-reads the log filter from `ARBITRO_LOG` (live log-level reload, no restart). |
 | `arbitroctl` (CLI) | `cargo install --git ... arbitroctl` | `list-streams`, `list-consumers`, `create-stream`, `delete-stream`, `purge-stream`, `drain-subject`, `delete-message`, `consumer-pending`. Talks to `ARBITRO_ADDR` (default `127.0.0.1:9898`). |
 
-For backup procedures, see [`docs/BACKUP.md`](./docs/BACKUP.md).
-
 ## Usage
+
+### Publish
+
+```rust
+// Single fire-and-forget
+client.publish(stream_id, b"orders.freemium.u1", payload.into()).unwrap();
+
+// Sync publish — waits for broker confirmation (RepOk)
+let reply = client.publish_sync(stream_id, b"orders.new", payload.into()).await?;
+
+// Publish with dedup (idempotency)
+client.publish_with_id(stream_id, b"orders.new", b"order-abc-123", payload.into()).unwrap();
+
+// High-density batch
+client.publish_batch(stream_id, &[
+    BatchEntry { subject: b"orders.premium.u1", payload: &payload, msg_id: b"" },
+    BatchEntry { subject: b"orders.premium.u2", payload: &payload, msg_id: b"" },
+]).unwrap();
+```
+
+### Publish with Headers
+
+Attach arbitrary key-value metadata to messages. Headers are stored alongside the payload and delivered transparently -- consumers receive the user payload without header overhead.
+
+```rust
+// Publish with custom headers (e.g. tracing, routing metadata)
+client.publish_with_headers(
+    stream_id,
+    b"orders.created",
+    &[(b"trace-id", b"abc-123"), (b"source", b"checkout-svc")],
+    payload.into(),
+).await?;
+
+// Headers with dedup (msg-id is a well-known header key)
+client.publish_with_headers(
+    stream_id,
+    b"orders.created",
+    &[(b"msg-id", b"order-abc-123"), (b"priority", b"high")],
+    payload.into(),
+).await?;
+```
+
+```typescript
+// TypeScript — headers as an object
+await client.publish('orders', 'orders.created', payload, {
+  headers: { 'trace-id': 'abc-123', 'source': 'checkout-svc' },
+});
+
+// Headers + dedup
+await client.publish('orders', 'orders.created', payload, {
+  msgId: 'order-abc-123',
+  headers: { priority: 'high' },
+});
+```
+
+```go
+// Go — headers via functional option
+err := client.Publish(ctx, "orders", "orders.created", payload,
+    arbitro.WithHeaders(map[string]string{
+        "trace-id": "abc-123",
+        "source":   "checkout-svc",
+    }),
+)
+```
+
+Headers use a zero-copy TLV wire format -- no serialization overhead on the broker hot path. The broker persists headers alongside the entry and strips them on delivery so consumers see only the user payload.
 
 ### Callback subscription (zero-latency)
 
@@ -165,19 +230,6 @@ while let Some(msg) = sub.next().await {
 }
 ```
 
-### Publish
-
-```rust
-// Single fire-and-forget
-client.publish(b"ORDERS", b"orders.freemium.u1", payload).await?;
-
-// High-density batch
-client.publish_batch(b"ORDERS", &[
-    (b"orders.premium.u1", &payload),
-    (b"orders.premium.u2", &payload),
-]).await?;
-```
-
 ## Cron Scheduling
 
 Register distributed cron jobs directly on the broker. Multiple workers can register the same name -- only one receives each fire (queue semantics). Crons survive reconnects automatically.
@@ -214,7 +266,7 @@ Schedule message delivery for the future. Messages are persisted immediately -- 
 
 ```rust
 // Deliver this message 5 seconds from now
-client.publish_delayed(stream_id, b"orders.reminder", payload, 5000).await?;
+let reply = client.publish_delayed(stream_id, b"orders.reminder", payload.into(), 5000).await?;
 ```
 
 ```typescript
@@ -230,7 +282,7 @@ Workflows are **entirely client-side**. The broker provides streams, consumer gr
 ```rust
 let wf = client.workflow(b"order-process")
     .trigger(b"orders.created")
-    .trigger_stream(orders_stream_id) // auto-subscribe for trigger
+    .trigger_stream(orders_stream_id)
     .step(b"validate", |ctx| async move {
         let order = validate(ctx.context)?;
         Ok(StepResult { context: order })
@@ -274,6 +326,9 @@ wf.stop();
 | **Context guard** | `max_context_size` (default 256 KB) rejects oversized payloads. |
 | **Multi-worker distribution** | Consumer group with round-robin delivery. Each process gets its own consumer in the shared group. |
 | **Idempotent transitions** | `publish_with_id` deduplicates step publishes. Survives broker restart. |
+| **Suspend / Resume** | `.suspend_step()` parks a workflow instance until an external event arrives via `wf.resume()`. |
+| **Cancel** | `wf.cancel(instance_id)` terminates a running or suspended instance. |
+| **Source** | `.source(stream, subject)` triggers instances from an external stream. |
 
 ## Message Replication
 

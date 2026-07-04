@@ -31,6 +31,29 @@ impl<'a> PublishView<'a> {
         Self { buf }
     }
 
+    /// Validate that `buf` holds a complete entry (header + subject +
+    /// reply + payload) before constructing a view over it. Returns
+    /// `None` on a truncated buffer or a header whose declared lengths
+    /// don't fit — callers must not slice on an unchecked `PublishView`.
+    #[inline]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < PUBLISH_ENTRY_SIZE {
+            return None;
+        }
+        let header = PublishEntry::ref_from_bytes(&buf[..PUBLISH_ENTRY_SIZE]).ok()?;
+        let sl = header.subj_len.get() as usize;
+        let rl = header.reply_len.get() as usize;
+        let dl = header.data_len.get() as usize;
+        let total = PUBLISH_ENTRY_SIZE
+            .checked_add(sl)?
+            .checked_add(rl)?
+            .checked_add(dl)?;
+        if total > buf.len() {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     pub fn header(&self) -> &PublishEntry {
         PublishEntry::ref_from_bytes(&self.buf[..PUBLISH_ENTRY_SIZE]).unwrap()
@@ -91,9 +114,15 @@ pub struct BatchIter<'a> {
 
 impl<'a> BatchIter<'a> {
     /// Create from frame body (starts with 4-byte count).
+    ///
+    /// A body shorter than the 4-byte count prefix yields an
+    /// already-exhausted iterator (`count() == 0`) instead of panicking.
     #[inline(always)]
     pub fn new(body: &'a [u8]) -> Self {
-        let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+        let count = match body.get(0..4) {
+            Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            None => 0,
+        };
         Self {
             buf: body,
             offset: 4,
@@ -110,14 +139,23 @@ impl<'a> BatchIter<'a> {
 impl<'a> Iterator for BatchIter<'a> {
     type Item = PublishView<'a>;
 
+    /// Validates that the remaining bytes hold a complete entry before
+    /// slicing. Untrusted wire data with lying length fields or a
+    /// truncated tail yields `None` instead of panicking.
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining == 0 {
             return None;
         }
+        let rest = self.buf.get(self.offset..)?;
+        let view = match PublishView::try_new(rest) {
+            Some(v) => v,
+            None => {
+                self.remaining = 0;
+                return None;
+            }
+        };
         self.remaining -= 1;
-
-        let view = PublishView::new(&self.buf[self.offset..]);
         self.offset += view.wire_len();
         Some(view)
     }

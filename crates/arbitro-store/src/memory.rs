@@ -12,7 +12,7 @@
 //! persistence) while `TolerantStore` maps a real file for durability.
 
 use crate::store::{entry_matches, Entry, EntryRef, Store, StoreError, StoreInfo};
-use arbitro_engine_v2::catalog::wire_hash_32;
+use arbitro_engine_v2::common::wire_hash_32;
 use memmap2::{MmapMut, MmapOptions};
 
 /// Default capacity per segment. Chosen as a balance between
@@ -133,13 +133,14 @@ impl MemoryStore {
     /// Seal the active segment, allocate a fresh one. Called when the
     /// next entry would exceed the active segment's capacity.
     #[inline(never)]
-    fn rotate(&mut self) {
-        let new_active = alloc_anon_segment(self.segment_size);
+    fn rotate(&mut self) -> Result<(), StoreError> {
+        let new_active = try_alloc_anon_segment(self.segment_size)?;
         let full_len = self.active_len;
         let full = std::mem::replace(&mut self.active, new_active);
         self.sealed.push(full);
         self.sealed_lens.push(full_len);
         self.active_len = 0;
+        Ok(())
     }
 
     /// Return an immutable slice into the segment identified by `segment_idx`,
@@ -156,19 +157,27 @@ impl MemoryStore {
     }
 
     #[inline]
-    fn push_entry(&mut self, entry: &EntryRef<'_>, timestamp: u64) -> u64 {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-
+    fn push_entry(&mut self, entry: &EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError> {
         let subj_len = entry.subject.len() as u16;
         let payload_len = entry.payload.len() as u32;
         let entry_bytes = (subj_len as usize) + (payload_len as usize);
+
+        // CRASH-2: reject entries that could never fit in a segment of
+        // this size, even after a fresh rotate. Without this check the
+        // rotate-then-write below would underflow/panic on the copy.
+        if entry_bytes > self.segment_size {
+            return Err(StoreError::EntryTooLarge);
+        }
+
+        let seq = self.next_seq;
         let subject_hash = wire_hash_32(entry.subject);
 
         // Rotate if this entry wouldn't fit in the active segment.
         if self.active_len + entry_bytes > self.segment_size {
-            self.rotate();
+            self.rotate()?;
         }
+
+        self.next_seq += 1;
 
         let segment_idx = self.sealed.len() as u32;
         let offset = self.active_len as u32;
@@ -194,7 +203,7 @@ impl MemoryStore {
         });
 
         self.total_bytes += entry_bytes as u64;
-        seq
+        Ok(seq)
     }
 
     #[inline]
@@ -358,7 +367,7 @@ impl MemoryStore {
 impl Store for MemoryStore {
     #[inline]
     fn append(&mut self, entry: EntryRef<'_>, timestamp: u64) -> Result<u64, StoreError> {
-        Ok(self.push_entry(&entry, timestamp))
+        self.push_entry(&entry, timestamp)
     }
 
     #[inline]
@@ -383,7 +392,7 @@ impl Store for MemoryStore {
             // up-front check would either over-allocate or miss the
             // boundary. The per-entry check is one integer compare;
             // dominant cost is the byte copy, which is unavoidable.
-            self.push_entry(entry, timestamp);
+            self.push_entry(entry, timestamp)?;
         }
         Ok(first)
     }
@@ -556,6 +565,19 @@ impl Store for MemoryStore {
         }
     }
 
+    fn tombstone_stream(&mut self, stream_id: u32) -> u64 {
+        let mut count = 0u64;
+        for meta in self.index.iter_mut() {
+            if meta.stream_id == stream_id
+                && meta.flags & crate::store::flags::TOMBSTONE == 0
+            {
+                meta.flags |= crate::store::flags::TOMBSTONE;
+                count += 1;
+            }
+        }
+        count
+    }
+
     fn info(&self) -> StoreInfo {
         StoreInfo {
             messages: self.index.len() as u64,
@@ -567,14 +589,19 @@ impl Store for MemoryStore {
 }
 
 /// Allocate an anonymous mmap of exactly `size` bytes, zero-initialised.
-/// Panics if the mapping fails — this is a constructor helper and an
-/// OOM/ENOMEM at this point is unrecoverable for the caller anyway.
+/// Panics if the mapping fails — used only from constructors, where an
+/// OOM/ENOMEM at startup is unrecoverable for the caller anyway.
 #[inline]
 fn alloc_anon_segment(size: usize) -> MmapMut {
-    MmapOptions::new()
-        .len(size)
-        .map_anon()
-        .expect("MemoryStore: anonymous mmap failed")
+    try_alloc_anon_segment(size).expect("MemoryStore: anonymous mmap failed")
+}
+
+/// Fallible variant used on the hot `rotate()` path (PERF-4) — an
+/// allocation failure mid-stream must propagate as `StoreError`, not
+/// panic and take the process down.
+#[inline]
+fn try_alloc_anon_segment(size: usize) -> Result<MmapMut, StoreError> {
+    Ok(MmapOptions::new().len(size).map_anon()?)
 }
 
 #[cfg(test)]

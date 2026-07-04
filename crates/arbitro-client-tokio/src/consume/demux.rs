@@ -36,6 +36,8 @@ use arbitro_proto::wire::{
 use arbitro_proto::v2::egress::{DeliverBody, DELIVER_BODY_FIXED};
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 
+use std::sync::Arc;
+
 use crate::consume::message::Message;
 use crate::state::Inner;
 
@@ -45,7 +47,7 @@ const ENVELOPE_SIZE: usize = HEADER_SIZE;
 /// Dispatch a single `Deliver` frame to its subscriber channel.
 ///
 /// Frame layout: `[Header 16B][DeliverBody 12B][subject subject_len B][payload …]`
-pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
+pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
     let hdr = match Header::ref_from_bytes(&frame[..HEADER_SIZE]) {
         Ok(h) => h,
         Err(_) => return,
@@ -85,6 +87,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
         payload,
         inner.ack_tx.clone(),
         inner.nack_tx.clone(),
+        Arc::clone(inner),
     );
     inner
         .metrics
@@ -102,7 +105,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Inner) {
 /// [N × (24B DeliveryEntryHeader + subject + reply_to + payload)]
 ///   consumer_id(4B) | seq(8B) | subj_len(2B) | reply_len(2B) | data_len(4B) | subject_hash(4B)
 /// ```
-pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
+pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
     // The Envelope (16B) precedes the batch header.
     let bh_start = ENVELOPE_SIZE;
     let bh_end = bh_start + REP_BATCH_FIXED_SIZE; // 16 + 4 = 20
@@ -160,6 +163,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Inner) {
             payload,
             inner.ack_tx.clone(),
             inner.nack_tx.clone(),
+            Arc::clone(inner),
         );
         inner
             .metrics

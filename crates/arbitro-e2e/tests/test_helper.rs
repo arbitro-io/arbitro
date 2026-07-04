@@ -10,6 +10,9 @@ pub struct TestServerBuilder {
     data_dir: Option<String>,
     shard_count: usize,
     shutdown_timeout: Duration,
+    max_frame_size: Option<usize>,
+    idle_timeout: Option<Duration>,
+    keepalive_interval: Option<Duration>,
 }
 
 impl Default for TestServerBuilder {
@@ -25,6 +28,9 @@ impl TestServerBuilder {
             data_dir: None,
             shard_count: 2,
             shutdown_timeout: Duration::from_millis(50),
+            max_frame_size: None,
+            idle_timeout: None,
+            keepalive_interval: None,
         }
     }
 
@@ -43,6 +49,21 @@ impl TestServerBuilder {
         self
     }
 
+    pub fn max_frame_size(mut self, size: usize) -> Self {
+        self.max_frame_size = Some(size);
+        self
+    }
+
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+
+    pub fn keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = Some(interval);
+        self
+    }
+
     pub async fn spawn(self) -> TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -57,6 +78,16 @@ impl TestServerBuilder {
             .listen_addr(addr)
             .shard_count(self.shard_count)
             .shutdown_timeout(self.shutdown_timeout);
+
+        if let Some(size) = self.max_frame_size {
+            config = config.max_frame_size(size);
+        }
+        if let Some(timeout) = self.idle_timeout {
+            config = config.idle_timeout(timeout);
+        }
+        if let Some(interval) = self.keepalive_interval {
+            config = config.keepalive_interval(interval);
+        }
 
         if let Some(ref dir) = self.data_dir {
             config = config.data_dir(dir);
@@ -113,6 +144,24 @@ impl TestServer {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("Failed to connect to {}", addr);
+    }
+
+    /// Connect with a custom `ClientConfig` (e.g. to disable auto-reconnect
+    /// so a disconnect is observable as an error rather than being masked
+    /// by a background reconnect).
+    pub async fn connect_with_config(&self, cfg: ClientConfig) -> Client {
+        for _ in 0..100 {
+            if let Ok(c) = Client::connect(ClientConfig {
+                addr: self.addr.clone(),
+                ..cfg.clone()
+            })
+            .await
+            {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("Failed to connect to {}", self.addr);
     }
 
     /// Deterministic shutdown.

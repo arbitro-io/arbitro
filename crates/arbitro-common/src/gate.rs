@@ -55,18 +55,13 @@ impl Gate {
     /// releases merge into a single wake.
     #[inline]
     pub fn release(&self) {
-        // `swap` returns the previous value. We only need to fire the
-        // notify on the 0 → 1 transition; further releases are no-ops
-        // until the consumer calls `lock()`.
-        if !self.open.swap(true, Ordering::Release) {
-            self.notify.notify_one();
-        } else {
-            // Idempotent wake — covers the race where the consumer
-            // raced past a stale `acquire()` and is about to await
-            // again. Without this second `notify_one`, a producer that
-            // sees the flag already set would never re-arm the wake.
-            self.notify.notify_one();
-        }
+        // Always notify: covers both the 0 → 1 transition and the race
+        // where the consumer raced past a stale `acquire()` and is about
+        // to await again. Without notifying on an already-open gate, a
+        // producer that sees the flag already set would never re-arm
+        // the wake.
+        self.open.store(true, Ordering::Release);
+        self.notify.notify_one();
     }
 
     /// Clear the "work available" signal. Called by drain when a cycle

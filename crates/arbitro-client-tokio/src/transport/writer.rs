@@ -41,13 +41,13 @@ mod tests {
         // Accept the write side.
         let accept_h = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (_, write_half) = client.into_split();
+        let (_, mut write_half) = client.into_split();
         let mut server_read = accept_h.await.unwrap();
 
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
-            writer_task(&mut consumer, write_half, cancel2).await.ok();
+            writer_task(&mut consumer, &mut write_half, cancel2).await.ok();
         });
 
         let mut buf = vec![0u8; total];
@@ -62,7 +62,7 @@ mod tests {
 
 pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
     consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
-    mut w: W,
+    w: &mut W,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
     loop {
@@ -71,7 +71,6 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
             _ = cancel.cancelled() => return Ok(()),
             result = consumer.recv_async() => {
                 let Ok(frame) = result else {
-                    let _ = w.shutdown().await;
                     return Ok(());
                 };
                 w.write_all(frame.as_slice()).await?;
@@ -82,4 +81,16 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
             }
         }
     }
+}
+
+/// 24-byte Disconnect frame: 16B header (action=0x0605, msg_len=8) + 8B body.
+#[inline]
+pub(crate) fn disconnect_frame() -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    // action = 0x0605 (Disconnect) little-endian at offset 0
+    buf[0] = 0x05;
+    buf[1] = 0x06;
+    // msg_len = 8 little-endian at offset 4
+    buf[4] = 8;
+    buf
 }

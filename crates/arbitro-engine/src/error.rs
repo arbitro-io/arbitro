@@ -8,14 +8,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ErrorCode {
-    // ── Graph errors ─────────────────────────────────────────────────────
-    /// Slab key has stale generation — entity was removed and slot reused.
-    StaleGeneration = 1,
-    /// Slab slot is vacant — entity was already removed.
-    SlotVacant = 2,
-    /// Slab is at maximum capacity.
-    SlabFull = 3,
-
     // ── Catalog errors ───────────────────────────────────────────────────
     /// Stream not found.
     StreamNotFound = 100,
@@ -41,14 +33,8 @@ pub enum ErrorCode {
     ConsumerPaused = 204,
     /// Queue is paused.
     QueuePaused = 205,
-
-    // ── Plugin errors ────────────────────────────────────────────────────
-    /// Plugin not registered.
-    PluginNotFound = 300,
-    /// Plugin init failed.
-    PluginInitFailed = 301,
-    /// Edge type not registered.
-    EdgeNotFound = 302,
+    /// Requested entity id exceeds `MAX_ENTITY_ID`.
+    EntityIdTooLarge = 206,
 
     // ── Config errors ────────────────────────────────────────────────────
     /// Config log I/O error.
@@ -57,20 +43,13 @@ pub enum ErrorCode {
     ConfigInvalid = 401,
     /// Consumer already exists with different config.
     ConsumerConfigMismatch = 402,
+    /// Subscription already exists with different config.
+    SubscriptionConfigMismatch = 403,
 }
 
 /// The primary error type for all engine operations.
 #[derive(Debug)]
 pub enum EngineError {
-    /// Slab lookup failed — stale generation or vacant slot.
-    StaleKey {
-        code: ErrorCode,
-        entity: &'static str,
-        index: u32,
-        expected_gen: u32,
-        actual_gen: u32,
-    },
-
     /// Entity not found by domain ID.
     NotFound {
         code: ErrorCode,
@@ -89,12 +68,6 @@ pub enum EngineError {
         entity: &'static str,
     },
 
-    /// Plugin-related error.
-    Plugin {
-        code: ErrorCode,
-        plugin: &'static str,
-    },
-
     /// Config/IO error.
     Config { code: ErrorCode, detail: String },
 }
@@ -102,15 +75,6 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EngineError::StaleKey {
-                entity,
-                index,
-                expected_gen,
-                actual_gen,
-                ..
-            } => {
-                write!(f, "stale key for {entity}[{index}]: expected gen {expected_gen}, got {actual_gen}")
-            }
             EngineError::NotFound { entity, .. } => {
                 write!(f, "{entity} not found")
             }
@@ -119,9 +83,6 @@ impl fmt::Display for EngineError {
             }
             EngineError::Duplicate { entity, .. } => {
                 write!(f, "duplicate {entity}")
-            }
-            EngineError::Plugin { plugin, .. } => {
-                write!(f, "plugin error: {plugin}")
             }
             EngineError::Config { detail, .. } => {
                 write!(f, "config error: {detail}")
@@ -136,11 +97,9 @@ impl EngineError {
     #[inline]
     pub fn code(&self) -> ErrorCode {
         match self {
-            EngineError::StaleKey { code, .. }
-            | EngineError::NotFound { code, .. }
+            EngineError::NotFound { code, .. }
             | EngineError::LimitExceeded { code, .. }
             | EngineError::Duplicate { code, .. }
-            | EngineError::Plugin { code, .. }
             | EngineError::Config { code, .. } => *code,
         }
     }
@@ -201,24 +160,24 @@ impl EngineError {
         }
     }
 
-    pub fn plugin_not_found(name: &'static str) -> Self {
-        EngineError::Plugin {
-            code: ErrorCode::PluginNotFound,
-            plugin: name,
-        }
-    }
-
-    pub fn edge_not_found(name: &'static str) -> Self {
-        EngineError::Plugin {
-            code: ErrorCode::EdgeNotFound,
-            plugin: name,
-        }
-    }
-
     pub fn consumer_config_mismatch() -> Self {
         EngineError::Config {
             code: ErrorCode::ConsumerConfigMismatch,
             detail: "consumer already exists with different config".to_string(),
+        }
+    }
+
+    pub fn subscription_config_mismatch() -> Self {
+        EngineError::Config {
+            code: ErrorCode::SubscriptionConfigMismatch,
+            detail: "subscription already exists with different config".to_string(),
+        }
+    }
+
+    pub fn entity_id_too_large() -> Self {
+        EngineError::LimitExceeded {
+            code: ErrorCode::EntityIdTooLarge,
+            detail: "entity id exceeds MAX_ENTITY_ID",
         }
     }
 }
@@ -233,10 +192,6 @@ mod tests {
     #[test]
     fn error_codes_are_distinct() {
         assert_ne!(
-            ErrorCode::StaleGeneration as u16,
-            ErrorCode::SlotVacant as u16
-        );
-        assert_ne!(
             ErrorCode::StreamNotFound as u16,
             ErrorCode::ConsumerNotFound as u16
         );
@@ -247,18 +202,5 @@ mod tests {
         let e = EngineError::stream_not_found();
         assert_eq!(e.to_string(), "stream not found");
         assert_eq!(e.code(), ErrorCode::StreamNotFound);
-    }
-
-    #[test]
-    fn stale_key_display() {
-        let e = EngineError::StaleKey {
-            code: ErrorCode::StaleGeneration,
-            entity: "pending",
-            index: 42,
-            expected_gen: 5,
-            actual_gen: 3,
-        };
-        assert!(e.to_string().contains("pending[42]"));
-        assert!(e.to_string().contains("gen 5"));
     }
 }

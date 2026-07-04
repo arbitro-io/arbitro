@@ -205,7 +205,7 @@ impl MetadataApplier for ReplayApplier {
                 // through NameRegistry to a small sequential engine StreamId
                 // (the engine catalog indexes match_tables by raw u32 — see
                 // common::name_registry for full rationale).
-                let wire_id = arbitro_engine_v2::catalog::wire_hash_32(name);
+                let wire_id = arbitro_engine_v2::common::wire_hash_32(name);
                 let (stream_id, _created) = self.server.names().get_or_create_stream(wire_id);
                 // Restore the per-stream idempotency window — same call
                 // `v2_create_stream` makes on the live path. Without this,
@@ -235,7 +235,7 @@ impl MetadataApplier for ReplayApplier {
             CMD_DELETE_STREAM => {
                 let sv = arbitro_proto::wire::stream::DeleteStreamView::new(view.body());
                 let name = sv.name();
-                let wire_id = arbitro_engine_v2::catalog::wire_hash_32(name);
+                let wire_id = arbitro_engine_v2::common::wire_hash_32(name);
                 let stream_id = match self.server.names().stream_seq(wire_id) {
                     Some(id) => id,
                     None => {

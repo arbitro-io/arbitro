@@ -435,6 +435,11 @@ impl ShardHandle {
         Ok(())
     }
 
+    /// Signal the shard to load the stream_lifecycle sidecar after replay.
+    pub async fn load_stream_lifecycle(&self) -> Result<(), SendError> {
+        self.send(ShardCommand::LoadStreamLifecycle).await
+    }
+
     pub fn send_shutdown(&self) {
         let _ = self.tx.try_send(ShardCommand::Shutdown);
         self.gate.release();

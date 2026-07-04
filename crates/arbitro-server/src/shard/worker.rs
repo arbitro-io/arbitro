@@ -48,6 +48,10 @@ pub(super) struct StreamRetention {
     pub max_bytes: u64,
     /// Age-based eviction threshold in milliseconds (0 = disabled).
     pub max_age_ms: u64,
+    /// Global journal seq at which this stream incarnation was created.
+    /// Drain skips entries with seq < created_at_seq for this stream_id.
+    /// 0 = no filter (backward compat for streams created before this feature).
+    pub created_at_seq: u64,
 }
 
 // ── Cross-handler private types ──────────────────────────────────────────────
@@ -388,6 +392,18 @@ pub struct CommandWorker {
     /// the count exceeds the consumer's `max_nack` threshold, the message
     /// is published to the DLQ stream and acked from the original.
     pub(super) dlq_nack_counts: HashMap<(u32, u64), u32, foldhash::fast::FixedState>,
+    /// Shard data directory (for sidecar files like stream_lifecycle.bin).
+    /// `None` when running in-memory (no `data_dir` configured).
+    pub(super) data_path: Option<std::path::PathBuf>,
+    /// True during replay — suppresses sidecar writes that would overwrite
+    /// the persisted created_at_seq with wrong values computed from the
+    /// already-populated store.
+    pub(super) replay_mode: bool,
+
+    /// Minimum seq of pending entries released by a dead binding. Deferred
+    /// until the next handle_bind restores demand so the drain can actually
+    /// deliver the entry.
+    pub(super) deferred_rewind_seq: Option<u64>,
 
     /// H12: timestamp of the last `wheel_tick + idempotency tick` pass.
     /// The `tokio::select!` sleep arm can be starved when commands are
@@ -830,6 +846,11 @@ impl CommandWorker {
             }
             ShardCommand::PauseConsumer(cmd) => self.handle_pause_consumer(cmd),
             ShardCommand::ResumeConsumer(cmd) => self.handle_resume_consumer(cmd),
+            ShardCommand::LoadStreamLifecycle => {
+                self.load_stream_lifecycle();
+                self.replay_mode = false;
+                self.rebuild_and_swap_snapshot();
+            }
             ShardCommand::Shutdown => {}
         }
     }
@@ -865,6 +886,14 @@ impl CommandWorker {
         }
         // Demand atomics are already updated by subscribe/unsubscribe handlers.
         // DeltaEvents demand_became_available/idle are informational only here.
+        // Track minimum released pending seq for deferred cursor rewind.
+        // Rewind happens on next handle_bind when demand is restored.
+        if !delta.pending_seqs_released.is_empty() {
+            if let Some(&min_seq) = delta.pending_seqs_released.iter().min() {
+                let prev = self.deferred_rewind_seq.unwrap_or(u64::MAX);
+                self.deferred_rewind_seq = Some(prev.min(min_seq));
+            }
+        }
         // Remove retired bindings
         for &bid in &delta.bindings_retired {
             self.bindings.retain(|b| b.binding_id != bid);
@@ -956,6 +985,15 @@ impl CommandWorker {
             }
         }
 
+        // Build per-stream created_at_seq vec, indexed by StreamId.raw().
+        // Drain skips entries with seq < created_at_seq for the stream.
+        let mut stream_created_at_seq = vec![0u64; max_stream_idx + 1];
+        for (sid, r) in &self.stream_retention {
+            if let Some(slot) = stream_created_at_seq.get_mut(sid.0 as usize) {
+                *slot = r.created_at_seq;
+            }
+        }
+
         self.snapshot.store(DrainSnapshot {
             // F19: wrap once into an Arc<[T]> so the drain thread sees
             // an immutable cheaply-cloneable slice instead of a Vec.
@@ -963,6 +1001,44 @@ impl CommandWorker {
             writers_by_conn,
             match_tables,
             stream_max_age_ms,
+            stream_created_at_seq,
         });
+    }
+
+    // ── Stream lifecycle sidecar persistence ────────────────────────────
+
+    /// Save stream lifecycle data (created_at_seq per stream) to a sidecar
+    /// file. Format: repeated `[stream_id: u32 LE][created_at_seq: u64 LE]`
+    /// (12 bytes per entry). Called after create/delete stream.
+    pub(super) fn save_stream_lifecycle(&self) {
+        let Some(ref dir) = self.data_path else { return };
+        let path = dir.join("stream_lifecycle.bin");
+        let mut buf = Vec::with_capacity(self.stream_retention.len() * 12);
+        for (sid, r) in &self.stream_retention {
+            buf.extend_from_slice(&sid.0.to_le_bytes());
+            buf.extend_from_slice(&r.created_at_seq.to_le_bytes());
+        }
+        if let Err(e) = std::fs::write(&path, &buf) {
+            tracing::warn!(error = %e, "failed to save stream_lifecycle sidecar");
+        }
+    }
+
+    /// Load stream lifecycle data from the sidecar file and patch
+    /// `stream_retention` entries with the persisted `created_at_seq`.
+    /// Must be called AFTER command log replay has populated stream_retention.
+    pub(super) fn load_stream_lifecycle(&mut self) {
+        let Some(ref dir) = self.data_path else { return };
+        let path = dir.join("stream_lifecycle.bin");
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        if bytes.len() % 12 != 0 {
+            return;
+        }
+        for chunk in bytes.chunks_exact(12) {
+            let sid = StreamId(u32::from_le_bytes(chunk[0..4].try_into().unwrap()));
+            let created_at_seq = u64::from_le_bytes(chunk[4..12].try_into().unwrap());
+            if let Some(r) = self.stream_retention.get_mut(&sid) {
+                r.created_at_seq = created_at_seq;
+            }
+        }
     }
 }

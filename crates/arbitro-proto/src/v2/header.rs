@@ -117,19 +117,19 @@ pub mod flag {
 
 // ── Per-message flags (offset 3, formerly `version`) ─────────────────────
 //
-// TODO §5: the broker honours none of these bits today. They are kept as
-// reserved markers so a future release can wire them up without breaking
-// existing clients that already happen to set them.
 pub mod entry_flag {
-    /// Reserved (TODO §5). No retain semantics implemented.
+    /// Reserved. No retain semantics implemented.
     pub const RETAIN: u8 = 1 << 0;
-    /// Reserved (TODO §5). Broker never decompresses on the read path —
+    /// Reserved. Broker never decompresses on the read path —
     /// payloads are stored exactly as received.
     pub const COMPRESSED: u8 = 1 << 1;
-    /// Reserved (TODO §5). Broker has only one backpressure policy
+    /// Reserved. Broker has only one backpressure policy
     /// today (drop on per-conn mpsc full); this bit is not consulted.
     pub const NO_BACKPRESSURE: u8 = 1 << 2;
-    // bits 3..7 reserved
+    /// The frame payload is already in ExtendedPayload format (user payload +
+    /// TLV headers block). The broker stores it directly with HAS_HEADERS flag
+    /// without re-wrapping.
+    pub const HAS_HEADERS: u8 = 1 << 4;
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use test_helper::{TestServer, TestServerBuilder};
 use std::collections::HashSet;
 use std::time::Duration;
 
-use arbitro_client_tokio::{Client, ClientError};
+use arbitro_client_tokio::ClientError;
 use bytes::Bytes;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -362,11 +362,11 @@ async fn publish_sync_on_dead_server_returns_error() {
     use std::time::Duration as D;
 
     let mut server = TestServerBuilder::new().spawn().await;
-    let addr = server.addr.clone();
 
     // Connect with no reconnect attempts — client will not retry after disconnect.
+    // Use connect_with_config for startup retry loop (server may not have bound yet).
     let cfg = ClientConfig {
-        addr: addr.clone(),
+        addr: String::new(),
         reconnect: ReconnectPolicy {
             base: D::from_millis(50),
             cap: D::from_millis(100),
@@ -374,7 +374,7 @@ async fn publish_sync_on_dead_server_returns_error() {
         },
         ..ClientConfig::default()
     };
-    let client = Client::connect(cfg).await.expect("client should connect");
+    let client = server.connect_with_config(cfg).await;
 
     let resp = client
         .create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0, 0)

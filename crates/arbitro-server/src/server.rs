@@ -30,6 +30,100 @@ use crate::transport::dispatch_v2;
 use crate::transport::registry::{ConnReader, ConnWriter};
 use crate::transport::ConnectionRegistry;
 
+/// FEAT-10: a permission grantable to an auth'd connection. Scaffold only —
+/// `check_permission` is wired into the auth path but no dispatch call site
+/// enforces per-action permissions yet (that requires plumbing an identity
+/// through `dispatch_v2`, outside this file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Publish,
+    Consume,
+    Admin,
+}
+
+/// One configured user: a bearer token mapped to an identity and the set
+/// of permissions that identity holds.
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub username: String,
+    pub token: String,
+    pub permissions: Vec<Permission>,
+}
+
+impl AuthUser {
+    pub fn has_permission(&self, perm: Permission) -> bool {
+        self.permissions.contains(&perm) || self.permissions.contains(&Permission::Admin)
+    }
+}
+
+/// FEAT-10: multi-user auth scaffold. Alongside (or instead of) the single
+/// shared `ARBITRO_AUTH_TOKEN`, `users` allows per-connection identity: each
+/// token maps to a username and a permission set. Populated today from
+/// `ARBITRO_AUTH_USERS` (format: `user1:token1:publish,consume;user2:token2:admin`),
+/// independent of `Config` so it can be added without touching config.rs.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    pub users: Vec<AuthUser>,
+}
+
+impl AuthConfig {
+    /// Look up a user by bearer token. Linear scan — fine for the small
+    /// user counts this is meant for; swap for a HashMap if that changes.
+    pub fn find_by_token(&self, token: &[u8]) -> Option<&AuthUser> {
+        self.users.iter().find(|u| u.token.as_bytes() == token)
+    }
+
+    /// Load from `ARBITRO_AUTH_USERS`. Returns an empty config (no
+    /// multi-user auth configured) if the env var is unset or empty.
+    pub fn from_env() -> Self {
+        let raw = match std::env::var("ARBITRO_AUTH_USERS") {
+            Ok(v) if !v.is_empty() => v,
+            _ => return Self::default(),
+        };
+        let users = raw
+            .split(';')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let mut parts = entry.splitn(3, ':');
+                let username = parts.next()?.to_string();
+                let token = parts.next()?.to_string();
+                let perms = parts
+                    .next()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter_map(|p| match p.trim() {
+                        "publish" => Some(Permission::Publish),
+                        "consume" => Some(Permission::Consume),
+                        "admin" => Some(Permission::Admin),
+                        "" => None,
+                        other => {
+                            tracing::warn!(permission = other, "ARBITRO_AUTH_USERS: unknown permission, skipping");
+                            None
+                        }
+                    })
+                    .collect();
+                Some(AuthUser { username, token, permissions: perms })
+            })
+            .collect();
+        Self { users }
+    }
+}
+
+/// FEAT-10: check whether an identity (resolved from `AuthConfig`) is
+/// allowed to perform an action gated by `perm`. Returns `true` when no
+/// multi-user auth is configured (single shared-token mode, or auth
+/// disabled) so this can be called unconditionally without changing
+/// behavior for brokers that don't opt into per-user permissions.
+pub fn check_permission(user: Option<&AuthUser>, perm: Permission) -> bool {
+    match user {
+        Some(u) => u.has_permission(perm),
+        None => true,
+    }
+}
+
 /// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
     config: Config,
@@ -129,6 +223,12 @@ impl ArbitroServer {
             applier.flush().await;
         }
 
+        // ── Load stream lifecycle sidecar (created_at_seq) ────────────
+        // Must run after replay so stream_retention entries exist to patch.
+        for i in 0..self.server.shard_count() {
+            let _ = self.server.shard(i).load_stream_lifecycle().await;
+        }
+
         // ── Rebuild idempotency tracker from journal ──────────────────
         // Scan each store for records with HAS_HEADERS flag and extract
         // "msg-id" headers to repopulate the IdempotencyTracker. This
@@ -178,6 +278,14 @@ impl ArbitroServer {
         // Internal shutdown signal
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // ROB-19: background tasks (cron, delayed maturation, health,
+        // metrics endpoint, per-connection read loops) are tracked here so
+        // shutdown can abort every one of them and wait, with a timeout,
+        // instead of trusting each loop to notice the shutdown watch and
+        // exit promptly.
+        let background_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>> =
+            Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new()));
+
         // Keepalive + idle timeout task
         let keepalive_registry = self.registry.clone();
         let idle_timeout = self.config.idle_timeout;
@@ -212,7 +320,7 @@ impl ArbitroServer {
         let cron_reg_clone = std::sync::Arc::clone(&cron_registry);
         let cron_connections = self.registry.clone();
         let cron_shutdown = shutdown_rx.clone();
-        let _cron_handle = tokio::spawn(async move {
+        background_tasks.lock().await.spawn(async move {
             crate::cron::cron_loop(cron_reg_clone, cron_connections, cron_shutdown).await;
         });
 
@@ -274,7 +382,7 @@ impl ArbitroServer {
             let mat_journal = std::sync::Arc::clone(&shared);
             let mat_server = self.server.clone();
             let mat_shutdown = shutdown_rx.clone();
-            tokio::spawn(async move {
+            background_tasks.lock().await.spawn(async move {
                 crate::delayed::delayed_maturation_loop(mat_journal, mat_server, mat_shutdown)
                     .await;
             });
@@ -320,15 +428,27 @@ impl ArbitroServer {
                     .iter()
                     .map(|(id, _)| PeerId(*id))
                     .collect();
-                let bootstrap_peers: Vec<BootstrapPeer> = self
-                    .config
-                    .cluster_peers
-                    .iter()
-                    .map(|(id, addr)| BootstrapPeer {
+                let mut bootstrap_peers: Vec<BootstrapPeer> = Vec::with_capacity(
+                    self.config.cluster_peers.len(),
+                );
+                for (id, addr) in &self.config.cluster_peers {
+                    let parsed = match addr.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                peer_id = id,
+                                addr = %addr,
+                                "ARBITRO_CLUSTER_PEERS: invalid peer address"
+                            );
+                            std::process::exit(2);
+                        }
+                    };
+                    bootstrap_peers.push(BootstrapPeer {
                         id: PeerId(*id),
-                        addr: addr.parse().expect("invalid peer addr"),
-                    })
-                    .collect();
+                        addr: parsed,
+                    });
+                }
 
                 let node_config = NodeConfig {
                     cluster_id: ClusterId(1),
@@ -354,20 +474,41 @@ impl ArbitroServer {
                 let storage_inner = std::sync::Arc::new(FileRaftStorage::new(&raft_dir));
                 let storage_for_raft = SharedRaftStorage(storage_inner.clone());
 
-                let peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> = self
-                    .config
-                    .cluster_peers
-                    .iter()
-                    .map(|(id, addr)| (PeerId(*id), addr.parse().expect("invalid peer addr")))
-                    .collect();
-                let bind_addr: std::net::SocketAddr = self
-                    .config
-                    .cluster_listen
-                    .parse()
-                    .expect("invalid cluster_listen addr");
-                let transport = TcpRaftTransport::new(bind_addr, peer_addrs.clone())
-                    .await
-                    .expect("failed to create raft transport");
+                let mut peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> =
+                    std::collections::HashMap::with_capacity(self.config.cluster_peers.len());
+                for (id, addr) in &self.config.cluster_peers {
+                    let parsed = match addr.parse() {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                peer_id = id,
+                                addr = %addr,
+                                "ARBITRO_CLUSTER_PEERS: invalid peer address"
+                            );
+                            std::process::exit(2);
+                        }
+                    };
+                    peer_addrs.insert(PeerId(*id), parsed);
+                }
+                let bind_addr: std::net::SocketAddr = match self.config.cluster_listen.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            addr = %self.config.cluster_listen,
+                            "ARBITRO_CLUSTER_LISTEN: invalid address"
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let transport = match TcpRaftTransport::new(bind_addr, peer_addrs.clone()).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to create raft transport");
+                        std::process::exit(2);
+                    }
+                };
 
                 // Extract the replication receiver BEFORE moving the
                 // transport into the Raft node. This channel receives
@@ -496,7 +637,7 @@ impl ArbitroServer {
             if !addr.is_empty() {
                 let health_server = self.server.clone();
                 let health_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
+                background_tasks.lock().await.spawn(async move {
                     run_healthcheck(addr, health_server, health_shutdown).await;
                 });
             }
@@ -511,7 +652,7 @@ impl ArbitroServer {
                 let m_server = self.server.clone();
                 let m_registry = self.registry.clone();
                 let m_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
+                background_tasks.lock().await.spawn(async move {
                     run_metrics_endpoint(addr, m_server, m_registry, m_shutdown).await;
                 });
             }
@@ -534,8 +675,17 @@ impl ArbitroServer {
         let tls_acceptor_shared = tls_acceptor.map(std::sync::Arc::new);
 
         let auth_token_shared: Option<Arc<str>> = self.config.auth_token.as_deref().map(Arc::from);
+        // FEAT-10: multi-user auth scaffold, loaded independently of Config.
+        let auth_config_shared: Arc<AuthConfig> = Arc::new(AuthConfig::from_env());
+        if !auth_config_shared.users.is_empty() {
+            tracing::info!(
+                users = auth_config_shared.users.len(),
+                "FEAT-10: multi-user auth configured"
+            );
+        }
         let max_frame_size = self.config.max_frame_size;
         let max_ops_per_sec = self.config.max_ops_per_sec;
+        let accept_background_tasks = Arc::clone(&background_tasks);
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -551,60 +701,81 @@ impl ArbitroServer {
 
                                 let _ = stream.set_nodelay(true);
 
-                                // F36: split into reader/writer — monomorphic enum.
-                                let (reader, writer): (ConnReader, ConnWriter);
-
-                                #[cfg(feature = "tls")]
-                                {
-                                    if let Some(ref acceptor) = tls_acceptor_shared {
-                                        match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => {
-                                                let (r, w) = tokio::io::split(tls_stream);
-                                                reader = ConnReader::Tls(r);
-                                                writer = ConnWriter::Tls(w);
-                                            }
-                                            Err(e) => {
-                                                tracing::debug!(%addr, error = %e, "TLS handshake failed");
-                                                continue;
-                                            }
-                                        }
-                                    } else {
-                                        let (r, w) = stream.into_split();
-                                        reader = ConnReader::Plain(r);
-                                        writer = ConnWriter::Plain(w);
-                                    }
-                                }
-
-                                #[cfg(not(feature = "tls"))]
-                                {
-                                    let (r, w) = stream.into_split();
-                                    reader = ConnReader::Plain(r);
-                                    writer = ConnWriter::Plain(w);
-                                }
-
-                                let conn_id = accept_registry.register(writer);
-                                tracing::debug!(conn_id, %addr, "accepted");
-
+                                // SEC-2: the TLS handshake used to run inline in the
+                                // accept loop, so one slow/malicious client doing the
+                                // handshake could stall acceptance of every other
+                                // connection. Move it into the spawned per-connection
+                                // task, bounded by a 10s timeout.
                                 let reg = accept_registry.clone();
                                 let srv = accept_server.clone();
                                 let sd = accept_shutdown.clone();
                                 let auth = auth_token_shared.clone();
+                                let auth_users = Arc::clone(&auth_config_shared);
                                 let cron = cron_registry.clone();
                                 let delayed = delayed_journal.clone();
                                 #[cfg(feature = "cluster")]
                                 let cluster = cluster_state.clone();
-                                tokio::spawn(async move {
+                                #[cfg(feature = "tls")]
+                                let tls_acceptor_for_conn = tls_acceptor_shared.clone();
+
+                                let conn_task = async move {
+                                    let (reader, writer): (ConnReader, ConnWriter);
+
+                                    #[cfg(feature = "tls")]
+                                    {
+                                        if let Some(acceptor) = tls_acceptor_for_conn {
+                                            let handshake = tokio::time::timeout(
+                                                std::time::Duration::from_secs(10),
+                                                acceptor.accept(stream),
+                                            )
+                                            .await;
+                                            match handshake {
+                                                Ok(Ok(tls_stream)) => {
+                                                    let (r, w) = tokio::io::split(tls_stream);
+                                                    reader = ConnReader::Tls(r);
+                                                    writer = ConnWriter::Tls(w);
+                                                }
+                                                Ok(Err(e)) => {
+                                                    tracing::debug!(%addr, error = %e, "TLS handshake failed");
+                                                    return;
+                                                }
+                                                Err(_) => {
+                                                    tracing::warn!(%addr, "TLS handshake timed out, dropping connection");
+                                                    return;
+                                                }
+                                            }
+                                        } else {
+                                            let (r, w) = stream.into_split();
+                                            reader = ConnReader::Plain(r);
+                                            writer = ConnWriter::Plain(w);
+                                        }
+                                    }
+
+                                    #[cfg(not(feature = "tls"))]
+                                    {
+                                        let (r, w) = stream.into_split();
+                                        reader = ConnReader::Plain(r);
+                                        writer = ConnWriter::Plain(w);
+                                    }
+
+                                    let conn_id = reg.register(writer);
+                                    tracing::debug!(conn_id, %addr, "accepted");
+
                                     read_loop(
-                                        conn_id, reader, srv, reg, sd, auth,
+                                        conn_id, reader, srv, reg, sd, auth, auth_users,
                                         max_frame_size, max_ops_per_sec, cron,
                                         delayed,
                                         #[cfg(feature = "cluster")]
                                         cluster,
                                     ).await;
-                                });
+                                };
+                                accept_background_tasks.lock().await.spawn(conn_task);
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "accept failed");
+                                // ROB-2: avoid a tight error loop (e.g. EMFILE) from
+                                // burning a CPU core while the fd table is exhausted.
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
@@ -633,24 +804,44 @@ impl ArbitroServer {
             let mut sigterm =
                 signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
 
-            // L15: SIGUSR1 dumps a diagnostic JSON snapshot to
-            // /tmp/arbitro-dump-{pid}.json. Listens forever (until process
-            // exit) so the operator can request multiple dumps per
-            // process. Wrapped in #[cfg(unix)]; non-unix is a no-op.
-            if let Ok(mut sigusr1) = signal(SignalKind::user_defined1()) {
+            // L15/SEC-9: SIGUSR1 dumps a diagnostic JSON snapshot to
+            // {data_dir}/arbitro-dump-{pid}-{ts_ms}.json (0600, refuses to
+            // overwrite). Listens forever (until process exit) so the
+            // operator can request multiple dumps per process. Wrapped in
+            // #[cfg(unix)]; non-unix is a no-op.
+            let dump_dir = self.config.data_dir.clone();
+            if let (Ok(mut sigusr1), Some(dump_dir)) =
+                (signal(SignalKind::user_defined1()), dump_dir)
+            {
                 let server_dump = self.server.clone();
                 let registry_dump = self.registry.clone();
                 tokio::spawn(async move {
+                    use std::fs::OpenOptions;
+                    use std::io::Write;
+                    #[cfg(unix)]
+                    use std::os::unix::fs::OpenOptionsExt;
+
                     while sigusr1.recv().await.is_some() {
                         let pid = std::process::id();
-                        let path = format!("/tmp/arbitro-dump-{pid}.json");
+                        let ts_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let path = std::path::Path::new(&dump_dir)
+                            .join(format!("arbitro-dump-{pid}-{ts_ms}.json"));
                         let dump = build_diagnostic_dump(&server_dump, &registry_dump).await;
-                        match std::fs::write(&path, &dump) {
+
+                        let mut opts = OpenOptions::new();
+                        opts.write(true).create_new(true);
+                        #[cfg(unix)]
+                        opts.mode(0o600);
+
+                        match opts.open(&path).and_then(|mut f| f.write_all(dump.as_bytes())) {
                             Ok(()) => {
-                                tracing::info!(path = %path, "SIGUSR1 diagnostic dump written")
+                                tracing::info!(path = %path.display(), "SIGUSR1 diagnostic dump written")
                             }
                             Err(e) => {
-                                tracing::warn!(path = %path, error = ?e, "SIGUSR1 dump write failed")
+                                tracing::warn!(path = %path.display(), error = ?e, "SIGUSR1 dump write failed")
                             }
                         }
                     }
@@ -691,6 +882,24 @@ impl ArbitroServer {
         keepalive_handle.abort();
         if let Some(h) = metrics_handle {
             h.abort();
+        }
+
+        // ROB-19: abort every tracked background task (cron, delayed
+        // maturation, health/metrics endpoints, per-connection read loops)
+        // and wait for them to actually finish unwinding, bounded so a
+        // stuck task can't hang shutdown forever.
+        {
+            let mut tasks = background_tasks.lock().await;
+            tasks.abort_all();
+            let drain = async {
+                while tasks.join_next().await.is_some() {}
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+                .await
+                .is_err()
+            {
+                tracing::warn!("background task drain timed out after abort");
+            }
         }
 
         // Send ServerShuttingDown to all connections
@@ -740,6 +949,7 @@ async fn read_loop(
     registry: ConnectionRegistry,
     mut shutdown: watch::Receiver<bool>,
     auth_token: Option<Arc<str>>,
+    auth_users: Arc<AuthConfig>,
     max_frame_size: usize,
     max_ops_per_sec: u32,
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
@@ -760,9 +970,32 @@ async fn read_loop(
     // Per-connection HELLO state. Connection is closed if the first 4
     // bytes are not the v2 magic.
     let mut hello_done: bool = false;
-    let mut auth_done: bool = auth_token.is_none(); // skip auth if no token configured
+    let mut auth_done: bool = auth_token.is_none() && auth_users.users.is_empty();
+    // FEAT-10: identity attached to this connection once a per-user token
+    // matches. `None` when running in shared-token (or no-auth) mode.
+    let mut identity: Option<AuthUser> = None;
+
+    // ROB-1: handshake deadline. A connection that doesn't complete HELLO +
+    // auth within this window is closed — otherwise a client that opens
+    // the socket and never sends anything ties up a task and a registry
+    // slot indefinitely.
+    let handshake_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
 
     'outer: loop {
+        // ROB-3: refill the token bucket based on elapsed wall time at the
+        // top of every outer iteration, instead of sleeping mid-drain. A
+        // window can elapse while the connection is blocked in the socket
+        // read below, so tokens are always caught up before we try to
+        // drain more frames.
+        if max_ops_per_sec > 0 {
+            let elapsed = window_start.elapsed();
+            if elapsed >= std::time::Duration::from_secs(1) {
+                let windows_passed = elapsed.as_secs();
+                window_start += std::time::Duration::from_secs(windows_passed);
+                tokens_remaining = max_ops_per_sec;
+            }
+        }
+
         // ---- Mandatory v2 handshake ---------------------------------------
         if !hello_done && acc.len() >= 4 {
             let m = u32::from_le_bytes([acc[0], acc[1], acc[2], acc[3]]);
@@ -775,16 +1008,40 @@ async fn read_loop(
                 break 'outer;
             }
             if acc.len() >= HELLO_FRAME_SIZE {
-                let _ = HelloFrame::parse(&acc[..HELLO_FRAME_SIZE]); // validates
-                let _ = acc.split_to(HELLO_FRAME_SIZE);
-                hello_done = true;
-                tracing::debug!(conn_id, "v2 HELLO accepted");
+                match HelloFrame::parse(&acc[..HELLO_FRAME_SIZE]) {
+                    Some(_) => {
+                        let _ = acc.split_to(HELLO_FRAME_SIZE);
+                        hello_done = true;
+                        tracing::debug!(conn_id, "v2 HELLO accepted");
+                    }
+                    None => {
+                        tracing::warn!(conn_id, "malformed HELLO frame, closing");
+                        send_error_frame(&registry, conn_id, ErrorCode::InvalidLength);
+                        break 'outer;
+                    }
+                }
             }
         }
 
         // ---- Auth check (first frame after Hello must be Auth) ------------
         if hello_done && !auth_done && acc.len() >= HEADER_SIZE_V2 {
             let msg_len = u32::from_le_bytes([acc[4], acc[5], acc[6], acc[7]]) as usize;
+            // SEC-1: auth frames carry a token, never a bulk payload — cap
+            // at 4096 bytes (and never above max_frame_size) before we
+            // buffer up to `total` bytes. Without this a client can send a
+            // huge msg_len and force the accumulator to grow unbounded
+            // waiting for a body that never fully arrives.
+            const MAX_AUTH_FRAME_BODY: usize = 4096;
+            if msg_len > MAX_AUTH_FRAME_BODY.min(max_frame_size) {
+                tracing::warn!(
+                    conn_id,
+                    msg_len,
+                    max = MAX_AUTH_FRAME_BODY.min(max_frame_size),
+                    "auth frame exceeds max size, closing"
+                );
+                send_error_frame(&registry, conn_id, ErrorCode::InvalidLength);
+                break 'outer;
+            }
             let total = HEADER_SIZE_V2 + msg_len;
             if acc.len() >= total {
                 let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
@@ -802,14 +1059,12 @@ async fn read_loop(
                 }
                 // Token is the body (after 16-byte header)
                 let token_bytes = &acc[HEADER_SIZE_V2..total];
-                let expected = auth_token.as_ref().unwrap();
-                // M14: constant-time comparison so a network
-                // observer can't recover the token byte-by-byte
-                // via timing of `!=`. We keep the early
-                // length-mismatch reject (constant against a known
-                // expected length is fine — the attacker already
-                // knows it from a single failed attempt).
-                let token_ok = {
+                // M14: constant-time comparison so a network observer
+                // can't recover the token byte-by-byte via timing of `!=`.
+                // We keep the early length-mismatch reject (constant
+                // against a known expected length is fine — the attacker
+                // already knows it from a single failed attempt).
+                let shared_token_ok = auth_token.as_ref().is_some_and(|expected| {
                     let e = expected.as_bytes();
                     if token_bytes.len() != e.len() {
                         false
@@ -820,8 +1075,16 @@ async fn read_loop(
                         }
                         diff == 0
                     }
+                });
+                // FEAT-10: fall back to per-user token lookup when the
+                // shared token doesn't match (or isn't configured).
+                let matched_user = if shared_token_ok {
+                    None
+                } else {
+                    auth_users.find_by_token(token_bytes).cloned()
                 };
-                if !token_ok {
+
+                if !shared_token_ok && matched_user.is_none() {
                     // H2: a wrong token is AuthFailed, not a server
                     // shutdown signal. Mis-coding this confuses
                     // bootstrap loops and credential-rotation logic.
@@ -829,15 +1092,28 @@ async fn read_loop(
                     send_error_frame(&registry, conn_id, ErrorCode::AuthFailed);
                     break 'outer;
                 }
+                if let Some(user) = matched_user {
+                    tracing::debug!(conn_id, username = %user.username, "auth accepted (per-user)");
+                    identity = Some(user);
+                } else {
+                    tracing::debug!(conn_id, "auth accepted");
+                }
                 let _ = acc.split_to(total);
                 auth_done = true;
-                tracing::debug!(conn_id, "auth accepted");
+                let _ = &identity; // FEAT-10: identity is attached for future permission checks.
             }
         }
 
         // ---- Drain whole v2 frames already in the accumulator -------------
         if hello_done && auth_done {
             loop {
+                // ROB-3: out of tokens for this window — stop draining and
+                // fall through to the socket-read select below. The top of
+                // the outer loop refills once the 1s window has elapsed.
+                if max_ops_per_sec > 0 && tokens_remaining == 0 {
+                    break;
+                }
+
                 if acc.len() < HEADER_SIZE_V2 {
                     break;
                 }
@@ -877,17 +1153,7 @@ async fn read_loop(
                     break 'outer;
                 }
 
-                // Rate limit: if max_ops_per_sec > 0, consume a token.
                 if max_ops_per_sec > 0 {
-                    if tokens_remaining == 0 {
-                        // Wait until the current 1-second window expires.
-                        let elapsed = window_start.elapsed();
-                        if elapsed < std::time::Duration::from_secs(1) {
-                            tokio::time::sleep(std::time::Duration::from_secs(1) - elapsed).await;
-                        }
-                        window_start = tokio::time::Instant::now();
-                        tokens_remaining = max_ops_per_sec;
-                    }
                     tokens_remaining -= 1;
                 }
             }
@@ -898,22 +1164,77 @@ async fn read_loop(
             acc.reserve(INITIAL_CAP);
         }
 
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                tracing::debug!(conn_id, "read loop stopping (shutdown)");
-                break 'outer;
-            }
-            r = reader.read_buf(&mut acc) => {
-                match r {
-                    Ok(0) => {
-                        tracing::debug!(conn_id, "client disconnected (EOF)");
-                        break 'outer;
+        if !auth_done {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    tracing::debug!(conn_id, "read loop stopping (shutdown)");
+                    break 'outer;
+                }
+                _ = tokio::time::sleep_until(handshake_deadline) => {
+                    tracing::warn!(conn_id, "handshake deadline exceeded, closing");
+                    send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
+                    break 'outer;
+                }
+                r = reader.read_buf(&mut acc) => {
+                    match r {
+                        Ok(0) => {
+                            tracing::debug!(conn_id, "client disconnected (EOF)");
+                            break 'outer;
+                        }
+                        Ok(_n) => { /* loop and try to drain */ }
+                        Err(e) => {
+                            tracing::debug!(conn_id, error = %e, "read error");
+                            break 'outer;
+                        }
                     }
-                    Ok(_n) => { /* loop and try to drain */ }
-                    Err(e) => {
-                        tracing::debug!(conn_id, error = %e, "read error");
-                        break 'outer;
+                }
+            }
+        } else if max_ops_per_sec > 0 && tokens_remaining == 0 {
+            // ROB-3: rate-limited with frames still buffered in `acc` — wake
+            // at the window refill deadline even if the client sends no
+            // further bytes, so already-buffered frames get drained on
+            // schedule instead of waiting on an unrelated read.
+            let refill_at = window_start + std::time::Duration::from_secs(1);
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    tracing::debug!(conn_id, "read loop stopping (shutdown)");
+                    break 'outer;
+                }
+                _ = tokio::time::sleep_until(refill_at) => { /* loop, top refills tokens */ }
+                r = reader.read_buf(&mut acc) => {
+                    match r {
+                        Ok(0) => {
+                            tracing::debug!(conn_id, "client disconnected (EOF)");
+                            break 'outer;
+                        }
+                        Ok(_n) => { /* loop and try to drain */ }
+                        Err(e) => {
+                            tracing::debug!(conn_id, error = %e, "read error");
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    tracing::debug!(conn_id, "read loop stopping (shutdown)");
+                    break 'outer;
+                }
+                r = reader.read_buf(&mut acc) => {
+                    match r {
+                        Ok(0) => {
+                            tracing::debug!(conn_id, "client disconnected (EOF)");
+                            break 'outer;
+                        }
+                        Ok(_n) => { /* loop and try to drain */ }
+                        Err(e) => {
+                            tracing::debug!(conn_id, error = %e, "read error");
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -922,12 +1243,18 @@ async fn read_loop(
 
     // EOF / shutdown / error: drain the engine bookkeeping for this conn,
     // then drop the connection from the registry. No frame is synthesized.
+    // PERF-10: fan the per-shard drains out concurrently instead of
+    // awaiting them one at a time — with N shards this turns teardown
+    // latency from O(N * drain_cost) into O(drain_cost). ShardRouter/
+    // ShardHandle are Arc-backed so cloning `server` per task is cheap.
+    let mut drain_set = tokio::task::JoinSet::new();
     for i in 0..server.shard_count() {
-        let _ = server
-            .shard(i)
-            .drain_connection(ConnectionId(conn_id))
-            .await;
+        let server = server.clone();
+        drain_set.spawn(async move {
+            let _ = server.shard(i).drain_connection(ConnectionId(conn_id)).await;
+        });
     }
+    while drain_set.join_next().await.is_some() {}
     registry.remove(conn_id);
 }
 
@@ -1101,7 +1428,7 @@ async fn run_healthcheck(addr: String, server: ShardRouter, mut shutdown: watch:
             return;
         }
     };
-    tracing::info!(target = "healthcheck", addr = %addr, "healthcheck listening on /health");
+    tracing::info!(target = "healthcheck", addr = %addr, "healthcheck listening on /health and /ready");
 
     loop {
         tokio::select! {
@@ -1111,7 +1438,7 @@ async fn run_healthcheck(addr: String, server: ShardRouter, mut shutdown: watch:
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let healthy = server.shard_count() > 0;
+                let srv = server.clone();
                 tokio::spawn(async move {
                     // Read until \r\n\r\n or 1 KiB, whichever first.
                     let mut buf = [0u8; 1024];
@@ -1131,19 +1458,69 @@ async fn run_healthcheck(addr: String, server: ShardRouter, mut shutdown: watch:
                             }
                         },
                     ).await;
-                    let body: &[u8] = if healthy { b"OK" } else { b"NO" };
+
+                    let path = parse_request_path(&buf[..total]);
+                    // FEAT-12: /health is a cheap liveness check (process up,
+                    // shard router initialized). /ready is a readiness check
+                    // that actually probes each shard with a 5s timeout —
+                    // any shard that doesn't answer in time fails readiness.
+                    let (healthy, status_body): (bool, &[u8]) = match path {
+                        "/ready" => {
+                            let ready = shard_router_ready(&srv).await;
+                            (ready, if ready { b"READY" } else { b"NOT READY" })
+                        }
+                        "/health" | "" => {
+                            let alive = srv.shard_count() > 0;
+                            (alive, if alive { b"OK" } else { b"NO" })
+                        }
+                        _ => {
+                            let resp = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found";
+                            let _ = sock.write_all(resp).await;
+                            let _ = sock.shutdown().await;
+                            return;
+                        }
+                    };
+
                     let status = if healthy { "200 OK" } else { "503 Service Unavailable" };
                     let resp = format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
+                        status_body.len()
                     );
                     let _ = sock.write_all(resp.as_bytes()).await;
-                    let _ = sock.write_all(body).await;
+                    let _ = sock.write_all(status_body).await;
                     let _ = sock.shutdown().await;
                 });
             }
         }
     }
+}
+
+/// FEAT-12: readiness probe — sends a lightweight round-trip command
+/// (`list_streams`, the cheapest existing shard query) to every shard with
+/// a 5s timeout. Any shard that errors or doesn't respond in time makes the
+/// broker report not-ready, since it means that shard's worker loop is
+/// stuck or dead.
+async fn shard_router_ready(server: &ShardRouter) -> bool {
+    if server.shard_count() == 0 {
+        return false;
+    }
+    let mut probes: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+    for i in 0..server.shard_count() {
+        let shard = server.shard(i).clone();
+        probes.spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), shard.list_streams())
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false)
+        });
+    }
+    let mut all_ok = true;
+    while let Some(res) = probes.join_next().await {
+        if !res.unwrap_or(false) {
+            all_ok = false;
+        }
+    }
+    all_ok
 }
 
 /// Periodic metrics task. Sums `MetricsSnapshot` across all shards every
@@ -1211,18 +1588,30 @@ async fn metrics_loop(
         let mut max_consumer_ack_pending = 0u32;
         let mut stream_messages = 0u64;
         let mut stream_bytes = 0u64;
+
+        // PERF-2: there is no single "give me every stream's stats"
+        // shard command yet, so this still costs one mpsc round trip per
+        // stream. Until that command exists, at least stop paying for
+        // those round trips serially — fan every `store_info` call (across
+        // every shard) out concurrently via JoinSet so total wall time is
+        // ~one round trip instead of N.
+        let mut info_set: tokio::task::JoinSet<(u64, u64)> = tokio::task::JoinSet::new();
         for i in 0..server.shard_count() {
             let shard = server.shard(i);
             if let Ok(r) = shard.list_streams().await {
                 streams += r.streams.len();
                 for (sid, _) in &r.streams {
-                    if let Ok(info) = shard
-                        .store_info(arbitro_engine_v2::types::StreamId(*sid))
-                        .await
-                    {
-                        stream_messages += info.messages;
-                        stream_bytes += info.bytes;
-                    }
+                    let shard = server.shard(i).clone();
+                    let sid = *sid;
+                    info_set.spawn(async move {
+                        match shard
+                            .store_info(arbitro_engine_v2::types::StreamId(sid))
+                            .await
+                        {
+                            Ok(info) => (info.messages, info.bytes),
+                            Err(_) => (0, 0),
+                        }
+                    });
                 }
             }
             if let Ok(states) = shard.consumer_states().await {
@@ -1236,6 +1625,12 @@ async fn metrics_loop(
                         max_consumer_ack_pending = s.ack_pending;
                     }
                 }
+            }
+        }
+        while let Some(res) = info_set.join_next().await {
+            if let Ok((messages, bytes)) = res {
+                stream_messages += messages;
+                stream_bytes += bytes;
             }
         }
         let connections = registry.active_count();

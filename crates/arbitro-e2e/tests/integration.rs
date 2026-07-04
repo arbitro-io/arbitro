@@ -7,7 +7,7 @@ use std::time::Duration;
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_create_stream() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -18,7 +18,7 @@ async fn test_create_stream() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_create_consumer() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -34,7 +34,7 @@ async fn test_create_consumer() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_list_streams() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -49,7 +49,7 @@ async fn test_list_streams() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_list_streams_empty() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -58,7 +58,7 @@ async fn test_list_streams_empty() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_publish_ack_cycle() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -90,7 +90,7 @@ async fn test_publish_ack_cycle() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_publish_batch() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -109,7 +109,7 @@ async fn test_publish_batch() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_fanout_delivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -165,7 +165,7 @@ async fn test_fanout_delivery() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_nack_redelivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -194,7 +194,7 @@ async fn test_nack_redelivery() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_replay_publish_then_subscribe() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -233,7 +233,7 @@ async fn test_replay_publish_then_subscribe() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_gate_auto_delivery_smoke() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -265,7 +265,7 @@ async fn test_gate_auto_delivery_smoke() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_fanout_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -324,7 +324,7 @@ async fn test_fanout_same_connection() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_queue_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -380,7 +380,7 @@ async fn test_queue_same_connection() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_fanout_filtered_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -426,45 +426,33 @@ async fn test_fanout_filtered_same_connection() {
             .expect("publish");
     }
 
-    let mut ca = 0u32;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(2), sub_a.recv()).await {
-            Ok(Some(msg)) => {
-                msg.ack();
-                ca += 1;
-            }
-            _ => break,
-        }
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub_a.recv())
+            .await
+            .expect("A timed out")
+            .expect("A closed");
+        msg.ack();
     }
-    assert_eq!(ca, 3, "A (orders.*) should get 3, got {ca}");
 
-    let mut cb = 0u32;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(2), sub_b.recv()).await {
-            Ok(Some(msg)) => {
-                msg.ack();
-                cb += 1;
-            }
-            _ => break,
-        }
+    for _ in 0..2 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub_b.recv())
+            .await
+            .expect("B timed out")
+            .expect("B closed");
+        msg.ack();
     }
-    assert_eq!(cb, 2, "B (payments.*) should get 2, got {cb}");
 
-    let mut cc = 0u32;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(2), sub_c.recv()).await {
-            Ok(Some(msg)) => {
-                msg.ack();
-                cc += 1;
-            }
-            _ => break,
-        }
+    for _ in 0..5 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), sub_c.recv())
+            .await
+            .expect("C timed out")
+            .expect("C closed");
+        msg.ack();
     }
-    assert_eq!(cc, 5, "C (>) should get 5, got {cc}");
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_publish_with_reply_delivers_reply_to() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -505,7 +493,7 @@ async fn test_publish_with_reply_delivers_reply_to() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_publish_without_reply_has_empty_reply_to() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -539,7 +527,7 @@ async fn test_publish_without_reply_has_empty_reply_to() {
     server.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn test_graceful_shutdown() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;

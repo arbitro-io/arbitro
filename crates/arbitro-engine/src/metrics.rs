@@ -28,7 +28,11 @@ pub struct EngineMetrics {
     pub publish_no_match: AtomicU64,
     pub publish_queues_pushed: AtomicU64,
     pub publish_fanout_notified: AtomicU64,
-    _pad0: [u8; 24],
+    /// Entries dropped via `Tombstone { reason: Expired }`.
+    pub entries_expired: AtomicU64,
+    /// Entries dropped via `Tombstone { reason: Tombstoned }`.
+    pub entries_tombstoned: AtomicU64,
+    _pad0: [u8; 8],
 
     // ── Claim ─────────────────────────────────
     pub claim_batches: AtomicU64,
@@ -72,7 +76,9 @@ impl EngineMetrics {
             publish_no_match: AtomicU64::new(0),
             publish_queues_pushed: AtomicU64::new(0),
             publish_fanout_notified: AtomicU64::new(0),
-            _pad0: [0; 24],
+            entries_expired: AtomicU64::new(0),
+            entries_tombstoned: AtomicU64::new(0),
+            _pad0: [0; 8],
 
             claim_batches: AtomicU64::new(0),
             claim_entries_delivered: AtomicU64::new(0),
@@ -111,6 +117,8 @@ impl EngineMetrics {
             publish_no_match: l(&self.publish_no_match),
             publish_queues_pushed: l(&self.publish_queues_pushed),
             publish_fanout_notified: l(&self.publish_fanout_notified),
+            entries_expired: l(&self.entries_expired),
+            entries_tombstoned: l(&self.entries_tombstoned),
 
             claim_batches: l(&self.claim_batches),
             claim_entries_delivered: l(&self.claim_entries_delivered),
@@ -152,6 +160,8 @@ pub struct MetricsSnapshot {
     pub publish_no_match: u64,
     pub publish_queues_pushed: u64,
     pub publish_fanout_notified: u64,
+    pub entries_expired: u64,
+    pub entries_tombstoned: u64,
 
     pub claim_batches: u64,
     pub claim_entries_delivered: u64,

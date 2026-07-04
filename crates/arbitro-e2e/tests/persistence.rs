@@ -957,3 +957,303 @@ async fn t8_retention_max_msgs_survives_restart() {
         server.shutdown().await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEST-1: Command log survives a bit-flip corruption in its trailing entry.
+//
+// CommandLog::record() frames each entry as [4 len_le][4 crc32_le][payload].
+// A single flipped bit inside the payload of the last entry breaks its
+// CRC32 check; replay() must skip that one entry (CRC mismatch) while
+// keeping every valid entry before it. This test creates 3 streams
+// (3 valid log entries), corrupts a byte inside the last entry's payload
+// on disk, restarts the broker, and asserts the first 2 streams recovered
+// cleanly while the corrupted 3rd did not silently reappear.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_log_recovers_valid_prefix_after_bitflip_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+    let log_path = dir.path().join("metadata.log");
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        client
+            .create_stream(b"alpha", b"alpha.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        client
+            .create_stream(b"beta", b"beta.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        client
+            .create_stream(b"gamma", b"gamma.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        server.shutdown().await;
+    }
+
+    // Flip a bit inside the payload of the last entry (the "gamma" stream
+    // creation). The payload starts right after the 8-byte header
+    // [len_le][crc32_le], so any byte at offset >= 8 in the final entry's
+    // span lands inside its payload and invalidates its CRC without
+    // touching the length prefix — replay stays aligned for the entries
+    // before it and cleanly stops after skipping the corrupted one.
+    {
+        let mut bytes = std::fs::read(&log_path).unwrap();
+        assert!(
+            bytes.len() > 16,
+            "expected at least 3 framed entries on disk, got {} bytes",
+            bytes.len()
+        );
+        let flip_at = bytes.len() - 4;
+        bytes[flip_at] ^= 0x01;
+        std::fs::write(&log_path, &bytes).unwrap();
+    }
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let names = TestServer::stream_names(&resp);
+
+        assert!(
+            names.iter().any(|n| n == b"alpha"),
+            "alpha (before corruption) must survive"
+        );
+        assert!(
+            names.iter().any(|n| n == b"beta"),
+            "beta (before corruption) must survive"
+        );
+        assert!(
+            !names.iter().any(|n| n == b"gamma"),
+            "gamma (corrupted entry) must not silently reappear"
+        );
+
+        // The broker must still be fully usable after recovering from
+        // the corrupted trailing entry — not stuck in a degraded state.
+        client
+            .create_stream(b"delta", b"delta.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .expect("broker must remain writable after corruption recovery");
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        assert!(
+            TestServer::stream_names(&resp)
+                .iter()
+                .any(|n| n == b"delta"),
+            "post-recovery writes must persist"
+        );
+        server.shutdown().await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEST-1b: A corrupted entry in the MIDDLE of the log (not just the tail)
+// is skipped without derailing replay of the entries that follow it,
+// since each entry's length prefix is read before its CRC is checked.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn command_log_skips_mid_log_corruption_and_continues_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+    let log_path = dir.path().join("metadata.log");
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        client
+            .create_stream(b"first", b"first.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        client
+            .create_stream(b"second", b"second.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        client
+            .create_stream(b"third", b"third.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        server.shutdown().await;
+    }
+
+    // Flip a bit near the start of the file — inside the payload of the
+    // FIRST entry ("first"), well past its 8-byte header.
+    {
+        let mut bytes = std::fs::read(&log_path).unwrap();
+        let flip_at = 10.min(bytes.len().saturating_sub(1));
+        bytes[flip_at] ^= 0x01;
+        std::fs::write(&log_path, &bytes).unwrap();
+    }
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let names = TestServer::stream_names(&resp);
+
+        assert!(
+            !names.iter().any(|n| n == b"first"),
+            "corrupted first entry must not reappear"
+        );
+        assert!(
+            names.iter().any(|n| n == b"second"),
+            "second entry (after corrupted first) must still replay"
+        );
+        assert!(
+            names.iter().any(|n| n == b"third"),
+            "third entry (after corrupted first) must still replay"
+        );
+        server.shutdown().await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// created_at_seq filters old entries after stream_id recycle
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn created_at_seq_filters_old_entries_after_recycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    // Phase 1: create streams, publish data, delete + recreate stream A.
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        // Create a filler stream to push global seq forward.
+        let resp = client
+            .create_stream(b"filler", b"filler.>", 0, 0, 0, 1, 1, 0, 0, 0)
+            .await
+            .unwrap();
+        let filler_sid = TestServer::parse_id(&resp);
+
+        // Publish ~99 messages to filler so stream A starts around seq 100.
+        for i in 0u32..99 {
+            let payload = i.to_le_bytes();
+            client
+                .publish_sync(
+                    filler_sid,
+                    b"filler.pad",
+                    Bytes::copy_from_slice(&payload),
+                )
+                .await
+                .expect("filler pre-publish");
+        }
+
+        // Create stream A and publish 100 messages (8 bytes each).
+        let resp = client
+            .create_stream(b"stream_a", b"stream_a.>", 0, 0, 0, 1, 1, 0, 0, 0)
+            .await
+            .unwrap();
+        let a_sid = TestServer::parse_id(&resp);
+
+        for i in 0u32..100 {
+            let payload = (i as u64).to_le_bytes();
+            client
+                .publish_sync(
+                    a_sid,
+                    b"stream_a.data",
+                    Bytes::copy_from_slice(&payload),
+                )
+                .await
+                .expect("publish to A");
+        }
+
+        // Push global seq far forward with filler messages.
+        // Use batches to speed this up — 500 messages at a time.
+        for batch in 0..1000 {
+            let payload = (batch as u64).to_le_bytes();
+            client
+                .publish_sync(
+                    filler_sid,
+                    b"filler.bulk",
+                    Bytes::copy_from_slice(&payload),
+                )
+                .await
+                .expect("filler bulk publish");
+        }
+
+        // Delete stream A.
+        client.delete_stream(b"stream_a").await.unwrap();
+
+        // Recreate stream A (gets the same recycled stream_id from IdPool).
+        let resp = client
+            .create_stream(b"stream_a", b"stream_a.>", 0, 0, 0, 1, 1, 0, 0, 0)
+            .await
+            .unwrap();
+        let a_sid2 = TestServer::parse_id(&resp);
+
+        // Publish 5 messages to the new incarnation of stream A.
+        for i in 0u32..5 {
+            let payload = (1000 + i as u64).to_le_bytes();
+            client
+                .publish_sync(
+                    a_sid2,
+                    b"stream_a.data",
+                    Bytes::copy_from_slice(&payload),
+                )
+                .await
+                .expect("publish to new A");
+        }
+
+        // Consume from new stream A — should see exactly 5 messages.
+        let resp = client
+            .create_consumer(a_sid2, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        let cid = TestServer::parse_id(&resp);
+        let mut sub = client.subscribe(a_sid2, cid, b"").await.unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), sub.recv()).await {
+                Ok(Some(msg)) => received.push(msg),
+                _ => break,
+            }
+        }
+        assert_eq!(
+            received.len(),
+            5,
+            "new stream A should only deliver 5 messages (not old 100), got {}",
+            received.len()
+        );
+
+        server.shutdown().await;
+    }
+
+    // Phase 2: restart and verify created_at_seq persists via sidecar.
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let a_sid =
+            TestServer::find_stream_id(&resp, b"stream_a").expect("stream_a not found after restart");
+
+        let resp = client
+            .create_consumer(a_sid, b"reader2", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        let cid = TestServer::parse_id(&resp);
+        let mut sub = client.subscribe(a_sid, cid, b"").await.unwrap();
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), sub.recv()).await {
+                Ok(Some(msg)) => received.push(msg),
+                _ => break,
+            }
+        }
+        assert_eq!(
+            received.len(),
+            5,
+            "after restart, new stream A should still only deliver 5 messages, got {}",
+            received.len()
+        );
+
+        server.shutdown().await;
+    }
+}

@@ -111,17 +111,26 @@ async fn cron_survives_server_restart() {
     let fire_count = Arc::new(AtomicU64::new(0));
     let fc = fire_count.clone();
 
-    let client = arbitro_client_tokio::Client::connect(ClientConfig {
-        addr: addr.clone(),
-        reconnect: ReconnectPolicy {
-            base: Duration::from_millis(100),
-            cap: Duration::from_millis(500),
-            max_attempts: Some(30),
-        },
-        ..ClientConfig::default()
-    })
-    .await
-    .expect("initial connect");
+    let client = {
+        let cfg = ClientConfig {
+            addr: addr.clone(),
+            reconnect: ReconnectPolicy {
+                base: Duration::from_millis(100),
+                cap: Duration::from_millis(500),
+                max_attempts: Some(30),
+            },
+            ..ClientConfig::default()
+        };
+        let mut c = None;
+        for _ in 0..100 {
+            if let Ok(cl) = arbitro_client_tokio::Client::connect(cfg.clone()).await {
+                c = Some(cl);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        c.expect("initial connect")
+    };
 
     let _cron = client
         .cron(b"reconnect-test")

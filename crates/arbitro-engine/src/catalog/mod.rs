@@ -8,12 +8,19 @@
 
 pub mod match_table;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use crate::common::wire_hash_32;
 use crate::error::{EngineError, EngineResult};
 use crate::events::DeltaEvents;
 use crate::types::*;
 use match_table::{MatchEntry, MatchTable};
+
+/// Upper bound on stream/consumer ids. Guards `ensure_*_slot` against a
+/// caller-supplied id triggering a huge `Vec::resize_with` allocation
+/// (SEC-4) — e.g. a malformed id of `u32::MAX` would otherwise attempt a
+/// multi-GB allocation.
+pub const MAX_ENTITY_ID: u32 = 65536;
 
 // ── Config types (input to catalog operations) ──────────────────────────────
 
@@ -91,7 +98,10 @@ pub struct SubscriptionInfo {
 pub struct Pending {
     pub seq: u64,
     pub subject_hash: u32,
-    pub _pad: u32,
+    /// Number of times this entry has been (re)delivered. Incremented on
+    /// each nack-driven redelivery; compared against `ConsumerInfo::max_nack`.
+    pub deliveries: u16,
+    pub _pad: u16,
 }
 const _: () = assert!(core::mem::size_of::<Pending>() == 16);
 
@@ -108,20 +118,17 @@ pub struct Binding {
     pub max_inflight: u32,
     pub paused: bool,
     pub fire_and_forget: bool,
-    /// In-flight messages awaiting ack. Inline in the binding —
-    /// `Vec<Pending>` for now, `SmallVec<[Pending; 4]>` once dep lands.
-    pub pending: Vec<Pending>,
-    /// F15: O(1) "is this seq pending on this binding?" lookup, kept in
-    /// sync with `pending`. The wheel-tick ack-timeout path queries this
-    /// per scheduled entry — a Vec walk was O(N) per scheduled timer.
-    pub pending_seqs: HashSet<u64, foldhash::fast::FixedState>,
+    /// In-flight messages awaiting ack, keyed by seq. O(1) insert, lookup,
+    /// and remove on ack/nack — replaces the old `Vec<Pending>` linear
+    /// scan + parallel `HashSet<u64>` dedup index (PERF-1).
+    pub pending: HashMap<u64, Pending, foldhash::fast::FixedState>,
 }
 
 impl Binding {
-    /// F15: O(1) pending lookup for wheel-tick / ack-timeout path.
+    /// O(1) pending lookup for wheel-tick / ack-timeout path.
     #[inline]
     pub fn is_pending(&self, seq: u64) -> bool {
-        self.pending_seqs.contains(&seq)
+        self.pending.contains_key(&seq)
     }
 }
 
@@ -149,6 +156,10 @@ pub struct Catalog {
     by_stream: HashMap<StreamId, Vec<BindingId>, foldhash::fast::FixedState>,
     by_consumer: HashMap<ConsumerId, Vec<BindingId>, foldhash::fast::FixedState>,
     by_connection: HashMap<ConnectionId, Vec<BindingId>, foldhash::fast::FixedState>,
+    /// ROB-13: at most one active binding per subscription. Consulted by
+    /// `subscribe` to replace a stale binding cleanly instead of leaving
+    /// two live bindings racing for the same subscription's deliveries.
+    by_subscription: HashMap<SubscriptionId, BindingId, foldhash::fast::FixedState>,
     next_binding_id: u32,
 
     // Connection tracking.
@@ -171,6 +182,7 @@ impl Catalog {
             by_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             by_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             by_connection: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_subscription: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_binding_id: 1,
             connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
@@ -178,12 +190,19 @@ impl Catalog {
         }
     }
 
+    /// SEC-4: reject ids beyond `MAX_ENTITY_ID` before resizing — an
+    /// unbounded id would otherwise drive `Vec::resize_with` to attempt a
+    /// huge allocation.
     #[inline(always)]
-    fn ensure_stream_slot(&mut self, id: StreamId) {
+    fn ensure_stream_slot(&mut self, id: StreamId) -> EngineResult<()> {
+        if id.0 > MAX_ENTITY_ID {
+            return Err(EngineError::entity_id_too_large());
+        }
         let idx = id.0 as usize;
         if idx >= self.streams.len() {
             self.streams.resize_with(idx + 4, || None);
         }
+        Ok(())
     }
 
     #[inline(always)]
@@ -238,7 +257,7 @@ impl Catalog {
 
     /// Create or ensure a stream exists. Idempotent.
     pub fn ensure_stream(&mut self, config: StreamConfig) -> EngineResult<()> {
-        self.ensure_stream_slot(config.id);
+        self.ensure_stream_slot(config.id)?;
         if self.streams[config.id.0 as usize].is_some() {
             return Ok(());
         }
@@ -416,7 +435,7 @@ impl Catalog {
                     mt.add_pattern(filter.clone(), match_entry);
                 } else {
                     let hash = wire_hash_32(filter);
-                    mt.add_exact(hash, match_entry);
+                    mt.add_exact(hash, filter, match_entry);
                 }
             }
         }
@@ -469,6 +488,11 @@ impl Catalog {
 
     /// Create a binding: connect a subscription to a connection. Updates
     /// match table with the connection_id and increments demand.
+    ///
+    /// ROB-13: a subscription may have at most one active binding. If one
+    /// already exists, it's retired cleanly (releasing its inflight and
+    /// match-table state) before the new binding is created — no window
+    /// where two bindings race for the same subscription's deliveries.
     pub fn subscribe(
         &mut self,
         connection_id: ConnectionId,
@@ -485,11 +509,19 @@ impl Catalog {
             .and_then(|s| s.as_ref())
             .ok_or_else(EngineError::consumer_not_found)?;
 
-        let binding_id = BindingId(self.next_binding_id);
-        self.next_binding_id += 1;
-
         let stream_id = sub.stream_id;
         let consumer_id = sub.consumer_id;
+        let queue_id = consumer.queue_id;
+        let max_inflight = consumer.max_inflight;
+        let paused = consumer.paused;
+        let fire_and_forget = consumer.ack_policy == AckPolicy::None;
+
+        if let Some(&old_binding_id) = self.by_subscription.get(&subscription_id) {
+            self.retire_binding(old_binding_id, events);
+        }
+
+        let binding_id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
 
         let binding = Binding {
             binding_id,
@@ -497,12 +529,11 @@ impl Catalog {
             consumer_id,
             connection_id,
             subscription_id,
-            queue_id: consumer.queue_id,
-            max_inflight: consumer.max_inflight,
-            paused: consumer.paused,
-            fire_and_forget: consumer.ack_policy == AckPolicy::None,
-            pending: Vec::new(),
-            pending_seqs: HashSet::with_hasher(foldhash::fast::FixedState::default()),
+            queue_id,
+            max_inflight,
+            paused,
+            fire_and_forget,
+            pending: HashMap::with_hasher(foldhash::fast::FixedState::default()),
         };
 
         self.bindings.insert(binding_id, binding);
@@ -518,6 +549,7 @@ impl Catalog {
             .entry(connection_id)
             .or_default()
             .push(binding_id);
+        self.by_subscription.insert(subscription_id, binding_id);
 
         // Precompute connection_id in match entries.
         self.bind_subscription_connection(stream_id, subscription_id, connection_id);
@@ -550,6 +582,11 @@ impl Catalog {
         }
         if let Some(v) = self.by_connection.get_mut(&binding.connection_id) {
             v.retain(|b| *b != binding_id);
+        }
+        // Only clear the subscription index if it still points at this
+        // binding — a replacement binding may have already overwritten it.
+        if self.by_subscription.get(&binding.subscription_id) == Some(&binding_id) {
+            self.by_subscription.remove(&binding.subscription_id);
         }
 
         // Unbind from match table.
@@ -758,19 +795,6 @@ impl Default for Catalog {
     fn default() -> Self {
         Self::new()
     }
-}
-
-// ── Wire hash (foldhash, deterministic fixed-seed) ──────────────────────────
-
-/// 32-bit wire hash used for subjects / stream ids / queue keys.
-/// Backed by `foldhash::fast::FixedState` (constant seed → deterministic
-/// across processes). ~1 ns for subjects ≤32 B.
-#[inline]
-pub fn wire_hash_32(data: &[u8]) -> u32 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = foldhash::fast::FixedState::default().build_hasher();
-    h.write(data);
-    h.finish() as u32
 }
 
 #[cfg(test)]

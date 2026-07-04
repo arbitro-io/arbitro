@@ -5,8 +5,15 @@
 //! Drastically simplified from the legacy graph-based context:
 //! * No `GraphStore`, `BuiltinEdges`, `ReadyState`, `FanoutQueue`.
 //! * No `ScratchReply` buffers (no claim/ack reply protocol).
-//! * No `IdempotencyWindow` (handled at store level).
 //! * No `CreditPlugin`, `EventBus`, `Scheduler` (plugins removed).
+//!
+//! Idempotency / message dedup is handled at the server layer — the
+//! dispatch path (`arbitro-server/src/transport/dispatch_v2.rs`) checks
+//! the per-stream `IdempotencyTracker` (`arbitro-server/src/shard/
+//! idempotency.rs`) before publishing. The tracker is opt-in via
+//! `idempotency_window_ms` at CreateStream time and is restored from
+//! the store on restart (see `recovery::rebuild_idempotency`). The
+//! engine itself has no idempotency logic — it is a pure oracle.
 //!
 //! What remains: `Catalog` (entity storage + match tables + bindings),
 //! `InFlightCounters` (subject/consumer/queue credits), `EngineMetrics`

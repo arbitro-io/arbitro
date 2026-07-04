@@ -1,8 +1,8 @@
 //! Cron wire frames — cold path, JSON-encoded bodies.
 //!
-//! All cron frames use the standard Envelope prefix. The body after the
-//! envelope is a JSON object for CreateCron / ListCrons replies, or a
-//! minimal fixed layout for CronFire / CronAck.
+//! All cron frames use the v2 `Header` prefix (see `crate::v2::header`).
+//! The body after the header is a JSON object for CreateCron / ListCrons
+//! replies, or a minimal fixed layout for CronFire / CronAck.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

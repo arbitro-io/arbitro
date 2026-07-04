@@ -115,13 +115,12 @@ async fn delete_then_recreate_same_name_is_functional() {
     let id_a = create_consumer(&client, stream_id, b"worker").await;
     client.delete_consumer(id_a).await.unwrap();
 
-    // Same name, after delete. Must succeed AND yield a fresh id.
+    // Same name, after delete. Must succeed.
+    // With IdPool slot recycling (ROB-29), the raw id MAY be reused —
+    // generation tags prevent aliasing. The important invariant is that
+    // the re-created consumer is reachable and functional.
     let id_b = create_consumer(&client, stream_id, b"worker").await;
-    assert_ne!(
-        id_a, id_b,
-        "re-created consumer must have a fresh id; reusing the deleted \
-         id would silently alias subscriptions to a half-cleaned entity"
-    );
+    let _ = id_b;
 
     // The freshly-recreated consumer must be reachable through GetConsumer.
     assert!(
@@ -177,13 +176,10 @@ async fn delete_stream_resets_consumer_namespace() {
     // foldhash) — that's fine and expected. The CONSUMER id must be
     // fresh: reusing the old id would silently alias the new consumer
     // to a no-longer-existent catalog slot.
-    assert_ne!(
-        consumer_id_a, consumer_id_b,
-        "after delete_stream → create_stream → create_consumer (same \
-         name), the consumer MUST get a fresh id; reusing {consumer_id_a} \
-         means NameRegistry kept a stale mapping pointing at a catalog \
-         slot that delete_stream removed (or should have removed)"
-    );
+    // With IdPool slot recycling (ROB-29), the raw consumer id MAY be
+    // reused after cascade-delete. The important invariant is that the
+    // re-created consumer on the new stream actually works end-to-end.
+    let _ = (consumer_id_a, consumer_id_b);
 
     // And the re-created consumer must actually work end-to-end:
     // subscribe + publish + receive.
@@ -284,16 +280,9 @@ async fn create_delete_cycles_no_leak() {
         );
     }
 
-    // Every cycle should yield a unique id (proves no slot reuse — the
-    // current `next_consumer` allocator never recycles; if that ever
-    // changes via IdPool wiring, update this assertion accordingly).
-    let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        CYCLES,
-        "every create must yield a distinct ConsumerId; collision would \
-         mean two different lifecycles share state"
-    );
+    // With IdPool slot recycling (ROB-29), the same raw id IS reused
+    // after delete — that's expected. The per-cycle count assertions
+    // above already prove that create/delete cycles don't leak.
     server.shutdown().await;
 }
 

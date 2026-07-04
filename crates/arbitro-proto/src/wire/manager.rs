@@ -60,9 +60,26 @@ impl<'a> CreateConsumerView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks `buf.len() >= CREATE_CONSUMER_FIXED_SIZE`
+    /// before wrapping it. Prefer this over `new()` for untrusted input
+    /// (e.g. metadata-log replay) — the accessor methods on a view built
+    /// from `new()` still `.unwrap()` on a truncated buffer.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < CREATE_CONSUMER_FIXED_SIZE {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     fn fixed(&self) -> &CreateConsumerFixed {
         CreateConsumerFixed::ref_from_bytes(&self.buf[..CREATE_CONSUMER_FIXED_SIZE]).unwrap()
+    }
+
+    #[inline(always)]
+    fn try_fixed(&self) -> Option<&CreateConsumerFixed> {
+        CreateConsumerFixed::ref_from_bytes(self.buf.get(..CREATE_CONSUMER_FIXED_SIZE)?).ok()
     }
 
     #[inline(always)]
@@ -111,6 +128,15 @@ impl<'a> CreateConsumerView<'a> {
         &self.buf[CREATE_CONSUMER_FIXED_SIZE..CREATE_CONSUMER_FIXED_SIZE + nl]
     }
 
+    /// Checked variant of `name()`: returns `None` instead of panicking
+    /// when `name_len` doesn't fit in the buffer.
+    #[inline(always)]
+    pub fn try_name(&self) -> Option<&'a [u8]> {
+        let nl = self.try_fixed()?.name_len.get() as usize;
+        self.buf
+            .get(CREATE_CONSUMER_FIXED_SIZE..CREATE_CONSUMER_FIXED_SIZE.checked_add(nl)?)
+    }
+
     /// Queue group name. Empty slice means "use stream name as default".
     #[inline(always)]
     pub fn group(&self) -> &'a [u8] {
@@ -120,6 +146,16 @@ impl<'a> CreateConsumerView<'a> {
         &self.buf[start..start + gl]
     }
 
+    /// Checked variant of `group()`.
+    #[inline(always)]
+    pub fn try_group(&self) -> Option<&'a [u8]> {
+        let f = self.try_fixed()?;
+        let nl = f.name_len.get() as usize;
+        let gl = f.group_len.get() as usize;
+        let start = CREATE_CONSUMER_FIXED_SIZE.checked_add(nl)?;
+        self.buf.get(start..start.checked_add(gl)?)
+    }
+
     #[inline(always)]
     pub fn subject(&self) -> &'a [u8] {
         let nl = self.fixed().name_len.get() as usize;
@@ -127,6 +163,19 @@ impl<'a> CreateConsumerView<'a> {
         let sl = self.fixed().subj_len.get() as usize;
         let start = CREATE_CONSUMER_FIXED_SIZE + nl + gl;
         &self.buf[start..start + sl]
+    }
+
+    /// Checked variant of `subject()`.
+    #[inline(always)]
+    pub fn try_subject(&self) -> Option<&'a [u8]> {
+        let f = self.try_fixed()?;
+        let nl = f.name_len.get() as usize;
+        let gl = f.group_len.get() as usize;
+        let sl = f.subj_len.get() as usize;
+        let start = CREATE_CONSUMER_FIXED_SIZE
+            .checked_add(nl)?
+            .checked_add(gl)?;
+        self.buf.get(start..start.checked_add(sl)?)
     }
 
     /// Start of the variable trailer after fixed + name + group + subject.
@@ -198,6 +247,16 @@ impl<'a> DeleteConsumerView<'a> {
         Self { buf }
     }
 
+    /// Fallible constructor: checks the buffer is large enough to hold
+    /// a `DeleteConsumerAction` before wrapping it.
+    #[inline(always)]
+    pub fn try_new(buf: &'a [u8]) -> Option<Self> {
+        if buf.len() < core::mem::size_of::<DeleteConsumerAction>() {
+            return None;
+        }
+        Some(Self { buf })
+    }
+
     #[inline(always)]
     pub fn consumer_id(&self) -> u32 {
         DeleteConsumerAction::ref_from_bytes(
@@ -206,5 +265,54 @@ impl<'a> DeleteConsumerView<'a> {
         .unwrap()
         .consumer_id
         .get()
+    }
+
+    /// Checked variant of `consumer_id()`: returns `None` instead of
+    /// panicking on a truncated buffer.
+    #[inline(always)]
+    pub fn try_consumer_id(&self) -> Option<u32> {
+        let bytes = self.buf.get(..core::mem::size_of::<DeleteConsumerAction>())?;
+        Some(DeleteConsumerAction::ref_from_bytes(bytes).ok()?.consumer_id.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_consumer_view_try_new_rejects_short_buffer() {
+        let short = [0u8; CREATE_CONSUMER_FIXED_SIZE - 1];
+        assert!(CreateConsumerView::try_new(&short).is_none());
+        assert!(CreateConsumerView::try_new(&[0u8; CREATE_CONSUMER_FIXED_SIZE]).is_some());
+    }
+
+    #[test]
+    fn create_consumer_view_try_name_rejects_truncated_trailer() {
+        let fixed = CreateConsumerFixed {
+            name_len: U16::new(100), // claims 100 bytes of name
+            subj_len: U16::new(0),
+            stream_id: U32::new(0),
+            max_inflight: U16::new(0),
+            ack_policy: 0,
+            deliver_policy: 0,
+            deliver_mode: 0,
+            _pad: 0,
+            group_len: U16::new(0),
+            ack_wait_ms: U32::new(0),
+            start_seq: U64::new(0),
+        };
+        let mut buf = Vec::new();
+        buf.extend_from_slice(fixed.as_bytes());
+        // No trailer bytes actually follow.
+        let view = CreateConsumerView::try_new(&buf).unwrap();
+        assert!(view.try_name().is_none());
+    }
+
+    #[test]
+    fn delete_consumer_view_try_new_rejects_short_buffer() {
+        assert!(DeleteConsumerView::try_new(&[0u8; 7]).is_none());
+        let view = DeleteConsumerView::try_new(&[0u8; 8]).unwrap();
+        assert_eq!(view.try_consumer_id(), Some(0));
     }
 }

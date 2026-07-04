@@ -92,7 +92,7 @@ pub(crate) async fn reader_task<R: AsyncRead + Unpin>(
     }
 }
 
-async fn dispatch(inner: &Inner, frame: Bytes) {
+async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
     // SAFETY: called only after verifying `frame.len() >= HEADER_SIZE`.
     let h = match Header::ref_from_bytes(&frame[..HEADER_SIZE]) {
         Ok(h) => h,

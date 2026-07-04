@@ -11,6 +11,25 @@
 //!
 //! Subject inflight + paused-state are tracked by the server (per-consumer
 //! ownership) and never via the engine, so the engine exposes neither.
+//!
+//! # Persistence (FEAT-4)
+//!
+//! The engine is a pure in-memory oracle — it owns no I/O and persists
+//! nothing itself. Durable state is handled at the server layer:
+//!
+//! - **Metadata** (create/delete stream/consumer): persisted via the
+//!   append-only command log (`arbitro-server/src/persistence/command_log.rs`).
+//!   Replayed at startup by `ReplayApplier`.
+//!
+//! - **Consumer cursor** (last-acked sequence): persisted via
+//!   `CMD_CURSOR_UPDATE` in the command log. Restored into
+//!   `NameRegistry::consumer_cursors` during replay.
+//!
+//! - **In-flight pending set**: memory-only. On restart, the consumer
+//!   resumes from its persisted cursor; messages between the cursor and
+//!   the stream head are eligible for redelivery. Pending entries and
+//!   redelivery-wheel timers are rebuilt from the consumer's position
+//!   in the store, not from a journal.
 
 // Level 0 — no internal deps
 pub mod common;

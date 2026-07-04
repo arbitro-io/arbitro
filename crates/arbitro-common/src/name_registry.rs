@@ -70,6 +70,8 @@ use std::sync::Mutex;
 
 use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId};
 
+use crate::id_pool::IdPool;
+
 /// Shared wire-id → engine-id registry.
 #[derive(Debug)]
 pub struct NameRegistry {
@@ -168,7 +170,10 @@ struct Inner {
     /// Per-stream quota limits. Indexed by `StreamId.0`. Authoritative copy;
     /// mirrored to `HotSnapshot.stream_quotas`.
     stream_quotas: Vec<StreamQuota>,
-    next_stream: u32,
+    /// Slot allocator backing `StreamId.0`. Recycles freed slots (ROB-29)
+    /// instead of growing monotonically; bumps a generation on reuse so
+    /// stale `(slot, gen)` pairs can be detected via `is_stream_current`.
+    stream_pool: IdPool,
 
     /// Consumers are keyed by `(stream_id, name)` because the wire never
     /// carries a pre-computed consumer id — the server allocates one and
@@ -197,7 +202,14 @@ struct Inner {
     /// invalid" meaning on the wire (and so client tests can sanity-check
     /// that a real id was returned). The engine indexes its per-consumer
     /// Vec by raw `consumer_id.0`, so wasting slot 0 costs one VecDeque.
-    next_consumer: u32,
+    /// Slot 0 is burned at construction time (see `Inner::new`) so the
+    /// pool never hands it out.
+    ///
+    /// Slot allocator backing `ConsumerId.0`. Recycles freed slots
+    /// (ROB-29) instead of growing monotonically; bumps a generation on
+    /// reuse so stale `(slot, gen)` pairs can be detected via
+    /// `is_consumer_current`.
+    consumer_pool: IdPool,
 
     /// Content-addressed queue ids: `(seq_stream, group_bytes) → QueueId`.
     /// Two consumers with the same group on the same stream MUST resolve
@@ -228,7 +240,7 @@ impl Inner {
                 foldhash::fast::FixedState::default(),
             ),
             stream_quotas: Vec::with_capacity(PREALLOC),
-            next_stream: 0,
+            stream_pool: IdPool::with_capacity(NameRegistry::MAX_SLOT_COUNT, PREALLOC),
             consumers_by_name: HashMap::with_capacity_and_hasher(
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
@@ -242,7 +254,14 @@ impl Inner {
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
             ),
-            next_consumer: 1,
+            consumer_pool: {
+                // Consumer ids start at 1 (slot 0 reserved as the
+                // conventional "unset" wire value). Burn slot 0 up front
+                // so `alloc()` never hands it out.
+                let mut pool = IdPool::with_capacity(NameRegistry::MAX_SLOT_COUNT, PREALLOC);
+                let _ = pool.alloc();
+                pool
+            },
             consumer_cursors: HashMap::with_capacity_and_hasher(
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
@@ -276,16 +295,18 @@ impl NameRegistry {
     pub const MAX_SLOT_COUNT: u32 = 4096;
 
     /// `true` iff a fresh `get_or_create_stream` would succeed today.
-    /// `false` once `next_stream` has hit `MAX_SLOT_COUNT`.
+    /// Accounts for recycled slots in `stream_pool` (ROB-29), not just
+    /// the high-water mark.
     pub fn stream_slots_available(&self) -> bool {
         let g = self.inner.lock().expect("name registry poisoned");
-        g.next_stream < Self::MAX_SLOT_COUNT
+        g.stream_pool.has_free() || g.stream_pool.slot_count() < Self::MAX_SLOT_COUNT as usize
     }
 
     /// `true` iff a fresh `get_or_create_consumer` would succeed today.
+    /// Accounts for recycled slots in `consumer_pool` (ROB-29).
     pub fn consumer_slots_available(&self) -> bool {
         let g = self.inner.lock().expect("name registry poisoned");
-        g.next_consumer < Self::MAX_SLOT_COUNT
+        g.consumer_pool.has_free() || g.consumer_pool.slot_count() < Self::MAX_SLOT_COUNT as usize
     }
 
     /// Take the inner mutex, run a mutator, then atomically swap a
@@ -322,11 +343,10 @@ impl NameRegistry {
             // dispatcher map it to `ErrorCode::StreamFull` (closest
             // existing wire code for "no room") without inventing a new
             // variant or letting the panic escape.
-            if g.next_stream >= Self::MAX_SLOT_COUNT {
+            let Ok((slot, _gen)) = g.stream_pool.alloc() else {
                 return (StreamId(u32::MAX), false);
-            }
-            let id = StreamId(g.next_stream);
-            g.next_stream += 1;
+            };
+            let id = StreamId(slot);
             g.streams_by_wire.insert(wire_id, id);
             if (id.0 as usize) >= g.streams_seq_to_wire.len() {
                 g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
@@ -377,11 +397,10 @@ impl NameRegistry {
                 }
                 return (id, false);
             }
-            if g.next_stream >= Self::MAX_SLOT_COUNT {
+            let Ok((slot, _gen)) = g.stream_pool.alloc() else {
                 return (StreamId(u32::MAX), false);
-            }
-            let id = StreamId(g.next_stream);
-            g.next_stream += 1;
+            };
+            let id = StreamId(slot);
             g.streams_by_wire.insert(wire_id, id);
             g.streams_name_by_wire
                 .insert(wire_id, expected_name.to_vec());
@@ -426,7 +445,10 @@ impl NameRegistry {
             .filter(|&w| w != 0)
     }
 
-    /// Drop a stream mapping. The integer is intentionally NOT recycled.
+    /// Drop a stream mapping. The slot is returned to `stream_pool`
+    /// (ROB-29) so a later `get_or_create_stream` can recycle it; the
+    /// pool bumps the slot's generation on reuse so stale `(slot, gen)`
+    /// pairs fail `is_stream_current`.
     pub fn remove_stream(&self, wire_id: u32) -> Option<StreamId> {
         self.with_inner_swap(|g| {
             let removed = g.streams_by_wire.remove(&wire_id)?;
@@ -440,8 +462,26 @@ impl NameRegistry {
             if let Some(slot) = g.streams_replicas.get_mut(removed.0 as usize) {
                 *slot = 0;
             }
+            let _ = g.stream_pool.free(removed.0);
             Some(removed)
         })
+    }
+
+    /// `true` iff `id` is the slot's current generation — i.e. it was
+    /// allocated by the most recent `get_or_create_stream*` for that
+    /// slot and has not since been freed and recycled. Anti-ABA check
+    /// for callers that persist `(StreamId, generation)` pairs
+    /// (ROB-29). `generation` is obtained from `stream_generation`.
+    pub fn is_stream_current(&self, id: StreamId, generation: u32) -> bool {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.stream_pool.is_current(id.0, generation)
+    }
+
+    /// Current generation for `id`'s slot, or `None` if the slot was
+    /// never allocated.
+    pub fn stream_generation(&self, id: StreamId) -> Option<u32> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.stream_pool.generation(id.0)
     }
 
     /// Set the idempotency window for an already-allocated stream. A
@@ -544,11 +584,10 @@ impl NameRegistry {
             // B1: same admission check as `get_or_create_stream`.
             // Sentinel `ConsumerId(u32::MAX)` with `created=false`
             // signals "no slots" to the dispatcher.
-            if g.next_consumer >= Self::MAX_SLOT_COUNT {
+            let Ok((slot, _gen)) = g.consumer_pool.alloc() else {
                 return (ConsumerId(u32::MAX), false);
-            }
-            let id = ConsumerId(g.next_consumer);
-            g.next_consumer += 1;
+            };
+            let id = ConsumerId(slot);
             g.consumers_by_name.insert(key, id);
             // Reserve a slot in `consumer_stream` so future
             // `set_consumer_stream` writes can land directly. Until the
@@ -576,7 +615,8 @@ impl NameRegistry {
     /// Drop a consumer mapping by (stream, name). Removes the composite
     /// key→id mapping and every reverse index keyed by that id, so a
     /// subsequent `consumer_id`, `consumer_queue`, `consumer_stream` or
-    /// `consumer_deliver_policy` all return `None`.
+    /// `consumer_deliver_policy` all return `None`. The slot is returned
+    /// to `consumer_pool` (ROB-29) for recycling.
     pub fn remove_consumer(&self, stream: StreamId, name: &[u8]) -> Option<ConsumerId> {
         self.with_inner_swap(|g| {
             let key = (stream, name.to_vec());
@@ -587,8 +627,26 @@ impl NameRegistry {
             }
             g.consumer_deliver.remove(&removed);
             g.consumer_cursors.remove(&removed);
+            let _ = g.consumer_pool.free(removed.0);
             Some(removed)
         })
+    }
+
+    /// `true` iff `id` is the slot's current generation — i.e. it was
+    /// allocated by the most recent `get_or_create_consumer` for that
+    /// slot and has not since been freed and recycled. Anti-ABA check
+    /// for callers that persist `(ConsumerId, generation)` pairs
+    /// (ROB-29). `generation` is obtained from `consumer_generation`.
+    pub fn is_consumer_current(&self, id: ConsumerId, generation: u32) -> bool {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumer_pool.is_current(id.0, generation)
+    }
+
+    /// Current generation for `id`'s slot, or `None` if the slot was
+    /// never allocated.
+    pub fn consumer_generation(&self, id: ConsumerId) -> Option<u32> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumer_pool.generation(id.0)
     }
 
     /// Return the `ConsumerId`s currently registered against
@@ -613,7 +671,8 @@ impl NameRegistry {
             .collect()
     }
 
-    /// Drop a consumer mapping by ID (reverse lookup).
+    /// Drop a consumer mapping by ID (reverse lookup). The slot is
+    /// returned to `consumer_pool` (ROB-29) for recycling.
     pub fn remove_consumer_by_id(&self, id: ConsumerId) -> Option<Vec<u8>> {
         self.with_inner_swap(|g| {
             let key = g.consumers_by_name.iter().find_map(|(k, &v)| {
@@ -631,6 +690,7 @@ impl NameRegistry {
             }
             g.consumer_deliver.remove(&id);
             g.consumer_cursors.remove(&id);
+            let _ = g.consumer_pool.free(id.0);
             Some(name)
         })
     }
@@ -798,15 +858,23 @@ mod tests {
     }
 
     #[test]
-    fn stream_remove_clears_both_directions_without_recycling() {
+    fn stream_remove_clears_reverse_and_recycles_slot() {
         let r = NameRegistry::new();
         r.get_or_create_stream(0x1);
         r.get_or_create_stream(0x2);
+        let gen_before = r.stream_generation(StreamId(0));
         r.remove_stream(0x1);
         // Reverse slot is cleared.
         assert_eq!(r.stream_wire(StreamId(0)), None);
-        // New allocations skip past the freed slot.
-        assert_eq!(r.get_or_create_stream(0x3), (StreamId(2), true));
+        // ROB-29: freed slot 0 is recycled by the next allocation instead
+        // of growing past it.
+        assert_eq!(r.get_or_create_stream(0x3), (StreamId(0), true));
+        // Recycling bumps the generation, so the old (slot, gen) pair is
+        // stale even though the raw slot number was reused.
+        assert_ne!(r.stream_generation(StreamId(0)), gen_before);
+        assert!(!r.is_stream_current(StreamId(0), gen_before.unwrap()));
+        // Next fresh allocation grows past both recycled and live slots.
+        assert_eq!(r.get_or_create_stream(0x4), (StreamId(2), true));
     }
 
     #[test]
@@ -881,5 +949,35 @@ mod tests {
         let mut found = r.consumers_for_stream(s);
         found.sort_by_key(|c| c.0);
         assert_eq!(found, vec![c1, c3]);
+    }
+
+    /// ROB-29: consumer slots are recycled via `IdPool` after delete,
+    /// with a generation bump preventing stale-ID reuse.
+    #[test]
+    fn consumer_slot_recycled_after_delete_with_generation_bump() {
+        let r = NameRegistry::new();
+        let s = StreamId(0);
+        let (alice, _) = r.get_or_create_consumer(s, b"alice");
+        let (bob, _) = r.get_or_create_consumer(s, b"bob");
+        assert_eq!(alice, ConsumerId(1));
+        assert_eq!(bob, ConsumerId(2));
+
+        let gen_before = r.consumer_generation(alice).unwrap();
+        assert!(r.is_consumer_current(alice, gen_before));
+
+        r.remove_consumer(s, b"alice");
+
+        // Freed slot 1 is recycled by the next create instead of growing
+        // past bob's slot.
+        let (carol, created) = r.get_or_create_consumer(s, b"carol");
+        assert!(created);
+        assert_eq!(carol, ConsumerId(1));
+
+        // Same raw slot, but the generation moved on — stale references
+        // to the old `alice` (slot=1, gen=gen_before) must not be
+        // mistaken for `carol`.
+        assert_ne!(r.consumer_generation(carol).unwrap(), gen_before);
+        assert!(!r.is_consumer_current(alice, gen_before));
+        assert!(r.is_consumer_current(carol, r.consumer_generation(carol).unwrap()));
     }
 }

@@ -104,6 +104,42 @@ impl tokio::io::AsyncRead for ConnReader {
     }
 }
 
+/// SEC-6: per-connection creation counters, checked against
+/// `Inner::quota_limits` before a stream/consumer/cron is created.
+#[derive(Default)]
+struct ConnQuota {
+    streams: u32,
+    consumers: u32,
+    crons: u32,
+}
+
+/// SEC-6: which quota a `check_and_incr_quota` call is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaKind {
+    Stream,
+    Consumer,
+    Cron,
+}
+
+/// SEC-6: configured per-connection quota ceilings. `0` means unlimited,
+/// matching the `ARBITRO_MAX_*_PER_CONN` env var convention in config.rs.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaLimits {
+    pub max_streams_per_conn: u32,
+    pub max_consumers_per_conn: u32,
+    pub max_crons_per_conn: u32,
+}
+
+impl Default for QuotaLimits {
+    fn default() -> Self {
+        Self {
+            max_streams_per_conn: 1000,
+            max_consumers_per_conn: 1000,
+            max_crons_per_conn: 1000,
+        }
+    }
+}
+
 /// TCP transport. Clone-friendly — backed by Arc.
 #[derive(Clone)]
 pub struct ConnectionRegistry {
@@ -112,7 +148,7 @@ pub struct ConnectionRegistry {
 
 struct Inner {
     /// **F8**: `parking_lot::Mutex` (no poison handling, faster
-    /// uncontested path) wrapping the sessions map. `touch()` no
+    /// uncontended path) wrapping the sessions map. `touch()` no
     /// longer takes this mutex thanks to the AtomicU64 `last_activity`
     /// inside `Session` — the only consumers of the lock are
     /// register / remove / get_write_tx / enqueue / sweep, all of which
@@ -131,6 +167,12 @@ struct Inner {
     /// because the per-connection mpsc was full. Optional so tests can
     /// continue to construct a registry without wiring it up.
     silent_drops: Option<Arc<crate::common::SilentDrops>>,
+    /// SEC-6: per-connection_id creation counters for streams,
+    /// consumers, and crons. Entries are created lazily on first use
+    /// and removed in `remove()`.
+    quotas: parking_lot::Mutex<HashMap<u64, ConnQuota, foldhash::fast::FixedState>>,
+    /// SEC-6: configured ceilings, checked by `check_and_incr_quota`.
+    quota_limits: parking_lot::RwLock<QuotaLimits>,
 }
 
 impl ConnectionRegistry {
@@ -148,8 +190,45 @@ impl ConnectionRegistry {
                 clock: parking_lot::RwLock::new(None),
                 write_buffer_cap: cap,
                 silent_drops: None,
+                quotas: parking_lot::Mutex::new(HashMap::with_hasher(
+                    foldhash::fast::FixedState::default(),
+                )),
+                quota_limits: parking_lot::RwLock::new(QuotaLimits::default()),
             }),
         }
+    }
+
+    /// SEC-6: override the default per-connection quota ceilings.
+    pub fn set_quota_limits(&self, limits: QuotaLimits) {
+        *self.inner.quota_limits.write() = limits;
+    }
+
+    /// SEC-6: check `conn_id`'s counter for `kind` against the configured
+    /// ceiling and, if under it, increment. Returns `true` when the
+    /// creation is allowed (and now counted), `false` when the quota is
+    /// exhausted (counter left unchanged).
+    pub fn check_and_incr_quota(&self, conn_id: u64, kind: QuotaKind) -> bool {
+        let limits = *self.inner.quota_limits.read();
+        let limit = match kind {
+            QuotaKind::Stream => limits.max_streams_per_conn,
+            QuotaKind::Consumer => limits.max_consumers_per_conn,
+            QuotaKind::Cron => limits.max_crons_per_conn,
+        };
+        if limit == 0 {
+            return true; // unlimited
+        }
+        let mut quotas = self.inner.quotas.lock();
+        let q = quotas.entry(conn_id).or_default();
+        let counter = match kind {
+            QuotaKind::Stream => &mut q.streams,
+            QuotaKind::Consumer => &mut q.consumers,
+            QuotaKind::Cron => &mut q.crons,
+        };
+        if *counter >= limit {
+            return false;
+        }
+        *counter += 1;
+        true
     }
 
     /// H10: wire the silent-drop counters. Called by the server after
@@ -236,6 +315,9 @@ impl ConnectionRegistry {
     /// Remove a session — drops the Sender, which closes the writer task.
     pub fn remove(&self, conn_id: u64) {
         self.inner.sessions.lock().remove(&conn_id);
+        // SEC-6: drop the quota counters along with the session so they
+        // don't accumulate forever across connect/disconnect cycles.
+        self.inner.quotas.lock().remove(&conn_id);
     }
 
     /// Update last activity timestamp. **F8**: no longer takes the
@@ -352,22 +434,37 @@ impl ConnectionRegistry {
 
     #[inline]
     fn enqueue(&self, conn_id: u64, frame: Bytes) -> bool {
-        let sessions = self.inner.sessions.lock();
-        match sessions.get(&conn_id) {
-            Some(s) => match s.write_tx.try_send(frame) {
-                Ok(_) => true,
-                Err(_) => {
-                    // H10: count every dropped frame so operators see
-                    // the slow-consumer signal in the metrics line
-                    // instead of guessing from broken application logs.
-                    if let Some(sd) = &self.inner.silent_drops {
-                        sd.inc_conn_write();
-                    }
-                    false
-                }
-            },
-            None => false,
+        let full = {
+            let sessions = self.inner.sessions.lock();
+            match sessions.get(&conn_id) {
+                Some(s) => match s.write_tx.try_send(frame) {
+                    Ok(_) => return true,
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                },
+                None => return false,
+            }
+        };
+        // H10: count every dropped frame so operators see the
+        // slow-consumer signal in the metrics line instead of guessing
+        // from broken application logs.
+        if let Some(sd) = &self.inner.silent_drops {
+            sd.inc_conn_write();
         }
+        // ROB-22: a full outbound queue means the peer isn't draining —
+        // further frames would silently pile up and get dropped one by
+        // one, hiding how far behind the connection actually is. Close
+        // it outright: drop the session (which drops the Sender, which
+        // ends the writer task) so the read loop's next frame observes
+        // a dead connection instead of quietly losing data forever.
+        if full {
+            tracing::warn!(
+                conn_id,
+                "outbound queue full, closing slow connection"
+            );
+            self.remove(conn_id);
+        }
+        false
     }
 }
 
