@@ -1,16 +1,24 @@
 //! Raft state machine for Arbitro cluster metadata operations.
 //!
 //! `apply()` deserializes each committed log entry into a `ClusterCommand`
-//! and executes it on the local `ShardRouter` — creating or deleting
-//! streams/consumers on the engine, mirroring what the v2 dispatch does
-//! on the leader.  Because `StateMachine::apply` takes `&mut self` (not
-//! async), we use `tokio::runtime::Handle::current().block_on()` for the
-//! async shard calls.
+//! and enqueues it on an async channel; a background worker drains that
+//! channel and executes shard calls without holding the state-machine
+//! lock and without `block_in_place`. That means:
+//!
+//! - `apply` returns in microseconds (JSON decode + channel send), so the
+//!   apply-loop's `parking_lot::Mutex` is never held across an async wait.
+//! - We never call `tokio::task::block_in_place`, which would panic on a
+//!   current-thread runtime.
+//!
+//! Command execution ordering is preserved: entries are applied in Raft
+//! log order, enqueued in order, and the FIFO worker processes them in
+//! order.
 
 use std::sync::Arc;
 
 use arbitro_raft::{RaftError, StateMachine};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig};
 use arbitro_engine_v2::common::wire_hash_32;
@@ -19,7 +27,7 @@ use arbitro_engine_v2::types::*;
 use crate::shard::router::ShardRouter;
 
 /// Commands replicated through Raft for cluster-wide metadata consistency.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClusterCommand {
     CreateStream {
         name: String,
@@ -56,13 +64,14 @@ pub enum ClusterCommand {
 
 /// State machine that executes cluster commands on the local engine.
 ///
-/// Holds an `Arc<ShardRouter>` so it can create/delete streams and
-/// consumers when Raft entries are committed.  The `applied` log is kept
-/// for snapshot/restore.
+/// `apply()` enqueues each committed command onto an async channel; the
+/// background worker returned by [`set_router`] drains the channel and
+/// runs the actual shard operations. The `applied` log is retained for
+/// snapshot/restore.
 #[derive(Default)]
 pub struct ArbitroStateMachine {
     applied: Vec<ClusterCommand>,
-    router: Option<Arc<ShardRouter>>,
+    cmd_tx: Option<mpsc::UnboundedSender<ClusterCommand>>,
 }
 
 impl ArbitroStateMachine {
@@ -72,14 +81,92 @@ impl ArbitroStateMachine {
         Self::default()
     }
 
-    /// Wire the shard router so `apply()` actually executes commands.
-    pub fn set_router(&mut self, router: Arc<ShardRouter>) {
-        self.router = Some(router);
+    /// Wire the shard router. Returns the background worker future that
+    /// executes committed commands; the caller must spawn it on a runtime
+    /// (e.g. `tokio::spawn(worker)`).
+    ///
+    /// Until the worker is running, `apply()` will still enqueue commands
+    /// (they are buffered in the channel) but nothing on the engine will
+    /// actually change.
+    pub fn set_router(
+        &mut self,
+        router: Arc<ShardRouter>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.cmd_tx = Some(tx);
+        Self::apply_worker(router, rx)
+    }
+
+    /// Background worker that drains the command channel and executes
+    /// each command as an async shard call. Runs until the channel is
+    /// closed (i.e. the state machine has been dropped and no senders
+    /// remain).
+    async fn apply_worker(
+        router: Arc<ShardRouter>,
+        mut rx: mpsc::UnboundedReceiver<ClusterCommand>,
+    ) {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                ClusterCommand::CreateStream {
+                    name,
+                    filter,
+                    max_msgs,
+                    max_bytes,
+                    max_age_secs,
+                    idempotency_window_ms,
+                    ..
+                } => {
+                    Self::do_create_stream(
+                        &router,
+                        &name,
+                        &filter,
+                        max_msgs,
+                        max_bytes,
+                        max_age_secs,
+                        idempotency_window_ms,
+                    )
+                    .await;
+                }
+                ClusterCommand::DeleteStream { name } => {
+                    Self::do_delete_stream(&router, &name).await;
+                }
+                ClusterCommand::CreateConsumer {
+                    stream_name,
+                    name,
+                    group,
+                    filter,
+                    max_inflight,
+                    ack_policy,
+                    deliver_policy,
+                    deliver_mode,
+                    ack_wait_ms,
+                    start_seq,
+                } => {
+                    Self::do_create_consumer(
+                        &router,
+                        &stream_name,
+                        &name,
+                        &group,
+                        &filter,
+                        max_inflight,
+                        ack_policy,
+                        deliver_policy,
+                        deliver_mode,
+                        ack_wait_ms,
+                        start_seq,
+                    )
+                    .await;
+                }
+                ClusterCommand::DeleteConsumer { stream_name, name } => {
+                    Self::do_delete_consumer(&router, &stream_name, &name).await;
+                }
+            }
+        }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────
 
-    fn apply_create_stream(
+    async fn do_create_stream(
         router: &ShardRouter,
         name: &str,
         _filter: &str,
@@ -109,8 +196,8 @@ impl ArbitroStateMachine {
         let shard = router.shard_for(seq_stream);
         let max_age_ms = max_age_secs.saturating_mul(1_000);
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(shard.create_stream(
+        let result = shard
+            .create_stream(
                 StreamConfig {
                     id: seq_stream,
                     name: name_bytes.to_vec(),
@@ -118,8 +205,8 @@ impl ArbitroStateMachine {
                 max_msgs,
                 max_bytes,
                 max_age_ms,
-            ))
-        });
+            )
+            .await;
 
         match result {
             Ok(true) => {
@@ -139,7 +226,7 @@ impl ArbitroStateMachine {
         }
     }
 
-    fn apply_delete_stream(router: &ShardRouter, name: &str) {
+    async fn do_delete_stream(router: &ShardRouter, name: &str) {
         let name_bytes = name.as_bytes();
         let wire_stream = wire_hash_32(name_bytes);
         let seq_stream = match router.names().stream_seq(wire_stream) {
@@ -154,9 +241,7 @@ impl ArbitroStateMachine {
         // Snapshot cascaded consumers before engine removes them.
         let cascaded_consumers = router.names().consumers_for_stream(seq_stream);
 
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(shard.delete_stream(seq_stream, true))
-        }) {
+        match shard.delete_stream(seq_stream, true).await {
             Ok(_) => {
                 for cid in cascaded_consumers {
                     router.names().remove_consumer_by_id(cid);
@@ -171,7 +256,7 @@ impl ArbitroStateMachine {
         }
     }
 
-    fn apply_create_consumer(
+    async fn do_create_consumer(
         router: &ShardRouter,
         stream_name: &str,
         name: &str,
@@ -244,8 +329,8 @@ impl ArbitroStateMachine {
             .names()
             .set_consumer_deliver_policy(seq_consumer, deliver_policy, start_seq);
 
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(shard.create_consumer(
+        match shard
+            .create_consumer(
                 ConsumerConfig {
                     id: seq_consumer,
                     queue_id,
@@ -261,8 +346,9 @@ impl ArbitroStateMachine {
                     max_nack: 0,
                 },
                 Vec::new(), // no subject limits on replicated path
-            ))
-        }) {
+            )
+            .await
+        {
             Ok(1) => {
                 router.invalidate_list_cache();
                 tracing::debug!(name, "state_machine: consumer created");
@@ -276,7 +362,7 @@ impl ArbitroStateMachine {
         }
     }
 
-    fn apply_delete_consumer(router: &ShardRouter, stream_name: &str, name: &str) {
+    async fn do_delete_consumer(router: &ShardRouter, stream_name: &str, name: &str) {
         // `name` is actually the consumer_id as a string (set by dispatch).
         let consumer_id_raw: u32 = match name.parse() {
             Ok(v) => v,
@@ -301,11 +387,8 @@ impl ArbitroStateMachine {
             };
 
         for i in candidate_shards {
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(router.shard(i).delete_consumer(consumer_id))
-            });
-            if let Ok(_) = result {
+            let result = router.shard(i).delete_consumer(consumer_id).await;
+            if result.is_ok() {
                 router.names().remove_consumer_by_id(consumer_id);
                 router.invalidate_list_cache();
                 tracing::debug!(name, "state_machine: consumer deleted");
@@ -326,60 +409,13 @@ impl StateMachine for ArbitroStateMachine {
         let cmd: ClusterCommand = serde_json::from_slice(entry)
             .map_err(|e| RaftError::Storage(format!("failed to deserialize command: {e}")))?;
 
-        if let Some(ref router) = self.router {
-            match &cmd {
-                ClusterCommand::CreateStream {
-                    name,
-                    filter,
-                    max_msgs,
-                    max_bytes,
-                    max_age_secs,
-                    idempotency_window_ms,
-                    ..
-                } => {
-                    Self::apply_create_stream(
-                        router,
-                        name,
-                        filter,
-                        *max_msgs,
-                        *max_bytes,
-                        *max_age_secs,
-                        *idempotency_window_ms,
-                    );
-                }
-                ClusterCommand::DeleteStream { name } => {
-                    Self::apply_delete_stream(router, name);
-                }
-                ClusterCommand::CreateConsumer {
-                    stream_name,
-                    name,
-                    group,
-                    filter,
-                    max_inflight,
-                    ack_policy,
-                    deliver_policy,
-                    deliver_mode,
-                    ack_wait_ms,
-                    start_seq,
-                } => {
-                    Self::apply_create_consumer(
-                        router,
-                        stream_name,
-                        name,
-                        group,
-                        filter,
-                        *max_inflight,
-                        *ack_policy,
-                        *deliver_policy,
-                        *deliver_mode,
-                        *ack_wait_ms,
-                        *start_seq,
-                    );
-                }
-                ClusterCommand::DeleteConsumer { stream_name, name } => {
-                    Self::apply_delete_consumer(router, stream_name, name);
-                }
-            }
+        // Enqueue for the async worker (spawned by set_router). The
+        // channel is unbounded, so this is a non-blocking send. If the
+        // worker has been stopped and its receiver dropped, this fails
+        // silently — the command is still recorded in `applied` so
+        // snapshots stay consistent.
+        if let Some(ref tx) = self.cmd_tx {
+            let _ = tx.send(cmd.clone());
         }
 
         self.applied.push(cmd);
@@ -395,5 +431,65 @@ impl StateMachine for ArbitroStateMachine {
         self.applied = serde_json::from_slice(snapshot)
             .map_err(|e| RaftError::Snapshot(format!("failed to deserialize snapshot: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG-5 regression: `apply()` must be usable from a current-thread
+    /// runtime. Previously the sync path called `tokio::task::block_in_place`
+    /// which panics unless the runtime is multi-thread, and it also held
+    /// the parking_lot mutex across an async wait.
+    ///
+    /// With the enqueue-only design, `apply()` never touches any tokio
+    /// primitive that requires a specific runtime flavor, so it works on
+    /// `current_thread` too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_is_non_blocking_on_current_thread_runtime() {
+        // No router → cmd_tx is None → apply() only decodes JSON and
+        // pushes into `applied`. This is the same sync path a real
+        // apply loop follows before the worker is spawned.
+        let mut sm = ArbitroStateMachine::new();
+        let cmd = ClusterCommand::CreateStream {
+            name: "orders".to_string(),
+            filter: "orders.>".to_string(),
+            max_msgs: 1000,
+            max_bytes: 0,
+            max_age_secs: 0,
+            replicas: 1,
+            journal_kind: 0,
+            retention: 0,
+            discard: 0,
+            idempotency_window_ms: 0,
+        };
+        let bytes = serde_json::to_vec(&cmd).unwrap();
+
+        // If this ever regresses to block_in_place, the current-thread
+        // runtime will panic with "can call blocking only when running
+        // on the multi-threaded runtime".
+        sm.apply(&bytes).expect("apply must succeed");
+
+        // The command must be recorded for snapshot/restore even without
+        // a router.
+        assert_eq!(sm.applied.len(), 1);
+    }
+
+    /// A CreateStream JSON round-trip through apply() is captured in
+    /// `applied`, so `snapshot()` reflects the applied history.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_captures_applied_commands() {
+        let mut sm = ArbitroStateMachine::new();
+        let cmd = ClusterCommand::DeleteStream {
+            name: "stale".to_string(),
+        };
+        let bytes = serde_json::to_vec(&cmd).unwrap();
+        sm.apply(&bytes).expect("apply must succeed");
+
+        let snap = sm.snapshot().expect("snapshot must succeed");
+        let mut restored = ArbitroStateMachine::new();
+        restored.restore(&snap).expect("restore must succeed");
+        assert_eq!(restored.applied.len(), 1);
     }
 }

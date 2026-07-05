@@ -546,9 +546,14 @@ impl ArbitroServer {
                     }
                 });
 
-                // State machine with ShardRouter wired in.
+                // State machine with ShardRouter wired in. `set_router`
+                // returns the background worker that drains the command
+                // channel and executes shard operations off the apply
+                // path — that keeps `apply()` non-blocking and avoids
+                // `block_in_place` on the current-thread runtime.
                 let mut sm = ArbitroStateMachine::new();
-                sm.set_router(std::sync::Arc::new(self.server.clone()));
+                let sm_worker = sm.set_router(std::sync::Arc::new(self.server.clone()));
+                tokio::spawn(sm_worker);
                 let sm = std::sync::Arc::new(parking_lot::Mutex::new(sm));
 
                 // Apply loop: polls the Raft commit index and applies
