@@ -523,6 +523,11 @@ impl ArbitroServer {
                     .expect("failed to create raft node");
                 let mut raft = ArbitroRaft::new(raft_node);
                 let client_handle = raft.client_handle();
+                // Take the commit-index observer BEFORE raft is moved
+                // into its background task; the apply loop needs to poll
+                // the committed boundary to preserve Raft's
+                // Committed-before-Applied safety property.
+                let commit_index_observer = raft.commit_index_observer();
 
                 let raft_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
@@ -546,10 +551,17 @@ impl ArbitroServer {
                 sm.set_router(std::sync::Arc::new(self.server.clone()));
                 let sm = std::sync::Arc::new(parking_lot::Mutex::new(sm));
 
-                // Apply loop: polls storage for new entries and applies them.
+                // Apply loop: polls the Raft commit index and applies
+                // committed entries to the local state machine.
                 let apply_shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
-                    apply_loop::apply_loop(storage_inner, sm, apply_shutdown).await;
+                    apply_loop::apply_loop(
+                        storage_inner,
+                        sm,
+                        commit_index_observer,
+                        apply_shutdown,
+                    )
+                    .await;
                 });
 
                 // ── Data-plane replication ────────────────────────────
