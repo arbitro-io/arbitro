@@ -363,44 +363,64 @@ impl ArbitroStateMachine {
     }
 
     async fn do_delete_consumer(router: &ShardRouter, stream_name: &str, name: &str) {
-        // `name` is actually the consumer_id as a string (set by dispatch).
-        let consumer_id_raw: u32 = match name.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::warn!(
-                    name,
-                    "state_machine: delete_consumer — unparseable consumer id"
+        // BUG-7: the dispatch path now sends wire-stable
+        // (stream_name, consumer_name) pairs instead of the leader's
+        // sequential consumer_id. Each follower resolves both to its
+        // OWN local ids — that way "delete consumer X on stream Y"
+        // targets the same logical consumer on every node, regardless
+        // of the id it happened to be assigned locally.
+        if stream_name.is_empty() || name.is_empty() {
+            tracing::warn!(
+                stream_name,
+                name,
+                "state_machine: delete_consumer — missing name(s) in cluster command"
+            );
+            return;
+        }
+        let wire_stream = wire_hash_32(stream_name.as_bytes());
+        let seq_stream = match router.names().stream_seq(wire_stream) {
+            Some(s) => s,
+            None => {
+                tracing::trace!(
+                    stream_name,
+                    "state_machine: delete_consumer — stream not found on this node"
                 );
                 return;
             }
         };
-        let consumer_id = ConsumerId(consumer_id_raw);
-
-        // Determine owning shard.
-        let candidate_shards: smallvec::SmallVec<[usize; 1]> =
-            match router.names().consumer_stream(consumer_id) {
-                Some(stream) => {
-                    let idx = stream.raw() as usize % router.shard_count();
-                    smallvec::smallvec![idx]
-                }
-                None => (0..router.shard_count()).collect(),
-            };
-
-        for i in candidate_shards {
-            let result = router.shard(i).delete_consumer(consumer_id).await;
-            if result.is_ok() {
-                router.names().remove_consumer_by_id(consumer_id);
-                router.invalidate_list_cache();
-                tracing::debug!(name, "state_machine: consumer deleted");
+        let consumer_id = match router.names().consumer_id(seq_stream, name.as_bytes()) {
+            Some(id) => id,
+            None => {
+                tracing::trace!(
+                    stream_name,
+                    name,
+                    "state_machine: delete_consumer — consumer not found on this node"
+                );
                 return;
             }
+        };
+        // The owning shard is a stable function of the local stream_seq —
+        // no fan-out needed now that we know the exact stream.
+        let shard_idx = seq_stream.raw() as usize % router.shard_count();
+        match router.shard(shard_idx).delete_consumer(consumer_id).await {
+            Ok(_) => {
+                router.names().remove_consumer_by_id(consumer_id);
+                router.invalidate_list_cache();
+                tracing::debug!(
+                    stream_name,
+                    name,
+                    "state_machine: consumer deleted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream_name,
+                    name,
+                    error = ?e,
+                    "state_machine: delete_consumer shard call failed"
+                );
+            }
         }
-        // Consumer not found on any shard — already deleted or never existed.
-        let _ = stream_name; // suppress unused warning
-        tracing::trace!(
-            name,
-            "state_machine: delete_consumer — not found on any shard"
-        );
     }
 }
 

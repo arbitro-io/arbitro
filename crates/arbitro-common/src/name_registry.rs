@@ -445,6 +445,33 @@ impl NameRegistry {
             .filter(|&w| w != 0)
     }
 
+    /// Reverse-lookup a stream's registered name by its engine seq id.
+    /// Cold path: takes the `inner` mutex. Returns `None` if the seq id
+    /// isn't currently mapped.
+    ///
+    /// Used by the cluster dispatch path to translate a leader-local
+    /// consumer id into a wire-stable `(stream_name, consumer_name)`
+    /// pair before proposing DeleteConsumer through Raft — followers
+    /// then resolve the pair to their own local ids.
+    pub fn stream_name(&self, seq: StreamId) -> Option<Vec<u8>> {
+        let wire = self.stream_wire(seq)?;
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.streams_name_by_wire.get(&wire).cloned()
+    }
+
+    /// Reverse-lookup a consumer's registered name by its engine id.
+    /// Cold path: takes the `inner` mutex and linearly scans
+    /// `consumers_by_name`. Returns `None` if the id isn't currently
+    /// registered.
+    ///
+    /// Peer to [`stream_name`], used by the cluster dispatch path.
+    pub fn consumer_name(&self, id: ConsumerId) -> Option<Vec<u8>> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumers_by_name
+            .iter()
+            .find_map(|((_, name), &v)| if v == id { Some(name.clone()) } else { None })
+    }
+
     /// Drop a stream mapping. The slot is returned to `stream_pool`
     /// (ROB-29) so a later `get_or_create_stream` can recycle it; the
     /// pool bumps the slot's generation on reuse so stale `(slot, gen)`

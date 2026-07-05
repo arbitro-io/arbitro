@@ -2185,9 +2185,37 @@ async fn v2_delete_consumer_raft(
             return;
         }
     };
+    // Resolve the leader-local `consumer_id` back to its wire-stable
+    // `(stream_name, consumer_name)` pair BEFORE proposing to Raft.
+    // Followers assign different sequential ids, so the raw id has no
+    // meaning outside this node — replicating names lets each follower
+    // do a local name → id lookup after apply. See BUG-7.
+    let cid = arbitro_engine_v2::types::ConsumerId(body.consumer_id);
+    let stream_name = server
+        .names()
+        .consumer_stream(cid)
+        .and_then(|s| server.names().stream_name(s))
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    let consumer_name = server
+        .names()
+        .consumer_name(cid)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default();
+    if stream_name.is_empty() || consumer_name.is_empty() {
+        // The consumer no longer exists locally (already deleted or
+        // never created on this leader). Nothing to replicate — reply
+        // OK so a retrying client doesn't spin.
+        tracing::debug!(
+            consumer_id = body.consumer_id,
+            "raft delete_consumer: consumer id unmapped on this leader — skipping propose"
+        );
+        send_rep_ok_v2(registry, conn_id, req_seq, 0);
+        return;
+    }
     let cmd = crate::cluster::state_machine::ClusterCommand::DeleteConsumer {
-        stream_name: String::new(),
-        name: format!("{}", body.consumer_id),
+        stream_name,
+        name: consumer_name,
     };
     match tokio::time::timeout(
         std::time::Duration::from_millis(500),
