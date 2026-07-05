@@ -190,7 +190,24 @@ impl ShardRouter {
             });
             let store: Box<dyn arbitro_store::Store> = match &shard_data_path {
                 Some(path) => {
-                    Box::new(arbitro_store::TolerantStore::new(path.clone()))
+                    // SEC-8: propagate the operator-configured fsync
+                    // policy into the message journal. Previously the
+                    // TolerantStore defaulted to `FsyncPolicy::None`
+                    // and `set_fsync_policy` was never called, so
+                    // ARBITRO_FSYNC_POLICY=every only affected the
+                    // command log + delayed journal — the actual
+                    // message data was silently at OS-buffer mercy.
+                    let store_fsync = match config.fsync_policy {
+                        crate::config::FsyncPolicy::Every => {
+                            arbitro_store::FsyncPolicy::EveryWrite
+                        }
+                        crate::config::FsyncPolicy::None => {
+                            arbitro_store::FsyncPolicy::None
+                        }
+                    };
+                    let mut tolerant = arbitro_store::TolerantStore::new(path.clone());
+                    tolerant.set_fsync_policy(store_fsync);
+                    Box::new(tolerant)
                 }
                 None => Box::new(MemoryStore::new()),
             };
