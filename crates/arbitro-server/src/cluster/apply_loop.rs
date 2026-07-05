@@ -17,12 +17,28 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arbitro_raft::{CommitIndexObserver, LogIndex, RaftStorage, StateMachine};
+use arbitro_raft::{CommitIndexObserver, LogIndex, RaftError, RaftStorage, StateMachine};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use super::state_machine::ArbitroStateMachine;
 use super::storage::FileRaftStorage;
+
+/// Error sentinel returned by `read_entries` when the caller's payload
+/// buffer is too small to fit the requested batch. Must exactly match
+/// the string produced by [`FileRaftStorage`] and [`SharedRaftStorage`]
+/// in `storage.rs`; if the storage message changes, this must too.
+const BUFFER_TOO_SMALL: &str = "payload_buf too small";
+
+/// Hard cap on the apply-loop payload buffer. Chosen to match the
+/// engine's per-entry frame ceiling so any valid Raft entry fits after
+/// at most log2(16 MB / 64 KB) = 8 doublings from the initial 64 KB.
+const PAYLOAD_BUF_MAX: usize = 16 * 1024 * 1024;
+
+/// Interval to sleep after a non-recoverable storage error or after
+/// hitting `PAYLOAD_BUF_MAX` without success — avoids busy-spinning the
+/// runtime while the operator investigates.
+const BACKOFF_ON_ERROR: Duration = Duration::from_secs(1);
 
 /// Continuously read committed log entries from Raft storage and apply
 /// them to the state machine. Returns when the shutdown signal fires.
@@ -77,13 +93,47 @@ pub async fn apply_loop(
         let to = LogIndex(apply_upper.0 + 1);
 
         let mut entries = Vec::new();
-        let read_result = storage.read_entries(from, to, &mut entries, &mut payload_buf);
-        if read_result.is_err() {
-            // Buffer may be too small — grow and retry next tick.
-            if payload_buf.len() < 1024 * 1024 {
-                payload_buf.resize(payload_buf.len() * 2, 0);
+        match storage.read_entries(from, to, &mut entries, &mut payload_buf) {
+            Ok(_) => {}
+            Err(RaftError::Storage(msg)) if msg == BUFFER_TOO_SMALL => {
+                if payload_buf.len() < PAYLOAD_BUF_MAX {
+                    let new_len = (payload_buf.len() * 2).min(PAYLOAD_BUF_MAX);
+                    payload_buf.resize(new_len, 0);
+                    // Retry with a larger buffer on the next tick — the
+                    // interval already keeps us from busy-spinning.
+                } else {
+                    // Cap reached: a single entry apparently exceeds
+                    // PAYLOAD_BUF_MAX. This is an operator-visible
+                    // condition — we cannot make progress until the
+                    // entry is either fixed (repair) or the cap is
+                    // raised (recompile). Log loudly and back off so we
+                    // don't burn the runtime.
+                    tracing::error!(
+                        from = from.0,
+                        to = to.0,
+                        buf_cap = PAYLOAD_BUF_MAX,
+                        "apply_loop: payload_buf at cap and entry still too large — apply is stalled"
+                    );
+                    tokio::time::sleep(BACKOFF_ON_ERROR).await;
+                }
+                continue;
             }
-            continue;
+            Err(e) => {
+                // Any other storage error (I/O, corrupt log, etc.).
+                // The previous implementation treated this as
+                // "buffer too small" and doubled the buffer forever
+                // — a silent CPU sink that never advanced last_applied.
+                // Log the real error and back off so it becomes
+                // visible in operator dashboards.
+                tracing::error!(
+                    error = ?e,
+                    from = from.0,
+                    to = to.0,
+                    "apply_loop: read_entries failed"
+                );
+                tokio::time::sleep(BACKOFF_ON_ERROR).await;
+                continue;
+            }
         }
 
         let mut sm = state_machine.lock();
