@@ -486,7 +486,7 @@ async fn test_publish_with_reply_delivers_reply_to() {
         .expect("timeout")
         .expect("message");
     assert_eq!(msg.subject(), b"rpc.request");
-    assert_eq!(msg.reply_to(), reply_subject.as_slice());
+    assert_eq!(msg.reply_to_raw(), reply_subject.as_slice());
     assert_eq!(&msg.payload()[..], b"hello");
     assert!(msg.has_reply_to());
     msg.ack();
@@ -520,7 +520,7 @@ async fn test_publish_without_reply_has_empty_reply_to() {
         .expect("timeout")
         .expect("message");
     assert_eq!(msg.subject(), b"norpc.msg");
-    assert!(msg.reply_to().is_empty());
+    assert!(msg.reply_to_raw().is_empty());
     assert!(!msg.has_reply_to());
     assert_eq!(&msg.payload()[..], b"data");
     msg.ack();
