@@ -444,9 +444,17 @@ impl ServiceBuilder {
 
                         let subject = msg.subject().to_vec();
 
-                        // Check if this is a reply (correlation routing)
-                        if let Some(corr_start) = find_subsequence(&subject, reply_prefix_bytes) {
-                            let corr_bytes = &subject[corr_start + reply_prefix_bytes.len()..];
+                        // Reply-routing check.
+                        //
+                        // A reply subject is EXACTLY `_svc.<name>._r.<corr_id>`
+                        // — the prefix must anchor at position 0. The previous
+                        // implementation searched for the prefix anywhere in
+                        // the subject (windows scan), so a legitimate method
+                        // whose name contained `_svc.<name>._r.<digits>`
+                        // was misclassified as a reply and either completed
+                        // an unrelated corr_id or was silently dropped.
+                        if subject.starts_with(reply_prefix_bytes) {
+                            let corr_bytes = &subject[reply_prefix_bytes.len()..];
                             if let Ok(corr_str) = std::str::from_utf8(corr_bytes) {
                                 if let Ok(corr_id) = corr_str.parse::<u64>() {
                                     reply_mux_clone.complete(corr_id, msg.payload());
@@ -524,12 +532,6 @@ impl Client {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
-}
 
 /// Parse a stream_id or consumer_id from a broker RepOk response.
 /// The first 8 bytes are a u64 LE representing the assigned ID.
