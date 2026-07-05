@@ -91,17 +91,17 @@ let svc = client.service(b"calculator")
     .max_inflight(1024)
     .build().await?;
 
-// Register method handlers
-svc.handle(b"add", |msg| async move {
-    let result = format!("sum={}", compute_add(msg.payload()));
-    msg.reply(result.as_bytes());
-    msg.ack();
+// Register method handlers.
+// The handler returns Result<Vec<u8>, HandlerError> — the framework
+// publishes the response to the requester and acks the delivery
+// automatically. Return `Err(_)` to nack. Return `Ok(vec![])` to ack
+// without replying.
+svc.handle(b"add", |req| async move {
+    Ok(format!("sum={}", compute_add(req.data())).into_bytes())
 });
 
-svc.handle(b"multiply", |msg| async move {
-    let result = format!("product={}", compute_mul(msg.payload()));
-    msg.reply(result.as_bytes());
-    msg.ack();
+svc.handle(b"multiply", |req| async move {
+    Ok(format!("product={}", compute_mul(req.data())).into_bytes())
 });
 
 // Send a request to another service (or self)

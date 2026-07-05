@@ -52,11 +52,10 @@ async fn service_basic_request_reply() {
 
     // Build a service that echoes back the payload prefixed with "re:"
     let svc = client.service("echo").build().await.expect("service build");
-    svc.handle(b"ping", |msg| async move {
+    svc.handle(b"ping", |req| async move {
         let mut reply = b"re:".to_vec();
-        reply.extend_from_slice(msg.data());
-        let _ = msg.reply(&reply);
-        msg.ack();
+        reply.extend_from_slice(req.data());
+        Ok(reply)
     });
 
     // Give dispatch loop time to register
@@ -80,9 +79,10 @@ async fn service_request_timeout() {
 
     // Service "slow" with a handler that never replies
     let svc = client.service("slow").build().await.expect("service build");
-    svc.handle(b"noreply", |msg| async move {
-        // Deliberately do NOT reply — just ack to clear the message
-        msg.ack();
+    svc.handle(b"noreply", |_req| async move {
+        // Deliberately return empty — the framework acks without replying,
+        // so the requester will time out waiting for a reply.
+        Ok(vec![])
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -101,7 +101,7 @@ async fn service_request_timeout() {
     assert!(result.is_err());
     match result.unwrap_err() {
         arbitro_client_tokio::ClientError::Timeout => {}
-        other => panic!("expected Timeout, got: {:?}", other),
+        other => panic!("expected Timeout, got: {other:?}"),
     }
 
     svc.close();
@@ -117,22 +117,19 @@ async fn service_multiple_handlers_concurrent() {
     let svc = client.service("multi").build().await.expect("service build");
 
     // Handler: "add" — parse two u32s from payload, return sum
-    svc.handle(b"add", |msg| async move {
-        let data = msg.data();
-        if data.len() == 8 {
-            let a = u32::from_le_bytes(data[..4].try_into().unwrap());
-            let b = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let sum = (a + b).to_le_bytes();
-            let _ = msg.reply(&sum);
+    svc.handle(b"add", |req| async move {
+        let data = req.data();
+        if data.len() != 8 {
+            return Ok(vec![]);
         }
-        msg.ack();
+        let a = u32::from_le_bytes(data[..4].try_into().unwrap());
+        let b = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        Ok((a + b).to_le_bytes().to_vec())
     });
 
     // Handler: "upper" — uppercase ASCII payload
-    svc.handle(b"upper", |msg| async move {
-        let upper: Vec<u8> = msg.data().iter().map(|b| b.to_ascii_uppercase()).collect();
-        let _ = msg.reply(&upper);
-        msg.ack();
+    svc.handle(b"upper", |req| async move {
+        Ok(req.data().iter().map(|b| b.to_ascii_uppercase()).collect())
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -182,11 +179,9 @@ async fn service_cross_connection() {
         .build()
         .await
         .expect("processor build");
-    processor.handle(b"double", |msg| async move {
-        let val = u32::from_le_bytes(msg.data()[..4].try_into().unwrap_or([0; 4]));
-        let result = (val * 2).to_le_bytes();
-        let _ = msg.reply(&result);
-        msg.ack();
+    processor.handle(b"double", |req| async move {
+        let val = u32::from_le_bytes(req.data()[..4].try_into().unwrap_or([0; 4]));
+        Ok((val * 2).to_le_bytes().to_vec())
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -224,10 +219,9 @@ async fn service_requester_disconnect_graceful() {
 
     // Service that takes 500ms to respond
     let svc = client.service("delayed").build().await.expect("service build");
-    svc.handle(b"slow", |msg| async move {
+    svc.handle(b"slow", |_req| async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = msg.reply(b"done");
-        msg.ack();
+        Ok(b"done".to_vec())
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -283,9 +277,8 @@ async fn service_crash_requester_timeout() {
         .build()
         .await
         .expect("crashable build");
-    svc.handle(b"work", |msg| async move {
-        let _ = msg.reply(b"ok");
-        msg.ack();
+    svc.handle(b"work", |_req| async move {
+        Ok(b"ok".to_vec())
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -318,7 +311,7 @@ async fn service_crash_requester_timeout() {
     assert!(result.is_err());
     match result.unwrap_err() {
         arbitro_client_tokio::ClientError::Timeout => {}
-        other => panic!("expected Timeout, got: {:?}", other),
+        other => panic!("expected Timeout, got: {other:?}"),
     }
 
     requester.close();

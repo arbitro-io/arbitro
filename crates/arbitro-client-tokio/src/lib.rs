@@ -81,7 +81,7 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronContext, CronHandle};
-pub use service::{Service, ServiceBuilder, ServiceHandle};
+pub use service::{HandlerError, HandlerResult, Request, Service, ServiceBuilder, ServiceHandle};
 pub use workflow::{
     ResumeContext, StepContext, StepOutcome, StepResult, TimeoutContext, WorkflowBuilder,
     WorkflowHandle,

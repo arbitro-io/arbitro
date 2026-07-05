@@ -12,8 +12,85 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
-use crate::consume::message::{encode_reply_to, Message};
+use crate::consume::message::encode_reply_to;
 use crate::error::ClientError;
+
+/// Error returned by a service handler.
+///
+/// Any error type that implements `std::error::Error + Send + Sync` can be
+/// converted with `?`. The dispatcher nacks the incoming message and does
+/// not send a reply.
+pub type HandlerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Result returned by a service handler.
+///
+/// - `Ok(bytes)` — dispatcher publishes `bytes` to the requester (if a
+///   reply address is present) and acks the message. An empty `Vec` acks
+///   without replying.
+/// - `Err(_)` — dispatcher nacks the message for redelivery.
+pub type HandlerResult = Result<Vec<u8>, HandlerError>;
+
+/// Incoming service request.
+///
+/// A read-only view over the delivered message. Ack/nack/reply are managed
+/// by the framework based on the handler's returned [`HandlerResult`], so
+/// this type intentionally does not expose them.
+#[derive(Debug)]
+pub struct Request {
+    subject: Box<[u8]>,
+    payload: Bytes,
+    has_reply: bool,
+    seq: u64,
+    consumer_id: u32,
+}
+
+impl Request {
+    /// Full subject the message was published to (e.g., `_svc.orders.charge`).
+    #[inline]
+    pub fn subject(&self) -> &[u8] {
+        &self.subject
+    }
+
+    /// Method segment after the service prefix (e.g., `charge`).
+    ///
+    /// Returns `None` if the subject is malformed. Uses the prefix
+    /// `_svc.<service-name>.` to locate the split.
+    pub fn method(&self, service_name: &str) -> Option<&[u8]> {
+        let prefix_len = SVC_PREFIX.len() + service_name.len() + 1;
+        (self.subject.len() > prefix_len).then(|| &self.subject[prefix_len..])
+    }
+
+    /// Payload bytes (zero-copy `Bytes` handle).
+    #[inline]
+    pub fn payload(&self) -> Bytes {
+        self.payload.clone()
+    }
+
+    /// Payload bytes as a slice.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// `true` if the request has a reply address — the requester is
+    /// waiting for a response. `false` for fire-and-forget sends.
+    #[inline]
+    pub fn has_reply(&self) -> bool {
+        self.has_reply
+    }
+
+    /// Delivery sequence number assigned by the broker.
+    #[inline]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Consumer that received this request.
+    #[inline]
+    pub fn consumer_id(&self) -> u32 {
+        self.consumer_id
+    }
+}
 
 /// Prefix for all service streams.
 const SVC_PREFIX: &[u8] = b"_svc.";
@@ -60,9 +137,10 @@ impl ReplyMux {
 
 // ── Service ──────────────────────────────────────────────────────────────────
 
-/// Type-erased handler: takes a Message and returns a pinned future.
+/// Type-erased handler: takes a Request and returns a pinned future
+/// resolving to a HandlerResult.
 type BoxHandler = Arc<
-    dyn Fn(Message) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    dyn Fn(Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = HandlerResult> + Send>>
         + Send
         + Sync,
 >;
@@ -182,14 +260,21 @@ impl Service {
 
     /// Register a handler for incoming requests matching `method`.
     ///
-    /// The handler receives a [`Message`] and should call `msg.reply(payload)`
-    /// to send the response back to the requester.
+    /// The handler receives a [`Request`] and returns a [`HandlerResult`]:
+    ///
+    /// - `Ok(bytes)` — the dispatcher publishes `bytes` back to the requester
+    ///   (if the request carried a reply address) and acks the delivery.
+    ///   Return `Ok(vec![])` to ack without replying.
+    /// - `Err(_)` — the dispatcher nacks the delivery for redelivery.
+    ///
+    /// The handler never touches ack/nack/reply itself; the framework
+    /// guarantees exactly one ack or nack per invocation.
     ///
     /// Returns a [`ServiceHandle`] that can be used to stop the handler.
     pub fn handle<F, Fut>(&self, method: &[u8], handler: F) -> ServiceHandle
     where
-        F: Fn(Message) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = ()> + Send + 'static,
+        F: Fn(Request) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = HandlerResult> + Send + 'static,
     {
         let cancel = self.cancel.child_token();
 
@@ -202,7 +287,7 @@ impl Service {
         match_prefix.push(b'.');
         match_prefix.extend_from_slice(method);
 
-        let boxed: BoxHandler = Arc::new(move |msg| Box::pin(handler(msg)));
+        let boxed: BoxHandler = Arc::new(move |req| Box::pin(handler(req)));
         self.handlers.lock().unwrap().push((match_prefix, boxed));
 
         ServiceHandle { cancel }
@@ -380,7 +465,26 @@ impl ServiceBuilder {
                         };
 
                         if let Some(h) = handler {
-                            tokio::spawn(h(msg));
+                            let req = Request {
+                                subject: subject.into_boxed_slice(),
+                                payload: msg.payload(),
+                                has_reply: msg.has_reply_to(),
+                                seq: msg.seq,
+                                consumer_id: msg.consumer_id,
+                            };
+                            tokio::spawn(async move {
+                                match h(req).await {
+                                    Ok(response) => {
+                                        if msg.has_reply_to() && !response.is_empty() {
+                                            let _ = msg.reply(&response);
+                                        }
+                                        msg.ack();
+                                    }
+                                    Err(_) => {
+                                        msg.nack();
+                                    }
+                                }
+                            });
                         } else {
                             msg.nack();
                         }
