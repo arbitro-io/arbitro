@@ -54,9 +54,10 @@ impl Request {
     /// Method segment after the service prefix (e.g., `charge`).
     ///
     /// Returns `None` if the subject is malformed. Uses the prefix
-    /// `_svc.<service-name>.` to locate the split.
+    /// `_svc.<service-name>.m.` to locate the split (methods live under
+    /// `.m.` to keep them separable from replies).
     pub fn method(&self, service_name: &str) -> Option<&[u8]> {
-        let prefix_len = SVC_PREFIX.len() + service_name.len() + 1;
+        let prefix_len = SVC_PREFIX.len() + service_name.len() + METHOD_INFIX.len();
         (self.subject.len() > prefix_len).then(|| &self.subject[prefix_len..])
     }
 
@@ -94,6 +95,14 @@ impl Request {
 
 /// Prefix for all service streams.
 const SVC_PREFIX: &[u8] = b"_svc.";
+/// Separator marking the method segment: `_svc.<name>.m.<method>`.
+///
+/// The `.m.` insert exists so the worker consumer can filter
+/// `_svc.<name>.m.>` and match ONLY method calls, never replies (which
+/// live under `_svc.<name>._r.<instance_id>.<corr_id>`). Without this
+/// separation the worker's queue group would load-balance replies away
+/// from the instance that issued the original request. See BUG-2.
+const METHOD_INFIX: &[u8] = b".m.";
 /// Separator before the reply correlation segment.
 const REPLY_INFIX: &[u8] = b"._r.";
 
@@ -157,6 +166,12 @@ pub struct Service {
     stream_id: u32,
     #[allow(dead_code)]
     consumer_id: u32,
+    /// Process-unique random id embedded in every reply subject issued
+    /// by `request()` and matched by the private reply consumer's
+    /// filter, so replies always land on the originating instance
+    /// even when N sibling instances share the queue-grouped worker
+    /// consumer. See BUG-2.
+    instance_id: u64,
     client: Client,
     reply_mux: Arc<ReplyMux>,
     /// Cache of resolved service name → stream_id.
@@ -203,20 +218,34 @@ impl Service {
         let corr_id = self.reply_mux.next_correlation();
         let rx = self.reply_mux.register(corr_id);
 
-        // Build subject: _svc.<target>.<method>
-        let mut subject = Vec::with_capacity(SVC_PREFIX.len() + target.len() + 1 + method.len());
+        // Build subject: _svc.<target>.m.<method>
+        let mut subject = Vec::with_capacity(
+            SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len(),
+        );
         subject.extend_from_slice(SVC_PREFIX);
         subject.extend_from_slice(target.as_bytes());
-        subject.push(b'.');
+        subject.extend_from_slice(METHOD_INFIX);
         subject.extend_from_slice(method);
 
-        // Build reply_to: encoded(self.stream_id, _svc.<self.name>._r.<corr_id>)
+        // Build reply_to: encoded(self.stream_id,
+        // _svc.<self.name>._r.<instance_id>.<corr_id>). The instance_id
+        // is what routes the reply to the private per-instance reply
+        // consumer instead of the queue-grouped worker consumer.
+        let instance_str = self.instance_id.to_string();
         let corr_str = corr_id.to_string();
-        let mut reply_subject =
-            Vec::with_capacity(SVC_PREFIX.len() + self.name.len() + REPLY_INFIX.len() + corr_str.len());
+        let mut reply_subject = Vec::with_capacity(
+            SVC_PREFIX.len()
+                + self.name.len()
+                + REPLY_INFIX.len()
+                + instance_str.len()
+                + 1
+                + corr_str.len(),
+        );
         reply_subject.extend_from_slice(SVC_PREFIX);
         reply_subject.extend_from_slice(self.name.as_bytes());
         reply_subject.extend_from_slice(REPLY_INFIX);
+        reply_subject.extend_from_slice(instance_str.as_bytes());
+        reply_subject.push(b'.');
         reply_subject.extend_from_slice(corr_str.as_bytes());
 
         let reply_to = encode_reply_to(self.stream_id, &reply_subject);
@@ -249,10 +278,12 @@ impl Service {
     ) -> Result<(), ClientError> {
         let target_stream_id = self.resolve_stream(target).await?;
 
-        let mut subject = Vec::with_capacity(SVC_PREFIX.len() + target.len() + 1 + method.len());
+        let mut subject = Vec::with_capacity(
+            SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len(),
+        );
         subject.extend_from_slice(SVC_PREFIX);
         subject.extend_from_slice(target.as_bytes());
-        subject.push(b'.');
+        subject.extend_from_slice(METHOD_INFIX);
         subject.extend_from_slice(method);
 
         self.client.publish(target_stream_id, &subject, payload)
@@ -279,12 +310,13 @@ impl Service {
         let cancel = self.cancel.child_token();
 
         // Build the subject prefix this handler matches:
-        // _svc.<name>.<method>
-        let mut match_prefix =
-            Vec::with_capacity(SVC_PREFIX.len() + self.name.len() + 1 + method.len());
+        // _svc.<name>.m.<method>
+        let mut match_prefix = Vec::with_capacity(
+            SVC_PREFIX.len() + self.name.len() + METHOD_INFIX.len() + method.len(),
+        );
         match_prefix.extend_from_slice(SVC_PREFIX);
         match_prefix.extend_from_slice(self.name.as_bytes());
-        match_prefix.push(b'.');
+        match_prefix.extend_from_slice(METHOD_INFIX);
         match_prefix.extend_from_slice(method);
 
         let boxed: BoxHandler = Arc::new(move |req| Box::pin(handler(req)));
@@ -372,23 +404,63 @@ impl ServiceBuilder {
         self
     }
 
-    /// Build the service: creates stream + consumer, starts dispatch loop.
+    /// Build the service: creates stream, two consumers (queue-grouped
+    /// worker for methods + per-instance private consumer for replies),
+    /// starts the dispatch loop that select!s over both.
     pub async fn build(self) -> Result<Service, ClientError> {
         // Names use dashes (validate_name allows [a-zA-Z0-9_-], no dots).
         // Subjects/filters use dots (validate_subject allows dots).
         let stream_name_str = format!("_svc-{}", self.name);
         let stream_name = stream_name_str.as_bytes();
 
-        // Build filter: _svc.<name>.>
-        let mut filter = Vec::with_capacity(SVC_PREFIX.len() + self.name.len() + 2);
-        filter.extend_from_slice(SVC_PREFIX);
-        filter.extend_from_slice(self.name.as_bytes());
-        filter.extend_from_slice(b".>");
+        // Process-unique instance id. Composed of the client's next
+        // seq counter mixed with a compile-time random-ish constant
+        // — good enough uniqueness within a single process. Used to
+        // scope the reply consumer's subject filter.
+        let instance_id: u64 = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        };
+        let instance_str = instance_id.to_string();
+
+        // Stream-scope filter (covers both methods and replies for
+        // stream creation).
+        let mut stream_filter = Vec::with_capacity(SVC_PREFIX.len() + self.name.len() + 2);
+        stream_filter.extend_from_slice(SVC_PREFIX);
+        stream_filter.extend_from_slice(self.name.as_bytes());
+        stream_filter.extend_from_slice(b".>");
+
+        // Worker filter: `_svc.<name>.m.>` — matches ONLY method calls.
+        let mut worker_filter = Vec::with_capacity(
+            SVC_PREFIX.len() + self.name.len() + METHOD_INFIX.len() + 1,
+        );
+        worker_filter.extend_from_slice(SVC_PREFIX);
+        worker_filter.extend_from_slice(self.name.as_bytes());
+        worker_filter.extend_from_slice(METHOD_INFIX);
+        worker_filter.push(b'>');
+
+        // Reply filter: `_svc.<name>._r.<instance_id>.>` — matches ONLY
+        // replies intended for THIS instance. Since the reply
+        // consumer is not queue-grouped, no sibling instance can
+        // steal these deliveries.
+        let mut reply_filter = Vec::with_capacity(
+            SVC_PREFIX.len()
+                + self.name.len()
+                + REPLY_INFIX.len()
+                + instance_str.len()
+                + 2,
+        );
+        reply_filter.extend_from_slice(SVC_PREFIX);
+        reply_filter.extend_from_slice(self.name.as_bytes());
+        reply_filter.extend_from_slice(REPLY_INFIX);
+        reply_filter.extend_from_slice(instance_str.as_bytes());
+        reply_filter.extend_from_slice(b".>");
 
         // Create stream (idempotent — server returns existing if already created)
         let resp = self.client.create_stream(
             stream_name,
-            &filter,
+            &stream_filter,
             0,    // max_msgs (unlimited)
             0,    // max_bytes (unlimited)
             3600, // max_age_secs (1 hour default for RPC)
@@ -401,13 +473,13 @@ impl ServiceBuilder {
 
         let stream_id = parse_stream_id_from_response(&resp)?;
 
-        // Create consumer with group for load balancing
-        let consumer_name = format!("_svc-{}-worker", self.name);
-        let consumer_resp = self.client.create_consumer(
+        // Worker consumer: queue-grouped so N instances share request load.
+        let worker_consumer_name = format!("_svc-{}-worker", self.name);
+        let worker_resp = self.client.create_consumer(
             stream_id,
-            consumer_name.as_bytes(),
-            consumer_name.as_bytes(), // group = same as name (load balanced)
-            &filter,
+            worker_consumer_name.as_bytes(),
+            worker_consumer_name.as_bytes(), // group = same name (load balanced)
+            &worker_filter,
             self.max_inflight as u16,
             1, // ack_policy: explicit
             0, // deliver_policy: all
@@ -415,56 +487,76 @@ impl ServiceBuilder {
             30_000, // ack_wait_ms
             0,      // start_seq
         ).await?;
+        let consumer_id = parse_consumer_id_from_response(&worker_resp)?;
+        let mut worker_sub = self
+            .client
+            .subscribe(stream_id, consumer_id, &worker_filter)
+            .await?;
 
-        let consumer_id = parse_consumer_id_from_response(&consumer_resp)?;
-
-        // Subscribe
-        let mut sub = self.client.subscribe(stream_id, consumer_id, &filter).await?;
+        // Reply consumer: private per-instance, NOT queue-grouped so
+        // replies are never load-balanced away. Fixes BUG-2.
+        let reply_consumer_name = format!("_svc-{}-reply-{}", self.name, instance_str);
+        let reply_resp = self.client.create_consumer(
+            stream_id,
+            reply_consumer_name.as_bytes(),
+            b"", // no group — solo delivery
+            &reply_filter,
+            self.max_inflight as u16,
+            1,      // ack_policy: explicit
+            0,      // deliver_policy: all
+            0,      // deliver_mode: push
+            30_000, // ack_wait_ms
+            0,      // start_seq
+        ).await?;
+        let reply_consumer_id = parse_consumer_id_from_response(&reply_resp)?;
+        let mut reply_sub = self
+            .client
+            .subscribe(stream_id, reply_consumer_id, &reply_filter)
+            .await?;
 
         let cancel = CancellationToken::new();
         let reply_mux = Arc::new(ReplyMux::new());
         let reply_mux_clone = Arc::clone(&reply_mux);
         let name_clone = self.name.clone();
         let cancel_clone = cancel.clone();
-        let handlers: HandlerRegistry =
-            Arc::new(Mutex::new(Vec::new()));
+        let handlers: HandlerRegistry = Arc::new(Mutex::new(Vec::new()));
         let handlers_clone: HandlerRegistry = handlers.clone();
+        let instance_str_clone = instance_str.clone();
 
-        // Spawn dispatch loop
+        // Dispatch loop — select! over BOTH consumers.
+        // Worker sub delivers only methods; reply sub delivers only
+        // replies for THIS instance. That separation is what fixes
+        // the multi-instance reply routing bug.
         tokio::spawn(async move {
-            let reply_prefix = format!("_svc.{name_clone}._r.");
+            let reply_prefix = format!("_svc.{name_clone}._r.{instance_str_clone}.");
             let reply_prefix_bytes = reply_prefix.as_bytes();
 
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel_clone.cancelled() => break,
-                    msg = sub.recv() => {
+                    msg = reply_sub.recv() => {
                         let Some(msg) = msg else { break };
-
-                        let subject = msg.subject().to_vec();
-
-                        // Reply-routing check.
-                        //
-                        // A reply subject is EXACTLY `_svc.<name>._r.<corr_id>`
-                        // — the prefix must anchor at position 0. The previous
-                        // implementation searched for the prefix anywhere in
-                        // the subject (windows scan), so a legitimate method
-                        // whose name contained `_svc.<name>._r.<digits>`
-                        // was misclassified as a reply and either completed
-                        // an unrelated corr_id or was silently dropped.
+                        let subject = msg.subject();
                         if subject.starts_with(reply_prefix_bytes) {
                             let corr_bytes = &subject[reply_prefix_bytes.len()..];
                             if let Ok(corr_str) = std::str::from_utf8(corr_bytes) {
                                 if let Ok(corr_id) = corr_str.parse::<u64>() {
                                     reply_mux_clone.complete(corr_id, msg.payload());
-                                    msg.ack();
-                                    continue;
                                 }
                             }
                         }
+                        // Ack unconditionally — replies never need
+                        // redelivery. A malformed subject is a
+                        // logic bug, not a transient failure.
+                        msg.ack();
+                    }
+                    msg = worker_sub.recv() => {
+                        let Some(msg) = msg else { break };
 
-                        // Route to registered handler
+                        let subject = msg.subject().to_vec();
+
+                        // Route to registered handler by subject prefix.
                         let handler = {
                             let locked = handlers_clone.lock().unwrap();
                             locked.iter()
@@ -508,6 +600,7 @@ impl ServiceBuilder {
             name: self.name,
             stream_id,
             consumer_id,
+            instance_id,
             client: self.client,
             reply_mux,
             stream_cache: Arc::new(Mutex::new(stream_cache)),
