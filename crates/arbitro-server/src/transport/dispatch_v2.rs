@@ -510,6 +510,35 @@ fn v2_publish_batch(
         }
     };
 
+    // ── Stream quota pre-check (DiscardPolicy::New) ────────────────────
+    //
+    // v2_publish (single) rejects an over-quota publish on
+    // `DiscardPolicy::New` (discard == 1) streams before appending. The
+    // batch path must apply the same gate so single and batch behave
+    // consistently — a discard=1 stream must not silently accept a batch
+    // that exceeds its quota when the same messages sent one-by-one
+    // would be rejected. Bytes are the sum of (subject_len + payload_len)
+    // across the batch, mirroring the single-publish accounting.
+    if let Some(quota) = server.names().stream_quota(seq_stream) {
+        if quota.discard == 1 {
+            let batch_count = f.body.count.get() as u64;
+            let mut batch_bytes: u64 = 0;
+            for v in f.iter() {
+                batch_bytes += (v.subject().len() + v.payload().len()) as u64;
+            }
+            let shared_store = server.store_for(seq_stream);
+            let info = shared_store.lock().info();
+            if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+            if quota.max_bytes > 0 && info.bytes + batch_bytes > quota.max_bytes {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+        }
+    }
+
     // ── Idempotency check (all-or-nothing) ────────────────────────────
     //
     // F6: stream-build EntryRef vec directly from `f.iter()` —
