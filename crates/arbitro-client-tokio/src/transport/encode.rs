@@ -322,6 +322,7 @@ pub(crate) fn encode_batch_ack_v2(seq: u64, consumer_id: u32, entries: &[(u64, u
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use arbitro_proto::action::Action;

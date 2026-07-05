@@ -223,8 +223,7 @@ impl CronRegistry {
             // SEC-7: bound the total number of distinct cron slots.
             if map.len() >= MAX_CRON_SLOTS {
                 return Err(format!(
-                    "cron registry is at the maximum of {} slots",
-                    MAX_CRON_SLOTS
+                    "cron registry is at the maximum of {MAX_CRON_SLOTS} slots"
                 ));
             }
             info!(name = %String::from_utf8_lossy(&name), every, "cron created");

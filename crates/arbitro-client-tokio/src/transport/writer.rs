@@ -10,6 +10,7 @@ use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
 
 /// Writer unit tests.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::transport::frame::{WriteFrame, INLINE_CAP, MAX_WRITE_PRODUCERS};

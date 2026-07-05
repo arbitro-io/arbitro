@@ -67,6 +67,8 @@ type BoxHandler = Arc<
         + Sync,
 >;
 
+type HandlerRegistry = Arc<Mutex<Vec<(Vec<u8>, BoxHandler)>>>;
+
 /// A named service that can handle incoming RPC requests and make outgoing
 /// requests to other services.
 ///
@@ -82,7 +84,7 @@ pub struct Service {
     /// Cache of resolved service name → stream_id.
     stream_cache: Arc<Mutex<HashMap<String, u32>>>,
     /// Registered handlers: subject prefix → handler fn.
-    handlers: Arc<Mutex<Vec<(Vec<u8>, BoxHandler)>>>,
+    handlers: HandlerRegistry,
     cancel: CancellationToken,
 }
 
@@ -214,11 +216,11 @@ impl Service {
         }
 
         // Build stream name: _svc-<target> (dashes, not dots — validate_name constraint)
-        let stream_name = format!("_svc-{}", target);
+        let stream_name = format!("_svc-{target}");
         let stream_name = stream_name.as_bytes();
 
         // Get stream info — this will fail if the stream doesn't exist
-        let resp = self.client.get_stream(&stream_name).await?;
+        let resp = self.client.get_stream(stream_name).await?;
 
         // Parse stream_id from the response (JSON: {"stream_id": N, ...})
         let stream_id = parse_stream_id_from_response(&resp)?;
@@ -339,13 +341,13 @@ impl ServiceBuilder {
         let reply_mux_clone = Arc::clone(&reply_mux);
         let name_clone = self.name.clone();
         let cancel_clone = cancel.clone();
-        let handlers: Arc<Mutex<Vec<(Vec<u8>, BoxHandler)>>> =
+        let handlers: HandlerRegistry =
             Arc::new(Mutex::new(Vec::new()));
-        let handlers_clone = Arc::clone(&handlers);
+        let handlers_clone: HandlerRegistry = handlers.clone();
 
         // Spawn dispatch loop
         tokio::spawn(async move {
-            let reply_prefix = format!("_svc.{}._r.", name_clone);
+            let reply_prefix = format!("_svc.{name_clone}._r.");
             let reply_prefix_bytes = reply_prefix.as_bytes();
 
             loop {

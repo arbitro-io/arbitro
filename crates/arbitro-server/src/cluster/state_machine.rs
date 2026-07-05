@@ -12,7 +12,8 @@ use std::sync::Arc;
 use arbitro_raft::{RaftError, StateMachine};
 use serde::{Deserialize, Serialize};
 
-use arbitro_engine_v2::catalog::{wire_hash_32, ConsumerConfig, StreamConfig};
+use arbitro_engine_v2::catalog::{ConsumerConfig, StreamConfig};
+use arbitro_engine_v2::common::wire_hash_32;
 use arbitro_engine_v2::types::*;
 
 use crate::shard::router::ShardRouter;

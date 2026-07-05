@@ -388,8 +388,7 @@ mod tests {
         }
         assert!(
             !t.contains(s(1), 0xFFFF, b"x"),
-            "window must be clamped to MAX_WINDOW_MS = {}ms",
-            MAX_WINDOW_MS,
+            "window must be clamped to MAX_WINDOW_MS = {MAX_WINDOW_MS}ms",
         );
     }
 
