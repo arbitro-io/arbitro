@@ -272,7 +272,28 @@ fn v2_publish(
     // and consult the shared tracker. The lock is held for the
     // membership check + insert only — sub-microsecond on a hash
     // miss, single-digit microseconds on a hash hit.
-    let msg_id = f.msg_id();
+    //
+    // When the client sends a pre-encoded ExtendedPayload (entry_flags
+    // has HAS_HEADERS), the msg-id lives inside the TLV block under
+    // key HDR_MSG_ID, not in the frame's dedicated msg_id field. Fall
+    // back to the payload header extraction so a client that stamps
+    // msg-id via headers gets deduped just like a legacy publisher
+    // that fills f.msg_id() directly.
+    let frame_msg_id = f.msg_id();
+    let has_headers_flag = f.header.entry_flags
+        & arbitro_proto::v2::header::entry_flag::HAS_HEADERS
+        != 0;
+    let msg_id: &[u8] = if !frame_msg_id.is_empty() {
+        frame_msg_id
+    } else if has_headers_flag {
+        arbitro_proto::wire::msg_headers::ExtendedPayload::ref_from_bytes(f.payload())
+            .ok()
+            .and_then(|ext| ext.headers_block())
+            .and_then(|hdrs| hdrs.get(arbitro_proto::wire::msg_headers::HDR_MSG_ID))
+            .unwrap_or(&[])
+    } else {
+        &[]
+    };
     let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
@@ -547,8 +568,41 @@ fn v2_publish_batch(
     // idempotency branch can iterate twice without an extra alloc.
     //
     // Fast-bail when the stream has no idempotency window.
+    //
+    // When the batch header carries HAS_HEADERS, every entry's payload
+    // is a pre-encoded ExtendedPayload and the per-entry msg-id lives
+    // inside its TLV block under HDR_MSG_ID rather than in the entry's
+    // dedicated msg_id field (same asymmetry as the single-publish path,
+    // BUG-8). `msg_id_of_view` centralizes that lookup so both the
+    // has-any pre-check and the record loop see the same effective id.
+    let batch_has_headers = f.header.entry_flags
+        & arbitro_proto::v2::header::entry_flag::HAS_HEADERS
+        != 0;
+    // Named fn instead of a closure because the msg_id / payload slices
+    // borrow from the frame's `'a` lifetime, which closures can't express
+    // with a higher-rank bound.
+    fn msg_id_of_view<'a>(
+        v: &arbitro_proto::v2::ingress::batch_pub_frame::BatchPubEntryView<'a>,
+        batch_has_headers: bool,
+    ) -> &'a [u8] {
+        let field = v.msg_id();
+        if !field.is_empty() {
+            return field;
+        }
+        if !batch_has_headers {
+            return &[];
+        }
+        arbitro_proto::wire::msg_headers::ExtendedPayload::ref_from_bytes(v.payload())
+            .ok()
+            .and_then(|ext| ext.headers_block())
+            .and_then(|hdrs| hdrs.get(arbitro_proto::wire::msg_headers::HDR_MSG_ID))
+            .unwrap_or(&[])
+    }
     let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
-    if window_ms > 0 && f.iter().any(|v| !v.msg_id().is_empty()) {
+    if window_ms > 0
+        && f.iter()
+            .any(|v| !msg_id_of_view(&v, batch_has_headers).is_empty())
+    {
         let shared = server.idempotency_for(seq_stream);
         let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
         let mut tracker = tracker_arc.lock();
@@ -562,7 +616,7 @@ fn v2_publish_batch(
         let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> = smallvec::SmallVec::new();
         let mut duplicate = false;
         for v in f.iter() {
-            let id = v.msg_id();
+            let id = msg_id_of_view(&v, batch_has_headers);
             if id.is_empty() {
                 continue;
             }
