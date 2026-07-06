@@ -467,7 +467,7 @@ pub async fn follower_replication_loop(
                 };
 
                 let stream_id_raw = header.stream_id.get();
-                let _first_seq = header.first_seq.get();
+                let leader_first_seq = header.first_seq.get();
                 let entry_count = header.entry_count.get();
                 let timestamp_ms = header.timestamp_ms.get();
                 let entries_data = &body[REPLICATE_ENTRIES_HEADER_SIZE..];
@@ -509,9 +509,27 @@ pub async fn follower_replication_loop(
                     });
                 }
 
-                // Append to local store.
+                // BUG-4 guard: verify the leader's first_seq aligns with our
+                // local next-seq (last_seq + 1). If not, the follower is
+                // out-of-sync — DROP this batch so seqs don't diverge
+                // silently. Catch-up will refill the gap.
                 let stream_id = arbitro_engine_v2::types::StreamId(stream_id_raw);
                 let store = store_lookup.store_for(stream_id);
+                {
+                    let guard = store.lock();
+                    let info = guard.info();
+                    let expected = if info.messages == 0 { leader_first_seq } else { info.last_seq + 1 };
+                    if expected != leader_first_seq {
+                        tracing::warn!(
+                            stream_id = stream_id_raw,
+                            leader_first_seq,
+                            local_next_seq = expected,
+                            "replication: seq divergence, dropping batch — catch-up required"
+                        );
+                        drop(guard);
+                        continue;
+                    }
+                }
                 let last_seq = match store.lock().append_batch(&refs, timestamp_ms) {
                     Ok(first) => {
                         let count = refs.len() as u64;
