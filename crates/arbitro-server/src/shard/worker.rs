@@ -838,9 +838,23 @@ impl CommandWorker {
     /// Returns `true` if shutdown was requested.
     fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
         if matches!(cmd, ShardCommand::Shutdown) {
+            if crate::shard::drain::chaos_debug() {
+                let info = self.store.lock().info();
+                eprintln!(
+                    "[SHUTDOWN-BEGIN] accum_total={} store_first={} store_last={} messages={}",
+                    self.accum_total, info.first_seq, info.last_seq, info.messages
+                );
+            }
             self.flush_accumulator();
             if let Err(e) = self.store.lock().shutdown() {
                 tracing::error!(error = ?e, "store shutdown failed");
+            }
+            if crate::shard::drain::chaos_debug() {
+                let info = self.store.lock().info();
+                eprintln!(
+                    "[SHUTDOWN-DONE] store_first={} store_last={} messages={}",
+                    info.first_seq, info.last_seq, info.messages
+                );
             }
             self.running
                 .store(false, std::sync::atomic::Ordering::Relaxed);

@@ -27,7 +27,7 @@
 //! delivered. Duplicates (redelivery after reconnect) are expected and handled
 //! by the `HashSet` deduplication.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
@@ -48,6 +48,11 @@ const STREAM: &[u8] = b"chaos";
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn chaos_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARBITRO_CHAOS_DEBUG").is_ok())
+}
 
 fn portpicker() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -181,6 +186,8 @@ async fn producer(
     cur_sid: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     acked: Arc<std::sync::Mutex<HashSet<u64>>>,
+    ack_timeline: Arc<std::sync::Mutex<HashMap<u64, (u64, u64)>>>,
+    run_start: Instant,
     ok_cnt: Arc<AtomicU64>,
     err_cnt: Arc<AtomicU64>,
 ) {
@@ -224,6 +231,10 @@ async fn producer(
             Ok(Ok(b)) => {
                 let seq = u64::from_le_bytes(b[..8].try_into().unwrap());
                 acked.lock().unwrap().insert(seq);
+                if chaos_debug() {
+                    let ms = run_start.elapsed().as_millis() as u64;
+                    ack_timeline.lock().unwrap().insert(seq, (ms, id));
+                }
                 ok_cnt.fetch_add(1, Relaxed);
             }
             _ => {
@@ -257,6 +268,8 @@ async fn consumer_loop(
     stop: Arc<AtomicBool>,
     force_reconnect: Arc<AtomicBool>,
     recv_seqs: Arc<std::sync::Mutex<HashSet<u64>>>,
+    recv_timeline: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    run_start: Instant,
     recv_total: Arc<AtomicU64>,
     reconnect_cnt: Arc<AtomicU64>,
 ) {
@@ -285,6 +298,10 @@ async fn consumer_loop(
             match tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
                 Ok(Some(msg)) => {
                     recv_seqs.lock().unwrap().insert(msg.seq);
+                    if chaos_debug() {
+                        let ms = run_start.elapsed().as_millis() as u64;
+                        recv_timeline.lock().unwrap().entry(msg.seq).or_insert(ms);
+                    }
                     recv_total.fetch_add(1, Relaxed);
                     msg.ack();
                     if force_reconnect.swap(false, Relaxed) {
@@ -359,11 +376,15 @@ async fn main() {
     let force_reconnect = Arc::new(AtomicBool::new(false));
 
     let acked_seqs = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let ack_timeline = Arc::new(std::sync::Mutex::new(HashMap::<u64, (u64, u64)>::new()));
     let ok_cnt = Arc::new(AtomicU64::new(0));
     let err_cnt = Arc::new(AtomicU64::new(0));
     let recv_seqs = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+    let recv_timeline = Arc::new(std::sync::Mutex::new(HashMap::<u64, u64>::new()));
     let recv_total = Arc::new(AtomicU64::new(0));
     let reconnect_cnt = Arc::new(AtomicU64::new(0));
+
+    let run_start = Instant::now();
 
     // ── Consumer task ──────────────────────────────────────────────────────
     tokio::spawn(consumer_loop(
@@ -373,6 +394,8 @@ async fn main() {
         Arc::clone(&cons_stop),
         Arc::clone(&force_reconnect),
         Arc::clone(&recv_seqs),
+        Arc::clone(&recv_timeline),
+        run_start,
         Arc::clone(&recv_total),
         Arc::clone(&reconnect_cnt),
     ));
@@ -387,14 +410,13 @@ async fn main() {
                 Arc::clone(&cur_sid),
                 Arc::clone(&prod_stop),
                 Arc::clone(&acked_seqs),
+                Arc::clone(&ack_timeline),
+                run_start,
                 Arc::clone(&ok_cnt),
                 Arc::clone(&err_cnt),
             ))
         })
         .collect();
-
-    // ── Main ticker + inline chaos events ─────────────────────────────────
-    let run_start = Instant::now();
 
     for t in 1u64..=RUN_SECS {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -539,6 +561,39 @@ async fn main() {
     } else {
         println!("  LOSS CHECK : ✗  FAIL — {missing_cnt} seqs missing");
         println!("               first 20: {missing_seqs:?}");
+        if chaos_debug() {
+            let atl = ack_timeline.lock().unwrap();
+            let rtl = recv_timeline.lock().unwrap();
+            println!();
+            println!("  ── MISSING-SEQ TIMELINE ─────────────────────────────────");
+            let mut sorted: Vec<u64> = acked.difference(&recvd).copied().collect();
+            sorted.sort_unstable();
+            for seq in sorted.iter().take(40) {
+                let (ack_ms, prod) = atl.get(seq).copied().unwrap_or((0, u64::MAX));
+                let recv_ms = rtl.get(seq).copied().unwrap_or(0);
+                println!(
+                    "  seq={seq} acked_at_ms={ack_ms} producer={prod} recv_ms={recv_ms}"
+                );
+            }
+            drop(atl); drop(rtl);
+            let mut ack_sorted: Vec<u64> = acked.iter().copied().collect();
+            ack_sorted.sort_unstable();
+            let ack_min = ack_sorted.first().copied().unwrap_or(0);
+            let ack_max = ack_sorted.last().copied().unwrap_or(0);
+            let mut recv_sorted: Vec<u64> = recvd.iter().copied().collect();
+            recv_sorted.sort_unstable();
+            let recv_max = recv_sorted.last().copied().unwrap_or(0);
+            let recv_min = recv_sorted.first().copied().unwrap_or(0);
+            println!();
+            println!(
+                "  ACK  range: [{ack_min} .. {ack_max}]  count={}",
+                ack_sorted.len()
+            );
+            println!(
+                "  RECV range: [{recv_min} .. {recv_max}]  count={}",
+                recv_sorted.len()
+            );
+        }
     }
     println!();
 

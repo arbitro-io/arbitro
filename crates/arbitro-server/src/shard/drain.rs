@@ -313,19 +313,25 @@ pub(in crate::shard) fn drain_deliver(
                 last_writer
             };
             let Some(writer) = writer else {
-                // Writer not found → connection truly gone (removed from
-                // registry). Mark dead so the engine retires bindings.
+                if chaos_debug() {
+                    eprintln!(
+                        "[FLUSH-DEAD-WRITER-NOT-FOUND] conn={} first_seq={} count={}",
+                        frame.connection_id.0, frame.first_seq, frame.count
+                    );
+                }
                 flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
                 return false;
             };
-            // M8: writer feedback — if the writer task has signalled an
-            // I/O error, skip this connection immediately. Frames sent
-            // to a dead writer's channel would pile up until the session
-            // is reaped, wasting memory and CPU.
             if writer
                 .write_failed
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
+                if chaos_debug() {
+                    eprintln!(
+                        "[FLUSH-DEAD-WRITE-FAILED] conn={} first_seq={} count={}",
+                        frame.connection_id.0, frame.first_seq, frame.count
+                    );
+                }
                 flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
                 return false;
             }
@@ -342,17 +348,26 @@ pub(in crate::shard) fn drain_deliver(
             // `try_send` hands the bytes back inside the Err so we can
             // safely keep `frame.first_seq` for tracking.
             let conn = frame.connection_id;
-            #[allow(unused_variables)]
             let count = frame.count;
             let first_seq = frame.first_seq;
             let ok = writer.write_tx.try_send(frame.bytes).is_ok();
 
             if ok {
+                if chaos_debug() {
+                    eprintln!(
+                        "[FLUSH-OK] conn={} first_seq={} last_seq={} count={}",
+                        conn.0, first_seq, first_seq + (count as u64).saturating_sub(1), count
+                    );
+                }
                 crate::lifecycle_trace!("30_send_bytes_done", conn.0, count as u64, "shard");
                 flush_results.push((conn, FlushOutcome::Ok));
             } else {
-                // Channel full → backpressure, NOT dead. Record first_seq
-                // so the cursor doesn't advance past undelivered entries.
+                if chaos_debug() {
+                    eprintln!(
+                        "[FLUSH-BACKPRESSURE] conn={} first_seq={} count={}",
+                        conn.0, first_seq, count
+                    );
+                }
                 flush_results.push((conn, FlushOutcome::Backpressured(first_seq)));
             }
             ok

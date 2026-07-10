@@ -390,6 +390,12 @@ impl TolerantStore {
         }
 
         if first != 0 {
+            if std::env::var("ARBITRO_CHAOS_DEBUG").is_ok() {
+                eprintln!(
+                    "[STORE-LOAD-SEG] path={:?} first_seq={} last_seq={} next_seq={} scan_end_off={}",
+                    path.file_name().unwrap_or_default(), first, last, self.next_seq, offset
+                );
+            }
             self.segments.push(SegmentMetadata {
                 path: path.to_path_buf(),
                 first_seq: first,
@@ -397,6 +403,11 @@ impl TolerantStore {
             });
             self.sealed_segments.push(mmap);
             self.load_tombstones_for_segment(first);
+        } else if std::env::var("ARBITRO_CHAOS_DEBUG").is_ok() {
+            eprintln!(
+                "[STORE-LOAD-SEG-EMPTY] path={:?} scan_end_off={}",
+                path.file_name().unwrap_or_default(), offset
+            );
         }
         Ok(())
     }

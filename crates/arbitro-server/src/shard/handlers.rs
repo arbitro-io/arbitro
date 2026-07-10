@@ -102,8 +102,23 @@ impl CommandWorker {
 
             match self.store.lock().append_batch(&refs, now_ms) {
                 Ok(first_seq) => {
+                    let entry_count = refs.len() as u64;
+                    if crate::shard::drain::chaos_debug() {
+                        eprintln!(
+                            "[APPEND-OK] stream={} first_seq={} last_seq={} count={} callers={}",
+                            stream_id.raw(), first_seq, first_seq + entry_count - 1,
+                            entry_count, callers.len()
+                        );
+                    }
                     let mut seq_offset = 0u64;
                     for caller in &callers {
+                        if crate::shard::drain::chaos_debug() {
+                            eprintln!(
+                                "[REPOK-SEND] conn={} env_seq={} assigned_seq={} count={}",
+                                caller.conn_id, caller.env_seq,
+                                first_seq + seq_offset, caller.entry_count
+                            );
+                        }
                         send_rep_ok_v2(
                             &self.registry,
                             caller.conn_id,
