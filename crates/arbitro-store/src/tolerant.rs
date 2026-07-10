@@ -286,36 +286,36 @@ impl TolerantStore {
         let mmap = unsafe { Mmap::map(&file)? };
         let segment_idx = self.sealed_segments.len() as u32;
 
+        let mut offset = 0usize;
+        let mut first = 0;
+        let mut last = 0;
+
         // FEAT-6: if a sidecar `.idx` exists for this segment, trust it
-        // instead of re-scanning + CRC-checking every byte. The sidecar
-        // is only written on clean seal (rotate/shutdown), so its mere
-        // presence implies the segment was not torn.
+        // for the records it covers instead of re-scanning + CRC-checking
+        // every byte. The sidecar is only written on clean seal
+        // (rotate/shutdown) — but the data file may hold acked records
+        // PAST the last sidecar entry (unclean restart over the same
+        // data_dir), so we must NOT stop here: resume the manual scan
+        // from the end of the last covered record and index any valid
+        // tail. Clean case: the scan hits a non-MAGIC byte immediately.
         if let Some(named_first_seq) = Self::segment_first_seq_from_path(path) {
             let idx_path = Self::idx_path(&self.base_path, named_first_seq);
             if let Some(entries) = Self::load_idx_sidecar(&idx_path, segment_idx) {
                 if let (Some(first_m), Some(last_m)) = (entries.first(), entries.last()) {
-                    let first = first_m.seq;
-                    let last = last_m.seq;
+                    first = first_m.seq;
+                    last = last_m.seq;
+                    offset = last_m.offset as usize
+                        + last_m.subj_len as usize
+                        + last_m.payload_len as usize
+                        + RECORD_CRC_SIZE;
                     for m in &entries {
                         self.total_bytes += (m.subj_len as u64) + (m.payload_len as u64);
                         self.next_seq = m.seq + 1;
                     }
                     self.index.extend(entries);
-                    self.segments.push(SegmentMetadata {
-                        path: path.to_path_buf(),
-                        first_seq: first,
-                        last_seq: last,
-                    });
-                    self.sealed_segments.push(mmap);
-                    self.load_tombstones_for_segment(first);
-                    return Ok(());
                 }
             }
         }
-
-        let mut offset = 0usize;
-        let mut first = 0;
-        let mut last = 0;
 
         while offset + HEADER_SIZE <= mmap.len() {
             let h = &mmap[offset..offset + HEADER_SIZE];
