@@ -543,12 +543,18 @@ impl CommandWorker {
                     // DeliverPolicy::All — if the consumer has a persisted
                     // cursor (from a previous session), resume from
                     // last_acked_seq + 1 instead of replaying from 0.
-                    if let Some(last_acked) = self.names.consumer_cursor(consumer_id) {
-                        self.counters.set_cursor(last_acked);
-                    } else {
-                        self.counters.set_cursor(0);
-                    }
-                    self.counters.clear_rewind();
+                    //
+                    // BUG3: use the same protocol as handle_bind
+                    // (set_cursor + signal_rewind), NOT a bare set_cursor +
+                    // clear_rewind. If a drain cycle is mid-flight during a
+                    // resubscribe, its final set_cursor(new_cursor) would
+                    // clobber the resume point and clear_rewind would erase
+                    // the correction (and any pending retirement rewind from
+                    // BUG2), skipping seqs forever. signal_rewind is durable:
+                    // the drain honours it at the top of its next cycle.
+                    let resume = self.names.consumer_cursor(consumer_id).unwrap_or(0);
+                    self.counters.set_cursor(resume);
+                    self.counters.signal_rewind(resume + 1);
                 }
                 1 => {
                     // DeliverPolicy::New — cursor stays at current position.

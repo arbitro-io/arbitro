@@ -140,7 +140,11 @@ impl DrainScratch {
 pub(in crate::shard) enum FlushOutcome {
     Ok,
     Backpressured(u64),
-    WriterGone,
+    /// Writer permanently gone. Carries the batch's first seq — like
+    /// `Backpressured` — so the cursor cannot advance past frames that
+    /// were never sent (BUG1: those seqs are not in `Binding.pending`,
+    /// so retirement releases nothing and no rewind would ever occur).
+    WriterGone(u64),
 }
 
 // ── Linear-scan helpers for per-cycle deltas ────────────────────────────────
@@ -282,7 +286,8 @@ pub(in crate::shard) fn drain_deliver(
     // FlushOutcome distinguishes between three cases:
     //  - Ok:             frame sent successfully
     //  - Backpressured:  channel full (transient), retry next cycle
-    //  - WriterGone:     writer not found (permanent), mark dead
+    //  - WriterGone:     writer not found (permanent); carries the batch
+    //                    first_seq so the cursor won't skip it, mark dead
     scratch.flush_results.clear();
     let mut flush_results = std::mem::take(&mut scratch.flush_results);
     {
@@ -310,7 +315,7 @@ pub(in crate::shard) fn drain_deliver(
             let Some(writer) = writer else {
                 // Writer not found → connection truly gone (removed from
                 // registry). Mark dead so the engine retires bindings.
-                flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
+                flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
                 return false;
             };
             // M8: writer feedback — if the writer task has signalled an
@@ -321,7 +326,7 @@ pub(in crate::shard) fn drain_deliver(
                 .write_failed
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                flush_results.push((frame.connection_id, FlushOutcome::WriterGone));
+                flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
                 return false;
             }
             crate::lifecycle_trace!(
@@ -379,7 +384,13 @@ pub(in crate::shard) fn drain_deliver(
                 track_skipped(&mut result.lowest_skipped, first_seq);
                 result.more_pending = true;
             }
-            FlushOutcome::WriterGone => {
+            FlushOutcome::WriterGone(first_seq) => {
+                // BUG1: the batch destined to this connection was never
+                // sent. Track its first seq so the cursor stops before it,
+                // and retry next cycle once the conn is retired / a live
+                // sibling picks it up.
+                track_skipped(&mut result.lowest_skipped, first_seq);
+                result.more_pending = true;
                 scratch.dead_connections.push(conn);
             }
         }
@@ -414,6 +425,13 @@ pub(in crate::shard) fn drain_deliver(
     let new_cursor = result
         .lowest_skipped
         .map_or(result.end - 1, |ls| ls.saturating_sub(1));
+    if chaos_debug() {
+        eprintln!(
+            "[chaos-debug] cursor {} -> {} (start={} end={} skipped={:?} more={})",
+            counters.cursor(), new_cursor, result.start, result.end,
+            result.lowest_skipped, result.more_pending
+        );
+    }
     counters.set_cursor(new_cursor);
 
     if result.end <= result.last_seq || result.lowest_skipped.is_some() {
@@ -432,12 +450,13 @@ pub(in crate::shard) fn drain_deliver(
         }
     }
 
+    // Only ever RE-OPEN the gate here. Clearing is owned exclusively by the
+    // drain worker loop, which clears BEFORE reading the store — so a
+    // concurrent publish's `release()` can never be clobbered by a stale
+    // end-of-cycle `lock()` (the tail-message lost-wakeup this avoids).
     if result.more_pending {
         gate.release();
         crate::lifecycle_trace!("33_drainer_exit_released", 0, 0, "shard");
-    } else {
-        gate.lock();
-        crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
     }
 }
 
@@ -622,6 +641,12 @@ fn dispatch_recipients(
     }
     let start = (entry.seq as usize) % n;
 
+    // TEMP chaos-debug — per-entry skip accounting, removed after diagnosis.
+    let mut dbg_recipients = 0u32;
+    let mut dbg_tracked = false;
+    let (mut dbg_conn0, mut dbg_qdedup, mut dbg_dead, mut dbg_unbound, mut dbg_wf) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+
     for i in 0..n {
         let raw = start + i;
         let idx = if raw >= n { raw - n } else { raw };
@@ -631,6 +656,7 @@ fn dispatch_recipients(
         let queue_id = me.queue_id;
 
         if connection_id == ConnectionId(0) {
+            dbg_conn0 += 1;
             continue;
         }
 
@@ -646,6 +672,7 @@ fn dispatch_recipients(
                 }
             }
             if already_served {
+                dbg_qdedup += 1;
                 continue;
             }
         }
@@ -661,6 +688,7 @@ fn dispatch_recipients(
             }
         }
         if conn_is_dead {
+            dbg_dead += 1;
             continue;
         }
 
@@ -672,14 +700,29 @@ fn dispatch_recipients(
         if me.binding_idx == arbitro_engine_v2::catalog::match_table::BINDING_IDX_UNBOUND
             || binding_idx >= bindings.len()
         {
+            dbg_unbound += 1;
             continue;
         }
         let binding = &bindings[binding_idx];
+
+        // BUG4: a binding whose writer has already failed is ineligible.
+        // Skip it WITHOUT marking `served_queues` so a queue's live sibling
+        // falls through and takes this entry, instead of the dead binding
+        // winning the round-robin pick and the frame being dropped as
+        // WriterGone at flush. One relaxed atomic load per candidate.
+        if binding
+            .write_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            dbg_wf += 1;
+            continue;
+        }
 
         // Paused check — atomic read.
         if counters.is_paused(consumer_id.0) {
             *more_pending = true;
             track_skipped(lowest_skipped, entry.seq);
+            dbg_tracked = true;
             continue;
         }
 
@@ -691,6 +734,7 @@ fn dispatch_recipients(
             {
                 *more_pending = true;
                 track_skipped(lowest_skipped, entry.seq);
+                dbg_tracked = true;
                 continue;
             }
 
@@ -709,6 +753,7 @@ fn dispatch_recipients(
                 if pending_subj + committed >= max {
                     *more_pending = true;
                     track_skipped(lowest_skipped, entry.seq);
+                    dbg_tracked = true;
                     continue;
                 }
             }
@@ -757,6 +802,7 @@ fn dispatch_recipients(
             };
 
         let fire_and_forget = binding.fire_and_forget;
+        dbg_recipients += 1;
         scratch.acc.add(
             connection_id,
             stream_id,
@@ -788,6 +834,15 @@ fn dispatch_recipients(
         if queue_id != QueueId(0) {
             scratch.served_queues.push(queue_id);
         }
+    }
+
+    // TEMP chaos-debug — an entry with matches but zero recipients and no
+    // skip-track is the loss signature: the cursor will advance past it.
+    if dbg_recipients == 0 && !dbg_tracked && chaos_debug() {
+        eprintln!(
+            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={}",
+            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf
+        );
     }
 }
 
@@ -934,4 +989,84 @@ fn notify_delivered_grouped(
 #[inline]
 fn track_skipped(lowest: &mut Option<u64>, seq: u64) {
     *lowest = Some(lowest.map_or(seq, |s| s.min(seq)));
+}
+
+// TEMP chaos-debug probe — remove after loss diagnosis.
+pub(in crate::shard) fn chaos_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ARBITRO_CHAOS_DEBUG").is_ok())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{NameRegistry, SilentDrops};
+    use crate::shard::shared::NotifyRing;
+
+    /// BUG1 — when a frame flushes as `WriterGone`, the cursor must NOT
+    /// advance past that batch. Before the fix, `WriterGone` skipped
+    /// `track_skipped`, so `new_cursor` jumped to `end - 1`, permanently
+    /// losing every seq in the failed batch (they are not in
+    /// `Binding.pending`, so no retirement rewind ever recovers them).
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_gone_leaves_cursor_before_failed_batch() {
+        let counters = SharedCounters::new();
+        let gate = Gate::new();
+        let names = Arc::new(NameRegistry::default());
+        let silent = SilentDrops::new();
+        let (mut producers, _rx, _sd) = NotifyRing::new(1);
+        let mut notify_tx = producers.pop().unwrap();
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+
+        // Empty snapshot → no writer for conn 5 → `find_writer` returns
+        // None → the frame flushes as WriterGone.
+        let snap = DrainSnapshot::empty();
+
+        // One frame for conn 5 whose batch starts at seq 10. No entry is
+        // pushed to `scratch.deliveries` (Phase 3 delivery loop is a no-op).
+        scratch.acc.clear();
+        scratch.acc.add(
+            ConnectionId(5),
+            StreamId(1),
+            ConsumerId(0),
+            10,
+            b"subj",
+            0,
+            &[],
+            b"payload",
+        );
+
+        let result = DrainReadResult {
+            start: 1,
+            end: 11, // end - 1 == 10 == the batch first_seq
+            more_pending: false,
+            lowest_skipped: None,
+            last_seq: 10,
+        };
+
+        drain_deliver(
+            &counters,
+            &snap,
+            &gate,
+            &names,
+            &mut scratch,
+            &mut consumer_subjects,
+            &mut notify_tx,
+            &silent,
+            result,
+        );
+
+        // With the fix the cursor stops at 9 (batch first_seq - 1); the
+        // buggy behaviour advanced it to 10, skipping seq 10 forever.
+        assert_eq!(
+            counters.cursor(),
+            9,
+            "cursor must not advance past the undelivered WriterGone batch",
+        );
+        // The conn was queued for retirement.
+        assert!(gate.is_open(), "more_pending must re-open the gate for retry");
+    }
 }

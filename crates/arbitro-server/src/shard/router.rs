@@ -313,7 +313,6 @@ impl ShardRouter {
                 ),
                 data_path: shard_data_path,
                 replay_mode: true,
-                deferred_rewind_seq: None,
                 #[cfg(feature = "cluster")]
                 replication_tx: Arc::clone(&replication_tx),
             };

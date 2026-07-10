@@ -174,8 +174,32 @@ impl DrainWorker {
                 return;
             }
 
-            while self.gate.is_open() {
+            loop {
                 crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
+
+                // ── Clear the gate BEFORE reading the store ───────────────
+                //
+                // This closes a tail-message lost-wakeup. A publish/ack does
+                // `append_batch → send ack → gate.release()` (see
+                // dispatch_v2). The drain's OLD end-of-cycle `gate.lock()`
+                // could wipe a `release()` that raced in just before it,
+                // stranding the entry in the store. Normally the next publish
+                // re-wakes the drain, but the FINAL message of a burst (no
+                // later publish — e.g. the last message before a server kill,
+                // or the last message of the whole run) would sit undelivered
+                // forever → delivery loss.
+                //
+                // By clearing here, at the TOP of the cycle:
+                //   * a `release()` that arrives AFTER this clear re-opens the
+                //     gate → the `is_open()` check at the bottom loops again;
+                //   * a `release()` CLOBBERED by this clear necessarily
+                //     appended its entry BEFORE releasing (publish orders
+                //     append-under-store-lock strictly before release), and we
+                //     take the store lock AFTER this clear, so the store read
+                //     below is guaranteed to observe that entry and deliver it.
+                // `drain_deliver` now only ever RE-OPENS the gate (on
+                // `more_pending`); it never clears it. Clearing is owned here.
+                self.gate.lock();
 
                 // Drain the command→drain event ring before deciding any
                 // delivery. This applies acks (subject inflight decs) and
@@ -220,8 +244,11 @@ impl DrainWorker {
                     )
                 };
                 // Store lock released — publish can proceed concurrently.
-                match read_result {
-                    Some(result) => super::drain::drain_deliver(
+                // `drain_deliver` re-opens the gate iff there is more work
+                // (`more_pending`); the `None` branch (no work this cycle)
+                // leaves the gate cleared by the top-of-loop `lock()`.
+                if let Some(result) = read_result {
+                    super::drain::drain_deliver(
                         &self.counters,
                         &snap,
                         &self.gate,
@@ -231,18 +258,24 @@ impl DrainWorker {
                         &mut self.notify_ring,
                         &self.silent_drops,
                         result,
-                    ),
-                    None => {
-                        self.gate.lock();
-                        crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
-                    }
+                    );
                 }
 
                 let stalled = self.counters.cursor() == prev_cursor;
 
-                // Backpressure: cursor didn't advance → downstream full.
+                // Backpressure: work remains (gate re-opened via `more_pending`)
+                // but the cursor didn't advance → downstream channel full.
+                // Yield briefly so the writer task can drain before we retry.
                 if stalled && self.gate.is_open() {
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                }
+
+                // No pending signal → genuinely idle: go back to sleep on
+                // `acquire()`. Any concurrent `release()` (publish/ack/rewind)
+                // that landed after the top-of-loop clear keeps the gate open
+                // and makes us loop instead.
+                if !self.gate.is_open() {
+                    crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
                     break;
                 }
             }
@@ -277,6 +310,24 @@ fn drain_event_ring(
             }
         }
     }
+}
+
+/// BUG2: rewind the drain cursor so seqs released by a retired binding get
+/// redelivered. Mirrors `handle_bind`'s protocol: move the cursor back for
+/// the common case (drain sleeping) AND `signal_rewind` so a mid-flight
+/// drain cycle can't clobber the cursor when it writes `new_cursor` at the
+/// end of its cycle. `signal_rewind` takes the min, so a smaller pending
+/// rewind (more replay) still wins — redelivery is safe, message loss is not.
+#[inline]
+fn rewind_released(counters: &SharedCounters, min_seq: u64) {
+    if min_seq == 0 {
+        return;
+    }
+    let cur = counters.cursor();
+    if min_seq - 1 < cur {
+        counters.set_cursor(min_seq - 1);
+    }
+    counters.signal_rewind(min_seq);
 }
 
 /// Mutable accessor for a consumer's subject inflight, creating the slot
@@ -403,11 +454,6 @@ pub struct CommandWorker {
     /// the persisted created_at_seq with wrong values computed from the
     /// already-populated store.
     pub(super) replay_mode: bool,
-
-    /// Minimum seq of pending entries released by a dead binding. Deferred
-    /// until the next handle_bind restores demand so the drain can actually
-    /// deliver the entry.
-    pub(super) deferred_rewind_seq: Option<u64>,
 
     /// H12: timestamp of the last `wheel_tick + idempotency tick` pass.
     /// The `tokio::select!` sleep arm can be starved when commands are
@@ -890,12 +936,16 @@ impl CommandWorker {
         }
         // Demand atomics are already updated by subscribe/unsubscribe handlers.
         // DeltaEvents demand_became_available/idle are informational only here.
-        // Track minimum released pending seq for deferred cursor rewind.
-        // Rewind happens on next handle_bind when demand is restored.
+        // BUG2: in-flight (delivered-but-unacked) seqs released by a retired
+        // binding must be redelivered. Rewind the drain cursor to the lowest
+        // released seq NOW — the drain owns redelivery and DeliverPolicy is
+        // re-evaluated at dispatch, so there's no reason to defer to the next
+        // bind. signal_rewind guards a mid-flight drain cycle from clobbering
+        // the cursor at cycle end (same protocol as handle_bind).
         if !delta.pending_seqs_released.is_empty() {
             if let Some(&min_seq) = delta.pending_seqs_released.iter().min() {
-                let prev = self.deferred_rewind_seq.unwrap_or(u64::MAX);
-                self.deferred_rewind_seq = Some(prev.min(min_seq));
+                rewind_released(&self.counters, min_seq);
+                self.gate.release();
             }
         }
         // Remove retired bindings
@@ -1044,5 +1094,54 @@ impl CommandWorker {
                 r.created_at_seq = created_at_seq;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BUG2 — retiring a binding with pending (in-flight, unacked) seqs
+    /// must rewind the drain cursor so those seqs get redelivered. Before
+    /// the fix, `min(pending_seqs_released)` was recorded into a write-only
+    /// `deferred_rewind_seq` field that nothing ever read → the seqs were
+    /// lost. `rewind_released` now moves the cursor back AND signals the
+    /// rewind so a mid-flight drain can't clobber it.
+    #[test]
+    fn released_pending_seqs_rewind_cursor_and_signal() {
+        let counters = SharedCounters::new();
+        counters.set_cursor(100);
+
+        // A dead binding released pending seqs; the lowest was 40.
+        rewind_released(&counters, 40);
+
+        assert_eq!(counters.cursor(), 39, "cursor rewound to min_seq - 1");
+        // Durable signal so a mid-flight drain honours the rewind at the
+        // top of its next cycle instead of the clobbered cursor.
+        assert_eq!(counters.take_rewind(), Some(40));
+    }
+
+    /// `rewind_released` never drags the cursor forward — if the cursor is
+    /// already behind the released seq, only the (durable) rewind signal is
+    /// posted so the drain's `min`-based `take_rewind` stays authoritative.
+    #[test]
+    fn released_pending_seqs_never_advance_cursor() {
+        let counters = SharedCounters::new();
+        counters.set_cursor(10);
+
+        rewind_released(&counters, 40); // min_seq - 1 == 39 > 10
+
+        assert_eq!(counters.cursor(), 10, "cursor must not move forward");
+        assert_eq!(counters.take_rewind(), Some(40));
+    }
+
+    /// seq 0 is the "no messages" sentinel — `rewind_released` is a no-op.
+    #[test]
+    fn released_seq_zero_is_noop() {
+        let counters = SharedCounters::new();
+        counters.set_cursor(5);
+        rewind_released(&counters, 0);
+        assert_eq!(counters.cursor(), 5);
+        assert_eq!(counters.take_rewind(), None);
     }
 }
