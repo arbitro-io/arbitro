@@ -16,6 +16,8 @@ pub struct ClientConfig {
     pub keep_alive: KeepAlive,
     /// Bound for the writer mpsc (back-pressure threshold).
     pub write_queue_capacity: usize,
+    /// TTL for hot-tier deferred acks before the sweep drops them unpersisted.
+    pub ack_pending_ttl: Duration,
     /// TLS configuration. `None` → plain TCP. Requires the `tls` feature.
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
@@ -30,6 +32,7 @@ impl Default for ClientConfig {
             reconnect: ReconnectPolicy::default(),
             keep_alive: KeepAlive::default(),
             write_queue_capacity: 4096,
+            ack_pending_ttl: Duration::from_secs(24 * 3600),
             #[cfg(feature = "tls")]
             tls: None,
         }

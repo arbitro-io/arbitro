@@ -4,9 +4,14 @@
 //! via `writev` — the egress builds only its own header + body and points at
 //! the shared payload region.
 
+pub mod ack_state;
 pub mod deliver_frame;
 pub mod rep_frame;
 
+pub use ack_state::{
+    AckBatchRespBody, AckBatchRespFrame, AckStateRepBody, AckStateRepFrame,
+    ACK_BATCH_RESP_BODY_SIZE, ACK_STATE_REP_BODY_SIZE,
+};
 pub use deliver_frame::{
     DeliverBatchEntry, DeliverBatchHeader, DeliverBody, DeliverFrame, DELIVER_BATCH_ENTRY_FIXED,
     DELIVER_BATCH_HEADER_FIXED, DELIVER_BODY_FIXED,

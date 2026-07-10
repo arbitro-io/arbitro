@@ -56,6 +56,12 @@ pub(crate) struct Inner {
     pub(crate) metrics: Arc<ClientMetrics>,
     /// Active cron job handlers — keyed by name, used by dispatch + reconnect.
     pub(crate) cron_state: crate::cron::CronState,
+    /// Ack-reliability hot layer: per-consumer deferred-ack tracking.
+    pub(crate) ackrel: Arc<crate::ackrel::AckRelay>,
+    /// Optional cold-tier (SQLite) backing for deferred acks. `None` unless
+    /// the caller opens a store — see `ack-persistence` feature.
+    #[cfg(feature = "ack-persistence")]
+    pub(crate) cold: Option<Arc<tokio::sync::Mutex<crate::ackrel::cold::ColdStore>>>,
 }
 
 impl Inner {

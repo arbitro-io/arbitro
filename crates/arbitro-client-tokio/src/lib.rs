@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod service;
 pub mod workflow;
 
+pub(crate) mod ackrel;
 pub(crate) mod conn;
 pub(crate) mod consume;
 pub(crate) mod manage;

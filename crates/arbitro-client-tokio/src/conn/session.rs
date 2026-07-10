@@ -15,7 +15,7 @@ use arbitro_proto::v2::ingress::hello::Role;
 use crate::conn::reconnect::Backoff;
 use crate::error::ClientError;
 use crate::state::Inner;
-use crate::transport::encode::encode_hello_v2;
+use crate::transport::encode::{encode_ack_state_req_v2, encode_hello_v2};
 use crate::transport::frame::{WriteFrame, WriteLease, WRITE_QUEUE_CAP};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
@@ -86,6 +86,7 @@ pub(crate) async fn spawn_connection(
     write_handshake(&mut w).await?;
     // Replay any subscriptions (none on first connect — future-proofs reconnect).
     replay_subscriptions(&inner, &mut session_replay_lease);
+    send_ack_state_reqs(&inner, &mut session_replay_lease);
     // Re-register any active cron jobs after reconnect.
     crate::cron::replay_crons(&inner);
 
@@ -141,6 +142,7 @@ pub(crate) async fn spawn_connection(
                         }
                         // Replay subscriptions + crons before the new session starts.
                         replay_subscriptions(&inner, &mut session_replay_lease);
+                        send_ack_state_reqs(&inner, &mut session_replay_lease);
                         crate::cron::replay_crons(&inner);
                         rh = Some(r);
                         wh = Some(w);
@@ -178,6 +180,39 @@ fn replay_subscriptions(inner: &Inner, lease: &mut WriteLease) {
     inner.last_pong_ns.store(Inner::now_ns(), Ordering::Relaxed);
     for sub_body in inner.subscriptions.all_sub_bodies() {
         let _ = lease.try_send(WriteFrame::Mono(sub_body));
+    }
+}
+
+/// Ack-reliability: request the broker's cursor/retention state for every
+/// consumer with outstanding deferred acks. Pipelined, fire-and-forget —
+/// the `AckStateRep` handler in `transport::reader` drives the follow-up
+/// `AckBatchFrame` flush.
+fn send_ack_state_reqs(inner: &Inner, lease: &mut WriteLease) {
+    let consumers = inner.ackrel.active_consumers();
+    #[cfg(feature = "ack-persistence")]
+    let mut consumers = consumers;
+    #[cfg(feature = "ack-persistence")]
+    {
+        if let Some(cold) = &inner.cold {
+            if let Ok(store) = cold.try_lock() {
+                if let Ok(summaries) = store.load_summaries() {
+                    for s in summaries {
+                        let pair = (s.consumer_id, s.generation);
+                        if !consumers.contains(&pair) {
+                            consumers.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (consumer_id, generation) in consumers {
+        let seq = inner.seq_alloc.next();
+        let _ = lease.try_send(WriteFrame::Mono(encode_ack_state_req_v2(
+            seq,
+            consumer_id,
+            generation,
+        )));
     }
 }
 

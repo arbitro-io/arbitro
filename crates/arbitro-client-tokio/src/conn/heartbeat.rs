@@ -117,6 +117,9 @@ mod tests {
             metrics: Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
+            ackrel: Arc::new(crate::ackrel::AckRelay::new()),
+            #[cfg(feature = "ack-persistence")]
+            cold: None,
         });
 
         // Should return immediately because cancel is already fired.

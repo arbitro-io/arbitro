@@ -1,12 +1,22 @@
 //! Delivered message type and fire-and-forget acknowledgement / nack.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
 use crate::error::ClientError;
 use crate::state::Inner;
+
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Magic byte prefix for encoded reply_to addresses that carry a stream_id.
 /// Format: `[0xFF][stream_id: 4B LE][subject bytes]`
@@ -164,15 +174,24 @@ impl Message {
 
     /// Fire-and-forget acknowledgement.
     ///
-    /// Enqueues an `AckCmd` into the ack-batcher task.  Silently drops if
-    /// the internal channel is full or the client has disconnected.
+    /// Enqueues an `AckCmd` into the ack-batcher task. If the channel is
+    /// full or the batcher is gone, the ack is not dropped — it is
+    /// recorded in the ack-reliability hot layer and flushed by the
+    /// batcher's periodic sweep (or replayed after reconnect).
     #[inline]
     pub fn ack(&self) {
-        let _ = self.ack_tx.try_send(AckCmd {
+        let cmd = AckCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
             subject_hash: self.subject_hash,
-        });
+        };
+        if self.ack_tx.try_send(cmd).is_err() {
+            let generation = self.inner.ackrel.generation_of(self.consumer_id);
+            self.inner
+                .ackrel
+                .record_deferred(self.consumer_id, generation, self.seq, now_ms());
+            self.inner.metrics.acks_deferred.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Fire-and-forget negative acknowledgement (immediate requeue).

@@ -11,6 +11,7 @@
 //! Hot paths: `PubFrame`, `BatchPubFrame`, `AckFrame`, `BatchAckFrame`.
 
 pub mod ack_frame;
+pub mod ack_state;
 pub mod batch_pub_frame;
 pub mod hello;
 pub mod nack_frame;
@@ -23,6 +24,11 @@ pub mod pub_with_reply;
 pub use ack_frame::{
     AckBody, AckFrame, BatchAckBody, BatchAckEntry, BatchAckFrame, ACK_BODY_SIZE,
     BATCH_ACK_BODY_FIXED, BATCH_ACK_ENTRY_SIZE,
+};
+pub use ack_state::{
+    AckBatchBody, AckBatchFrame, AckStateReqBody, AckStateReqFrame, ACK_BATCH_BODY_FIXED,
+    ACK_BATCH_MAX_SEQS, ACK_STATE_REQ_BODY_SIZE, ACK_STATUS_BATCH_TOO_LARGE,
+    ACK_STATUS_CONSUMER_UNKNOWN, ACK_STATUS_GENERATION_MISMATCH, ACK_STATUS_OK,
 };
 pub use batch_pub_frame::{
     BatchPubBody, BatchPubEntryHeader, BatchPubEntryView, BatchPubFrame, BatchPubIter,

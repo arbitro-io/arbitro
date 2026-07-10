@@ -8,22 +8,26 @@
 //! - `Pong`                           → update `last_pong_ns` heartbeat timestamp.
 //! - everything else                  → silently drop.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use zerocopy::FromBytes;
 
 use arbitro_proto::action::Action;
+use arbitro_proto::v2::egress::ack_state::{AckBatchRespFrame, AckStateRepFrame};
 use arbitro_proto::v2::egress::rep_frame::RepErrFrame;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 
 use crate::consume::demux;
 use crate::error::ClientError;
 use crate::state::Inner;
+use crate::transport::encode::encode_ack_batch_v2;
+use crate::transport::frame::WriteFrame;
 
 /// Initial read buffer capacity.
 const READ_BUF_INITIAL: usize = 64 * 1024;
@@ -149,8 +153,122 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
         return;
     }
 
+    // ── Ack-reliability ────────────────────────────────────────────
+    if action == Action::AckStateRep.as_u16() {
+        dispatch_ack_state_rep(inner, &frame);
+        return;
+    }
+
+    if action == Action::AckBatchResp.as_u16() {
+        dispatch_ack_batch_resp(inner, &frame);
+        return;
+    }
+
     // All other actions are silently dropped (system frames, etc.)
     let _ = action;
+}
+
+/// `AckStateRep`: the broker's authoritative cursor/retention snapshot for
+/// one consumer, sent in response to `AckStateReq` (reconnect replay).
+///
+/// A generation mismatch means our local hot/cold state is stale relative
+/// to the broker (e.g. consumer was recreated) — wipe it wholesale rather
+/// than try to reconcile entry-by-entry. Otherwise, trim the deferred set
+/// to the broker's confirmed/retained range and flush what survives.
+fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
+    let Ok(rep) = AckStateRepFrame::ref_from_bytes(&frame[..AckStateRepFrame::WIRE_SIZE]) else {
+        return;
+    };
+    let consumer_id = rep.body.consumer_id.get();
+    let generation = rep.body.generation.get();
+    let cursor = rep.body.cursor.get();
+    let low_seq = rep.body.low_seq.get();
+    let high_seq = rep.body.high_seq.get();
+
+    if generation != inner.ackrel.generation_of(consumer_id) {
+        // `ensure` on a new generation replaces the slot wholesale — the
+        // purge invariant for a session/consumer change.
+        inner.ackrel.ensure(consumer_id, generation);
+        #[cfg(feature = "ack-persistence")]
+        if let Some(cold) = inner.cold.clone() {
+            tokio::task::spawn_blocking(move || {
+                let mut store = cold.blocking_lock();
+                let _ = store.purge_generation(consumer_id);
+            });
+        }
+        return;
+    }
+
+    inner.ackrel.purge_up_to(consumer_id, cursor);
+    // Below the broker's retention floor — will never be confirmable.
+    inner.ackrel.purge_up_to(consumer_id, low_seq.saturating_sub(1));
+
+    let pending = inner.ackrel.drain_ascending(consumer_id, usize::MAX);
+    if let Some(&max_seq) = pending.last() {
+        if max_seq > high_seq {
+            inner.metrics.suspicious_seq_over_high.fetch_add(1, Ordering::Relaxed);
+            warn_rate_limited(consumer_id, max_seq, high_seq);
+        }
+    }
+    for chunk in pending.chunks(1000) {
+        let seq = inner.seq_alloc.next();
+        let out = WriteFrame::Mono(encode_ack_batch_v2(seq, consumer_id, generation, 0, chunk));
+        let _ = crate::publish::enqueue(&inner.pool, out);
+    }
+}
+
+/// `AckBatchResp`: broker confirms cumulative ack up to `new_cursor` for one
+/// consumer — purge the confirmed range from the hot (and, when enabled,
+/// cold) tier. `still_pending` is informational only for now.
+fn dispatch_ack_batch_resp(inner: &Arc<Inner>, frame: &Bytes) {
+    let Ok(rep) = AckBatchRespFrame::ref_from_bytes(&frame[..AckBatchRespFrame::WIRE_SIZE]) else {
+        return;
+    };
+    let consumer_id = rep.body.consumer_id.get();
+    let new_cursor = rep.body.new_cursor.get();
+
+    let purged = inner.ackrel.purge_up_to(consumer_id, new_cursor);
+    inner.metrics.acks_confirmed.fetch_add(purged as u64, Ordering::Relaxed);
+
+    #[cfg(feature = "ack-persistence")]
+    if let Some(cold) = inner.cold.clone() {
+        let generation = inner.ackrel.generation_of(consumer_id);
+        tokio::task::spawn_blocking(move || {
+            let mut store = cold.blocking_lock();
+            // Best-effort summary: the hot tier doesn't expose per-consumer
+            // min/max/count, so this purge writes a placeholder — safe
+            // because `consumer_state` is only a startup-preload hint and
+            // gets fully reconciled by the next `write_batch`/`ensure` pass.
+            let summary = crate::ackrel::cold::StateSummary {
+                consumer_id,
+                generation,
+                count: 0,
+                min_seq: 0,
+                max_seq: 0,
+            };
+            let _ = store.purge_up_to(consumer_id, generation, new_cursor, summary);
+        });
+    }
+}
+
+/// Rate-limits the "deferred ack above broker high-water mark" warning to
+/// at most once per 5s across all consumers — this fires on a protocol
+/// anomaly, not per-message, but is still on the reader hot path.
+static LAST_SUSPICIOUS_WARN_NS: AtomicU64 = AtomicU64::new(0);
+const SUSPICIOUS_WARN_INTERVAL_NS: u64 = 5_000_000_000;
+
+fn warn_rate_limited(consumer_id: u32, seq: u64, high_seq: u64) {
+    let now = now_ns();
+    let last = LAST_SUSPICIOUS_WARN_NS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < SUSPICIOUS_WARN_INTERVAL_NS {
+        return;
+    }
+    if LAST_SUSPICIOUS_WARN_NS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        warn!(consumer_id, seq, high_seq, "deferred ack seq above broker high-water mark");
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +302,9 @@ mod tests {
             metrics: Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
+            ackrel: Arc::new(crate::ackrel::AckRelay::new()),
+            #[cfg(feature = "ack-persistence")]
+            cold: None,
         })
     }
 

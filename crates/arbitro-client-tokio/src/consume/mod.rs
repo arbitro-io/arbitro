@@ -2,17 +2,20 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::consume::message::{AckCmd, Message, NackCmd};
 use crate::error::ClientError;
 use crate::state::Inner;
 use crate::transport::encode::{
-    encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2,
+    encode_ack_batch_v2, encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2,
 };
 use crate::transport::frame::{WriteFrame, WriteLease, INLINE_CAP};
 
@@ -119,14 +122,31 @@ pub(crate) fn subscribe_async(
 
 // ── ack_batcher_task ──────────────────────────────────────────────────────────
 
+#[inline]
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How often the deferred-ack sweep tick fires.
+const SWEEP_TICK: Duration = Duration::from_millis(100);
+/// TTL-expiry check runs once every this many ticks (~60s at `SWEEP_TICK`).
+const EXPIRE_EVERY_TICKS: u32 = 600;
+
 /// Drains `AckCmd`s from `Message::ack()` calls, batches them, and
-/// enqueues `AckFrame` / `BatchAckFrame` via a dedicated lease.
+/// enqueues `AckFrame` / `BatchAckFrame` via a dedicated lease. Also
+/// services the ack-reliability hot layer: deferred acks (recorded when
+/// the channel above was full) are flushed on a timer and TTL-expired
+/// periodically.
 ///
 /// Runs for the **Client lifetime** (not per-session), so acks enqueued
 /// during a reconnect window are preserved in the ring and flushed once
 /// the new writer task starts.
 ///
-/// Uses `recv().await` + `try_recv()` drain — zero spin loop.
+/// Uses `recv().await` + `try_recv()` drain plus a `tokio::time::interval`
+/// tick — zero spin loop.
 pub(crate) async fn ack_batcher_task(
     mut rx: mpsc::Receiver<AckCmd>,
     inner: Arc<Inner>,
@@ -134,6 +154,10 @@ pub(crate) async fn ack_batcher_task(
     mut lease: WriteLease,
 ) {
     use arbitro_proto::v2::ingress::ack_frame::AckFrame;
+
+    let mut sweep = tokio::time::interval(SWEEP_TICK);
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks_since_expire: u32 = 0;
 
     loop {
         tokio::select! {
@@ -172,6 +196,32 @@ pub(crate) async fn ack_batcher_task(
                         WriteFrame::Mono(encode_batch_ack_v2(seq, consumer_id, &entries))
                     };
                     let _ = lease.try_send(frame);
+                }
+            }
+            _ = sweep.tick() => {
+                // Flush every consumer with outstanding deferred acks. Not
+                // removed from the hot set here — only `AckBatchResp`
+                // (transport::reader dispatch) purges on broker confirm.
+                for (consumer_id, generation) in inner.ackrel.active_consumers() {
+                    let seqs = inner.ackrel.drain_ascending(consumer_id, 1000);
+                    if seqs.is_empty() {
+                        continue;
+                    }
+                    let seq = inner.seq_alloc.next();
+                    let frame = WriteFrame::Mono(encode_ack_batch_v2(seq, consumer_id, generation, 0, &seqs));
+                    let _ = lease.try_send(frame);
+                }
+
+                ticks_since_expire += 1;
+                if ticks_since_expire >= EXPIRE_EVERY_TICKS {
+                    ticks_since_expire = 0;
+                    let now = now_ms();
+                    let cutoff = now.saturating_sub(inner.cfg.ack_pending_ttl.as_millis() as u64);
+                    let expired = inner.ackrel.expire(cutoff, now);
+                    if expired > 0 {
+                        inner.metrics.acks_expired.fetch_add(expired as u64, Ordering::Relaxed);
+                        warn!(expired, "ack-batcher: TTL-expired deferred acks dropped unpersisted");
+                    }
                 }
             }
         }

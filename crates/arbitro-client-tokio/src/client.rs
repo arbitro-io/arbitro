@@ -72,6 +72,9 @@ impl Client {
             metrics: Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
+            ackrel: Arc::new(crate::ackrel::AckRelay::new()),
+            #[cfg(feature = "ack-persistence")]
+            cold: None,
         });
 
         // Dedicated leases for the long-lived background tasks — carved out
@@ -734,6 +737,24 @@ impl Client {
     #[inline]
     pub fn metrics_snapshot(&self) -> crate::metrics::ClientMetricsSnapshot {
         self.inner.metrics.snapshot()
+    }
+
+    /// Total deferred-ack entries currently buffered in the client-side
+    /// ack-reliability hot layer, across all consumers.
+    #[inline]
+    pub fn pending_hot_count(&self) -> u64 {
+        self.inner.ackrel.hot_count()
+    }
+
+    /// Age in milliseconds of the oldest deferred ack still buffered in
+    /// the hot layer. `0` if nothing is pending.
+    #[inline]
+    pub fn oldest_pending_age_ms(&self) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.inner.ackrel.oldest_pending_age_ms(now_ms)
     }
 
     // ── Cron scheduling ────────────────────────────────────────────────

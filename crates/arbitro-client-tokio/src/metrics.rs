@@ -28,6 +28,18 @@ pub struct ClientMetrics {
     // ── Ack / Nack ──────────────────────────────────────────────────
     pub acks_sent: AtomicU64,
     pub nacks_sent: AtomicU64,
+    /// Acks buffered in the client-side hot layer, not yet on the wire.
+    pub acks_deferred: AtomicU64,
+    /// Deferred acks that made it to broker-confirmed (cold) storage.
+    pub acks_persisted_cold: AtomicU64,
+    /// Deferred acks dropped by the TTL sweep before broker confirm.
+    pub acks_expired: AtomicU64,
+    /// Acks the broker confirmed via `AckBatchResp`.
+    pub acks_confirmed: AtomicU64,
+    /// Redeliveries caught by the seen-cache before the user callback ran.
+    pub dedup_hits: AtomicU64,
+    /// Deliveries with `seq` above the consumer's known high-water mark.
+    pub suspicious_seq_over_high: AtomicU64,
 
     // ── Manage (CRUD requests) ──────────────────────────────────────
     pub manage_requests_sent: AtomicU64,
@@ -49,6 +61,12 @@ impl ClientMetrics {
             active_subscriptions: AtomicUsize::new(0),
             acks_sent: AtomicU64::new(0),
             nacks_sent: AtomicU64::new(0),
+            acks_deferred: AtomicU64::new(0),
+            acks_persisted_cold: AtomicU64::new(0),
+            acks_expired: AtomicU64::new(0),
+            acks_confirmed: AtomicU64::new(0),
+            dedup_hits: AtomicU64::new(0),
+            suspicious_seq_over_high: AtomicU64::new(0),
             manage_requests_sent: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
             last_pong_rtt_ns: AtomicU64::new(0),
@@ -66,6 +84,12 @@ impl ClientMetrics {
             active_subscriptions: self.active_subscriptions.load(Ordering::Relaxed),
             acks_sent: l(&self.acks_sent),
             nacks_sent: l(&self.nacks_sent),
+            acks_deferred: l(&self.acks_deferred),
+            acks_persisted_cold: l(&self.acks_persisted_cold),
+            acks_expired: l(&self.acks_expired),
+            acks_confirmed: l(&self.acks_confirmed),
+            dedup_hits: l(&self.dedup_hits),
+            suspicious_seq_over_high: l(&self.suspicious_seq_over_high),
             manage_requests_sent: l(&self.manage_requests_sent),
             reconnects: l(&self.reconnects),
             last_pong_rtt_ns: l(&self.last_pong_rtt_ns),
@@ -84,6 +108,12 @@ pub struct ClientMetricsSnapshot {
     pub active_subscriptions: usize,
     pub acks_sent: u64,
     pub nacks_sent: u64,
+    pub acks_deferred: u64,
+    pub acks_persisted_cold: u64,
+    pub acks_expired: u64,
+    pub acks_confirmed: u64,
+    pub dedup_hits: u64,
+    pub suspicious_seq_over_high: u64,
     pub manage_requests_sent: u64,
     pub reconnects: u64,
     pub last_pong_rtt_ns: u64,

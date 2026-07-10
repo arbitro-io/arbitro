@@ -34,6 +34,10 @@ use arbitro_proto::action::Action;
 use arbitro_proto::error::ErrorCode;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
+use arbitro_proto::v2::ingress::ack_state::{
+    AckBatchFrame, AckStateReqFrame, ACK_BATCH_MAX_SEQS, ACK_STATUS_BATCH_TOO_LARGE,
+    ACK_STATUS_CONSUMER_UNKNOWN, ACK_STATUS_OK,
+};
 use arbitro_proto::v2::ingress::batch_pub_frame::BatchPubFrame;
 use arbitro_proto::v2::ingress::nack_frame::{BatchNackFrame, NackFrame};
 use arbitro_proto::v2::ingress::pub_delayed_frame::PubDelayedFrame;
@@ -51,7 +55,9 @@ use zerocopy::IntoBytes;
 #[allow(unused_imports)]
 use crate::cluster::ClusterState;
 
-use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
+use crate::common::reply_v2::{
+    send_ack_batch_resp_v2, send_ack_state_rep_v2, send_error_v2, send_rep_ok_v2,
+};
 use crate::shard::router::ShardRouter;
 use crate::transport::ConnectionRegistry;
 
@@ -120,6 +126,8 @@ pub async fn dispatch_frame_v2(
         Action::Ack => v2_ack(conn_id, &frame, server).await,
         Action::AckTerm => v2_ack_term(conn_id, &frame, server).await,
         Action::BatchAck => v2_batch_ack(conn_id, &frame, server).await,
+        Action::AckStateReq => v2_ack_state(conn_id, req_seq, &frame, server, registry).await,
+        Action::AckBatch => v2_ack_batch(conn_id, req_seq, &frame, server, registry).await,
         Action::Nack => v2_nack(conn_id, &frame, server).await,
         Action::BatchNack => v2_batch_nack(conn_id, &frame, server).await,
         Action::Subscribe => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
@@ -807,6 +815,151 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         });
     }
     let _ = shard.ack(consumer_id, conn_id, entries).await;
+}
+
+/// AckStateReq — read-only cursor/retention query, no mutation.
+async fn v2_ack_state(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match AckStateReqFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    // Informational today — a later watermark task will compare this
+    // against the server's generation to detect a stale client cursor.
+    let _req_gen = f.body.generation.get();
+    let seq_stream = match server.names().consumer_stream(consumer_id) {
+        Some(s) => s,
+        None => {
+            send_ack_state_rep_v2(
+                registry,
+                conn_id,
+                req_seq,
+                consumer_id.0,
+                0,
+                0,
+                0,
+                0,
+                ACK_STATUS_CONSUMER_UNKNOWN,
+            );
+            return;
+        }
+    };
+    let cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
+    let generation = server.names().consumer_generation(consumer_id).unwrap_or(0);
+    let info = server.store_for(seq_stream).lock().info();
+    send_ack_state_rep_v2(
+        registry,
+        conn_id,
+        req_seq,
+        consumer_id.0,
+        generation,
+        cursor,
+        info.first_seq,
+        info.last_seq,
+        ACK_STATUS_OK,
+    );
+}
+
+/// AckBatch — request/reply batch ack with per-batch outcome counters.
+/// Reuses `shard.ack`'s full engine execute+cursor+persistence path;
+/// pre-counts accepted/ignored/below_retention before dispatch since
+/// `shard.ack` doesn't report per-entry outcomes.
+async fn v2_ack_batch(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    let f = match AckBatchFrame::ref_from_bytes(&frame[..]) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let consumer_id = ConsumerId(f.body.consumer_id.get());
+    // B2: bounds-checked seqs view — silently drop the frame if the
+    // count field is lying, mirroring v2_batch_ack.
+    let Some(seqs) = f.try_seqs() else { return };
+
+    if seqs.len() > ACK_BATCH_MAX_SEQS {
+        send_ack_batch_resp_v2(
+            registry,
+            conn_id,
+            req_seq,
+            consumer_id.0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            ACK_STATUS_BATCH_TOO_LARGE,
+        );
+        return;
+    }
+
+    let seq_stream = match server.names().consumer_stream(consumer_id) {
+        Some(s) => s,
+        None => {
+            send_ack_batch_resp_v2(
+                registry,
+                conn_id,
+                req_seq,
+                consumer_id.0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                ACK_STATUS_CONSUMER_UNKNOWN,
+            );
+            return;
+        }
+    };
+
+    let cursor_before = server.names().consumer_cursor(consumer_id).unwrap_or(0);
+    let low = server.store_for(seq_stream).lock().info().first_seq;
+
+    let mut accepted_entries: Vec<AckEntry> = Vec::with_capacity(seqs.len());
+    let mut accepted: u32 = 0;
+    let mut ignored: u32 = 0;
+    let mut below_retention: u32 = 0;
+    for s in seqs {
+        let seq = s.get();
+        if seq <= cursor_before {
+            ignored += 1;
+        } else if seq < low {
+            below_retention += 1;
+        } else {
+            accepted += 1;
+            accepted_entries.push(AckEntry {
+                stream_id: seq_stream,
+                seq,
+            });
+        }
+    }
+
+    let shard = server.shard_for(seq_stream);
+    let _ = shard.ack(consumer_id, conn_id, accepted_entries).await;
+
+    let new_cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
+    // still_pending: no watermark tracked yet — later server task.
+    send_ack_batch_resp_v2(
+        registry,
+        conn_id,
+        req_seq,
+        consumer_id.0,
+        new_cursor,
+        accepted,
+        ignored,
+        below_retention,
+        0,
+        ACK_STATUS_OK,
+    );
 }
 
 /// Single-entry NACK — fire-and-forget, no reply. Always immediate (delay=0).

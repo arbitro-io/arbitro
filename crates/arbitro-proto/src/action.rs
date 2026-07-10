@@ -100,6 +100,16 @@ pub enum Action {
     CronAck = 0x0705,
 
     // 0x09xx — Reserved (workflow orchestration removed — moved to client-side library).
+
+    // 0x0Axx — Ack reliability
+    /// Client→server: request the durable ack cursor state for a consumer.
+    AckStateReq = 0x0A01,
+    /// Server→client: reply to `AckStateReq` with cursor + retention bounds.
+    AckStateRep = 0x0A02,
+    /// Client→server: batch of sequences to ack, checked against `generation`.
+    AckBatch = 0x0A03,
+    /// Server→client: reply to `AckBatch` with per-batch outcome counters.
+    AckBatchResp = 0x0A04,
 }
 
 impl Action {
@@ -160,6 +170,11 @@ impl Action {
             0x0705 => Some(Self::CronAck),
 
             // 0x0901..=0x0908 reserved (workflow removed).
+
+            0x0A01 => Some(Self::AckStateReq),
+            0x0A02 => Some(Self::AckStateRep),
+            0x0A03 => Some(Self::AckBatch),
+            0x0A04 => Some(Self::AckBatchResp),
 
             _ => None,
         }

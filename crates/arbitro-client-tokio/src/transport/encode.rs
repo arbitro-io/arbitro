@@ -16,6 +16,7 @@ use arbitro_proto::v2::cold::{
     SubjectLimit as ColdSubjectLimit, Unsubscribe,
 };
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
+use arbitro_proto::v2::ingress::ack_state::{AckBatchFrame, AckStateReqFrame};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
 use arbitro_proto::v2::ingress::nack_frame::{BatchNackFrame, NackFrame};
 use arbitro_proto::v2::ingress::pub_with_reply::PubWithReplyFrame;
@@ -316,6 +317,29 @@ pub(crate) fn encode_batch_ack_v2(seq: u64, consumer_id: u32, entries: &[(u64, u
     let size = BatchAckFrame::wire_size(entries.len());
     let mut buf = vec![0u8; size];
     BatchAckFrame::encode_into(&mut buf, seq, consumer_id, entries);
+    Bytes::from(buf)
+}
+
+/// Ack-reliability: request the broker's cursor/retention state for one
+/// consumer. Sent on reconnect for every consumer with outstanding
+/// deferred acks (see `conn::session::send_ack_state_reqs`).
+#[inline]
+pub(crate) fn encode_ack_state_req_v2(seq: u64, consumer_id: u32, generation: u32) -> Bytes {
+    let f = AckStateReqFrame::new(seq, consumer_id, generation);
+    Bytes::copy_from_slice(f.as_bytes())
+}
+
+/// Ack-reliability: flush a batch of deferred `seq`s for one consumer.
+pub(crate) fn encode_ack_batch_v2(
+    seq: u64,
+    consumer_id: u32,
+    generation: u32,
+    flags: u32,
+    seqs: &[u64],
+) -> Bytes {
+    let size = AckBatchFrame::wire_size(seqs.len());
+    let mut buf = vec![0u8; size];
+    AckBatchFrame::encode_into(&mut buf, seq, consumer_id, generation, flags, seqs);
     Bytes::from(buf)
 }
 
