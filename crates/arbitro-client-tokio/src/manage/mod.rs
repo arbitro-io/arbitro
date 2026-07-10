@@ -11,6 +11,8 @@
 //! (StreamInfo etc.) live in the engine crate and can be applied by
 //! callers as needed.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 pub use arbitro_proto::v2::manager::SubjectLimit;
@@ -25,17 +27,20 @@ use crate::transport::encode::{
     encode_list_consumers_v2, encode_list_streams_v2, encode_purge_stream_v2,
 };
 use crate::transport::frame::WriteFrame;
-use crate::transport::frame::WriteProducer;
+use crate::transport::frame::WritePool;
 
 #[inline]
 async fn request(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq: u64,
     body: Bytes,
 ) -> Result<Bytes, ClientError> {
     let rx = pending.register(seq);
-    crate::publish::enqueue(tx, WriteFrame::Mono(body))?;
+    if let Err(e) = crate::publish::enqueue(pool, WriteFrame::Mono(body)) {
+        pending.cancel(seq); // leak-guard: see F3
+        return Err(e);
+    }
     rx.recv_async()
         .await
         .map_err(|_| ClientError::ChannelClosed)
@@ -44,7 +49,7 @@ async fn request(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_stream(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
@@ -72,41 +77,41 @@ pub(crate) async fn create_stream(
         discard,
         idempotency_window_ms,
     );
-    request(tx, pending, seq, buf).await
+    request(pool, pending, seq, buf).await
 }
 
 pub(crate) async fn delete_stream(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_delete_stream_v2(seq, name)).await
+    request(pool, pending, seq, encode_delete_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn get_stream(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_get_stream_v2(seq, name)).await
+    request(pool, pending, seq, encode_get_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn purge_stream(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_purge_stream_v2(seq, name)).await
+    request(pool, pending, seq, encode_purge_stream_v2(seq, name)).await
 }
 
 pub(crate) async fn drain_subject(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
@@ -114,7 +119,7 @@ pub(crate) async fn drain_subject(
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(
-        tx,
+        pool,
         pending,
         seq,
         encode_drain_subject_v2(seq, name, subject),
@@ -123,30 +128,30 @@ pub(crate) async fn drain_subject(
 }
 
 pub(crate) async fn delete_message(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     name: &[u8],
     msg_seq: u64,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_delete_message_v2(seq, name, msg_seq)).await
+    request(pool, pending, seq, encode_delete_message_v2(seq, name, msg_seq)).await
 }
 
 pub(crate) async fn list_streams(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     offset: u32,
     limit: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_list_streams_v2(seq, offset, limit)).await
+    request(pool, pending, seq, encode_list_streams_v2(seq, offset, limit)).await
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_consumer(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -176,18 +181,18 @@ pub(crate) async fn create_consumer(
         start_seq,
         subject_limits,
     );
-    request(tx, pending, seq, buf).await
+    request(pool, pending, seq, buf).await
 }
 
 pub(crate) async fn delete_consumer(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(
-        tx,
+        pool,
         pending,
         seq,
         encode_delete_consumer_v2(seq, consumer_id),
@@ -196,17 +201,17 @@ pub(crate) async fn delete_consumer(
 }
 
 pub(crate) async fn consumer_stats(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(tx, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
+    request(pool, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
 }
 
 pub(crate) async fn get_consumer(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -214,7 +219,7 @@ pub(crate) async fn get_consumer(
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(
-        tx,
+        pool,
         pending,
         seq,
         encode_get_consumer_v2(seq, stream_id, name),
@@ -223,7 +228,7 @@ pub(crate) async fn get_consumer(
 }
 
 pub(crate) async fn list_consumers(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -232,7 +237,7 @@ pub(crate) async fn list_consumers(
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(
-        tx,
+        pool,
         pending,
         seq,
         encode_list_consumers_v2(seq, stream_id, offset, limit),

@@ -230,12 +230,18 @@ impl ShardRouter {
             let shard_has_idempotency = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Notification ring: drain → command (deliveries + dead connections).
-            // SPSC Ring — drain is the sole producer, command task is the sole consumer.
-            let notify_ring = Arc::new(NotifyRing::new());
+            // SPSC — drain owns the single producer, command task owns the consumer.
+            // Modelled as Mpsc(m=1) so the consumer's async recv future is
+            // explicitly `Send` (see rust-lang/rust#100013).
+            let (mut notify_producers, notify_rx, _notify_shutdown) = NotifyRing::new(1);
+            let notify_tx = notify_producers
+                .pop()
+                .expect("NotifyRing::new(1) yields exactly one producer");
 
             // Drain-event ring: command → drain (ack-driven subject-inflight
-            // decrements + consumer-removed cleanup). SPSC.
-            let drain_evt_ring = Arc::new(DrainEventRing::new());
+            // decrements + consumer-removed cleanup). SPSC — command owns
+            // the producer, drain owns the consumer.
+            let (drain_evt_tx, drain_evt_rx) = DrainEventRing::new();
 
             // ── Drain thread — pure: gate.acquire → drain_cycle ──────
             let drain_worker = DrainWorker {
@@ -251,8 +257,8 @@ impl ShardRouter {
                 },
                 drain_scratch: super::drain::DrainScratch::new(),
                 running: Arc::clone(&running),
-                notify_ring: Arc::clone(&notify_ring),
-                drain_evt_rx: Arc::clone(&drain_evt_ring),
+                notify_ring: notify_tx,
+                drain_evt_rx,
                 consumer_subjects: Vec::new(),
                 silent_drops: Arc::clone(&silent_drops),
             };
@@ -275,8 +281,8 @@ impl ShardRouter {
                 registry: registry.clone(),
                 names: Arc::clone(&names),
                 rx,
-                notify_ring,
-                drain_evt_tx: drain_evt_ring,
+                notify_ring: notify_rx,
+                drain_evt_tx,
                 running: Arc::clone(&running),
                 flusher_config: FlusherConfig::default(),
                 accum_streams: std::collections::HashMap::with_hasher(

@@ -348,7 +348,16 @@ impl<T> SnapshotSwap<T> {
 /// SPSC notification ring: drain OS thread (producer) → command tokio task (consumer).
 /// Capacity is power-of-two (8192 = 2^13). Drain uses `try_send` (non-blocking),
 /// command uses `recv_async` (async) + `try_recv` (batch drain).
-pub type NotifyRing = arbitro_kit::stream::Ring<DrainNotification, 8192, arbitro_kit::NotifyWaiter>;
+/// SPSC-shaped fan-in channel — modelled with an Mpsc(m=1) so the consumer
+/// exposes `recv_async_send`, whose future is explicitly `Send + 'a`.
+/// The plain `Ring<…, NotifyWaiter>` consumer's `recv_async` future
+/// hits rust-lang/rust#100013 ("Send is not general enough") when awaited
+/// from a task spawned via `tokio::spawn`.
+pub type NotifyRing = arbitro_kit::route::Mpsc<DrainNotification, 8192, arbitro_kit::NotifyWaiter>;
+pub type NotifyProducer =
+    arbitro_kit::route::MpscProducer<DrainNotification, 8192, arbitro_kit::NotifyWaiter>;
+pub type NotifyConsumer =
+    arbitro_kit::route::MpscConsumer<DrainNotification, 8192, arbitro_kit::NotifyWaiter>;
 
 /// Messages from drain thread → command thread.
 ///

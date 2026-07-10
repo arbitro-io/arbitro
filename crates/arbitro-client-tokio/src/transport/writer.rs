@@ -26,7 +26,7 @@ mod tests {
 
         let (mut producers, mut consumer, _shutdown) =
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
-        let producer = producers.remove(0);
+        let mut producer = producers.remove(0);
 
         // Enqueue 3 fixed payloads (pad inline arrays with zeros after content).
         let chunks: &[&[u8]] = &[b"aaa", b"bbbbb", b"cc"];

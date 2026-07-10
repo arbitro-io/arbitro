@@ -14,7 +14,7 @@ use crate::state::Inner;
 use crate::transport::encode::{
     encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2,
 };
-use crate::transport::frame::{WriteFrame, INLINE_CAP};
+use crate::transport::frame::{WriteFrame, WriteLease, INLINE_CAP};
 
 pub mod demux;
 pub mod message;
@@ -56,16 +56,10 @@ impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
         self.inner.subscriptions.remove(self.consumer_id);
         // Fire-and-forget Unsubscribe to the broker.
-        // Lock held only for `try_send` (nanoseconds, no await).
-        // Silently dropped if the channel is full or session is torn down.
+        // Silently dropped if the pool is exhausted, full, or torn down.
         let seq = self.inner.seq_alloc.next();
         let frame = encode_unsub_v2(seq, self.consumer_id);
-        let _ = self
-            .inner
-            .admin_producer
-            .lock()
-            .unwrap()
-            .try_send(WriteFrame::Mono(frame));
+        let _ = crate::publish::enqueue(&self.inner.pool, WriteFrame::Mono(frame));
     }
 }
 
@@ -96,13 +90,8 @@ pub(crate) fn subscribe_async(
     // 2. Reserve a pending slot for the RepOk reply.
     let rx_pending = inner.pending.register(seq);
 
-    // 3. Enqueue the SubFrame via the admin producer (sync — no await).
-    let enqueue_result = inner
-        .admin_producer
-        .lock()
-        .unwrap()
-        .try_send(WriteFrame::Mono(sub_body))
-        .map_err(|_| ClientError::ChannelClosed);
+    // 3. Enqueue the SubFrame via a leased producer (sync — no await).
+    let enqueue_result = crate::publish::enqueue(&inner.pool, WriteFrame::Mono(sub_body));
 
     let inner2 = Arc::clone(&inner);
     async move {
@@ -131,7 +120,7 @@ pub(crate) fn subscribe_async(
 // ── ack_batcher_task ──────────────────────────────────────────────────────────
 
 /// Drains `AckCmd`s from `Message::ack()` calls, batches them, and
-/// enqueues `AckFrame` / `BatchAckFrame` via the admin producer.
+/// enqueues `AckFrame` / `BatchAckFrame` via a dedicated lease.
 ///
 /// Runs for the **Client lifetime** (not per-session), so acks enqueued
 /// during a reconnect window are preserved in the ring and flushed once
@@ -142,6 +131,7 @@ pub(crate) async fn ack_batcher_task(
     mut rx: mpsc::Receiver<AckCmd>,
     inner: Arc<Inner>,
     cancel: CancellationToken,
+    mut lease: WriteLease,
 ) {
     use arbitro_proto::v2::ingress::ack_frame::AckFrame;
 
@@ -161,8 +151,6 @@ pub(crate) async fn ack_batcher_task(
                 }
 
                 // Group by consumer_id — each consumer gets its own ack frame.
-                // Build the map first (no lock), then take the admin lock once
-                // for the entire emit loop (nanoseconds; no await inside).
                 let mut by_consumer: HashMap<u32, Vec<(u64, u32)>> = HashMap::new();
                 for cmd in &batch {
                     by_consumer
@@ -171,7 +159,6 @@ pub(crate) async fn ack_batcher_task(
                         .push((cmd.seq, cmd.subject_hash));
                 }
 
-                let admin = inner.admin_producer.lock().unwrap();
                 for (consumer_id, entries) in by_consumer {
                     let seq = inner.seq_alloc.next();
                     let frame = if entries.len() == 1 {
@@ -184,7 +171,7 @@ pub(crate) async fn ack_batcher_task(
                     } else {
                         WriteFrame::Mono(encode_batch_ack_v2(seq, consumer_id, &entries))
                     };
-                    let _ = admin.try_send(frame);
+                    let _ = lease.try_send(frame);
                 }
             }
         }
@@ -194,13 +181,14 @@ pub(crate) async fn ack_batcher_task(
 // ── nack_batcher_task ─────────────────────────────────────────────────────────
 
 /// Drains `NackCmd`s from `Message::nack()` calls, batches them, and
-/// enqueues `NackFrame` / `BatchNackFrame` via the admin producer.
+/// enqueues `NackFrame` / `BatchNackFrame` via a dedicated lease.
 ///
 /// Identical structure to `ack_batcher_task` — see its doc for rationale.
 pub(crate) async fn nack_batcher_task(
     mut rx: mpsc::Receiver<NackCmd>,
     inner: Arc<Inner>,
     cancel: CancellationToken,
+    mut lease: WriteLease,
 ) {
     use arbitro_proto::v2::ingress::nack_frame::NackFrame;
 
@@ -227,7 +215,6 @@ pub(crate) async fn nack_batcher_task(
                         .push((cmd.seq, cmd.subject_hash, cmd.delay_ms));
                 }
 
-                let admin = inner.admin_producer.lock().unwrap();
                 for (consumer_id, entries) in by_consumer {
                     let seq = inner.seq_alloc.next();
                     // Use single NackFrame only when no delay and single entry.
@@ -240,7 +227,7 @@ pub(crate) async fn nack_batcher_task(
                     } else {
                         WriteFrame::Mono(encode_batch_nack_v2(seq, consumer_id, &entries))
                     };
-                    let _ = admin.try_send(frame);
+                    let _ = lease.try_send(frame);
                 }
             }
         }

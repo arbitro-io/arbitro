@@ -40,8 +40,15 @@ const _: () = {
     // The assert is a reminder; rustc will error first if the enum grows.
 };
 
-/// Convenience alias used across publish/manage/session.
-pub(crate) type WriteProducer = arbitro_kit::route::MpscAsyncProducer<WriteFrame, WRITE_QUEUE_CAP>;
+/// Shared pool of write producers leased out to publish/manage callers and
+/// to the long-lived background tasks (heartbeat, ack/nack batchers,
+/// session replay).
+pub(crate) type WritePool =
+    arbitro_kit::route::MpscProducerPool<WriteFrame, WRITE_QUEUE_CAP, arbitro_kit::NotifyWaiter>;
+
+/// A single leased slot from [`WritePool`].
+pub(crate) type WriteLease =
+    arbitro_kit::route::MpscProducerLease<WriteFrame, WRITE_QUEUE_CAP, arbitro_kit::NotifyWaiter>;
 
 /// Work item enqueued by producers and drained by the single writer task.
 #[derive(Debug)]

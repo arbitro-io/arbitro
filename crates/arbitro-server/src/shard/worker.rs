@@ -29,10 +29,10 @@ use tokio::sync::mpsc;
 use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::consumer_subjects::ConsumerSubjects;
-use crate::shard::drain_events::{DrainEvent, DrainEventRing};
+use crate::shard::drain_events::DrainEvent;
 use crate::shard::router::SharedStore;
 use crate::shard::shared::{
-    DrainNotification, DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap,
+    DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap,
 };
 use crate::transport::ConnectionRegistry;
 
@@ -131,12 +131,12 @@ pub struct DrainWorker {
     pub(super) drain_scratch: super::drain::DrainScratch,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     /// Notifications to command thread (deliveries + dead connections).
-    /// SPSC Ring — drain is the sole producer, command task is the sole consumer.
-    pub(super) notify_ring: Arc<NotifyRing>,
+    /// SPSC — drain owns the sole producer half (this task).
+    pub(super) notify_ring: crate::shard::shared::NotifyProducer,
     /// Drain-event ring: command → drain (ack-driven subject inflight decs).
-    /// SPSC — drain is the sole consumer, command task is the sole producer.
+    /// SPSC — drain owns the sole consumer half (this task).
     /// Drained at the top of every drain cycle via non-blocking `try_recv`.
-    pub(super) drain_evt_rx: Arc<DrainEventRing>,
+    pub(super) drain_evt_rx: crate::shard::drain_events::DrainEventConsumer,
     /// Per-consumer subject inflight, indexed by `ConsumerId.raw()`. Slot
     /// is lazily allocated on first inc; reset to `None` on
     /// `DrainEvent::ConsumerRemoved`. Single-thread owned by drain — no
@@ -181,7 +181,7 @@ impl DrainWorker {
                 // delivery. This applies acks (subject inflight decs) and
                 // consumer removals so the upcoming dispatch sees current
                 // per-consumer state.
-                drain_event_ring(&self.drain_evt_rx, &mut self.consumer_subjects);
+                drain_event_ring(&mut self.drain_evt_rx, &mut self.consumer_subjects);
 
                 let now_ms = if self.drain_config.max_age_ms > 0 {
                     std::time::SystemTime::now()
@@ -228,7 +228,7 @@ impl DrainWorker {
                         &self.names,
                         &mut self.drain_scratch,
                         &mut self.consumer_subjects,
-                        &self.notify_ring,
+                        &mut self.notify_ring,
                         &self.silent_drops,
                         result,
                     ),
@@ -254,8 +254,11 @@ impl DrainWorker {
 /// subject inflight slots. Non-blocking; returns as soon as the ring is
 /// empty. Called at the top of every drain cycle.
 #[inline]
-fn drain_event_ring(rx: &DrainEventRing, consumer_subjects: &mut Vec<Option<ConsumerSubjects>>) {
-    while let Some(evt) = rx.try_recv() {
+fn drain_event_ring(
+    rx: &mut crate::shard::drain_events::DrainEventConsumer,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+) {
+    while let Ok(evt) = rx.try_recv() {
         match evt {
             DrainEvent::Ack {
                 consumer_id,
@@ -323,12 +326,13 @@ pub struct CommandWorker {
     pub(super) names: Arc<crate::common::NameRegistry>,
     pub(super) rx: mpsc::Receiver<ShardCommand>,
     /// Notifications from drain thread (deliveries + dead connections).
-    /// SPSC Ring shared with DrainWorker — command task is the sole consumer.
-    pub(super) notify_ring: Arc<NotifyRing>,
-    /// Drain-event ring shared with DrainWorker — command task is the
-    /// sole producer, drain thread is the sole consumer. Used to push
-    /// ack-driven subject inflight decrements + consumer cleanup events.
-    pub(super) drain_evt_tx: Arc<DrainEventRing>,
+    /// SPSC — command owns the sole consumer half (this task).
+    pub(super) notify_ring: crate::shard::shared::NotifyConsumer,
+    /// Drain-event ring shared with DrainWorker — command owns the sole
+    /// producer half (this task), drain thread is the sole consumer.
+    /// Used to push ack-driven subject inflight decrements + consumer
+    /// cleanup events.
+    pub(super) drain_evt_tx: crate::shard::drain_events::DrainEventProducer,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     // Accumulator
     pub(super) flusher_config: FlusherConfig,
@@ -502,7 +506,7 @@ impl CommandWorker {
                             None => return,
                         }
                     }
-                    n = self.notify_ring.recv_async_send() => {
+                    Ok(n) = self.notify_ring.recv_async_send() => {
                         self.handle_notification(n);
                     }
                     _ = tokio::time::sleep(timeout) => {
@@ -544,7 +548,7 @@ impl CommandWorker {
                             None => return,
                         }
                     }
-                    n = self.notify_ring.recv_async_send() => {
+                    Ok(n) = self.notify_ring.recv_async_send() => {
                         self.handle_notification(n);
                     }
                     _ = tokio::time::sleep(eviction_sleep) => {

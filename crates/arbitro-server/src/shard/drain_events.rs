@@ -36,7 +36,7 @@
 //! came from. We log it as a degradation signal and move on.
 
 use arbitro_engine_v2::types::*;
-use arbitro_kit::stream::Ring;
+use arbitro_kit::stream::{Consumer, Producer, Ring};
 
 /// Capacity of the SPSC ring. Power-of-two by contract.
 ///
@@ -54,6 +54,8 @@ pub const DRAIN_EVENT_CAP: usize = 2048;
 /// non-blocking `try_send` / `try_recv` API. The drain is woken via the
 /// shared `Gate`, not via the ring's own waiter.
 pub type DrainEventRing = Ring<DrainEvent, DRAIN_EVENT_CAP, arbitro_kit::ParkWaiter>;
+pub type DrainEventProducer = Producer<DrainEvent, DRAIN_EVENT_CAP, arbitro_kit::ParkWaiter>;
+pub type DrainEventConsumer = Consumer<DrainEvent, DRAIN_EVENT_CAP, arbitro_kit::ParkWaiter>;
 
 /// Messages from command thread → drain thread.
 ///

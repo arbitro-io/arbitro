@@ -1,5 +1,5 @@
 //! Per-session lifecycle: dial, handshake, replay subscriptions, spawn
-//! writer + reader + heartbeat, run until any task drops, drain pending.
+//! writer + reader, run until either drops, drain pending.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -12,12 +12,11 @@ use tracing::{debug, warn};
 
 use arbitro_proto::v2::ingress::hello::Role;
 
-use crate::conn::heartbeat::heartbeat_task;
 use crate::conn::reconnect::Backoff;
 use crate::error::ClientError;
 use crate::state::Inner;
 use crate::transport::encode::encode_hello_v2;
-use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
+use crate::transport::frame::{WriteFrame, WriteLease, WRITE_QUEUE_CAP};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
 
@@ -80,12 +79,13 @@ async fn dial(
 pub(crate) async fn spawn_connection(
     consumer: MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
     inner: Arc<Inner>,
+    mut session_replay_lease: WriteLease,
 ) -> Result<(), ClientError> {
     // Initial connection — fast failure path.
     let (r, mut w) = dial(&inner).await?;
     write_handshake(&mut w).await?;
     // Replay any subscriptions (none on first connect — future-proofs reconnect).
-    replay_subscriptions(&inner);
+    replay_subscriptions(&inner, &mut session_replay_lease);
     // Re-register any active cron jobs after reconnect.
     crate::cron::replay_crons(&inner);
 
@@ -98,6 +98,7 @@ pub(crate) async fn spawn_connection(
 
         loop {
             let session_cancel = cancel.child_token();
+            *inner.session_cancel.lock().unwrap() = Some(session_cancel.clone());
 
             let res = if let (Some(w), Some(r)) = (wh.take(), rh.take()) {
                 run_session(
@@ -112,6 +113,7 @@ pub(crate) async fn spawn_connection(
                 Err(ClientError::Disconnected)
             };
 
+            *inner.session_cancel.lock().unwrap() = None;
             inner.pending.drain_disconnected();
 
             if cancel.is_cancelled() {
@@ -138,7 +140,7 @@ pub(crate) async fn spawn_connection(
                             continue;
                         }
                         // Replay subscriptions + crons before the new session starts.
-                        replay_subscriptions(&inner);
+                        replay_subscriptions(&inner, &mut session_replay_lease);
                         crate::cron::replay_crons(&inner);
                         rh = Some(r);
                         wh = Some(w);
@@ -163,26 +165,24 @@ async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(w: &mut W) -> Result<()
     Ok(())
 }
 
-/// Enqueue all stored `sub_body` frames via the admin producer.
+/// Enqueue all stored `sub_body` frames via the dedicated session-replay lease.
 ///
 /// Called after a successful handshake so the broker re-registers all
 /// active consumers.  Fire-and-forget — writer picks them up.
-fn replay_subscriptions(inner: &Inner) {
-    let sub_bodies = inner.subscriptions.all_sub_bodies();
-    if sub_bodies.is_empty() {
-        return;
-    }
-    // Reset the heartbeat timestamp so we don't time-out during replay.
+///
+/// Unconditionally resets `last_pong_ns` on every session start (not just
+/// when there are subscriptions to replay) — heartbeat now runs for the
+/// whole Client lifetime rather than per-session, so this is the only
+/// place left that gives it a fresh timeout window after a reconnect.
+fn replay_subscriptions(inner: &Inner, lease: &mut WriteLease) {
     inner.last_pong_ns.store(Inner::now_ns(), Ordering::Relaxed);
-
-    let admin = inner.admin_producer.lock().unwrap();
-    for sub_body in sub_bodies {
-        let _ = admin.try_send(WriteFrame::Mono(sub_body));
+    for sub_body in inner.subscriptions.all_sub_bodies() {
+        let _ = lease.try_send(WriteFrame::Mono(sub_body));
     }
 }
 
-/// Run writer + reader + heartbeat concurrently under a child token.
-/// Returns when the first of the three finishes (error or clean exit).
+/// Run writer + reader concurrently under a child token.
+/// Returns when the first of the two finishes (error or clean exit).
 ///
 /// After the select resolves, if the parent cancel (`inner.cancel`) was
 /// the trigger, we send a Disconnect frame so the server releases
@@ -199,12 +199,8 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let cfg_ka = inner.cfg.keep_alive.clone();
-
     let inner_r = Arc::clone(&inner);
-    let inner_hb = Arc::clone(&inner);
     let cancel_r = cancel.clone();
-    let cancel_hb = cancel.clone();
 
     let reader_h = tokio::spawn(reader_task(r, inner_r, cancel_r));
 
@@ -219,10 +215,6 @@ where
                 Ok(v) => v,
                 Err(_) => Err(ClientError::Disconnected),
             }
-        }
-        r = heartbeat_task(inner_hb, cfg_ka, cancel_hb) => {
-            cancel.cancel();
-            r
         }
     };
 

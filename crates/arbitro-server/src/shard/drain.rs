@@ -30,7 +30,7 @@ use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::shared::{
-    find_writer, DrainNotification, DrainSnapshot, NotifyRing, SharedCounters,
+    find_writer, DrainNotification, DrainSnapshot, SharedCounters,
 };
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
@@ -271,7 +271,7 @@ pub(in crate::shard) fn drain_deliver(
     names: &Arc<crate::common::NameRegistry>,
     scratch: &mut DrainScratch,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-    notify_tx: &NotifyRing,
+    notify_tx: &mut crate::shard::shared::NotifyProducer,
     silent_drops: &crate::common::SilentDrops,
     mut result: DrainReadResult,
 ) {
@@ -453,7 +453,7 @@ pub(in crate::shard) fn drain_cycle(
     cfg: &DrainConfig,
     scratch: &mut DrainScratch,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-    notify_tx: &NotifyRing,
+    notify_tx: &mut crate::shard::shared::NotifyProducer,
     silent_drops: &crate::common::SilentDrops,
     now_ms: u64,
 ) {
@@ -802,7 +802,7 @@ fn dispatch_recipients(
 /// truth for ack-matching.
 #[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
-    notify_tx: &NotifyRing,
+    notify_tx: &mut crate::shard::shared::NotifyProducer,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
     flush_results: &[(ConnectionId, FlushOutcome)],

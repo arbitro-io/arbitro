@@ -77,24 +77,26 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             m.ack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
-            // Find bindings for this consumer and release matching pendings.
             // F3+F4: SmallVec<[BindingId; 4]> — most consumers have 1-3 bindings,
             // avoids a heap alloc per ack batch.
             let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
-            for bid in binding_ids {
-                if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                    let queue_raw = binding.queue_id.raw();
-                    for ack in entries.iter() {
-                        // PERF-1: O(1) HashMap::remove instead of a linear
-                        // scan + swap_remove on a Vec.
+            for ack in entries.iter() {
+                // Invariant: each entry is matched at most once across bindings.
+                for &bid in &binding_ids {
+                    if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                        if binding.stream_id != ack.stream_id {
+                            continue;
+                        }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {
+                            let queue_raw = binding.queue_id.raw();
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
                             ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
+                            break;
                         }
                     }
                 }
@@ -113,22 +115,24 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
             // Release inflight — redelivery handled by drain.
-            // F3+F4: SmallVec for binding ids.
             let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
-            for bid in binding_ids {
-                if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                    let queue_raw = binding.queue_id.raw();
-                    for ack in entries.iter() {
-                        // PERF-1: O(1) HashMap::remove instead of a linear
-                        // scan + swap_remove on a Vec.
+            for ack in entries.iter() {
+                // Invariant: each entry is matched at most once across bindings.
+                for &bid in &binding_ids {
+                    if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                        if binding.stream_id != ack.stream_id {
+                            continue;
+                        }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {
+                            let queue_raw = binding.queue_id.raw();
                             events
                                 .subject_hashes_acked
                                 .push((consumer_id.raw(), pending.subject_hash));
                             ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
+                            break;
                         }
                     }
                 }

@@ -187,7 +187,7 @@ impl<'a> CronBuilder<'a> {
 
         let rx = self.client.inner.pending.register(seq);
         crate::publish::enqueue(
-            self.client.producer(),
+            &self.client.inner.pool,
             crate::transport::frame::WriteFrame::Mono(frame),
         )?;
         rx.recv_async()
@@ -229,10 +229,10 @@ impl CronHandle {
         let frame = encode_delete_cron(seq, &self.name);
 
         let rx = self.inner.pending.register(seq);
-        {
-            let admin = self.inner.admin_producer.lock().unwrap();
-            let _ = admin.try_send(crate::transport::frame::WriteFrame::Mono(frame));
-        }
+        let _ = crate::publish::enqueue(
+            &self.inner.pool,
+            crate::transport::frame::WriteFrame::Mono(frame),
+        );
         let _ = rx.recv_async().await;
 
         // Remove local handler
@@ -281,9 +281,7 @@ fn send_cron_ack(inner: &Inner, name: &[u8], ok: bool) {
     let seq = inner.seq_alloc.next();
     let frame = encode_cron_ack(seq, name, ok);
     let wf = crate::transport::frame::WriteFrame::Mono(frame);
-    if let Ok(admin) = inner.admin_producer.lock() {
-        let _ = admin.try_send(wf);
-    }
+    let _ = crate::publish::enqueue(&inner.pool, wf);
 }
 
 // ── Reconnect replay ───────────────────────────────────────────────────────
@@ -295,8 +293,6 @@ pub(crate) fn replay_crons(inner: &Inner) {
         let seq = inner.seq_alloc.next();
         let frame = encode_create_cron(seq, &body);
         let wf = crate::transport::frame::WriteFrame::Mono(frame);
-        if let Ok(admin) = inner.admin_producer.lock() {
-            let _ = admin.try_send(wf);
-        }
+        let _ = crate::publish::enqueue(&inner.pool, wf);
     }
 }

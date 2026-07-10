@@ -151,7 +151,7 @@ impl Message {
     /// for this to work. Returns `ClientError::NoReplyAddress` if reply_to
     /// is empty or not in the encoded format.
     ///
-    /// This is a fire-and-forget publish via the admin producer — it does
+    /// This is a fire-and-forget publish via a leased producer — it does
     /// not wait for broker confirmation.
     pub fn reply(&self, payload: &[u8]) -> Result<(), ClientError> {
         let (target_stream_id, subject) = decode_reply_to(&self.reply_to)
@@ -159,12 +159,7 @@ impl Message {
 
         let seq = self.inner.seq_alloc.next();
         let frame = crate::publish::encode_pub_frame_for_reply(seq, target_stream_id, subject, payload);
-        self.inner
-            .admin_producer
-            .lock()
-            .unwrap()
-            .try_send(frame)
-            .map_err(|_| ClientError::ChannelClosed)
+        crate::publish::enqueue(&self.inner.pool, frame)
     }
 
     /// Fire-and-forget acknowledgement.

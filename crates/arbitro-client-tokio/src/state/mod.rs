@@ -16,7 +16,7 @@ use crate::metrics::ClientMetrics;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::state::subscriptions::Subscriptions;
-use crate::transport::frame::WriteProducer;
+use crate::transport::frame::WritePool;
 
 pub(crate) mod pending;
 pub(crate) mod seq;
@@ -26,22 +26,23 @@ pub(crate) mod subscriptions;
 pub(crate) struct Inner {
     /// Static configuration (addr, reconnect policy, keep-alive timings).
     pub(crate) cfg: ClientConfig,
-    /// Pool of free write producers.  Popped by `Client::clone`, returned
-    /// by `Client::drop`.  Panics when exhausted (> `MAX_WRITE_PRODUCERS`
-    /// concurrent clones).
-    pub(crate) producer_pool: Mutex<Vec<WriteProducer>>,
+    /// Shared pool of write producers.  Ad-hoc callers (publish/manage/cron)
+    /// lease a slot for the duration of a single `try_send`; the long-lived
+    /// background tasks (heartbeat, ack/nack batchers, session replay) hold
+    /// a dedicated lease for their whole lifetime.
+    pub(crate) pool: Arc<WritePool>,
     /// In-flight request-reply correlation (`seq → OneShotAsyncSender`).
     pub(crate) pending: Arc<Pending>,
     /// Monotonic u64 sequence counter.
     pub(crate) seq_alloc: SeqAllocator,
     /// Root cancellation token — cancelled on `Client::close()` or drop.
     pub(crate) cancel: CancellationToken,
+    /// Session-scoped cancel — set by the reconnect loop on each new session,
+    /// cancelled by the heartbeat watchdog on stale pong. Never cancels the
+    /// client-level `cancel`, so reconnect keeps running.
+    pub(crate) session_cancel: Mutex<Option<CancellationToken>>,
     /// Active subscriptions: `consumer_id → delivery channel + replay body`.
     pub(crate) subscriptions: Arc<Subscriptions>,
-    /// Dedicated write producer for the ack-batcher, heartbeat, and
-    /// sub-replay paths.  Lock held only for a single `try_send`
-    /// (nanoseconds) — never across await points.
-    pub(crate) admin_producer: Mutex<WriteProducer>,
     /// Sender into the ack-batcher task.  Cloned cheaply into every `Message`.
     pub(crate) ack_tx: tokio::sync::mpsc::Sender<AckCmd>,
     /// Sender into the nack-batcher task.  Cloned cheaply into every `Message`.

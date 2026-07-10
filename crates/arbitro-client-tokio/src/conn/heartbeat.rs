@@ -16,7 +16,7 @@ use arbitro_proto::v2::header::HEADER_SIZE;
 use crate::config::KeepAlive;
 use crate::error::ClientError;
 use crate::state::Inner;
-use crate::transport::frame::{WriteFrame, INLINE_CAP};
+use crate::transport::frame::{WriteFrame, WriteLease, INLINE_CAP};
 
 #[inline]
 fn now_ns() -> u64 {
@@ -36,6 +36,7 @@ pub(crate) async fn heartbeat_task(
     inner: Arc<Inner>,
     cfg: KeepAlive,
     cancel: CancellationToken,
+    mut lease: WriteLease,
 ) -> Result<(), ClientError> {
     // Initialise last_pong to now so we don't time-out during handshake.
     inner.last_pong_ns.store(now_ns(), Ordering::Relaxed);
@@ -51,8 +52,11 @@ pub(crate) async fn heartbeat_task(
                 let timeout_ns = cfg.timeout.as_nanos() as u64;
 
                 if age_ns > timeout_ns {
-                    cancel.cancel();   // kill writer + reader siblings
-                    return Err(ClientError::Disconnected);
+                    if let Some(tok) = inner.session_cancel.lock().unwrap().as_ref() {
+                        tok.cancel();
+                    }
+                    inner.last_pong_ns.store(now_ns(), Ordering::Relaxed);
+                    continue;
                 }
 
                 // ── 2. Send Ping (header-only, 16 B) ──────────────────
@@ -66,7 +70,7 @@ pub(crate) async fn heartbeat_task(
                 data[1] = action_le[1];
                 let frame = WriteFrame::Inline(data, HEADER_SIZE as u16);
 
-                let _ = inner.admin_producer.lock().unwrap().try_send(frame);
+                let _ = lease.try_send(frame);
             }
         }
     }
@@ -89,35 +93,34 @@ mod tests {
         cancel.cancel(); // pre-cancel
 
         // Build a minimal Inner just to satisfy the signature.
-        // We use a real ring so try_send doesn't panic.
+        // We use a real pool so try_send/acquire don't panic.
         use crate::config::ClientConfig;
         use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
         use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
         use arbitro_kit::route::MpscAsync;
-        use std::sync::Mutex;
 
-        let (mut producers, _consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
-        let admin = producers.remove(0);
+        let (pool, _consumer, _shutdown) =
+            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        let lease = pool.acquire().unwrap();
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(4);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(4);
         let inner = Arc::new(Inner {
             cfg: ClientConfig::default(),
-            producer_pool: Mutex::new(producers),
+            pool,
             pending: Arc::new(Pending::new()),
             seq_alloc: SeqAllocator::new(),
             cancel: cancel.clone(),
             subscriptions: Arc::new(Subscriptions::new()),
-            admin_producer: Mutex::new(admin),
             ack_tx,
             nack_tx,
             last_pong_ns: std::sync::atomic::AtomicU64::new(0),
             metrics: Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state: crate::cron::CronState::new(),
+            session_cancel: std::sync::Mutex::new(None),
         });
 
         // Should return immediately because cancel is already fired.
-        let result = heartbeat_task(inner, cfg, cancel).await;
+        let result = heartbeat_task(inner, cfg, cancel, lease).await;
         assert!(result.is_ok());
     }
 }

@@ -161,30 +161,29 @@ mod tests {
     use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
     use arbitro_kit::route::MpscAsync;
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     /// Build a minimal `Inner` for use in unit tests (no real connection).
     fn make_inner(cancel: CancellationToken) -> Arc<Inner> {
-        let (mut producers, _consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
-        let admin = producers.remove(0);
+        let (pool, _consumer, _shutdown) =
+            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(16);
         Arc::new(Inner {
             cfg: ClientConfig::default(),
-            producer_pool: Mutex::new(producers),
+            pool,
             pending: Arc::new(Pending::new()),
             seq_alloc: SeqAllocator::new(),
             cancel: cancel.clone(),
             subscriptions: Arc::new(Subscriptions::new()),
-            admin_producer: Mutex::new(admin),
             ack_tx,
             nack_tx,
             last_pong_ns: AtomicU64::new(0),
             metrics: Arc::new(crate::metrics::ClientMetrics::new()),
             cron_state: crate::cron::CronState::new(),
+            session_cancel: std::sync::Mutex::new(None),
         })
     }
 

@@ -82,6 +82,13 @@ impl Pending {
         }
     }
 
+    /// Remove `seq` without completing it. Silent if absent (already
+    /// completed or never registered).
+    // leak-guard: see F3
+    pub(crate) fn cancel(&self, seq: u64) {
+        let _ = self.map.lock().unwrap().remove(&seq);
+    }
+
     /// Resolve every pending entry with `Disconnected`. Called on session
     /// teardown so awaiting callers wake instead of hanging forever.
     pub fn drain_disconnected(&self) {

@@ -324,7 +324,7 @@ fn bench_step4_kit(c: &mut Criterion) {
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
-    let producer = producers.remove(0);
+    let mut producer = producers.remove(0);
 
     rt.block_on(async {
         tokio::spawn(async move { while consumer.recv_async().await.is_ok() {} });
@@ -435,7 +435,7 @@ fn bench_step6(c: &mut Criterion) {
     let mut buf = vec![0u8; size];
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<usize, 4096>::new(1);
-    let producer = producers.remove(0);
+    let mut producer = producers.remove(0);
 
     let addr = rt.block_on(start_drain_server());
     rt.block_on(async {
@@ -562,7 +562,7 @@ fn bench_step8(c: &mut Criterion) {
 
     let (mut producers, mut consumer, _shutdown) =
         MpscAsync::<(usize, OneShotAsyncSender<()>), 4096>::new(1);
-    let producer = producers.remove(0);
+    let mut producer = producers.remove(0);
 
     let addr = rt.block_on(start_drain_server());
     rt.block_on(async {
@@ -638,7 +638,7 @@ fn bench_step9_inline_vs_alloc(c: &mut Criterion) {
     let size = PubFrame::wire_size(subject.len(), 0, PAYLOAD_LEN);
 
     let (mut producers, mut consumer, _shutdown) = MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(1);
-    let producer = producers.remove(0);
+    let mut producer = producers.remove(0);
 
     let addr = rt.block_on(start_drain_server());
     rt.block_on(async {

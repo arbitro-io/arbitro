@@ -44,6 +44,10 @@ pub enum ClientError {
     #[error("channel closed")]
     ChannelClosed,
 
+    /// Every slot in the write-producer pool is currently leased.
+    #[error("write producer pool exhausted")]
+    PoolExhausted,
+
     /// Local config validation failed before the request hit the wire.
     /// Returned by the `ConsumerBuilder` / `StreamBuilder` helpers when
     /// invariants on `ConsumerConfigBuilder::build` (or equivalent) are

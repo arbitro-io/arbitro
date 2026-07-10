@@ -1,6 +1,7 @@
 //! Publish helpers — fire-and-forget and request/reply variants.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use arbitro_proto::v2::header::entry_flag;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
@@ -13,18 +14,19 @@ use crate::error::ClientError;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::transport::encode::{encode_pub_batch_v2, encode_pub_with_reply_v2, BatchEntry};
-use crate::transport::frame::{WriteFrame, WriteProducer, INLINE_CAP};
+use crate::transport::frame::{WriteFrame, WritePool, INLINE_CAP};
 
 /// Maximum number of entries in a single publish-batch frame.
 /// Batches larger than this are automatically chunked by the client.
 pub const PUBLISH_BATCH_MAX: usize = 256;
 
-/// Enqueue a frame into the producer ring via `try_send`.
-/// Synchronous — no await — so `&WriteProducer` never crosses an await
-/// point and futures that call this remain `Send`.
+/// Lease a producer slot from `pool` and `try_send` a single frame.
+/// Synchronous — no await — so the borrow never crosses an await point and
+/// futures that call this remain `Send`.
 #[inline]
-pub(crate) fn enqueue(tx: &WriteProducer, frame: WriteFrame) -> Result<(), ClientError> {
-    tx.try_send(frame).map_err(|_| ClientError::ChannelClosed)
+pub(crate) fn enqueue(pool: &Arc<WritePool>, frame: WriteFrame) -> Result<(), ClientError> {
+    let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
+    lease.try_send(frame).map_err(|_| ClientError::ChannelClosed)
 }
 
 /// Encode a single PubFrame into a `WriteFrame`.
@@ -67,7 +69,7 @@ fn encode_pub_frame(
 /// Fire-and-forget publish (single subject, single payload).
 #[inline]
 pub(crate) fn publish_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
@@ -76,7 +78,7 @@ pub(crate) fn publish_async(
 ) -> Result<(), ClientError> {
     let seq = seq_alloc.next();
     enqueue(
-        tx,
+        pool,
         encode_pub_frame(seq, stream_id, subject, msg_id, &payload),
     )
 }
@@ -86,7 +88,7 @@ pub(crate) fn publish_async(
 /// Automatically chunks into sub-batches of [`PUBLISH_BATCH_MAX`] entries
 /// when the caller provides more than 256 entries.
 pub(crate) fn publish_batch_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     entries: &[BatchEntry<'_>],
@@ -94,7 +96,7 @@ pub(crate) fn publish_batch_async(
     for chunk in entries.chunks(PUBLISH_BATCH_MAX) {
         let seq = seq_alloc.next();
         enqueue(
-            tx,
+            pool,
             WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, chunk)),
         )?;
     }
@@ -105,11 +107,11 @@ pub(crate) fn publish_batch_async(
 /// that awaits the broker reply.
 ///
 /// All synchronous work (encode, register, enqueue) is done before the
-/// `async move` block so that no `&WriteProducer` / `&Pending` borrow
+/// `async move` block so that no `&WritePool` / `&Pending` borrow
 /// crosses the await point. Only the owned `rx` receiver (which is `Send`)
 /// lives inside the returned future.
 pub(crate) fn publish_sync_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -120,7 +122,10 @@ pub(crate) fn publish_sync_async(
     let seq = seq_alloc.next();
     let frame = encode_pub_frame(seq, stream_id, subject, msg_id, &payload);
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(tx, frame);
+    let enqueue_result = enqueue(pool, frame);
+    if enqueue_result.is_err() {
+        pending.cancel(seq); // leak-guard: see F3
+    }
     async move {
         enqueue_result?;
         rx.recv_async()
@@ -134,7 +139,7 @@ pub(crate) fn publish_sync_async(
 /// The message will be delivered to consumers after `delay_ms` milliseconds.
 /// Returns a future that resolves once the broker confirms receipt.
 pub(crate) fn publish_delayed_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -147,7 +152,10 @@ pub(crate) fn publish_delayed_async(
         seq, stream_id, subject, &payload, delay_ms,
     ));
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(tx, frame);
+    let enqueue_result = enqueue(pool, frame);
+    if enqueue_result.is_err() {
+        pending.cancel(seq); // leak-guard: see F3
+    }
     async move {
         enqueue_result?;
         rx.recv_async()
@@ -164,7 +172,7 @@ pub(crate) fn publish_delayed_async(
 /// to that subject. The caller is responsible for subscribing to the
 /// reply_to subject (typically an `_INBOX.<token>` pattern) before calling.
 pub(crate) fn publish_with_reply_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -178,7 +186,10 @@ pub(crate) fn publish_with_reply_async(
         seq, stream_id, subject, reply_to, msg_id, &payload,
     ));
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(tx, frame);
+    let enqueue_result = enqueue(pool, frame);
+    if enqueue_result.is_err() {
+        pending.cancel(seq); // leak-guard: see F3
+    }
     async move {
         enqueue_result?;
         rx.recv_async()
@@ -195,7 +206,7 @@ pub(crate) fn publish_with_reply_async(
 /// Subsequent chunks are sent fire-and-forget style (no pending slot)
 /// because only the first seq is meaningful to the caller.
 pub(crate) fn publish_batch_sync_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -208,7 +219,7 @@ pub(crate) fn publish_batch_sync_async(
     let seq = seq_alloc.next();
     let rx = pending.register(seq);
     let mut enqueue_result = enqueue(
-        tx,
+        pool,
         WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, first_chunk)),
     );
 
@@ -217,13 +228,17 @@ pub(crate) fn publish_batch_sync_async(
         for chunk in chunks {
             let seq = seq_alloc.next();
             if let Err(e) = enqueue(
-                tx,
+                pool,
                 WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, chunk)),
             ) {
                 enqueue_result = Err(e);
                 break;
             }
         }
+    }
+
+    if enqueue_result.is_err() {
+        pending.cancel(seq); // leak-guard: see F3
     }
 
     async move {
@@ -291,7 +306,7 @@ fn encode_pub_frame_with_headers(
 
 /// Sync publish with arbitrary headers. Awaits broker confirmation.
 pub(crate) fn publish_with_headers_sync_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
@@ -302,7 +317,10 @@ pub(crate) fn publish_with_headers_sync_async(
     let seq = seq_alloc.next();
     let frame = encode_pub_frame_with_headers(seq, stream_id, subject, headers, &payload);
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(tx, frame);
+    let enqueue_result = enqueue(pool, frame);
+    if enqueue_result.is_err() {
+        pending.cancel(seq); // leak-guard: see F3
+    }
     async move {
         enqueue_result?;
         rx.recv_async()
@@ -327,7 +345,7 @@ pub(crate) fn encode_pub_frame_for_reply(
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn publish_with_headers_async(
-    tx: &WriteProducer,
+    pool: &Arc<WritePool>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
@@ -336,7 +354,7 @@ pub(crate) fn publish_with_headers_async(
 ) -> Result<(), ClientError> {
     let seq = seq_alloc.next();
     enqueue(
-        tx,
+        pool,
         encode_pub_frame_with_headers(seq, stream_id, subject, headers, &payload),
     )
 }
