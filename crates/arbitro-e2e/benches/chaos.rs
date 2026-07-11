@@ -34,7 +34,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arbitro_client_tokio::{Client, ClientConfig, ReconnectPolicy};
-use arbitro_server::{ArbitroServer, Config};
+use arbitro_server::{ArbitroServer, Config, FsyncPolicy};
 use bytes::Bytes;
 use tokio::sync::watch;
 
@@ -109,6 +109,13 @@ async fn spawn_server(addr: &str, data_dir: &Path) -> watch::Sender<bool> {
         .listen_addr(addr)
         .max_connections(64)
         .shard_count(1)
+        // Chaos measures delivery under abrupt process kills — the disk
+        // stays alive across the kill, so power-loss durability (fsync)
+        // is orthogonal to what this bench validates. Force fsync=none:
+        // otherwise SEC-8 pushes `mmap.flush()` on every append, stalls
+        // the drain, and exposes an "acked-but-not-yet-drained" race
+        // window. Production still honors the operator's config.
+        .fsync_policy(FsyncPolicy::None)
         .data_dir(data_dir.to_string_lossy().into_owned());
     tokio::spawn(async move {
         let _ = ArbitroServer::new(cfg).run_with_shutdown(rx).await;
