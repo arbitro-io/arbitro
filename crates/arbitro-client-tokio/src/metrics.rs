@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[derive(Debug, Default)]
 pub struct ClientMetrics {
     // ── Publish ─────────────────────────────────────────────────────
-    /// `publish` + `publish_sync` calls (one per logical message).
+    /// `publish` + `publish_wait` calls (one per logical message).
     pub publishes_sent: AtomicU64,
     /// Entries inside `publish_batch` calls (summed across batches).
     pub publish_batch_entries: AtomicU64,
-    /// `publish_sync` calls that returned an error from the broker.
+    /// `publish_wait` calls that returned an error from the broker.
     pub publish_errors: AtomicU64,
 
     // ── Subscribe / deliver ─────────────────────────────────────────
@@ -30,13 +30,15 @@ pub struct ClientMetrics {
     pub nacks_sent: AtomicU64,
     /// Acks buffered in the client-side hot layer, not yet on the wire.
     pub acks_deferred: AtomicU64,
-    /// Deferred acks that made it to broker-confirmed (cold) storage.
-    pub acks_persisted_cold: AtomicU64,
+    /// Acks recorded into the durable dedup store (WAL) on `Message::ack`.
+    pub ackstore_records: AtomicU64,
+    /// Durable-dedup store operations that returned an error (record/confirm).
+    pub ackstore_errors: AtomicU64,
     /// Deferred acks dropped by the TTL sweep before broker confirm.
     pub acks_expired: AtomicU64,
     /// Acks the broker confirmed via `AckBatchResp`.
     pub acks_confirmed: AtomicU64,
-    /// Redeliveries caught by the seen-cache before the user callback ran.
+    /// Redeliveries caught by the dedup store before the user callback ran.
     pub dedup_hits: AtomicU64,
     /// Deliveries with `seq` above the consumer's known high-water mark.
     pub suspicious_seq_over_high: AtomicU64,
@@ -62,7 +64,8 @@ impl ClientMetrics {
             acks_sent: AtomicU64::new(0),
             nacks_sent: AtomicU64::new(0),
             acks_deferred: AtomicU64::new(0),
-            acks_persisted_cold: AtomicU64::new(0),
+            ackstore_records: AtomicU64::new(0),
+            ackstore_errors: AtomicU64::new(0),
             acks_expired: AtomicU64::new(0),
             acks_confirmed: AtomicU64::new(0),
             dedup_hits: AtomicU64::new(0),
@@ -85,7 +88,8 @@ impl ClientMetrics {
             acks_sent: l(&self.acks_sent),
             nacks_sent: l(&self.nacks_sent),
             acks_deferred: l(&self.acks_deferred),
-            acks_persisted_cold: l(&self.acks_persisted_cold),
+            ackstore_records: l(&self.ackstore_records),
+            ackstore_errors: l(&self.ackstore_errors),
             acks_expired: l(&self.acks_expired),
             acks_confirmed: l(&self.acks_confirmed),
             dedup_hits: l(&self.dedup_hits),
@@ -109,7 +113,8 @@ pub struct ClientMetricsSnapshot {
     pub acks_sent: u64,
     pub nacks_sent: u64,
     pub acks_deferred: u64,
-    pub acks_persisted_cold: u64,
+    pub ackstore_records: u64,
+    pub ackstore_errors: u64,
     pub acks_expired: u64,
     pub acks_confirmed: u64,
     pub dedup_hits: u64,

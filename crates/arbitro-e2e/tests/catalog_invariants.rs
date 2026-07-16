@@ -188,7 +188,7 @@ async fn delete_stream_resets_consumer_namespace() {
         .await
         .unwrap();
     client
-        .publish_sync(stream_id_b, b"events.x", Bytes::from_static(b"hello"))
+        .publish_wait(stream_id_b, b"events.x", Bytes::from_static(b"hello"))
         .await
         .unwrap();
     let msg = tokio::time::timeout(Duration::from_secs(2), handle.recv())
@@ -437,7 +437,7 @@ async fn delete_recreate_subscription_delivers() {
     let id_a = create_consumer(&client, stream_id, b"worker").await;
     let mut sub_a = client.subscribe(stream_id, id_a, b"").await.unwrap();
     client
-        .publish_sync(stream_id, b"orders.first", Bytes::from_static(b"first"))
+        .publish_wait(stream_id, b"orders.first", Bytes::from_static(b"first"))
         .await
         .unwrap();
     let msg_a = tokio::time::timeout(Duration::from_secs(2), sub_a.recv())
@@ -451,7 +451,7 @@ async fn delete_recreate_subscription_delivers() {
     let id_b = create_consumer(&client, stream_id, b"worker").await;
     let mut sub_b = client.subscribe(stream_id, id_b, b"").await.unwrap();
     client
-        .publish_sync(stream_id, b"orders.second", Bytes::from_static(b"second"))
+        .publish_wait(stream_id, b"orders.second", Bytes::from_static(b"second"))
         .await
         .unwrap();
     let msg_b = tokio::time::timeout(Duration::from_secs(2), sub_b.recv())

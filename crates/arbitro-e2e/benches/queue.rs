@@ -235,9 +235,9 @@ async fn main() {
         .map(|_| BatchEntry::new(SUBJECT, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     manager
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
-        .expect("publish_batch_sync");
+        .expect("publish_batch_wait");
     let pub_elapsed = pub_start.elapsed();
     println!(
         "  published {msgs} msgs in {:.2?} ({:.0} msg/s)",

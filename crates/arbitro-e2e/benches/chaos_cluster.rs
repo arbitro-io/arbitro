@@ -224,7 +224,7 @@ async fn producer(
             tick = Instant::now();
         }
 
-        let fut = client.as_ref().unwrap().publish_sync(
+        let fut = client.as_ref().unwrap().publish_wait(
             sid,
             subj.as_bytes(),
             Bytes::copy_from_slice(&payload),

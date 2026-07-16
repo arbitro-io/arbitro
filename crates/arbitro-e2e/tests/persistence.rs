@@ -226,7 +226,7 @@ async fn messages_survive_restart_with_disk_store() {
         for i in 0u32..10 {
             let payload = format!("msg-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid,
                     b"durable.events",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -389,7 +389,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
         for i in 0u32..5 {
             let payload = format!("old-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid,
                     b"recycled.data",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -408,7 +408,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
         for i in 0u32..2 {
             let payload = format!("new-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid2,
                     b"recycled.data",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -480,7 +480,7 @@ async fn consumer_and_messages_survive_together() {
         for i in 0u32..5 {
             let payload = format!("event-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid,
                     b"durable.data",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -549,7 +549,7 @@ async fn publish_after_restart_continues() {
         for i in 0u32..3 {
             let payload = format!("before-{i}");
             client
-                .publish_sync(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes()))
+                .publish_wait(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes()))
                 .await
                 .expect("publish");
         }
@@ -573,7 +573,7 @@ async fn publish_after_restart_continues() {
         for i in 0u32..3 {
             let payload = format!("after-{i}");
             client
-                .publish_sync(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes()))
+                .publish_wait(sid, b"seq.data", Bytes::copy_from_slice(payload.as_bytes()))
                 .await
                 .expect("publish");
         }
@@ -619,7 +619,7 @@ async fn messages_survive_multiple_restarts() {
         for i in 0u32..3 {
             let payload = format!("c1-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid,
                     b"multi.data",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -638,7 +638,7 @@ async fn messages_survive_multiple_restarts() {
         for i in 0u32..3 {
             let payload = format!("c2-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     sid,
                     b"multi.data",
                     Bytes::copy_from_slice(payload.as_bytes()),
@@ -886,13 +886,13 @@ async fn t8_retention_max_msgs_survives_restart() {
         for i in 0u32..PUBLISH {
             let p = format!("msg-{i}");
             client
-                .publish_sync(
+                .publish_wait(
                     stream_id,
                     b"capped.event",
                     Bytes::copy_from_slice(p.as_bytes()),
                 )
                 .await
-                .expect("publish_sync");
+                .expect("publish_wait");
         }
         server.shutdown().await;
     }
@@ -1134,7 +1134,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..99 {
             let payload = i.to_le_bytes();
             client
-                .publish_sync(
+                .publish_wait(
                     filler_sid,
                     b"filler.pad",
                     Bytes::copy_from_slice(&payload),
@@ -1153,7 +1153,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..100 {
             let payload = (i as u64).to_le_bytes();
             client
-                .publish_sync(
+                .publish_wait(
                     a_sid,
                     b"stream_a.data",
                     Bytes::copy_from_slice(&payload),
@@ -1167,7 +1167,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for batch in 0..1000 {
             let payload = (batch as u64).to_le_bytes();
             client
-                .publish_sync(
+                .publish_wait(
                     filler_sid,
                     b"filler.bulk",
                     Bytes::copy_from_slice(&payload),
@@ -1190,7 +1190,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..5 {
             let payload = (1000 + i as u64).to_le_bytes();
             client
-                .publish_sync(
+                .publish_wait(
                     a_sid2,
                     b"stream_a.data",
                     Bytes::copy_from_slice(&payload),

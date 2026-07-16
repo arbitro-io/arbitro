@@ -1,7 +1,7 @@
-//! Concurrent `publish_sync` regression gate — MERGE GATE.
+//! Concurrent `publish_wait` regression gate — MERGE GATE.
 //!
 //! The legacy `arbitro-client` deterministically timed out when two or more
-//! cloned handles called `publish_sync` concurrently, because its single OS
+//! cloned handles called `publish_wait` concurrently, because its single OS
 //! thread + ack-loop architecture serialized all round-trips.
 //!
 //! This test proves `arbitro-client-tokio` handles conn=1/2/4/8 with zero
@@ -44,9 +44,9 @@ async fn connect(addr: &str) -> Client {
 
 // ── MERGE GATE ────────────────────────────────────────────────────────────────
 
-/// `conn_count` concurrent clones each call `publish_sync` 1 000 times.
+/// `conn_count` concurrent clones each call `publish_wait` 1 000 times.
 /// Total round-trips = conn_count × 1 000.  All must complete within 15 s.
-async fn run_concurrent_publish_sync(conn_count: usize, stream_id: u32, root: &Client) {
+async fn run_concurrent_publish_wait(conn_count: usize, stream_id: u32, root: &Client) {
     const PER_CONN: u32 = 1_000;
     const BUDGET: Duration = Duration::from_secs(15);
 
@@ -59,10 +59,10 @@ async fn run_concurrent_publish_sync(conn_count: usize, stream_id: u32, root: &C
         let sid = stream_id;
         let h = tokio::spawn(async move {
             for i in 0u32..PER_CONN {
-                c.publish_sync(sid, b"conc.sync", Bytes::from(i.to_le_bytes().to_vec()))
+                c.publish_wait(sid, b"conc.sync", Bytes::from(i.to_le_bytes().to_vec()))
                     .await
                     .unwrap_or_else(|e| {
-                        panic!("publish_sync failed (conn_count={conn_count}, i={i}): {e}")
+                        panic!("publish_wait failed (conn_count={conn_count}, i={i}): {e}")
                     });
             }
         });
@@ -79,13 +79,13 @@ async fn run_concurrent_publish_sync(conn_count: usize, stream_id: u32, root: &C
 
     assert!(
         result.is_ok(),
-        "concurrent publish_sync timed out at conn_count={conn_count}  \
+        "concurrent publish_wait timed out at conn_count={conn_count}  \
          (regression: old client failed at conn=2/4/8)"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_publish_sync_no_timeout_conn_1_2_4_8() {
+async fn concurrent_publish_wait_no_timeout_conn_1_2_4_8() {
     let addr = start_server().await;
     let root = connect(&addr).await;
 
@@ -96,7 +96,7 @@ async fn concurrent_publish_sync_no_timeout_conn_1_2_4_8() {
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
     for conn_count in [1usize, 2, 4, 8] {
-        run_concurrent_publish_sync(conn_count, stream_id, &root).await;
+        run_concurrent_publish_wait(conn_count, stream_id, &root).await;
     }
 
     root.delete_stream(b"conc-sync-gate").await.ok();

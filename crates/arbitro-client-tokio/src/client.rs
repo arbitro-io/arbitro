@@ -46,7 +46,41 @@ impl Client {
     ///
     /// Resolves once the initial TCP dial + HELLO handshake succeeds.
     /// All subsequent reconnects happen transparently in the background.
+    ///
+    /// Redelivery dedup is disabled. To survive restarts without
+    /// reprocessing already-acked messages, use
+    /// [`Client::connect_with_ackstore`].
     pub async fn connect(cfg: ClientConfig) -> Result<Self, ClientError> {
+        Self::connect_with(cfg, None).await
+    }
+
+    /// Connect with a durable redelivery-dedup [`Store`](crate::ackstore::Store).
+    ///
+    /// The store is keyed by `(stream_name, consumer_name, seq)` and persists
+    /// which messages were processed+acked. After a restart, a redelivery of an
+    /// already-acked message is recognized and silently re-acked instead of
+    /// re-running the user handler. Pass a [`Wal`](crate::ackstore::wal::Wal)
+    /// for durability or a [`MemoryStore`](crate::ackstore::memory::MemoryStore)
+    /// for in-process dedup only.
+    ///
+    /// Dedup only activates for subscriptions created via
+    /// [`Client::subscribe_dedup`] (which carries the stream/consumer names the
+    /// store needs to resolve a slot).
+    pub async fn connect_with_ackstore(
+        cfg: ClientConfig,
+        store: Arc<dyn crate::ackstore::Store>,
+    ) -> Result<Self, ClientError> {
+        // Rebuild in-memory state from the log before any delivery arrives.
+        store
+            .restore()
+            .map_err(|e| ClientError::InvalidConfig(format!("ackstore restore: {e}")))?;
+        Self::connect_with(cfg, Some(store)).await
+    }
+
+    async fn connect_with(
+        cfg: ClientConfig,
+        ack_store: Option<Arc<dyn crate::ackstore::Store>>,
+    ) -> Result<Self, ClientError> {
         use arbitro_kit::route::MpscAsync;
 
         // Allocate the shared write-producer pool (16 leasable slots).
@@ -73,8 +107,7 @@ impl Client {
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
             ackrel: Arc::new(crate::ackrel::AckRelay::new()),
-            #[cfg(feature = "ack-persistence")]
-            cold: None,
+            ack_store,
         });
 
         // Dedicated leases for the long-lived background tasks — carved out
@@ -114,8 +147,18 @@ impl Client {
     }
 
     /// Cancel every spawned task immediately.  Idempotent.
+    ///
+    /// If a durable ackstore is configured, its buffered records are flushed
+    /// and the log is closed (final fsync) before returning.
     pub fn close(&self) {
+        // Cancel the background tasks FIRST so the ack-batcher's periodic
+        // `store.sync()` can't race a spurious call against a store we're
+        // about to close, then do the final flush + close.
         self.inner.cancel.cancel();
+        if let Some(store) = &self.inner.ack_store {
+            let _ = store.sync();
+            let _ = store.close();
+        }
     }
 
     // ── publish ───────────────────────────────────────────────────────────────
@@ -124,7 +167,7 @@ impl Client {
     ///
     /// For idempotent publishes on streams with a non-zero
     /// `idempotency_window_ms`, use [`Client::publish_with_id`] /
-    /// [`Client::publish_sync_with_id`].
+    /// [`Client::publish_wait_with_id`].
     #[inline]
     pub fn publish(
         &self,
@@ -172,30 +215,34 @@ impl Client {
         self.publish(stream_id, subject, Bytes::copy_from_slice(payload))
     }
 
-    /// Sync publish — awaits broker confirmation (RepOk with first_seq).
+    /// Publish and **wait for the broker's OK** (RepOk with first_seq).
+    ///
+    /// "wait" = wait for the broker to acknowledge receipt — NOT a disk fsync.
+    /// Whether that OK implies durability (in-memory accept vs fsync-to-disk) is
+    /// decided by the target stream's journal/persistence policy, not this call.
     #[inline]
-    pub fn publish_sync(
+    pub fn publish_wait(
         &self,
         stream_id: u32,
         subject: &[u8],
         payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
-        self.publish_sync_with_id(stream_id, subject, &[], payload)
+        self.publish_wait_with_id(stream_id, subject, &[], payload)
     }
 
-    /// Sync publish with an explicit `msg_id` for broker dedup.
-    /// Returns `Err(ErrorCode::IdempotencyDuplicate)` when the broker
-    /// has already seen this `(stream_id, msg_id)` within the stream's
+    /// Publish and wait for the broker's OK, with an explicit `msg_id` for
+    /// broker dedup. Returns `Err(ErrorCode::IdempotencyDuplicate)` when the
+    /// broker has already seen this `(stream_id, msg_id)` within the stream's
     /// `idempotency_window_ms`.
     #[inline]
-    pub fn publish_sync_with_id(
+    pub fn publish_wait_with_id(
         &self,
         stream_id: u32,
         subject: &[u8],
         msg_id: &[u8],
         payload: Bytes,
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
-        crate::publish::publish_sync_async(
+        crate::publish::publish_wait_async(
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
@@ -226,18 +273,61 @@ impl Client {
         r
     }
 
-    pub fn publish_batch_sync(
+    /// Batch publish and wait for the broker's OK (RepOk with the batch's
+    /// `first_seq`). "wait" = wait for acknowledgement, not a disk fsync — the
+    /// stream's persistence policy decides what the OK guarantees.
+    pub fn publish_batch_wait(
         &self,
         stream_id: u32,
         entries: &[BatchEntry<'_>],
     ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
-        crate::publish::publish_batch_sync_async(
+        crate::publish::publish_batch_wait_async(
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
             stream_id,
             entries,
         )
+    }
+
+    // ── Deprecated `*_sync` aliases ─────────────────────────────────────────
+    // Renamed to `*_wait`: "sync" wrongly implied disk-sync, but these only
+    // wait for the broker's OK (receipt). Kept for backward compatibility.
+
+    /// Deprecated alias for [`publish_wait`](Self::publish_wait).
+    #[deprecated(note = "renamed to `publish_wait` — it waits for the broker OK, not a disk fsync")]
+    #[inline]
+    pub fn publish_sync(
+        &self,
+        stream_id: u32,
+        subject: &[u8],
+        payload: Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        self.publish_wait(stream_id, subject, payload)
+    }
+
+    /// Deprecated alias for [`publish_wait_with_id`](Self::publish_wait_with_id).
+    #[deprecated(note = "renamed to `publish_wait_with_id`")]
+    #[inline]
+    pub fn publish_sync_with_id(
+        &self,
+        stream_id: u32,
+        subject: &[u8],
+        msg_id: &[u8],
+        payload: Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        self.publish_wait_with_id(stream_id, subject, msg_id, payload)
+    }
+
+    /// Deprecated alias for [`publish_batch_wait`](Self::publish_batch_wait).
+    #[deprecated(note = "renamed to `publish_batch_wait`")]
+    #[inline]
+    pub fn publish_batch_sync(
+        &self,
+        stream_id: u32,
+        entries: &[BatchEntry<'_>],
+    ) -> impl std::future::Future<Output = Result<Bytes, ClientError>> + Send {
+        self.publish_batch_wait(stream_id, entries)
     }
 
     /// Publish a message with a delivery delay.
@@ -322,7 +412,7 @@ impl Client {
     /// and stripped on delivery — consumers receive only the user payload.
     ///
     /// If a header with key `b"msg-id"` is present, it is used for
-    /// broker-side idempotency dedup (equivalent to `publish_sync_with_id`).
+    /// broker-side idempotency dedup (equivalent to `publish_wait_with_id`).
     pub fn publish_with_headers(
         &self,
         stream_id: u32,
@@ -354,7 +444,39 @@ impl Client {
         consumer_id: u32,
         filter: &[u8],
     ) -> impl std::future::Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
-        crate::consume::subscribe_async(Arc::clone(&self.inner), stream_id, consumer_id, filter)
+        crate::consume::subscribe_async(Arc::clone(&self.inner), stream_id, consumer_id, filter, None)
+    }
+
+    /// Subscribe with durable redelivery dedup keyed by
+    /// `(stream_name, consumer_name)`.
+    ///
+    /// Identical to [`Client::subscribe`], but resolves an [`ackstore`] slot
+    /// so that after a restart an already-processed message is recognized and
+    /// re-acked instead of re-delivered to your handler. Requires the client
+    /// to have been created with [`Client::connect_with_ackstore`]; without a
+    /// store, this behaves exactly like `subscribe` (no dedup).
+    ///
+    /// The names MUST match those used to create the stream and consumer — the
+    /// numeric `consumer_id` is ephemeral (it changes on delete+recreate) and
+    /// cannot be a durable dedup key, whereas `seq` is stream-scoped so
+    /// `(stream_name, consumer_name, seq)` is stable across consumer recreation.
+    ///
+    /// [`ackstore`]: crate::ackstore
+    pub fn subscribe_dedup<'a>(
+        &self,
+        stream_name: &'a str,
+        consumer_name: &'a str,
+        stream_id: u32,
+        consumer_id: u32,
+        filter: &'a [u8],
+    ) -> impl std::future::Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
+        crate::consume::subscribe_async(
+            Arc::clone(&self.inner),
+            stream_id,
+            consumer_id,
+            filter,
+            Some((stream_name, consumer_name)),
+        )
     }
 
     // ── manage ────────────────────────────────────────────────────────────────

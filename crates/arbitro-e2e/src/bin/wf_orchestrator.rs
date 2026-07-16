@@ -105,7 +105,7 @@ async fn run() -> i32 {
         payload.push(0); // attempt = 0
         payload.extend_from_slice(format!("job-{i}").as_bytes());
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 task_stream_id,
                 subject,
                 msg_id.as_bytes(),

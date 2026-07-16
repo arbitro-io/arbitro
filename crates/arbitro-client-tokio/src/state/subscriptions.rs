@@ -4,11 +4,13 @@
 //! frames by `consumer_id`.  No `SubjectTrie` is needed client-side.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::ackstore::SlotRef;
 use crate::consume::message::Message;
 
 /// Per-subscription state stored in the registry.
@@ -19,6 +21,11 @@ pub(crate) struct SubRecord {
     pub sub_body: Bytes,
     /// Sender end of the message delivery channel.
     pub tx: mpsc::Sender<Message>,
+    /// Durable dedup slot for this `(stream, consumer)`, resolved once at
+    /// subscribe time. `None` when persistence is disabled. Cloned into each
+    /// delivered `Message` (record-on-ack) and consulted on the delivery hot
+    /// path (`seen`) and the broker-cursor path (`confirm_up_to`).
+    pub slot: Option<Arc<dyn SlotRef>>,
 }
 
 impl std::fmt::Debug for SubRecord {
@@ -51,6 +58,7 @@ impl Subscriptions {
         consumer_id: u32,
         stream_id: u32,
         sub_body: Bytes,
+        slot: Option<Arc<dyn SlotRef>>,
     ) -> mpsc::Receiver<Message> {
         let (tx, rx) = mpsc::channel(4096);
         self.inner.write().unwrap().insert(
@@ -59,6 +67,7 @@ impl Subscriptions {
                 stream_id,
                 sub_body,
                 tx,
+                slot,
             },
         );
         rx
@@ -91,13 +100,24 @@ impl Subscriptions {
         true
     }
 
-    /// Look up the `stream_id` for a registered consumer.
-    pub fn stream_id_of(&self, consumer_id: u32) -> Option<u32> {
+    /// Look up the `(stream_id, dedup slot)` for a registered consumer in a
+    /// single lock acquisition. Returns `(0, None)` when unknown — matching
+    /// the demux hot path's `unwrap_or` fallbacks.
+    pub fn route_of(&self, consumer_id: u32) -> (u32, Option<Arc<dyn SlotRef>>) {
+        match self.inner.read().unwrap().get(&consumer_id) {
+            Some(r) => (r.stream_id, r.slot.clone()),
+            None => (0, None),
+        }
+    }
+
+    /// Look up the durable dedup slot for a registered consumer. Used by the
+    /// broker-cursor cleanup path (`AckBatchResp` / `AckStateRep`).
+    pub fn slot_of(&self, consumer_id: u32) -> Option<Arc<dyn SlotRef>> {
         self.inner
             .read()
             .unwrap()
             .get(&consumer_id)
-            .map(|r| r.stream_id)
+            .and_then(|r| r.slot.clone())
     }
 
     /// Return all stored `sub_body` buffers for reconnect replay.

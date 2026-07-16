@@ -189,23 +189,6 @@ fn replay_subscriptions(inner: &Inner, lease: &mut WriteLease) {
 /// `AckBatchFrame` flush.
 fn send_ack_state_reqs(inner: &Inner, lease: &mut WriteLease) {
     let consumers = inner.ackrel.active_consumers();
-    #[cfg(feature = "ack-persistence")]
-    let mut consumers = consumers;
-    #[cfg(feature = "ack-persistence")]
-    {
-        if let Some(cold) = &inner.cold {
-            if let Ok(store) = cold.try_lock() {
-                if let Ok(summaries) = store.load_summaries() {
-                    for s in summaries {
-                        let pair = (s.consumer_id, s.generation);
-                        if !consumers.contains(&pair) {
-                            consumers.push(pair);
-                        }
-                    }
-                }
-            }
-        }
-    }
     for (consumer_id, generation) in consumers {
         let seq = inner.seq_alloc.next();
         let _ = lease.try_send(WriteFrame::Mono(encode_ack_state_req_v2(

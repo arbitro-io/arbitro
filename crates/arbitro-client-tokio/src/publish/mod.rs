@@ -110,7 +110,7 @@ pub(crate) fn publish_batch_async(
 /// `async move` block so that no `&WritePool` / `&Pending` borrow
 /// crosses the await point. Only the owned `rx` receiver (which is `Send`)
 /// lives inside the returned future.
-pub(crate) fn publish_sync_async(
+pub(crate) fn publish_wait_async(
     pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,
@@ -205,7 +205,7 @@ pub(crate) fn publish_with_reply_async(
 /// Returns the broker reply (`first_seq`) from the **first** chunk.
 /// Subsequent chunks are sent fire-and-forget style (no pending slot)
 /// because only the first seq is meaningful to the caller.
-pub(crate) fn publish_batch_sync_async(
+pub(crate) fn publish_batch_wait_async(
     pool: &Arc<WritePool>,
     pending: &Pending,
     seq_alloc: &SeqAllocator,

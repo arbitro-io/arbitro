@@ -77,6 +77,44 @@ while let Some(msg) = sub.recv().await {
 }
 ```
 
+## Persistent Redelivery Dedup (ackstore)
+
+The broker delivers at-least-once, so a crash between "processed" and
+"acked" can lead to a redelivery. To skip work already done — even across a
+process restart — attach a durable dedup store keyed by
+`(stream_name, consumer_name, seq)`:
+
+```rust
+use arbitro_client_tokio::ackstore::wal::Wal;
+use arbitro_client_tokio::ackstore::WalConfig;
+
+// Durable write-ahead log; survives restarts.
+let wal = Wal::open(WalConfig::new("/var/lib/app/ackstore"))?;
+let client = Client::connect_with_ackstore(cfg, wal).await?;
+
+// subscribe_dedup carries the names the store needs to resolve a slot.
+let mut sub = client
+    .subscribe_dedup("orders", "worker", stream_id, consumer, b"")
+    .await?;
+while let Some(msg) = sub.recv().await {
+    process(&msg.payload); // runs at most once per seq, across restarts
+    msg.ack();             // records the seq into the WAL
+}
+```
+
+On `ack`, the message's `seq` is recorded into the log. On delivery, a
+lock-free `(min,max)` bounds probe skips any `seq` already recorded (the
+redelivery is silently re-acked). The broker's ack cursor
+(`AckBatchResp` / `AckStateRep`) drives `confirm_up_to`, dropping confirmed
+seqs so the live set stays tiny with no periodic job. The key is the
+**names**, not the numeric `consumer_id` — a consumer deleted and recreated
+under the same name still recognizes already-completed work.
+
+The [`Store`] trait is pluggable: `Wal` is the durable backend,
+`MemoryStore` an in-process one; a future infra swap needs no hot-path
+changes. (This WAL replaced the old optional SQLite cold tier — there is no
+longer any `rusqlite` dependency.)
+
 ## Service (Request/Reply RPC)
 
 Build named services with automatic stream/consumer creation, handler dispatch, and correlated request/reply.

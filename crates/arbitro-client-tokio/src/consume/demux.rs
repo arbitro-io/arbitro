@@ -75,7 +75,25 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
     let subject = Box::from(&frame[body_end..payload_off]);
     let reply_to = Bytes::new(); // Single Deliver does not carry reply_to
     let payload = frame.slice(payload_off..);
-    let stream_id = inner.subscriptions.stream_id_of(consumer_id).unwrap_or(0);
+    let (stream_id, slot) = inner.subscriptions.route_of(consumer_id);
+
+    // Durable redelivery dedup: if this seq was already processed+acked
+    // (even in a prior process lifetime), re-ack so the broker advances its
+    // cursor and stops redelivering — without re-running the user handler.
+    if let Some(s) = &slot {
+        if s.seen(deliver_seq) {
+            inner
+                .metrics
+                .dedup_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
+                seq: deliver_seq,
+                consumer_id,
+                subject_hash,
+            });
+            return;
+        }
+    }
 
     let msg = Message::new(
         deliver_seq,
@@ -88,6 +106,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         inner.ack_tx.clone(),
         inner.nack_tx.clone(),
         Arc::clone(inner),
+        slot,
     );
     inner
         .metrics
@@ -138,7 +157,10 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         let subject_hash = entry.subject_hash.get();
         off = entry_end;
 
-        if frame.len() < off + data_len {
+        // Validate the interior layout before slicing: a malformed entry with
+        // `subj_len`/`reply_len` exceeding `data_len` (or a `data_len` past the
+        // frame) would otherwise panic the reader task on the slice below.
+        if frame.len() < off + data_len || subj_len + reply_len > data_len {
             break;
         }
         let subject = Box::from(&frame[off..off + subj_len]);
@@ -151,7 +173,23 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         let payload = frame.slice(payload_start..off + data_len);
         off += data_len;
 
-        let stream_id = inner.subscriptions.stream_id_of(consumer_id).unwrap_or(0);
+        let (stream_id, slot) = inner.subscriptions.route_of(consumer_id);
+
+        // Durable redelivery dedup (see `dispatch_deliver`).
+        if let Some(s) = &slot {
+            if s.seen(deliver_seq) {
+                inner
+                    .metrics
+                    .dedup_hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
+                    seq: deliver_seq,
+                    consumer_id,
+                    subject_hash,
+                });
+                continue;
+            }
+        }
 
         let msg = Message::new(
             deliver_seq,
@@ -164,6 +202,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
             inner.ack_tx.clone(),
             inner.nack_tx.clone(),
             Arc::clone(inner),
+            slot,
         );
         inner
             .metrics

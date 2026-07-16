@@ -43,6 +43,7 @@ pub mod service;
 pub mod workflow;
 
 pub(crate) mod ackrel;
+pub mod ackstore;
 pub(crate) mod conn;
 pub(crate) mod consume;
 pub(crate) mod manage;

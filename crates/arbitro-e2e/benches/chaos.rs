@@ -15,7 +15,7 @@
 //! Management methods (`create_stream`, `create_consumer`, etc.) are
 //! `async fn(&self)` — their futures borrow `&Client` across `.await`.
 //! Since `Client: !Sync`, `&Client: !Send`, so those futures are `!Send`.
-//! `tokio::spawn` requires `Future: Send`.  Only `publish_sync` and
+//! `tokio::spawn` requires `Future: Send`.  Only `publish_wait` and
 //! `subscribe` are designed as `fn(&self) -> impl Future + Send`.
 //!
 //! Running chaos logic inline in `main` (which uses `block_on`, no `Send`
@@ -42,7 +42,7 @@ use tokio::sync::watch;
 
 const RUN_SECS: u64 = 18;
 const N_PRODUCERS: u64 = 4;
-const RATE: u64 = 150; // target publish_sync msg/s per producer
+const RATE: u64 = 150; // target publish_wait msg/s per producer
 const JOURNAL_DISK: u8 = 1;
 const STREAM: &[u8] = b"chaos";
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -184,7 +184,7 @@ fn rss_mb() -> f64 {
 
 // ── Producer ──────────────────────────────────────────────────────────────────
 //
-// Only calls `publish_sync` (impl Future + Send) and `connect_retry` (free fn).
+// Only calls `publish_wait` (impl Future + Send) and `connect_retry` (free fn).
 // NO management async fn(&self) calls — those require Client: Sync.
 
 async fn producer(
@@ -225,9 +225,9 @@ async fn producer(
             tick = Instant::now();
         }
 
-        // publish_sync(&self) -> impl Future + 'static + Send — borrow ends
+        // publish_wait(&self) -> impl Future + 'static + Send — borrow ends
         // after the call; future is self-contained (no &Client held across .await).
-        let fut = client.as_ref().unwrap().publish_sync(
+        let fut = client.as_ref().unwrap().publish_wait(
             sid,
             subj.as_bytes(),
             Bytes::copy_from_slice(&payload),
@@ -361,7 +361,7 @@ async fn main() {
     println!("    t= 8s — consumer force-disconnect + reconnect");
     println!("    t=12s — server kill");
     println!("    t=13s — server restart (new port)");
-    println!("  publish_sync timeout={PUBLISH_TIMEOUT:?}  producer reconnects after 3 errors");
+    println!("  publish_wait timeout={PUBLISH_TIMEOUT:?}  producer reconnects after 3 errors");
     println!();
 
     // ── Initial server ─────────────────────────────────────────────────────

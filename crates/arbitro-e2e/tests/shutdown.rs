@@ -60,10 +60,10 @@ async fn programmatic_shutdown_stops_accept() {
     }
 }
 
-/// After shutdown, `publish_sync` calls that were in-flight wake with an error
+/// After shutdown, `publish_wait` calls that were in-flight wake with an error
 /// rather than hanging past the disconnect.
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_wakes_inflight_publish_sync() {
+async fn shutdown_wakes_inflight_publish_wait() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
@@ -73,10 +73,10 @@ async fn shutdown_wakes_inflight_publish_sync() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
 
-    // Queue up several publish_sync futures BEFORE killing the server.
+    // Queue up several publish_wait futures BEFORE killing the server.
     let mut handles = Vec::new();
     for i in 0u64..20 {
-        let fut = client.publish_sync(sid, b"sd_wake.ev", Bytes::copy_from_slice(&i.to_le_bytes()));
+        let fut = client.publish_wait(sid, b"sd_wake.ev", Bytes::copy_from_slice(&i.to_le_bytes()));
         handles.push(tokio::spawn(fut));
     }
 
@@ -93,14 +93,14 @@ async fn shutdown_wakes_inflight_publish_sync() {
         v
     })
     .await
-    .expect("all publish_sync calls must wake within 5 s of shutdown");
+    .expect("all publish_wait calls must wake within 5 s of shutdown");
 
     assert_eq!(outcomes.len(), 20);
     // Some may have succeeded (sent before the kill), some errored — both are fine.
     // The invariant is: none are still pending (the test didn't time out).
 }
 
-/// Publish-then-shutdown: messages that received a `publish_sync` ack BEFORE
+/// Publish-then-shutdown: messages that received a `publish_wait` ack BEFORE
 /// shutdown are durable — they survive a server restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn acked_messages_survive_shutdown() {
@@ -122,11 +122,11 @@ async fn acked_messages_survive_shutdown() {
         .collect();
     client.publish_batch(sid, &entries).expect("publish_batch");
 
-    // Confirm via publish_sync so we know the last message is persisted.
+    // Confirm via publish_wait so we know the last message is persisted.
     let last = client
-        .publish_sync(sid, b"sd_durable.ev", Bytes::copy_from_slice(b"last"))
+        .publish_wait(sid, b"sd_durable.ev", Bytes::copy_from_slice(b"last"))
         .await
-        .expect("publish_sync should succeed");
+        .expect("publish_wait should succeed");
     let last_seq = u64::from_le_bytes(last[..8].try_into().unwrap());
     assert!(last_seq >= 51, "expected seq ≥51, got {last_seq}");
 
@@ -177,9 +177,9 @@ async fn sigterm_triggers_graceful_shutdown() {
 
     // Confirm at least one message is durably written.
     client
-        .publish_sync(sid, b"sd_sigterm.ev", Bytes::copy_from_slice(b"probe"))
+        .publish_wait(sid, b"sd_sigterm.ev", Bytes::copy_from_slice(b"probe"))
         .await
-        .expect("publish_sync before shutdown");
+        .expect("publish_wait before shutdown");
 
     // External shutdown() — same call the SIGTERM handler makes internally.
     server.shutdown().await;
@@ -224,9 +224,9 @@ async fn sigterm_raw_signal_isolated() {
     let sid = TestServer::parse_id(&resp);
 
     client
-        .publish_sync(sid, b"sd_raw_sig.ev", Bytes::copy_from_slice(b"probe"))
+        .publish_wait(sid, b"sd_raw_sig.ev", Bytes::copy_from_slice(b"probe"))
         .await
-        .expect("publish_sync before SIGTERM");
+        .expect("publish_wait before SIGTERM");
 
     // Send the actual OS SIGTERM — server's signal handler will catch it.
     signal::kill(Pid::this(), Signal::SIGTERM).expect("kill(SIGTERM)");
@@ -242,7 +242,7 @@ async fn sigterm_raw_signal_isolated() {
     server2.shutdown().await;
 }
 
-/// SIGTERM while publish_sync calls are in-flight: all callers must wake
+/// SIGTERM while publish_wait calls are in-flight: all callers must wake
 /// (error or ok), never hang.
 ///
 /// Note: firing SIGTERM at Pid::this() is process-wide — it would also shut
@@ -251,7 +251,7 @@ async fn sigterm_raw_signal_isolated() {
 /// the SIGTERM → watch bridge itself is validated by
 /// `sigterm_triggers_graceful_shutdown`.
 #[tokio::test(flavor = "multi_thread")]
-async fn sigterm_wakes_inflight_publish_sync() {
+async fn sigterm_wakes_inflight_publish_wait() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
@@ -263,7 +263,7 @@ async fn sigterm_wakes_inflight_publish_sync() {
 
     let mut handles = Vec::new();
     for i in 0u64..20 {
-        let fut = client.publish_sync(
+        let fut = client.publish_wait(
             sid,
             b"sd_sig_wake.ev",
             Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -375,7 +375,7 @@ async fn shutdown_under_concurrent_publish_load() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
 
-    // Spawn 4 concurrent publish_sync producers.
+    // Spawn 4 concurrent publish_wait producers.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ok_n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let err_n = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -388,7 +388,7 @@ async fn shutdown_under_concurrent_publish_load() {
             let err_n = std::sync::Arc::clone(&err_n);
             tokio::spawn(async move {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let fut = client.publish_sync(
+                    let fut = client.publish_wait(
                         sid,
                         b"sd_load.ev",
                         Bytes::copy_from_slice(&id.to_le_bytes()),

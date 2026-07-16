@@ -76,7 +76,7 @@ async fn publish_to_missing_stream_errors() {
 
     // Use a non-existent stream_id (e.g., u32::MAX)
     let result = client
-        .publish_sync(u32::MAX, b"ghost_event", Bytes::copy_from_slice(b"data"))
+        .publish_wait(u32::MAX, b"ghost_event", Bytes::copy_from_slice(b"data"))
         .await;
     assert!(
         result.is_err(),
@@ -142,7 +142,7 @@ async fn publish_single_delivers_correctly() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"chat_hello", Bytes::copy_from_slice(b"world"))
+        .publish_wait(stream_id, b"chat_hello", Bytes::copy_from_slice(b"world"))
         .await
         .expect("publish");
 
@@ -182,7 +182,7 @@ async fn publish_batch_delivers_all() {
         .map(|_| BatchEntry::new(&b"logs_line"[..], Bytes::copy_from_slice(b"data")))
         .collect();
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect("publish_batch");
 
@@ -214,19 +214,19 @@ async fn publish_sequences_monotonic() {
     let stream_id = TestServer::parse_id(&resp);
 
     let resp1 = client
-        .publish_sync(stream_id, b"counter_inc", Bytes::copy_from_slice(b"1"))
+        .publish_wait(stream_id, b"counter_inc", Bytes::copy_from_slice(b"1"))
         .await
         .unwrap();
     let seq1 = u64::from_le_bytes(resp1[..8].try_into().unwrap());
 
     let resp2 = client
-        .publish_sync(stream_id, b"counter_inc", Bytes::copy_from_slice(b"2"))
+        .publish_wait(stream_id, b"counter_inc", Bytes::copy_from_slice(b"2"))
         .await
         .unwrap();
     let seq2 = u64::from_le_bytes(resp2[..8].try_into().unwrap());
 
     let resp3 = client
-        .publish_sync(stream_id, b"counter_inc", Bytes::copy_from_slice(b"3"))
+        .publish_wait(stream_id, b"counter_inc", Bytes::copy_from_slice(b"3"))
         .await
         .unwrap();
     let seq3 = u64::from_le_bytes(resp3[..8].try_into().unwrap());
@@ -254,7 +254,7 @@ async fn replay_deliver_all_historical() {
         .map(|_| BatchEntry::new(&b"history.evt"[..], Bytes::copy_from_slice(b"data")))
         .collect();
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect("publish_batch");
 
@@ -319,7 +319,7 @@ async fn ack_prevents_redelivery() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"acktest_msg", Bytes::copy_from_slice(b"data"))
+        .publish_wait(stream_id, b"acktest_msg", Bytes::copy_from_slice(b"data"))
         .await
         .expect("publish");
 
@@ -357,7 +357,7 @@ async fn nack_causes_redelivery() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"nacktest_msg", Bytes::copy_from_slice(b"data"))
+        .publish_wait(stream_id, b"nacktest_msg", Bytes::copy_from_slice(b"data"))
         .await
         .expect("publish");
 
@@ -408,7 +408,7 @@ async fn delivery_preserves_order() {
     for i in 0..20u32 {
         let payload = i.to_le_bytes();
         client
-            .publish_sync(stream_id, b"ordered_seq", Bytes::copy_from_slice(&payload))
+            .publish_wait(stream_id, b"ordered_seq", Bytes::copy_from_slice(&payload))
             .await
             .expect("publish");
     }
@@ -470,7 +470,7 @@ async fn fanout_two_consumers_each_receive_all() {
     // Publish 5 messages
     for i in 0..5u32 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"events_tick",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -531,7 +531,7 @@ async fn queue_group_distributes_messages() {
     // Publish 10 messages
     for i in 0..10u32 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"tasks_job",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -630,7 +630,7 @@ async fn fanout_with_subject_filters() {
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         publisher
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 subj.as_bytes(),
                 Bytes::copy_from_slice(b"order-data"),
@@ -641,7 +641,7 @@ async fn fanout_with_subject_filters() {
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         publisher
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 subj.as_bytes(),
                 Bytes::copy_from_slice(b"pay-data"),
@@ -757,14 +757,14 @@ async fn queue_with_subject_filters_no_false_dedup() {
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         publisher
-            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
+            .publish_wait(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
             .await
             .expect("publish");
     }
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         publisher
-            .publish_sync(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
+            .publish_wait(stream_id, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
             .await
             .expect("publish");
     }
@@ -868,7 +868,7 @@ async fn queue_overlapping_filters_no_duplicates() {
     for i in 0..10u32 {
         let subj = format!("events.{i}");
         publisher
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 subj.as_bytes(),
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -976,7 +976,7 @@ async fn consumers_on_different_streams_isolated() {
 
     // Publish to logs only
     client
-        .publish_sync(stream_id1, b"logs_line", Bytes::copy_from_slice(b"hello"))
+        .publish_wait(stream_id1, b"logs_line", Bytes::copy_from_slice(b"hello"))
         .await
         .expect("publish");
 
@@ -1056,7 +1056,7 @@ async fn queue_group_multi_client() {
     let publisher = server.connect().await;
     for i in 0..10u32 {
         publisher
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"qtasks_job",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -1150,7 +1150,7 @@ async fn fanout_multi_client() {
     let publisher = server.connect().await;
     for i in 0..5u32 {
         publisher
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"fevents_tick",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -1259,7 +1259,7 @@ async fn queue_group_three_clients_100_msgs() {
         .map(|_| BatchEntry::new(&b"q3_job"[..], Bytes::copy_from_slice(b"work")))
         .collect();
     publisher
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect("publish_batch");
 
@@ -1355,7 +1355,7 @@ async fn streams_are_isolated() {
 
     // Publish to stream alpha only
     client
-        .publish_sync(stream_id_a, b"alpha_event", Bytes::copy_from_slice(b"data"))
+        .publish_wait(stream_id_a, b"alpha_event", Bytes::copy_from_slice(b"data"))
         .await
         .expect("publish");
 
@@ -1391,7 +1391,7 @@ async fn ack_sync_returns_ok() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"acksync_ev", Bytes::copy_from_slice(b"payload"))
+        .publish_wait(stream_id, b"acksync_ev", Bytes::copy_from_slice(b"payload"))
         .await
         .expect("publish");
 
@@ -1451,7 +1451,7 @@ async fn max_inflight_caps_delivery() {
     // Publish 5 messages
     for i in 0..5u8 {
         client
-            .publish_sync(stream_id, b"inf_subj", Bytes::copy_from_slice(&[i]))
+            .publish_wait(stream_id, b"inf_subj", Bytes::copy_from_slice(&[i]))
             .await
             .expect("publish");
     }
@@ -1541,7 +1541,7 @@ async fn max_subject_inflight_multiple_patterns() {
         BatchEntry::new(b"message.premium.orders", Bytes::copy_from_slice(b"P4")),
     ];
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect("publish_batch");
 

@@ -125,9 +125,10 @@ impl DelayedJournal {
     /// The file is created lazily on the first `append`.
     pub fn new(data_dir: &Path) -> Self {
         let path = data_dir.join("delayed.log");
+        // Mirrors config.rs: durability is opt-in. Default = no per-write fsync.
         let fsync_policy = match std::env::var("ARBITRO_FSYNC_POLICY").as_deref() {
-            Ok("none") => FsyncPolicy::None,
-            _ => FsyncPolicy::Every,
+            Ok("every") => FsyncPolicy::Every,
+            _ => FsyncPolicy::None,
         };
         Self {
             path,

@@ -83,6 +83,11 @@ pub struct Message {
     ack_tx: mpsc::Sender<AckCmd>,
     nack_tx: mpsc::Sender<NackCmd>,
     inner: Arc<Inner>,
+    /// Durable dedup slot for this delivery's `(stream, consumer)`, resolved
+    /// once at subscribe time. `None` when persistence is disabled. On ack the
+    /// message's `seq` is recorded here so a redelivery after restart is
+    /// recognized and skipped. See [`crate::ackstore`].
+    slot: Option<Arc<dyn crate::ackstore::SlotRef>>,
 }
 
 impl std::fmt::Debug for Message {
@@ -110,6 +115,7 @@ impl Message {
         ack_tx: mpsc::Sender<AckCmd>,
         nack_tx: mpsc::Sender<NackCmd>,
         inner: Arc<Inner>,
+        slot: Option<Arc<dyn crate::ackstore::SlotRef>>,
     ) -> Self {
         Self {
             seq,
@@ -122,6 +128,7 @@ impl Message {
             ack_tx,
             nack_tx,
             inner,
+            slot,
         }
     }
 
@@ -180,6 +187,20 @@ impl Message {
     /// batcher's periodic sweep (or replayed after reconnect).
     #[inline]
     pub fn ack(&self) {
+        // Durable dedup: record this seq as processed so a redelivery (even
+        // after a client restart) is recognized and skipped. Append is
+        // buffered — a periodic `Store::sync` makes it durable. Idempotent.
+        if let Some(slot) = &self.slot {
+            match slot.record(self.seq) {
+                Ok(()) => {
+                    self.inner.metrics.ackstore_records.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    self.inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(seq = self.seq, error = %e, "ackstore: record failed");
+                }
+            }
+        }
         let cmd = AckCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,

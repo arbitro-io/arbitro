@@ -273,7 +273,7 @@ async fn workflow_idempotent_no_duplicate_steps() {
     payload.extend_from_slice(b"payload");
 
     let result = client
-        .publish_sync_with_id(
+        .publish_wait_with_id(
             task_stream_id,
             subject,
             msg_id.as_bytes(),
@@ -993,7 +993,7 @@ async fn workflow_source_basic() {
 
     // Publish to the source stream (NOT the workflow stream).
     client
-        .publish_sync(src_stream_id, b"payments.completed", Bytes::from_static(b"order_99"))
+        .publish_wait(src_stream_id, b"payments.completed", Bytes::from_static(b"order_99"))
         .await
         .expect("publish to source");
 
@@ -1055,8 +1055,8 @@ async fn workflow_source_multiple() {
         .await
         .expect("workflow start");
 
-    client.publish_sync(sid_a, b"orders.new", Bytes::from_static(b"from_orders")).await.unwrap();
-    client.publish_sync(sid_b, b"refunds.new", Bytes::from_static(b"from_refunds")).await.unwrap();
+    client.publish_wait(sid_a, b"orders.new", Bytes::from_static(b"from_orders")).await.unwrap();
+    client.publish_wait(sid_b, b"refunds.new", Bytes::from_static(b"from_refunds")).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while count.load(Ordering::SeqCst) < 2 {
@@ -1115,7 +1115,7 @@ async fn workflow_source_plus_trigger() {
     // Manual trigger.
     handle.trigger(&client, b"manual").await.unwrap();
     // Source trigger.
-    client.publish_sync(src_sid, b"events.click", Bytes::from_static(b"source")).await.unwrap();
+    client.publish_wait(src_sid, b"events.click", Bytes::from_static(b"source")).await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while count.load(Ordering::SeqCst) < 2 {

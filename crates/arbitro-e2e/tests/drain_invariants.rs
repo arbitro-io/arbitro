@@ -133,7 +133,7 @@ async fn ack_wait_timeout_redelivers() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"acktimeout.event", Bytes::from_static(b"hello"))
+        .publish_wait(stream_id, b"acktimeout.event", Bytes::from_static(b"hello"))
         .await
         .unwrap();
 
@@ -187,7 +187,7 @@ async fn max_inflight_pauses_then_resumes_on_ack() {
     for i in 0u32..10 {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"flow.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -273,24 +273,24 @@ async fn wildcard_single_token_filter_matches_correctly() {
 
     // 3 should match (a/b/c at the wildcard slot); 1 should NOT.
     //
-    // `publish_sync` so each message is confirmed in the store before we
+    // `publish_wait` so each message is confirmed in the store before we
     // measure the drain — keeps the test deterministic regardless of how
     // long the broker takes to apply the publishes (which can spike under
     // load and turn fire-and-forget + tight drain timeout into a flake).
     client
-        .publish_sync(stream_id, b"wcsingle.a.event", Bytes::from_static(b"a"))
+        .publish_wait(stream_id, b"wcsingle.a.event", Bytes::from_static(b"a"))
         .await
         .unwrap();
     client
-        .publish_sync(stream_id, b"wcsingle.b.event", Bytes::from_static(b"b"))
+        .publish_wait(stream_id, b"wcsingle.b.event", Bytes::from_static(b"b"))
         .await
         .unwrap();
     client
-        .publish_sync(stream_id, b"wcsingle.c.event", Bytes::from_static(b"c"))
+        .publish_wait(stream_id, b"wcsingle.c.event", Bytes::from_static(b"c"))
         .await
         .unwrap();
     client
-        .publish_sync(
+        .publish_wait(
             stream_id,
             b"wcsingle.a.b.event",
             Bytes::from_static(b"too-many-tokens"),
@@ -346,7 +346,7 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
         .await
         .unwrap();
 
-    // All 4 of these match `wcmulti.>`. Use publish_sync so each message
+    // All 4 of these match `wcmulti.>`. Use publish_wait so each message
     // is confirmed in the store before we measure the drain — the bare
     // `publish` is fire-and-forget at the LOCAL socket buffer, not the
     // broker, and `drain_n` with a short per-msg timeout would otherwise
@@ -359,7 +359,7 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
     ];
     for s in subjects {
         client
-            .publish_sync(stream_id, s, Bytes::from_static(b"data"))
+            .publish_wait(stream_id, s, Bytes::from_static(b"data"))
             .await
             .unwrap();
     }
@@ -398,7 +398,7 @@ async fn delete_consumer_mid_drain_stops_delivery() {
     for i in 0u32..20 {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"mid.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -484,7 +484,7 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
     for i in 0u32..10 {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"midstream.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -545,7 +545,7 @@ async fn ack_policy_none_drains_without_acks() {
     for i in 0..N {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"fire.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -630,7 +630,7 @@ async fn ack_policy_none_ignores_max_inflight() {
     for i in 0..N {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"fire-cap.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -681,7 +681,7 @@ async fn ack_policy_explicit_does_enforce_max_inflight() {
     for i in 0..N {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"explicit-cap.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -753,7 +753,7 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
     for i in 0..N {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"fire-subj.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -789,7 +789,7 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
     for i in 0u32..10 {
         let p = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"seq.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -875,7 +875,7 @@ async fn slow_consumer_fast_publisher_is_lossless() {
     for i in 0..N {
         let p = format!("msg-{i:03}");
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"pace.event",
                 Bytes::copy_from_slice(p.as_bytes()),
@@ -922,11 +922,11 @@ async fn recycle_subject_after_ack_drains_fresh_batch() {
         create_consumer(&client, stream_id, b"worker", b"", b"", 10, 1, 0, 30_000, 0).await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
-    // Cycle 1 — publish_sync so the broker has confirmed acceptance
+    // Cycle 1 — publish_wait so the broker has confirmed acceptance
     // of every message before we measure drain.
     for i in 0u32..5 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"recycle.event",
                 Bytes::copy_from_slice(format!("c1-{i}").as_bytes()),
@@ -943,7 +943,7 @@ async fn recycle_subject_after_ack_drains_fresh_batch() {
     // Cycle 2 — same subject.
     for i in 0u32..5 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"recycle.event",
                 Bytes::copy_from_slice(format!("c2-{i}").as_bytes()),
@@ -1011,7 +1011,7 @@ async fn slow_consumer_does_not_starve_fast_consumer() {
     const N: usize = 30;
     for i in 0..N {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"fair.event",
                 Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
@@ -1108,7 +1108,7 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
                 let sid = TestServer::parse_id(&resp);
                 for i in 0..PER_PUB {
                     let payload = format!("p{p}-i{i}");
-                    c.publish_sync(
+                    c.publish_wait(
                         sid,
                         b"concur.event",
                         Bytes::copy_from_slice(payload.as_bytes()),
@@ -1170,13 +1170,13 @@ async fn resubscribe_continues_from_cursor() {
     // Phase 1: subscribe, drain 3, ack, drop.
     {
         let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
-        // publish_sync waits for the broker's RepOk per message so we
+        // publish_wait waits for the broker's RepOk per message so we
         // know all 5 are committed in the store BEFORE we measure the
         // drain — rules out a publish-arrival race that would skew the
         // assertion.
         for i in 0u32..5 {
             client
-                .publish_sync(
+                .publish_wait(
                     stream_id,
                     b"cursor.event",
                     Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
@@ -1191,11 +1191,11 @@ async fn resubscribe_continues_from_cursor() {
         }
     } // handle dropped — subscription closed at the client end
 
-    // While unsubscribed, publish more. publish_sync guarantees these
+    // While unsubscribed, publish more. publish_wait guarantees these
     // are confirmed in the store before re-subscribe.
     for i in 5u32..8 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"cursor.event",
                 Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
@@ -1298,7 +1298,7 @@ async fn t13_single_shard_saturation_no_silent_drops() {
 // This test creates a stream with max_age=1s, fills it with messages,
 // waits for expiry, then publishes a new message and asserts the publish
 // completes within a tight deadline. If eviction blocked the entire
-// shard worker unbounded, publish_sync would time out.
+// shard worker unbounded, publish_wait would time out.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1334,7 +1334,7 @@ async fn evict_expired_does_not_stall_publish() {
         })
         .collect();
     client
-        .publish_batch_sync(stream_id, &batch)
+        .publish_batch_wait(stream_id, &batch)
         .await
         .expect("fill batch");
 
@@ -1345,15 +1345,15 @@ async fn evict_expired_does_not_stall_publish() {
     // during this call — it must complete within 2 seconds regardless.
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        client.publish_sync(stream_id, b"evict_test.fresh", Bytes::from_static(b"alive")),
+        client.publish_wait(stream_id, b"evict_test.fresh", Bytes::from_static(b"alive")),
     )
     .await;
 
     match result {
         Ok(Ok(_)) => {} // publish completed within deadline — pass
-        Ok(Err(e)) => panic!("publish_sync errored (eviction may have broken state): {e:?}"),
+        Ok(Err(e)) => panic!("publish_wait errored (eviction may have broken state): {e:?}"),
         Err(_) => panic!(
-            "publish_sync timed out after 2s — evict_expired likely stalled the shard worker"
+            "publish_wait timed out after 2s — evict_expired likely stalled the shard worker"
         ),
     }
     server.shutdown().await;
@@ -1385,7 +1385,7 @@ async fn partial_write_recovery_redelivers_unacked() {
     // Publish 5 messages before subscribing.
     for i in 0u32..5 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"pw_recover.ev",
                 Bytes::copy_from_slice(format!("msg-{i}").as_bytes()),
@@ -1482,7 +1482,7 @@ async fn triple_fanout_two_explicit_one_none_all_receive() {
     const N: usize = 15;
     for i in 0..N {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"triple.ev",
                 Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
@@ -1565,7 +1565,7 @@ async fn mixed_ack_explicit_and_none_both_receive_all() {
     const N: usize = 20;
     for i in 0..N {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"mixed.event",
                 Bytes::copy_from_slice(format!("m-{i}").as_bytes()),

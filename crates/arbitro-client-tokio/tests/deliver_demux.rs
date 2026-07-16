@@ -91,13 +91,13 @@ async fn wildcard_subject_fanout_correct() {
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
             pub_client
-                .publish_sync(
+                .publish_wait(
                     stream_id,
                     b"deliver.test",
                     Bytes::from(i.to_le_bytes().to_vec()),
                 )
                 .await
-                .expect("publish_sync");
+                .expect("publish_wait");
         }
     });
 
@@ -191,7 +191,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
             pub_a
-                .publish_sync(stream_a, b"a.subj", Bytes::from(i.to_le_bytes().to_vec()))
+                .publish_wait(stream_a, b"a.subj", Bytes::from(i.to_le_bytes().to_vec()))
                 .await
                 .expect("pub A");
         }
@@ -199,7 +199,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
     tokio::spawn(async move {
         for i in 0u32..MSG_COUNT {
             pub_b
-                .publish_sync(stream_b, b"b.subj", Bytes::from(i.to_le_bytes().to_vec()))
+                .publish_wait(stream_b, b"b.subj", Bytes::from(i.to_le_bytes().to_vec()))
                 .await
                 .expect("pub B");
         }

@@ -1179,7 +1179,7 @@ impl WorkflowHandle {
         );
         let task = encode_task(instance_id, 0, 0, context);
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 self.task_stream_id,
                 subject.as_bytes(),
                 msg_id.as_bytes(),
@@ -1218,7 +1218,7 @@ impl WorkflowHandle {
             String::from_utf8_lossy(&self.name),
         );
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 self.task_stream_id,
                 subject.as_bytes(),
                 format!("wf:{instance_id}:cancel").as_bytes(),
@@ -1245,7 +1245,7 @@ impl WorkflowHandle {
             String::from_utf8_lossy(&self.name),
         );
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 self.task_stream_id,
                 subject.as_bytes(),
                 format!("wf:{instance_id}:resume:{seq}").as_bytes(),

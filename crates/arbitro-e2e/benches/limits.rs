@@ -197,7 +197,7 @@ async fn stage0_cap_enforced() -> (u32, u32, Duration) {
         .map(|_| BatchEntry::new(one_subject, Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 
@@ -280,7 +280,7 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
         .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     client
-        .publish_batch_sync(stream_id, &basic_entries)
+        .publish_batch_wait(stream_id, &basic_entries)
         .await
         .unwrap();
     let mut got = 0u32;
@@ -300,7 +300,7 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
         .collect();
     let start = Instant::now();
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 
@@ -403,7 +403,7 @@ async fn isolated_latency(iters: u64) -> Vec<Duration> {
         .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
         .collect();
     client
-        .publish_batch_sync(stream_id, &basic_entries)
+        .publish_batch_wait(stream_id, &basic_entries)
         .await
         .unwrap();
 
@@ -458,7 +458,7 @@ async fn multi_client_isolated_latency(iters: u64, n_clients: u64) -> Vec<Vec<Du
                 .map(|s| BatchEntry::new(s.as_bytes(), Bytes::copy_from_slice(payload.as_slice())))
                 .collect();
             client
-                .publish_batch_sync(stream_id, &basic_entries)
+                .publish_batch_wait(stream_id, &basic_entries)
                 .await
                 .unwrap();
 
@@ -540,7 +540,7 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
 
     let start = Instant::now();
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 

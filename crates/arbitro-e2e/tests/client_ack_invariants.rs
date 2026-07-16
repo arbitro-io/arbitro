@@ -8,10 +8,10 @@ use arbitro_client_tokio::ClientError;
 use bytes::Bytes;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 1. Concurrent publish_sync correlation
+// 1. Concurrent publish_wait correlation
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// N concurrent `publish_sync` calls on the same client must each receive
+/// N concurrent `publish_wait` calls on the same client must each receive
 /// **their own** ack. The server assigns a monotonic `ref_seq` per stream,
 /// so the set of returned ref_seqs must be exactly `{1..=N}` — no
 /// duplicates (would mean two callers got the same reply), no gaps
@@ -21,7 +21,7 @@ use bytes::Bytes;
 /// keys must route replies one-to-one to waiters, even under concurrent
 /// allocation + concurrent reply delivery.
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_publish_sync_correlation() {
+async fn concurrent_publish_wait_correlation() {
     const N: u64 = 100;
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -32,11 +32,11 @@ async fn concurrent_publish_sync_correlation() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // Obtain all futures synchronously before spawning — publish_sync returns
+    // Obtain all futures synchronously before spawning — publish_wait returns
     // `impl Future + Send` so the futures themselves can be sent to tasks.
     let mut handles = Vec::with_capacity(N as usize);
     for i in 0..N {
-        let fut = client.publish_sync(
+        let fut = client.publish_wait(
             stream_id,
             b"corr_ev",
             Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -46,7 +46,7 @@ async fn concurrent_publish_sync_correlation() {
 
     let mut seqs = HashSet::with_capacity(N as usize);
     for h in handles {
-        let resp = h.await.unwrap().expect("publish_sync should ack");
+        let resp = h.await.unwrap().expect("publish_wait should ack");
         let ref_seq = u64::from_le_bytes(resp[..8].try_into().unwrap());
         assert!(
             seqs.insert(ref_seq),
@@ -69,10 +69,10 @@ async fn concurrent_publish_sync_correlation() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 2. Many in-flight publish_sync, server dies → all callers wake
+// 2. Many in-flight publish_wait, server dies → all callers wake
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Spawn N `publish_sync` calls, then shut the server down. Every caller
+/// Spawn N `publish_wait` calls, then shut the server down. Every caller
 /// must wake with an `Err(_)` — never hang past the request timeout.
 ///
 /// This invariant is what makes the pending registry safe to swap: any
@@ -81,7 +81,7 @@ async fn concurrent_publish_sync_correlation() {
 /// `Sender` closes the `Receiver`. With `Pipe<T>`, the equivalent is
 /// the disconnect path explicitly poisoning every pending Pipe.
 #[tokio::test(flavor = "multi_thread")]
-async fn many_inflight_publish_sync_wake_on_disconnect() {
+async fn many_inflight_publish_wait_wake_on_disconnect() {
     const N: u64 = 50;
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -92,11 +92,11 @@ async fn many_inflight_publish_sync_wake_on_disconnect() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // Launch N concurrent publish_sync, each carrying a slow-ish payload.
-    // Obtain futures synchronously (publish_sync returns impl Future + Send).
+    // Launch N concurrent publish_wait, each carrying a slow-ish payload.
+    // Obtain futures synchronously (publish_wait returns impl Future + Send).
     let mut handles = Vec::with_capacity(N as usize);
     for i in 0..N {
-        let fut = client.publish_sync(
+        let fut = client.publish_wait(
             stream_id,
             b"orphan_ev",
             Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -133,20 +133,20 @@ async fn many_inflight_publish_sync_wake_on_disconnect() {
 // 3. Pending registry recycles cleanly (no leak across calls)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// After resolving a `publish_sync`, the env_seq slot must be released so
+/// After resolving a `publish_wait`, the env_seq slot must be released so
 /// the next call can reuse it without colliding with the previous waiter.
 ///
 /// Direct leak detection requires touching `Inner.pending` (private).
-/// Behaviorally we exercise it: 1000 sequential `publish_sync` calls
+/// Behaviorally we exercise it: 1000 sequential `publish_wait` calls
 /// must all complete in sub-second wall time. If the registry leaked
 /// `oneshot::Sender`s (or, post-swap, `Arc<Pipe<_>>`s), memory would
 /// grow but the test would still pass — so we add a second probe:
-/// after the loop, one more `publish_sync` succeeds, proving the
+/// after the loop, one more `publish_wait` succeeds, proving the
 /// registry is still functional (not deadlocked on a stale entry that
 /// happens to alias a new env_seq via u32 wrap — irrelevant at 1000,
 /// but shape of the test is the same at any N).
 #[tokio::test(flavor = "multi_thread")]
-async fn publish_sync_recycles_env_seq() {
+async fn publish_wait_recycles_env_seq() {
     const N: u64 = 1000;
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -160,13 +160,13 @@ async fn publish_sync_recycles_env_seq() {
     let mut last_seq = 0u64;
     for i in 0..N {
         let resp = client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"recycle_ev",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
             )
             .await
-            .expect("publish_sync should succeed mid-loop");
+            .expect("publish_wait should succeed mid-loop");
         let s = u64::from_le_bytes(resp[..8].try_into().unwrap());
         assert!(s > last_seq, "ref_seq must be monotonic");
         last_seq = s;
@@ -174,9 +174,9 @@ async fn publish_sync_recycles_env_seq() {
 
     // Probe: registry still alive after N calls.
     let resp = client
-        .publish_sync(stream_id, b"recycle_ev", Bytes::copy_from_slice(b"final"))
+        .publish_wait(stream_id, b"recycle_ev", Bytes::copy_from_slice(b"final"))
         .await
-        .expect("post-loop publish_sync must succeed (registry not stuck)");
+        .expect("post-loop publish_wait must succeed (registry not stuck)");
     let final_seq = u64::from_le_bytes(resp[..8].try_into().unwrap());
     assert!(final_seq > last_seq);
     server.shutdown().await;
@@ -188,14 +188,14 @@ async fn publish_sync_recycles_env_seq() {
 
 /// Mixed concurrent traffic: producer publishes N messages, consumer
 /// receives + acks them, while a second task fires unrelated
-/// `publish_sync` calls. Acks are fire-and-forget, so they don't share
+/// `publish_wait` calls. Acks are fire-and-forget, so they don't share
 /// the pending registry with the publishes in the new client.
 ///
 /// Invariant: acks and publish replies never cross-route. Verified by:
 ///   - All N messages received once (no redelivery → ack worked).
-///   - All side-channel publish_syncs succeed.
+///   - All side-channel publish_waits succeed.
 #[tokio::test(flavor = "multi_thread")]
-async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
+async fn ack_sync_and_publish_wait_share_registry_without_crosstalk() {
     const N: usize = 50;
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
@@ -224,7 +224,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
-    // Side-channel: another stream, fire publish_syncs in parallel.
+    // Side-channel: another stream, fire publish_waits in parallel.
     let resp = client
         .create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
@@ -234,7 +234,7 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     // Publish N messages on the consumed stream.
     for i in 0..N {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"mix_ev",
                 Bytes::copy_from_slice(&(i as u64).to_le_bytes()),
@@ -243,10 +243,10 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
             .expect("publish");
     }
 
-    // Obtain N publish_sync futures synchronously (they are Send), then spawn them.
+    // Obtain N publish_wait futures synchronously (they are Send), then spawn them.
     let mut side_futures = Vec::with_capacity(N);
     for i in 0..N {
-        let fut = client.publish_sync(
+        let fut = client.publish_wait(
             side_stream_id,
             b"side_ev",
             Bytes::copy_from_slice(&(i as u64).to_le_bytes()),
@@ -273,12 +273,12 @@ async fn ack_sync_and_publish_sync_share_registry_without_crosstalk() {
     for (i, r) in side_results.iter().enumerate() {
         assert!(
             r.is_ok(),
-            "side publish_sync #{i} failed: {:?}",
+            "side publish_wait #{i} failed: {:?}",
             r.as_ref().err()
         );
     }
 
-    // No redelivery — acks took effect, didn't leak into the publish_sync waiters.
+    // No redelivery — acks took effect, didn't leak into the publish_wait waiters.
     let extra = tokio::time::timeout(Duration::from_millis(300), handle.recv()).await;
     assert!(
         extra.is_err(),
@@ -315,7 +315,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     client
-        .publish_sync(stream_id, b"stale_ev", Bytes::copy_from_slice(b"once"))
+        .publish_wait(stream_id, b"stale_ev", Bytes::copy_from_slice(b"once"))
         .await
         .expect("publish");
 
@@ -342,7 +342,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
 // 6. ClientError variants on disconnect are well-formed (no surprises)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// `publish_sync` raced with server shutdown must resolve (ok or error) within
+/// `publish_wait` raced with server shutdown must resolve (ok or error) within
 /// the timeout — never hang, never return an unexpected error variant.
 ///
 /// Two outcomes are correct:
@@ -353,11 +353,11 @@ async fn stale_message_ack_after_disconnect_is_silent() {
 ///
 /// What must NOT happen: the future hangs indefinitely or panics.
 ///
-/// Note: `publish_sync` is a lazy future — no frame is sent until it is
+/// Note: `publish_wait` is a lazy future — no frame is sent until it is
 /// first polled. The future is spawned here so it races concurrently with
 /// the shutdown signal rather than being blocked behind it.
 #[tokio::test(flavor = "multi_thread")]
-async fn publish_sync_on_dead_server_returns_error() {
+async fn publish_wait_on_dead_server_returns_error() {
     use arbitro_client_tokio::{ClientConfig, ReconnectPolicy};
     use std::time::Duration as D;
 
@@ -382,11 +382,11 @@ async fn publish_sync_on_dead_server_returns_error() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    // Spawn the publish_sync future so it starts running concurrently with
+    // Spawn the publish_wait future so it starts running concurrently with
     // the shutdown signal. It may complete (Ok) during the drain window or
     // fail (Err) if the session ends first.
     let handle =
-        tokio::spawn(client.publish_sync(stream_id, b"dead_ev", Bytes::copy_from_slice(b"x")));
+        tokio::spawn(client.publish_wait(stream_id, b"dead_ev", Bytes::copy_from_slice(b"x")));
 
     // Signal shutdown — drain_disconnected() will wake any pending waiters.
     server.shutdown().await;
@@ -455,13 +455,13 @@ async fn t11_reconnect_resumes_unacked_tail() {
         for i in 0u32..5 {
             let p = format!("m-{i}");
             client_a
-                .publish_sync(
+                .publish_wait(
                     stream_id,
                     b"sub.event",
                     Bytes::copy_from_slice(p.as_bytes()),
                 )
                 .await
-                .expect("publish_sync");
+                .expect("publish_wait");
         }
 
         // Receive and ack the first 3 only.
@@ -551,7 +551,7 @@ async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
     let mut handle = owner.subscribe(stream_id, consumer_id, b"").await.unwrap();
     for i in 0u32..5 {
         owner
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"t7.ev",
                 Bytes::copy_from_slice(&i.to_le_bytes()),

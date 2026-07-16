@@ -288,9 +288,9 @@ async fn run_batch_sync(
             let batches = total.div_ceil(batch_size);
             for b in 0..batches {
                 let size = batch_size.min(total - b * batch_size);
-                c.publish_batch_sync(stream_id, &entries[..size])
+                c.publish_batch_wait(stream_id, &entries[..size])
                     .await
-                    .expect("publish_batch_sync");
+                    .expect("publish_batch_wait");
             }
         });
     }
@@ -328,9 +328,9 @@ async fn prefill_streams(
                 let size = BATCH_SIZE.min(total - b * BATCH_SIZE);
                 let slice = &entries[..size];
                 if b + 1 == batches {
-                    c.publish_batch_sync(stream_id, slice)
+                    c.publish_batch_wait(stream_id, slice)
                         .await
-                        .expect("prefill publish_batch_sync");
+                        .expect("prefill publish_batch_wait");
                 } else {
                     loop {
                         match c.publish_batch(stream_id, slice) {
@@ -536,7 +536,13 @@ fn main() {
     let replay_iterations = cfg_replay_iterations();
 
     let rt = Runtime::new().unwrap();
-    let addr = rt.block_on(start_server());
+    let addr = match std::env::var("ARBITRO_ADDR") {
+        Ok(a) => {
+            println!("Using external server at {a}");
+            a
+        }
+        Err(_) => rt.block_on(start_server()),
+    };
 
     let stream_names: Vec<Vec<u8>> = (0..MAX_STREAMS)
         .map(|i| format!("ingest_{i}").into_bytes())
@@ -706,7 +712,7 @@ fn main() {
         }
 
         // ── Batch publish SYNC ──────────────────────────────────────────
-        println!("\n[ publish_batch_sync — batch={batch_size}, {total_msgs} msgs total/iter, server-confirmed ]");
+        println!("\n[ publish_batch_wait — batch={batch_size}, {total_msgs} msgs total/iter, server-confirmed ]");
         print_header();
 
         for &n in &concurrency {
@@ -958,9 +964,9 @@ fn main() {
                         let size = batch_size.min(total - b * batch_size);
                         if b + 1 == batches {
                             pub_client
-                                .publish_batch_sync(fanout_stream_id, &entries[..size])
+                                .publish_batch_wait(fanout_stream_id, &entries[..size])
                                 .await
-                                .expect("fanout publish_batch_sync");
+                                .expect("fanout publish_batch_wait");
                         } else {
                             loop {
                                 match pub_client.publish_batch(fanout_stream_id, &entries[..size]) {

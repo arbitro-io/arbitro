@@ -16,7 +16,7 @@ use std::time::Duration;
 
 const SUBJECT: &[u8] = b"limits.frame";
 
-/// Compute the payload length that makes a `publish_sync(stream_id, SUBJECT, payload)`
+/// Compute the payload length that makes a `publish_wait(stream_id, SUBJECT, payload)`
 /// frame's wire `msg_len` equal exactly `target_msg_len`.
 fn payload_len_for_msg_len(target_msg_len: usize) -> usize {
     target_msg_len - PUB_BODY_FIXED - SUBJECT.len()
@@ -48,7 +48,7 @@ async fn publish_at_exact_max_frame_size_succeeds() {
     let payload = vec![0xABu8; payload_len];
 
     let resp = client
-        .publish_sync(stream_id, SUBJECT, Bytes::from(payload))
+        .publish_wait(stream_id, SUBJECT, Bytes::from(payload))
         .await
         .expect("publish at exactly max_frame_size must succeed");
     let _ = TestServer::parse_id(&resp);
@@ -95,7 +95,7 @@ async fn publish_one_byte_over_max_frame_size_disconnects() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        client.publish_sync(stream_id, SUBJECT, Bytes::from(payload)),
+        client.publish_wait(stream_id, SUBJECT, Bytes::from(payload)),
     )
     .await
     .expect("server must not hang — it should drop the connection promptly");
@@ -141,7 +141,7 @@ async fn multi_mb_payload_round_trips() {
     let payload: Vec<u8> = (0..PAYLOAD_SIZE).map(|i| (i % 251) as u8).collect();
 
     client
-        .publish_sync(stream_id, b"big.data", Bytes::copy_from_slice(&payload))
+        .publish_wait(stream_id, b"big.data", Bytes::copy_from_slice(&payload))
         .await
         .expect("multi-MB publish must succeed");
 

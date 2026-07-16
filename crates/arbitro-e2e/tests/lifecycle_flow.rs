@@ -27,7 +27,7 @@ async fn trace_publish_subscribe_ack_flow() {
 
     for i in 0..3u32 {
         client
-            .publish_sync(
+            .publish_wait(
                 stream_id,
                 b"trace_stream.evt",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -101,7 +101,7 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
 
     for i in 0u32..5 {
         client
-            .publish_sync(
+            .publish_wait(
                 old_stream_id,
                 b"t12.ev",
                 Bytes::copy_from_slice(&i.to_le_bytes()),
@@ -147,7 +147,7 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
     // Publish 3 new entries on the fresh stream.
     for i in 100u32..103 {
         client
-            .publish_sync(
+            .publish_wait(
                 new_stream_id,
                 b"t12.new",
                 Bytes::copy_from_slice(&i.to_le_bytes()),

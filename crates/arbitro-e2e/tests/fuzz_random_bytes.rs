@@ -87,7 +87,7 @@ async fn t20_random_bytes_after_hello_never_abort_broker() {
     // can still serve management calls. If the broker had panicked,
     // this would hang or error.
     sibling
-        .publish_sync(
+        .publish_wait(
             alive_stream_id,
             b"alive_check.ping",
             Bytes::from_static(b"OK"),

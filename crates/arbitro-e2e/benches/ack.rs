@@ -112,7 +112,7 @@ async fn setup(
         .collect();
     // Use sync to ensure publish is stored before we try to receive.
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 
@@ -234,7 +234,7 @@ async fn stage_ack_multi(total: u64, n_clients: u64) -> (Duration, u64) {
         .collect();
     let start = Instant::now();
     control
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 
@@ -291,7 +291,7 @@ async fn correctness_probe(client: &Client, probe_count: u32) -> u32 {
 
     // Publish after subscribing so delivery is live.
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .unwrap();
 

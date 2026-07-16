@@ -480,7 +480,7 @@ async fn workflow_across_cluster_nodes() {
     let pub_client = TestServer::connect_to(&client_addrs[1]).await;
     let pub_result = tokio::time::timeout(
         Duration::from_secs(5),
-        pub_client.publish_sync_with_id(
+        pub_client.publish_wait_with_id(
             stream_id,
             b"_wf.cluster-test.step.0",
             msg_id,
@@ -681,7 +681,7 @@ async fn message_replication_survives_leader_kill() {
             let payload = format!("msg-{i}");
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                pub_client.publish_sync(
+                pub_client.publish_wait(
                     stream_id,
                     b"test.repl",
                     Bytes::from(payload),

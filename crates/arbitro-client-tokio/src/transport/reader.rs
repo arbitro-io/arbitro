@@ -113,6 +113,11 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
     }
 
     if action == Action::RepError.as_u16() {
+        // Guard the fixed-size slice: a truncated RepError (msg_len smaller than
+        // the RepErr body) would panic the reader task on the slice below.
+        if frame.len() < core::mem::size_of::<RepErrFrame>() {
+            return;
+        }
         if let Ok(rep) = RepErrFrame::ref_from_bytes(&frame[..core::mem::size_of::<RepErrFrame>()])
         {
             inner
@@ -176,6 +181,9 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
 /// than try to reconcile entry-by-entry. Otherwise, trim the deferred set
 /// to the broker's confirmed/retained range and flush what survives.
 fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
+    if frame.len() < AckStateRepFrame::WIRE_SIZE {
+        return; // truncated frame — don't panic the reader on the slice
+    }
     let Ok(rep) = AckStateRepFrame::ref_from_bytes(&frame[..AckStateRepFrame::WIRE_SIZE]) else {
         return;
     };
@@ -189,19 +197,22 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
         // `ensure` on a new generation replaces the slot wholesale — the
         // purge invariant for a session/consumer change.
         inner.ackrel.ensure(consumer_id, generation);
-        #[cfg(feature = "ack-persistence")]
-        if let Some(cold) = inner.cold.clone() {
-            tokio::task::spawn_blocking(move || {
-                let mut store = cold.blocking_lock();
-                let _ = store.purge_generation(consumer_id);
-            });
-        }
         return;
     }
 
     inner.ackrel.purge_up_to(consumer_id, cursor);
     // Below the broker's retention floor — will never be confirmable.
     inner.ackrel.purge_up_to(consumer_id, low_seq.saturating_sub(1));
+
+    // Durable dedup: the broker's cursor is a cumulative ack floor — it never
+    // redelivers at or below it, so drop those seqs from the WAL live set.
+    // Keeps the set tiny with no periodic job (see `SlotRef::confirm_up_to`).
+    if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
+        if let Err(e) = slot.confirm_up_to(cursor) {
+            inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
+        }
+    }
 
     let pending = inner.ackrel.drain_ascending(consumer_id, usize::MAX);
     if let Some(&max_seq) = pending.last() {
@@ -218,9 +229,13 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
 }
 
 /// `AckBatchResp`: broker confirms cumulative ack up to `new_cursor` for one
-/// consumer — purge the confirmed range from the hot (and, when enabled,
-/// cold) tier. `still_pending` is informational only for now.
+/// consumer — purge the confirmed range from the hot ack tier and (when a
+/// durable ackstore is configured) drop the confirmed seqs from its live set.
+/// `still_pending` is informational only for now.
 fn dispatch_ack_batch_resp(inner: &Arc<Inner>, frame: &Bytes) {
+    if frame.len() < AckBatchRespFrame::WIRE_SIZE {
+        return; // truncated frame — don't panic the reader on the slice
+    }
     let Ok(rep) = AckBatchRespFrame::ref_from_bytes(&frame[..AckBatchRespFrame::WIRE_SIZE]) else {
         return;
     };
@@ -230,24 +245,13 @@ fn dispatch_ack_batch_resp(inner: &Arc<Inner>, frame: &Bytes) {
     let purged = inner.ackrel.purge_up_to(consumer_id, new_cursor);
     inner.metrics.acks_confirmed.fetch_add(purged as u64, Ordering::Relaxed);
 
-    #[cfg(feature = "ack-persistence")]
-    if let Some(cold) = inner.cold.clone() {
-        let generation = inner.ackrel.generation_of(consumer_id);
-        tokio::task::spawn_blocking(move || {
-            let mut store = cold.blocking_lock();
-            // Best-effort summary: the hot tier doesn't expose per-consumer
-            // min/max/count, so this purge writes a placeholder — safe
-            // because `consumer_state` is only a startup-preload hint and
-            // gets fully reconciled by the next `write_batch`/`ensure` pass.
-            let summary = crate::ackrel::cold::StateSummary {
-                consumer_id,
-                generation,
-                count: 0,
-                min_seq: 0,
-                max_seq: 0,
-            };
-            let _ = store.purge_up_to(consumer_id, generation, new_cursor, summary);
-        });
+    // Durable dedup cleanup: the broker confirmed cumulative ack up to
+    // `new_cursor`, so those seqs are safe to drop from the WAL live set.
+    if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
+        if let Err(e) = slot.confirm_up_to(new_cursor) {
+            inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
+        }
     }
 }
 
@@ -303,8 +307,7 @@ mod tests {
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
             ackrel: Arc::new(crate::ackrel::AckRelay::new()),
-            #[cfg(feature = "ack-persistence")]
-            cold: None,
+            ack_store: None,
         })
     }
 

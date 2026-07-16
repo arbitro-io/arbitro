@@ -40,7 +40,7 @@ async fn main() -> std::io::Result<()> {
         println!("  ARBITRO_TLS_KEY           TLS private key PEM path");
         println!("  ARBITRO_AUTH_TOKEN        Auth token for Hello frame");
         println!("  ARBITRO_MAX_OPS_PER_SEC  Max frames/sec per connection (0 = unlimited)");
-        println!("  ARBITRO_FSYNC_POLICY     Metadata fsync: \"every\" (default) or \"none\"");
+        println!("  ARBITRO_FSYNC_POLICY     Store fsync: \"none\" (default) or \"every\" (strict durability)");
         println!("  ARBITRO_LOG               tracing filter directive (SIGHUP reloads)");
         println!("  ARBITRO_LOG_FORMAT        Log format: \"json\" or \"text\" (default)");
         println!("  ARBITRO_MAX_STREAMS_PER_CONN   Max streams per connection (default: 1000)");

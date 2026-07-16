@@ -9,7 +9,6 @@ description = "Pure-tokio Arbitro client built on arbitro-kit primitives (Mpsc, 
 [features]
 default = []
 tls = ["tokio-rustls", "rustls", "webpki-roots"]
-ack-persistence = ["rusqlite"]
 
 [dependencies]
 arbitro-proto      = { path = "../arbitro-proto" }
@@ -27,9 +26,6 @@ thiserror     = "1"
 tokio-rustls  = { version = "0.26", optional = true }
 rustls        = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots  = { version = "0.26", optional = true }
-
-# Cold-tier ack persistence (optional — enable with `features = ["ack-persistence"]`)
-rusqlite      = { version = "0.31", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio          = { workspace = true }

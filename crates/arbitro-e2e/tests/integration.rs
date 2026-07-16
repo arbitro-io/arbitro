@@ -79,7 +79,7 @@ async fn test_publish_ack_cycle() {
         .map(|_| BatchEntry::new(b"orders.new", Bytes::copy_from_slice(b"test-payload")))
         .collect();
     client
-        .publish_batch_sync(sid, &entries)
+        .publish_batch_wait(sid, &entries)
         .await
         .expect("publish_batch");
 
@@ -103,7 +103,7 @@ async fn test_publish_batch() {
         .map(|_| BatchEntry::new(b"batch.msg", Bytes::copy_from_slice(b"data")))
         .collect();
     client
-        .publish_batch_sync(sid, &entries)
+        .publish_batch_wait(sid, &entries)
         .await
         .expect("publish_batch");
     server.shutdown().await;
@@ -145,7 +145,7 @@ async fn test_fanout_delivery() {
     for i in 0..10u32 {
         let payload = format!("msg-{i}");
         client
-            .publish_sync(
+            .publish_wait(
                 sid,
                 b"fanout.evt",
                 Bytes::copy_from_slice(payload.as_bytes()),
@@ -182,7 +182,7 @@ async fn test_nack_redelivery() {
     let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
 
     client
-        .publish_sync(sid, b"nack.msg", Bytes::copy_from_slice(b"data"))
+        .publish_wait(sid, b"nack.msg", Bytes::copy_from_slice(b"data"))
         .await
         .expect("publish");
     let msg = sub.recv().await.unwrap();
@@ -208,7 +208,7 @@ async fn test_replay_publish_then_subscribe() {
         .map(|_| BatchEntry::new(b"replay.evt", Bytes::copy_from_slice(b"data")))
         .collect();
     client
-        .publish_batch_sync(sid, &entries)
+        .publish_batch_wait(sid, &entries)
         .await
         .expect("publish_batch");
 
@@ -253,7 +253,7 @@ async fn test_gate_auto_delivery_smoke() {
         for i in 0..5u32 {
             let payload = format!("r{round}-{i}");
             client
-                .publish_sync(sid, b"gate.evt", Bytes::copy_from_slice(payload.as_bytes()))
+                .publish_wait(sid, b"gate.evt", Bytes::copy_from_slice(payload.as_bytes()))
                 .await
                 .expect("publish");
         }
@@ -300,7 +300,7 @@ async fn test_fanout_same_connection() {
 
     for i in 0..10u32 {
         client
-            .publish_sync(sid, b"fsc.evt", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_wait(sid, b"fsc.evt", Bytes::copy_from_slice(&i.to_le_bytes()))
             .await
             .expect("publish");
     }
@@ -351,7 +351,7 @@ async fn test_queue_same_connection() {
 
     for i in 0..10u32 {
         client
-            .publish_sync(sid, b"qsc.job", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_wait(sid, b"qsc.job", Bytes::copy_from_slice(&i.to_le_bytes()))
             .await
             .expect("publish");
     }
@@ -414,14 +414,14 @@ async fn test_fanout_filtered_same_connection() {
     for i in 0..3u32 {
         let subj = format!("orders.{i}");
         client
-            .publish_sync(sid, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
+            .publish_wait(sid, subj.as_bytes(), Bytes::copy_from_slice(b"o"))
             .await
             .expect("publish");
     }
     for i in 0..2u32 {
         let subj = format!("payments.{i}");
         client
-            .publish_sync(sid, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
+            .publish_wait(sid, subj.as_bytes(), Bytes::copy_from_slice(b"p"))
             .await
             .expect("publish");
     }
@@ -511,7 +511,7 @@ async fn test_publish_without_reply_has_empty_reply_to() {
 
     // Normal publish (no reply)
     client
-        .publish_sync(sid, b"norpc.msg", Bytes::from_static(b"data"))
+        .publish_wait(sid, b"norpc.msg", Bytes::from_static(b"data"))
         .await
         .expect("publish");
 

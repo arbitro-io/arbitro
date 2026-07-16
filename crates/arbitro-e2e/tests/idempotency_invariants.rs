@@ -37,11 +37,11 @@ async fn stream_without_window_allows_duplicates() {
     let stream_id = TestServer::parse_id(&resp);
 
     client
-        .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
         .await
         .expect("first publish should succeed");
     client
-        .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
         .await
         .expect("second publish must also succeed when window=0");
     server.shutdown().await;
@@ -64,11 +64,11 @@ async fn stream_with_window_rejects_duplicate_msg_id() {
     let stream_id = TestServer::parse_id(&resp);
 
     client
-        .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1"))
         .await
         .expect("first publish");
     let err = client
-        .publish_sync_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1-prime"))
+        .publish_wait_with_id(stream_id, b"k.a", b"msg-1", Bytes::from_static(b"v1-prime"))
         .await
         .expect_err("duplicate must be rejected");
     assert!(
@@ -95,7 +95,7 @@ async fn empty_msg_id_is_never_deduped() {
     // Three identical publishes with NO msg_id — all three must land.
     for _ in 0..3 {
         client
-            .publish_sync(stream_id, b"k.x", Bytes::from_static(b"v"))
+            .publish_wait(stream_id, b"k.x", Bytes::from_static(b"v"))
             .await
             .expect("empty-id publish must always succeed");
     }
@@ -115,15 +115,15 @@ async fn different_msg_ids_are_independent() {
     let stream_id = TestServer::parse_id(&resp);
 
     client
-        .publish_sync_with_id(stream_id, b"k", b"id-a", Bytes::from_static(b"a"))
+        .publish_wait_with_id(stream_id, b"k", b"id-a", Bytes::from_static(b"a"))
         .await
         .expect("id-a accepted");
     client
-        .publish_sync_with_id(stream_id, b"k", b"id-b", Bytes::from_static(b"b"))
+        .publish_wait_with_id(stream_id, b"k", b"id-b", Bytes::from_static(b"b"))
         .await
         .expect("id-b accepted (different id)");
     client
-        .publish_sync_with_id(stream_id, b"k", b"id-c", Bytes::from_static(b"c"))
+        .publish_wait_with_id(stream_id, b"k", b"id-c", Bytes::from_static(b"c"))
         .await
         .expect("id-c accepted (different id)");
     server.shutdown().await;
@@ -151,25 +151,25 @@ async fn two_streams_isolated_one_with_one_without() {
 
     // First publish to dedup stream — accepted.
     client
-        .publish_sync_with_id(dedup_id, b"a.x", b"shared-id", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(dedup_id, b"a.x", b"shared-id", Bytes::from_static(b"v1"))
         .await
         .expect("dedup first publish");
 
     // Same msg_id on the plain stream — must be accepted (different stream).
     client
-        .publish_sync_with_id(plain_id, b"b.x", b"shared-id", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(plain_id, b"b.x", b"shared-id", Bytes::from_static(b"v1"))
         .await
         .expect("plain stream is not deduped");
 
     // Repeat on plain — still accepted.
     client
-        .publish_sync_with_id(plain_id, b"b.x", b"shared-id", Bytes::from_static(b"v2"))
+        .publish_wait_with_id(plain_id, b"b.x", b"shared-id", Bytes::from_static(b"v2"))
         .await
         .expect("plain stream accepts duplicates");
 
     // Repeat on dedup — must be rejected.
     let err = client
-        .publish_sync_with_id(dedup_id, b"a.x", b"shared-id", Bytes::from_static(b"v2"))
+        .publish_wait_with_id(dedup_id, b"a.x", b"shared-id", Bytes::from_static(b"v2"))
         .await
         .expect_err("dedup stream rejects duplicate");
     assert!(
@@ -194,7 +194,7 @@ async fn delete_and_recreate_clears_dedup_state() {
     let first_id = TestServer::parse_id(&resp);
 
     client
-        .publish_sync_with_id(first_id, b"k", b"reused", Bytes::from_static(b"v1"))
+        .publish_wait_with_id(first_id, b"k", b"reused", Bytes::from_static(b"v1"))
         .await
         .expect("first publish");
 
@@ -208,7 +208,7 @@ async fn delete_and_recreate_clears_dedup_state() {
 
     // The reused msg_id must be accepted on the fresh stream.
     client
-        .publish_sync_with_id(second_id, b"k", b"reused", Bytes::from_static(b"v2"))
+        .publish_wait_with_id(second_id, b"k", b"reused", Bytes::from_static(b"v2"))
         .await
         .expect("recreated stream starts with empty dedup state");
     server.shutdown().await;
@@ -237,7 +237,7 @@ async fn batch_with_all_unique_ids_succeeds() {
         BatchEntry::with_msg_id(b"k", b"b-3", Bytes::from_static(b"v3")),
     ];
     client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect("unique-id batch must succeed");
     server.shutdown().await;
@@ -259,7 +259,7 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
 
     // Seed the dedup window with one id.
     client
-        .publish_sync_with_id(stream_id, b"k", b"seeded", Bytes::from_static(b"seed"))
+        .publish_wait_with_id(stream_id, b"k", b"seeded", Bytes::from_static(b"seed"))
         .await
         .expect("seed");
 
@@ -269,7 +269,7 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
         BatchEntry::with_msg_id(b"k", b"new-2", Bytes::from_static(b"v2")),
     ];
     let err = client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect_err("batch with a colliding id must be rejected");
     assert!(
@@ -280,11 +280,11 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
     // After the rejection, the OTHER ids in the batch must NOT have
     // been recorded — we can publish them individually and they land.
     client
-        .publish_sync_with_id(stream_id, b"k", b"new-1", Bytes::from_static(b"v1-retry"))
+        .publish_wait_with_id(stream_id, b"k", b"new-1", Bytes::from_static(b"v1-retry"))
         .await
         .expect("non-colliding id must remain unrecorded after batch rejection");
     client
-        .publish_sync_with_id(stream_id, b"k", b"new-2", Bytes::from_static(b"v2-retry"))
+        .publish_wait_with_id(stream_id, b"k", b"new-2", Bytes::from_static(b"v2-retry"))
         .await
         .expect("non-colliding id must remain unrecorded after batch rejection");
     server.shutdown().await;
@@ -309,7 +309,7 @@ async fn batch_with_internal_duplicate_is_rejected() {
         BatchEntry::with_msg_id(b"k", b"twin", Bytes::from_static(b"v2")),
     ];
     let err = client
-        .publish_batch_sync(stream_id, &entries)
+        .publish_batch_wait(stream_id, &entries)
         .await
         .expect_err("batch with internal twin id must be rejected");
     assert!(
@@ -344,13 +344,13 @@ async fn cross_restart_dedup_survives() {
         let stream_id = TestServer::parse_id(&resp);
 
         client
-            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1"))
+            .publish_wait_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1"))
             .await
             .expect("first publish must succeed");
 
         // Within the same session, the duplicate must be rejected.
         let err = client
-            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1-dup"))
+            .publish_wait_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v1-dup"))
             .await
             .expect_err("duplicate within same session");
         assert!(is_duplicate(&err));
@@ -377,7 +377,7 @@ async fn cross_restart_dedup_survives() {
         // The same msg_id must be REJECTED — dedup state was rebuilt
         // from the journal on startup.
         let err = client
-            .publish_sync_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v2"))
+            .publish_wait_with_id(stream_id, b"k", b"cross-id", Bytes::from_static(b"v2"))
             .await
             .expect_err(
                 "cross-restart dedup must reject duplicate; the broker \
@@ -390,7 +390,7 @@ async fn cross_restart_dedup_survives() {
 
         // A NEW msg_id must still be accepted.
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 stream_id,
                 b"k",
                 b"fresh-id",
@@ -429,7 +429,7 @@ async fn batch_mixed_id_and_no_id_entries() {
         BatchEntry::with_msg_id(b"k", b"m-3", Bytes::from_static(b"c")),
     ];
     client
-        .publish_batch_sync(stream_id, &first)
+        .publish_batch_wait(stream_id, &first)
         .await
         .expect("mixed batch first attempt should land");
 
@@ -440,7 +440,7 @@ async fn batch_mixed_id_and_no_id_entries() {
         BatchEntry::new(b"k", Bytes::from_static(b"y-again")),
     ];
     client
-        .publish_batch_sync(stream_id, &second)
+        .publish_batch_wait(stream_id, &second)
         .await
         .expect("empty-id entries are never deduped, fresh ids accepted");
 
@@ -450,7 +450,7 @@ async fn batch_mixed_id_and_no_id_entries() {
         BatchEntry::with_msg_id(b"k", b"m-1", Bytes::from_static(b"replay")),
     ];
     let err = client
-        .publish_batch_sync(stream_id, &third)
+        .publish_batch_wait(stream_id, &third)
         .await
         .expect_err("batch with replayed id must be rejected");
     assert!(
@@ -499,7 +499,7 @@ async fn delivery_with_headers_strips_metadata() {
 
     // Publish with a msg_id — triggers HAS_HEADERS extended payload internally.
     client
-        .publish_sync_with_id(
+        .publish_wait_with_id(
             stream_id,
             b"k.a",
             b"test-msg-id",
@@ -563,7 +563,7 @@ async fn cross_restart_idempotency_with_consumer() {
 
         // Publish with msg_id "dedup-1".
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 stream_id,
                 b"k.ev",
                 b"dedup-1",
@@ -604,7 +604,7 @@ async fn cross_restart_idempotency_with_consumer() {
 
         // Re-publishing "dedup-1" must be REJECTED — idempotency state rebuilt.
         let err = client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 stream_id,
                 b"k.ev",
                 b"dedup-1",
@@ -619,7 +619,7 @@ async fn cross_restart_idempotency_with_consumer() {
 
         // Publish a NEW msg_id "dedup-2" — must succeed.
         client
-            .publish_sync_with_id(
+            .publish_wait_with_id(
                 stream_id,
                 b"k.ev",
                 b"dedup-2",

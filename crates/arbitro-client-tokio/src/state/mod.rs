@@ -58,10 +58,10 @@ pub(crate) struct Inner {
     pub(crate) cron_state: crate::cron::CronState,
     /// Ack-reliability hot layer: per-consumer deferred-ack tracking.
     pub(crate) ackrel: Arc<crate::ackrel::AckRelay>,
-    /// Optional cold-tier (SQLite) backing for deferred acks. `None` unless
-    /// the caller opens a store — see `ack-persistence` feature.
-    #[cfg(feature = "ack-persistence")]
-    pub(crate) cold: Option<Arc<tokio::sync::Mutex<crate::ackrel::cold::ColdStore>>>,
+    /// Optional durable redelivery-dedup store (WAL). `None` unless the caller
+    /// enables persistence via [`crate::config::ClientConfig::ack_store`].
+    /// Replaces the old SQLite cold tier.
+    pub(crate) ack_store: Option<Arc<dyn crate::ackstore::Store>>,
 }
 
 impl Inner {

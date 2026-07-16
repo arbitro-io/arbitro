@@ -5,7 +5,7 @@
 //! * `publish_single`       — fire-and-forget single PUB per iter.
 //! * `publish_batch`        — fire-and-forget batch of 100 messages per iter.
 //! * `publish_single_sync`  — request/reply single PUB per iter.
-//! * `publish_batch_sync`   — request/reply batch of 100 messages per iter.
+//! * `publish_batch_wait`   — request/reply batch of 100 messages per iter.
 //!
 //! Each iteration fans the workload across `N` pre-spawned client tasks; the
 //! reported throughput is the aggregate (criterion divides by elapsed time).
@@ -213,7 +213,7 @@ fn bench_publish_single_sync(c: &mut Criterion) {
                 rt.block_on(async move {
                     fanout(&fix.clients, conns, move |client, _| async move {
                         let payload = Bytes::from_static(&[0u8; PAYLOAD_LEN]);
-                        let _ = client.publish_sync(stream_id, b"bench", payload).await;
+                        let _ = client.publish_wait(stream_id, b"bench", payload).await;
                     })
                     .await;
                 });
@@ -223,9 +223,9 @@ fn bench_publish_single_sync(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_publish_batch_sync(c: &mut Criterion) {
+fn bench_publish_batch_wait(c: &mut Criterion) {
     let rt = build_runtime();
-    let mut group = c.benchmark_group("publish_batch_sync");
+    let mut group = c.benchmark_group("publish_batch_wait");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(5));
     group.throughput(Throughput::Elements(BATCH_MESSAGES as u64));
@@ -243,7 +243,7 @@ fn bench_publish_batch_sync(c: &mut Criterion) {
                         let entries: Vec<BatchEntry<'_>> = (0..BATCH_MESSAGES)
                             .map(|_| BatchEntry::new(b"bench", payload.clone()))
                             .collect();
-                        let _ = client.publish_batch_sync(stream_id, &entries).await;
+                        let _ = client.publish_batch_wait(stream_id, &entries).await;
                     })
                     .await;
                 });
@@ -258,6 +258,6 @@ criterion_group!(
     bench_publish_single,
     bench_publish_batch,
     bench_publish_single_sync,
-    bench_publish_batch_sync,
+    bench_publish_batch_wait,
 );
 criterion_main!(benches);

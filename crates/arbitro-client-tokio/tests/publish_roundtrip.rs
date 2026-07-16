@@ -72,9 +72,9 @@ async fn publish_single_and_batch_no_errors() {
 
     // Sync publish — waits for broker RepOk.
     let _resp = client
-        .publish_sync(stream_id, b"test.sync", Bytes::from_static(b"payload"))
+        .publish_wait(stream_id, b"test.sync", Bytes::from_static(b"payload"))
         .await
-        .expect("publish_sync");
+        .expect("publish_wait");
 
     client
         .delete_stream(b"pub-test")
@@ -84,7 +84,7 @@ async fn publish_single_and_batch_no_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_publish_sync_no_timeout() {
+async fn concurrent_publish_wait_no_timeout() {
     let addr = start_server().await;
     let client = connect(&addr).await;
 
@@ -94,19 +94,19 @@ async fn concurrent_publish_sync_no_timeout() {
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
 
-    // 4 concurrent publish_sync goroutines — each sends 100 messages.
+    // 4 concurrent publish_wait goroutines — each sends 100 messages.
     let mut handles = Vec::new();
     for _ in 0..4 {
         let c = client.clone();
         let h = tokio::spawn(async move {
             for i in 0u32..100 {
-                c.publish_sync(
+                c.publish_wait(
                     stream_id,
                     b"conc.subject",
                     Bytes::from(i.to_le_bytes().to_vec()),
                 )
                 .await
-                .expect("publish_sync in concurrent task");
+                .expect("publish_wait in concurrent task");
             }
         });
         handles.push(h);

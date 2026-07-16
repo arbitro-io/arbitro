@@ -1,11 +1,11 @@
 //! Client-side ack-reliability hot layer: per-consumer deferred-ack
-//! tracking ([`pending`]) plus redelivery dedup ([`seen`]). Pure data
-//! structures — wiring into `Inner`/session/batcher is a separate step.
+//! tracking ([`pending`]). Pure data structures — wiring into
+//! `Inner`/session/batcher is a separate step.
+//!
+//! Redelivery dedup now lives in the durable [`crate::ackstore`] WAL, which
+//! replaced both the old in-memory `SeenCache` and the SQLite cold tier.
 
-#[cfg(feature = "ack-persistence")]
-pub(crate) mod cold;
 pub(crate) mod pending;
-pub(crate) mod seen;
 
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
@@ -15,14 +15,12 @@ use pending::ConsumerPending;
 /// Top-level ack-reliability state, one instance per `Inner`.
 pub(crate) struct AckRelay {
     per_consumer: RwLock<Vec<Option<Box<ConsumerPending>>>>,
-    pub seen: seen::SeenCache,
 }
 
 impl AckRelay {
     pub fn new() -> Self {
         Self {
             per_consumer: RwLock::new(Vec::new()),
-            seen: seen::SeenCache::new(),
         }
     }
 
@@ -172,23 +170,5 @@ mod tests {
         assert!(relay.is_pending(0, 100));
         relay.ensure(0, 2);
         assert!(!relay.is_pending(0, 100));
-    }
-
-    #[test]
-    fn seen_dedup_hit_then_miss() {
-        let seen = seen::SeenCache::new();
-        assert!(seen.insert_check(1, 100));
-        assert!(!seen.insert_check(1, 100));
-        assert!(seen.insert_check(1, 101));
-    }
-
-    #[test]
-    fn seen_fifo_eviction() {
-        let seen = seen::SeenCache::with_cap(2);
-        assert!(seen.insert_check(1, 1));
-        assert!(seen.insert_check(1, 2));
-        assert!(seen.insert_check(1, 3));
-        // cap=2 evicted (1,1); it's a miss (newly inserted) again.
-        assert!(seen.insert_check(1, 1));
     }
 }

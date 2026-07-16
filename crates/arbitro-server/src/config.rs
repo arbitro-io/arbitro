@@ -48,9 +48,16 @@ pub struct Config {
     /// When set, connections that exceed this rate are throttled — the
     /// read loop sleeps until the next token is available.
     pub max_ops_per_sec: u32,
-    /// Fsync policy for the metadata command log.
-    /// - "every" (default): fdatasync after every metadata write (safest)
-    /// - "none": no fsync (fastest, risk of metadata loss on crash)
+    /// Fsync/durability policy for the persistent stores (message journal +
+    /// metadata command log). This is the durability knob — publishing to a
+    /// disk-backed stream is only bounded by fsync when this is `Every`.
+    ///
+    /// - "none" (**default**): no per-write fsync. The store flushes on its own
+    ///   schedule (timer / segment rotation) and on shutdown. This matches the
+    ///   `Tolerant` journal's "tolerant of loss" semantics — fast, may lose the
+    ///   last few writes on a hard crash.
+    /// - "every": fdatasync after every write (strict durability — every write
+    ///   is on disk before the OK). Opt in via `ARBITRO_FSYNC_POLICY=every`.
     pub fsync_policy: FsyncPolicy,
     /// Cluster peer addresses (comma-separated). When set with the `cluster`
     /// feature enabled, the broker boots in Clustered mode. Format:
@@ -69,12 +76,13 @@ pub struct Config {
     pub max_crons_per_conn: u32,
 }
 
-/// Fsync policy for metadata persistence.
+/// Fsync/durability policy for the persistent stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsyncPolicy {
-    /// fdatasync after every metadata write (default, safest).
+    /// fdatasync after every write (strict durability, opt-in).
     Every,
-    /// No fsync — OS buffers may lose data on crash.
+    /// No per-write fsync — flush on the store's own schedule + shutdown
+    /// (default). Fast; may lose the last few writes on a hard crash.
     None,
 }
 
@@ -103,9 +111,12 @@ impl Config {
             auth_token: std::env::var("ARBITRO_AUTH_TOKEN").ok(),
             max_frame_size: env_parse("ARBITRO_MAX_FRAME_SIZE", 64 * 1024 * 1024),
             max_ops_per_sec: env_parse("ARBITRO_MAX_OPS_PER_SEC", 0),
+            // Durability is opt-IN, not opt-out: the default is no per-write
+            // fsync (Tolerant = "tolerant of loss"). Set ARBITRO_FSYNC_POLICY=
+            // every for strict per-write durability.
             fsync_policy: match std::env::var("ARBITRO_FSYNC_POLICY").as_deref() {
-                Ok("none") => FsyncPolicy::None,
-                _ => FsyncPolicy::Every,
+                Ok("every") => FsyncPolicy::Every,
+                _ => FsyncPolicy::None,
             },
             cluster_peers: parse_cluster_peers(),
             cluster_node_id: env_parse("ARBITRO_CLUSTER_NODE_ID", 1),
@@ -262,7 +273,7 @@ impl Default for Config {
             auth_token: None,
             max_frame_size: 64 * 1024 * 1024,
             max_ops_per_sec: 0,
-            fsync_policy: FsyncPolicy::Every,
+            fsync_policy: FsyncPolicy::None,
             cluster_peers: Vec::new(),
             cluster_node_id: 1,
             cluster_listen: "0.0.0.0:9900".into(),

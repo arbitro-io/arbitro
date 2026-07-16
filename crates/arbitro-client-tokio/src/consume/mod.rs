@@ -79,16 +79,34 @@ pub(crate) fn subscribe_async(
     stream_id: u32,
     consumer_id: u32,
     filter: &[u8],
+    names: Option<(&str, &str)>,
 ) -> impl Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
     let seq = inner.seq_alloc.next();
     let sub_body = encode_sub_v2(seq, 0, consumer_id, 0, filter);
+
+    // Resolve the durable dedup slot up front (cold path, sync). Only when a
+    // store is configured AND the caller supplied the `(stream, consumer)`
+    // names the key needs — the numeric consumer_id is ephemeral and unusable
+    // as a durable key. A resolve error disables dedup for this subscription
+    // rather than failing the subscribe.
+    let slot = match (&inner.ack_store, names) {
+        (Some(store), Some((stream, consumer))) => match store.slot(stream, consumer) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+                warn!(stream, consumer, error = %e, "ackstore: slot resolve failed; dedup disabled for this sub");
+                None
+            }
+        },
+        _ => None,
+    };
 
     // 1. Register channel BEFORE enqueuing the SubFrame.
     //    Any Deliver frames that arrive while the round-trip is in flight
     //    are buffered in the channel (capacity = 4096).
     let rx = inner
         .subscriptions
-        .register(consumer_id, stream_id, sub_body.clone());
+        .register(consumer_id, stream_id, sub_body.clone(), slot);
 
     // 2. Reserve a pending slot for the RepOk reply.
     let rx_pending = inner.pending.register(seq);
@@ -210,6 +228,15 @@ pub(crate) async fn ack_batcher_task(
                     let seq = inner.seq_alloc.next();
                     let frame = WriteFrame::Mono(encode_ack_batch_v2(seq, consumer_id, generation, 0, &seqs));
                     let _ = lease.try_send(frame);
+                }
+
+                // Durable dedup: flush buffered ack records to disk each tick
+                // so a crash loses at most `SWEEP_TICK` of recorded acks.
+                if let Some(store) = &inner.ack_store {
+                    if let Err(e) = store.sync() {
+                        inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+                        warn!(error = %e, "ackstore: periodic sync failed");
+                    }
                 }
 
                 ticks_since_expire += 1;

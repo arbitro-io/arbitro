@@ -43,6 +43,10 @@ name    = "throughput"
 harness = false
 
 [[bench]]
+name    = "throughput_matrix"
+harness = false
+
+[[bench]]
 name    = "limits"
 harness = false
 
