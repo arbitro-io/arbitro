@@ -676,6 +676,29 @@ impl Client {
         .await
     }
 
+    /// Pause delivery for a consumer (broker action `0x0506`). The broker
+    /// stops dispatching until [`Client::resume_consumer`] is called.
+    pub async fn pause_consumer(&self, consumer_id: u32) -> Result<Bytes, ClientError> {
+        crate::manage::pause_consumer(
+            &self.inner.pool,
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            consumer_id,
+        )
+        .await
+    }
+
+    /// Resume delivery for a paused consumer (broker action `0x0507`).
+    pub async fn resume_consumer(&self, consumer_id: u32) -> Result<Bytes, ClientError> {
+        crate::manage::resume_consumer(
+            &self.inner.pool,
+            &self.inner.pending,
+            &self.inner.seq_alloc,
+            consumer_id,
+        )
+        .await
+    }
+
     pub async fn get_consumer(&self, stream_id: u32, name: &[u8]) -> Result<Bytes, ClientError> {
         crate::manage::get_consumer(
             &self.inner.pool,

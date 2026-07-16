@@ -12,7 +12,7 @@ use zerocopy::IntoBytes;
 use arbitro_proto::v2::cold::{
     ColdBody, ConsumerStats, CreateConsumer as CreateConsumerCold,
     CreateStream as CreateStreamCold, DeleteConsumer, DeleteMessage, DeleteStream, DrainSubject,
-    GetConsumer, GetStream, ListConsumers, ListStreams, PurgeStream,
+    GetConsumer, GetStream, ListConsumers, ListStreams, PauseConsumer, PurgeStream, ResumeConsumer,
     SubjectLimit as ColdSubjectLimit, Unsubscribe,
 };
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
@@ -277,6 +277,16 @@ pub(crate) fn encode_delete_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
 /// ConsumerStats request frame — cold path (v2::cold).
 pub(crate) fn encode_consumer_stats_v2(seq: u64, consumer_id: u32) -> Bytes {
     ConsumerStats { consumer_id }.encode(seq)
+}
+
+/// PauseConsumer — cold-path frame (v2::cold).
+pub(crate) fn encode_pause_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
+    PauseConsumer { consumer_id }.encode(seq)
+}
+
+/// ResumeConsumer — cold-path frame (v2::cold).
+pub(crate) fn encode_resume_consumer_v2(seq: u64, consumer_id: u32) -> Bytes {
+    ResumeConsumer { consumer_id }.encode(seq)
 }
 
 /// GetConsumer — cold-path frame (v2::cold).

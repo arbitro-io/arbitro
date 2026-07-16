@@ -24,7 +24,8 @@ use crate::transport::encode::{
     encode_consumer_stats_v2, encode_create_consumer_v2, encode_create_stream_v2,
     encode_delete_consumer_v2, encode_delete_message_v2, encode_delete_stream_v2,
     encode_drain_subject_v2, encode_get_consumer_v2, encode_get_stream_v2,
-    encode_list_consumers_v2, encode_list_streams_v2, encode_purge_stream_v2,
+    encode_list_consumers_v2, encode_list_streams_v2, encode_pause_consumer_v2,
+    encode_purge_stream_v2, encode_resume_consumer_v2,
 };
 use crate::transport::frame::WriteFrame;
 use crate::transport::frame::WritePool;
@@ -208,6 +209,26 @@ pub(crate) async fn consumer_stats(
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
     request(pool, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
+}
+
+pub(crate) async fn pause_consumer(
+    pool: &Arc<WritePool>,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    consumer_id: u32,
+) -> Result<Bytes, ClientError> {
+    let seq = seq_alloc.next();
+    request(pool, pending, seq, encode_pause_consumer_v2(seq, consumer_id)).await
+}
+
+pub(crate) async fn resume_consumer(
+    pool: &Arc<WritePool>,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+    consumer_id: u32,
+) -> Result<Bytes, ClientError> {
+    let seq = seq_alloc.next();
+    request(pool, pending, seq, encode_resume_consumer_v2(seq, consumer_id)).await
 }
 
 pub(crate) async fn get_consumer(
