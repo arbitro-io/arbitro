@@ -572,13 +572,31 @@ impl ArbitroServer {
                             if let Err(e) = result {
                                 tracing::error!(error = %e, "raft node stopped");
                             }
+                            return;
                         }
                         _ = async {
                             let mut rx = raft_shutdown;
                             let _ = rx.changed().await;
-                        } => {
-                            tracing::info!("raft node shutting down");
+                        } => {}
+                    }
+                    // L10: graceful drain — freeze intake, hand leadership
+                    // off to the most caught-up voter, resolve commit
+                    // waiters, then stop. Bounded so a stuck handoff can
+                    // never hang shutdown; on timeout or error the node is
+                    // still cleanly stopped when `raft` drops below
+                    // (Drop calls stop()).
+                    const DRAIN_TIMEOUT: std::time::Duration =
+                        std::time::Duration::from_secs(5);
+                    tracing::info!("raft node shutting down: draining (leadership handoff)");
+                    match tokio::time::timeout(DRAIN_TIMEOUT, raft.drain()).await {
+                        Ok(Ok(())) => tracing::info!("raft drain complete"),
+                        Ok(Err(e)) => {
+                            tracing::error!(error = %e, "raft drain failed; stopping anyway");
                         }
+                        Err(_) => tracing::warn!(
+                            timeout_secs = DRAIN_TIMEOUT.as_secs(),
+                            "raft drain timed out; stopping anyway"
+                        ),
                     }
                 });
 

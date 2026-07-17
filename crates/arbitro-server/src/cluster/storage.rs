@@ -387,13 +387,13 @@ impl FileRaftStorage {
         inner
             .file
             .set_len(cut)
-            .map_err(|e| RaftError::Storage(format!("truncate raft log: {e}")))?;
+            .map_err(|e| storage_write_err("truncate raft log", e))?;
         // Durability: the truncation itself must survive a crash, otherwise
         // a replaced suffix could resurrect on restart.
         inner
             .file
             .sync_all()
-            .map_err(|e| RaftError::Storage(format!("fsync raft log: {e}")))?;
+            .map_err(|e| storage_write_err("fsync raft log", e))?;
         inner.entries.truncate(pos);
         inner.tail = cut;
         Ok(())
@@ -474,6 +474,27 @@ impl FileRaftStorage {
             last_included_term: Term(term),
         };
         Ok(Some((meta, payload.to_vec())))
+    }
+}
+
+/// C8: wrap an IO failure from a WRITE path (append / write / fsync /
+/// rename) into a `RaftError`.
+///
+/// Resource-exhaustion kinds (`StorageFull` / `QuotaExceeded` /
+/// `OutOfMemory` — ENOSPC/EDQUOT class) are forwarded as
+/// [`RaftError::Io`] with the kind preserved, so the raft run loop
+/// classifies them as `ErrorClass::Resource` and degrades to read-only
+/// survival instead of dying (crate-side C8). Every other kind — and every
+/// logic error — stays the stringified [`RaftError::Storage`], which is
+/// Fatal: corruption or a real bug must never be masked as "disk full".
+fn storage_write_err(what: &str, e: std::io::Error) -> RaftError {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull
+        | std::io::ErrorKind::QuotaExceeded
+        | std::io::ErrorKind::OutOfMemory => {
+            RaftError::Io(std::io::Error::new(e.kind(), format!("{what}: {e}")))
+        }
+        _ => RaftError::Storage(format!("{what}: {e}")),
     }
 }
 
@@ -594,7 +615,7 @@ impl RaftStorage for FileRaftStorage {
         // Durability contract (C-D1): the state must be on stable storage
         // before we return Ok — temp file + fsync + atomic rename + dir fsync.
         write_file_durable(&self.hard_state_path, &data)
-            .map_err(|e| RaftError::Storage(format!("write hard_state: {e}")))?;
+            .map_err(|e| storage_write_err("write hard_state", e))?;
         Ok(())
     }
 
@@ -644,18 +665,18 @@ impl RaftStorage for FileRaftStorage {
         inner
             .file
             .seek(SeekFrom::Start(base))
-            .map_err(|e| RaftError::Storage(format!("seek raft log: {e}")))?;
+            .map_err(|e| storage_write_err("seek raft log", e))?;
         inner
             .file
             .write_all(&buf)
-            .map_err(|e| RaftError::Storage(format!("write raft log: {e}")))?;
+            .map_err(|e| storage_write_err("write raft log", e))?;
         // Durability contract (P1-1): the entries must be on stable storage
         // BEFORE this returns Ok — the leader counts our ack toward the
         // commit quorum. Per-append fsync; group-commit is deferred (G2).
         inner
             .file
             .sync_all()
-            .map_err(|e| RaftError::Storage(format!("fsync raft log: {e}")))?;
+            .map_err(|e| storage_write_err("fsync raft log", e))?;
 
         inner.tail = base + buf.len() as u64;
         inner.entries.extend(staged);
@@ -728,11 +749,11 @@ impl RaftStorage for FileRaftStorage {
         let tmp = PathBuf::from(tmp);
         {
             let mut f = std::fs::File::create(&tmp)
-                .map_err(|e| RaftError::Storage(format!("create compact tmp: {e}")))?;
+                .map_err(|e| storage_write_err("create compact tmp", e))?;
             f.write_all(&buf)
-                .map_err(|e| RaftError::Storage(format!("write compact tmp: {e}")))?;
+                .map_err(|e| storage_write_err("write compact tmp", e))?;
             f.sync_all()
-                .map_err(|e| RaftError::Storage(format!("fsync compact tmp: {e}")))?;
+                .map_err(|e| storage_write_err("fsync compact tmp", e))?;
         }
 
         // Atomic replace. On Unix this succeeds even while the old WAL
@@ -742,13 +763,13 @@ impl RaftStorage for FileRaftStorage {
         // merely stays uncompacted); production runs on Linux/WSL.
         if let Err(e) = std::fs::rename(&tmp, &self.log_path) {
             let _ = std::fs::remove_file(&tmp);
-            return Err(RaftError::Storage(format!("rename compacted log: {e}")));
+            return Err(storage_write_err("rename compacted log", e));
         }
         #[cfg(unix)]
         if let Some(dir) = self.log_path.parent() {
             std::fs::File::open(dir)
                 .and_then(|d| d.sync_all())
-                .map_err(|e| RaftError::Storage(format!("fsync data dir: {e}")))?;
+                .map_err(|e| storage_write_err("fsync data dir", e))?;
         }
 
         // Swap the handle to the new file and fix up the RAM index.
@@ -780,7 +801,7 @@ impl RaftStorage for FileRaftStorage {
         data.extend_from_slice(&crc.to_le_bytes());
         data.extend_from_slice(snapshot);
         write_file_durable(&self.snapshot_path, &data)
-            .map_err(|e| RaftError::Storage(format!("write snapshot: {e}")))?;
+            .map_err(|e| storage_write_err("write snapshot", e))?;
         *self.snapshot.lock() = Some((meta.clone(), snapshot.to_vec()));
         Ok(())
     }
