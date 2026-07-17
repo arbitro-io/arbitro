@@ -28,6 +28,12 @@ lifecycle_trace = []
 # TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:thiserror"]
 cluster = ["dep:arbitro-raft"]
+# Mutual TLS for inter-node Raft traffic (D1) + certificate-derived peer
+# identity binding (D2). Opt-in: activated at runtime only when
+# ARBITRO_CLUSTER_TLS_CERT / _KEY / _CA are all set. Without this feature
+# (or without the env vars) the cluster transport runs the original
+# plaintext path unchanged.
+cluster-tls = ["cluster", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:x509-parser"]
 
 [dependencies]
 arbitro-engine-v2 = { workspace = true }
@@ -57,9 +63,13 @@ rustls-pemfile    = { version = "2", optional = true }
 thiserror         = { version = "1", optional = true }
 # Cluster (optional)
 arbitro-raft      = { path = "../../../arbitro-raft", optional = true }
+# cluster-tls only: parse peer-cert SAN/CN to derive the authenticated PeerId (D2)
+x509-parser       = { version = "0.16", optional = true }
 
 [dev-dependencies]
-# (intentionally empty — benches now use only workspace deps)
+# Ephemeral test certificates for the cluster mTLS / identity-binding tests.
+rcgen    = "0.13"
+tempfile = { workspace = true }
 
 # Benches removed: they were strategy comparisons used during
 # development, not regression benchmarks. Add a new bench under

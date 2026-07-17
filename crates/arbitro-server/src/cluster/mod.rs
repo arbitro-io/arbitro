@@ -8,6 +8,7 @@
 
 pub mod apply_loop;
 pub mod replication;
+pub mod security;
 pub mod state_machine;
 pub mod storage;
 pub mod transport;

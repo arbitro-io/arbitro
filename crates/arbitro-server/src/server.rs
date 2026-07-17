@@ -454,6 +454,9 @@ impl ArbitroServer {
                     cluster_id: ClusterId(1),
                     node_id,
                     peers,
+                    // A13: the server boots as a full voter; learner-mode boot
+                    // is not wired into the env-config yet.
+                    learners: Vec::new(),
                     bootstrap_peers,
                     timing: TimingConfig {
                         heartbeat_ms: 50,
@@ -471,7 +474,13 @@ impl ArbitroServer {
                 // Shared storage: the Arc<FileRaftStorage> is shared between
                 // the RaftNode (via SharedRaftStorage wrapper) and the apply
                 // loop that reads committed entries.
-                let storage_inner = std::sync::Arc::new(FileRaftStorage::new(&raft_dir));
+                let storage_inner = match FileRaftStorage::new(&raft_dir) {
+                    Ok(s) => std::sync::Arc::new(s),
+                    Err(e) => {
+                        tracing::error!(error = %e, dir = %raft_dir.display(), "failed to open raft storage");
+                        panic!("failed to open raft storage: {e}");
+                    }
+                };
                 let storage_for_raft = SharedRaftStorage(storage_inner.clone());
 
                 let mut peer_addrs: std::collections::HashMap<PeerId, std::net::SocketAddr> =
@@ -502,7 +511,29 @@ impl ArbitroServer {
                         std::process::exit(2);
                     }
                 };
-                let transport = match TcpRaftTransport::new(bind_addr, peer_addrs.clone()).await {
+                // Security posture from env (D1 mTLS + D2 identity binding).
+                // No security env vars set => plaintext, identical to the
+                // historical behavior. TLS env vars set on a build without
+                // `cluster-tls` is a hard error (never silently downgrade).
+                let cluster_security =
+                    match crate::cluster::security::ClusterSecurityConfig::from_env() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(error = %e, "invalid cluster security configuration");
+                            std::process::exit(2);
+                        }
+                    };
+                let transport = match TcpRaftTransport::new_with_limits(
+                    bind_addr,
+                    peer_addrs.clone(),
+                    cluster_security,
+                    // D3 inbound resource limits (frame-size cap, connection
+                    // cap, optional rate quota, accept jail) from
+                    // ARBITRO_CLUSTER_* env, with safe generous defaults.
+                    crate::cluster::transport::ClusterTransportLimits::from_env(),
+                )
+                .await
+                {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to create raft transport");
@@ -521,7 +552,12 @@ impl ArbitroServer {
 
                 let raft_node = RaftNode::new(node_config, storage_for_raft, transport)
                     .expect("failed to create raft node");
-                let mut raft = ArbitroRaft::new(raft_node);
+                // The server applies committed entries through its own
+                // apply loop (below) via the commit-index observer, so the
+                // engine-side state machine is a no-op here. Replacing it
+                // with the real `ArbitroStateMachine` is the L4/A6 work
+                // (kill the leader double-apply).
+                let mut raft = ArbitroRaft::new(raft_node, NoopStateMachine);
                 let client_handle = raft.client_handle();
                 // Take the commit-index observer BEFORE raft is moved
                 // into its background task; the apply loop needs to poll
