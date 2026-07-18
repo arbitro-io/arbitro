@@ -61,6 +61,11 @@ pub async fn propose_command(
     cmd: &state_machine::ClusterCommand,
 ) -> Result<(), String> {
     let payload = serde_json::to_vec(cmd).map_err(|e| e.to_string())?;
-    client.write(&payload).await.map_err(|e| format!("{e:?}"))?;
+    // Zero-copy hand-off (H5): the serialized Vec converts into `Bytes` for
+    // free instead of being re-copied at the mailbox boundary.
+    client
+        .write_bytes(payload.into())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     Ok(())
 }
