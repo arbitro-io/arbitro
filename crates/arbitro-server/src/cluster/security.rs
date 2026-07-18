@@ -23,8 +23,9 @@
 //!     This is weaker than mTLS (no crypto, and peers co-hosted on one IP are
 //!     mutually indistinguishable) but stops off-cluster hosts from injecting
 //!     frames with a member's id.
-//!   Any received frame whose header `from` disagrees with the bound identity
-//!   is dropped and counted (see `TcpRaftTransport::spoofed_frames_rejected`).
+//!
+//! Any received frame whose header `from` disagrees with the bound identity
+//! is dropped and counted (see `TcpRaftTransport::spoofed_frames_rejected`).
 //!
 //! # Certificate rotation
 //!

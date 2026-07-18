@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# Test/bench-only crate (publish = false). Allow the ergonomic lints that fire
+# across the E2E harnesses and benches — none of this ships to users.
+[lints.clippy]
+while_let_loop = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+needless_lifetimes = "allow"
+manual_clamp = "allow"
+doc_overindented_list_items = "allow"
+doc_lazy_continuation = "allow"
+
 [dependencies]
 zerocopy       = { workspace = true }
 bytes          = { workspace = true }

@@ -204,7 +204,7 @@ fn decode_rust<'a>(buf: &'a [u8]) -> Frame<'a> {
 // ── 3. bytes::Buf DECODE ─────────────────────────────────────────────────
 #[inline(never)]
 fn decode_bytes<'a>(buf: &'a [u8]) -> Frame<'a> {
-    let mut cur = &buf[..];
+    let mut cur = buf;
     let total_len = cur.get_u32();
     let msg_type = cur.get_u8();
     let seq = cur.get_u32();

@@ -412,7 +412,7 @@ async fn run_replay(
                 }
                 count += 1;
                 let log_interval = if expected <= 1_000 { 100 } else { 50_000 };
-                if count % log_interval == 0 {
+                if count.is_multiple_of(log_interval) {
                     let dt = last_log.elapsed().as_millis();
                     let batch = log_interval as u128;
                     eprintln!(

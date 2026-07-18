@@ -67,7 +67,7 @@ const DIST_SUBS: &[DistSub] = &[
     DistSub {
         label: "message.client.vip.>",
         filter: b"message.client.vip.>",
-        expected: 1 * DIST_PER_SUBJECT,
+        expected: DIST_PER_SUBJECT,
     },
     DistSub {
         label: "ignore.me",
@@ -433,7 +433,7 @@ async fn run_distribution() {
         while remaining > 0 {
             let size = remaining.min(BATCH_SIZE);
             let entries: Vec<BatchEntry<'_>> = (0..size)
-                .map(|_| BatchEntry::new(*subject, Bytes::copy_from_slice(PAYLOAD)))
+                .map(|_| BatchEntry::new(subject, Bytes::copy_from_slice(PAYLOAD)))
                 .collect();
             loop {
                 match setup.publish_batch(stream_id, &entries) {

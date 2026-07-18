@@ -109,6 +109,7 @@ impl AckBatchRespFrame {
     pub const WIRE_SIZE: usize = HEADER_SIZE + ACK_BATCH_RESP_BODY_SIZE;
 
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)] // one arg per wire field of the frame
     pub fn new(
         seq: u64,
         consumer_id: u32,

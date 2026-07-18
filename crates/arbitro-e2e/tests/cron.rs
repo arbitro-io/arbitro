@@ -83,7 +83,7 @@ async fn cron_10_workers_single_delivery() {
     // With 5 seconds and 1 fire/sec, we expect ~5 total fires across
     // all 10 workers combined (NOT 50 — that would mean all 10 got each fire).
     assert!(
-        fires >= 3 && fires <= 7,
+        (3..=7).contains(&fires),
         "expected 3-7 total fires (one worker per fire), got {fires}. \
          If {fires} ≈ 50, the broker is delivering to ALL workers (fanout bug)."
     );

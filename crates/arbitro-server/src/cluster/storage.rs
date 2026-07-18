@@ -260,6 +260,7 @@ impl FileRaftStorage {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // WAL: preserve the existing log for replay
             .open(log_path)?;
 
         let mut data = Vec::new();

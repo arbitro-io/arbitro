@@ -60,6 +60,7 @@ impl AckRelay {
     }
 
     /// GATE step 1: no slot means never deferred, never pending.
+    #[allow(dead_code)] // query counterpart of the gate API, kept for completeness
     pub fn is_pending(&self, cid: u32, seq: u64) -> bool {
         let g = self.per_consumer.read().unwrap();
         match g.get(cid as usize) {

@@ -53,6 +53,20 @@ pub struct WalConfig {
     pub(crate) now: Clock,
 }
 
+impl std::fmt::Debug for WalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalConfig")
+            .field("dir", &self.dir)
+            .field("ttl", &self.ttl)
+            .field("sweep_interval", &self.sweep_interval)
+            .field("fsync", &self.fsync)
+            .field("max_cap", &self.max_cap)
+            .field("snapshot_every_n", &self.snapshot_every_n)
+            .field("compact_at_bytes", &self.compact_at_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WalConfig {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -109,6 +123,12 @@ pub struct Wal {
     sweep: Mutex<Option<JoinHandle<()>>>,
 }
 
+impl std::fmt::Debug for Wal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Wal").finish_non_exhaustive()
+    }
+}
+
 pub(crate) struct WalSlot {
     pub slot_id: u32,
     pub stream: String,
@@ -141,6 +161,7 @@ impl Wal {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // WAL: preserve the existing log for replay
             .open(&path)?;
 
         let core = Arc::new(WalCore {
@@ -795,6 +816,7 @@ pub(crate) type LiveMap = HashMap<u64, i64>;
 /// Scan a whole file image into per-slot live sets + names. Returns the byte
 /// offset just past the last fully-valid frame (for truncation). Shared by
 /// replay and compaction.
+#[allow(clippy::type_complexity)] // internal replay result; naming the tuple adds no clarity
 pub(crate) fn scan_bytes(
     data: &[u8],
     ttl_cutoff: i64,

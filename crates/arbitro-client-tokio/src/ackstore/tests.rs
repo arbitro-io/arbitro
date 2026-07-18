@@ -1,5 +1,6 @@
 //! Real tests for the ackstore WAL: crash recovery, TTL, corruption, snapshot,
 //! ConfirmUpTo, compaction, concurrency — mirroring the Go suite.
+#![allow(dead_code)] // test clock helper exposes set/add for symmetry
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;

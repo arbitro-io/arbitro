@@ -223,10 +223,7 @@ async fn stage0_cap_enforced() -> (u32, u32, Duration) {
     let extra_window = Duration::from_millis(250);
     let extras_start = Instant::now();
     while extras_start.elapsed() < extra_window {
-        match tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
-            Ok(Some(_)) => extras += 1,
-            _ => {}
-        }
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await { extras += 1 }
     }
 
     assert_eq!(
@@ -320,10 +317,7 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
     let extra_window = Duration::from_millis(250);
     let extras_start = Instant::now();
     while extras_start.elapsed() < extra_window {
-        match tokio::time::timeout(Duration::from_millis(50), sub.recv()).await {
-            Ok(Some(_)) => extras += 1,
-            _ => {}
-        }
+        if let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await { extras += 1 }
     }
     assert_eq!(
         extras, 0,

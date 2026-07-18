@@ -71,6 +71,7 @@ impl ConsumerPending {
     }
 
     /// GATE CASCADE: range check on atomics before ever taking the lock.
+    #[allow(dead_code)] // query counterpart of the gate API, kept for completeness
     pub fn is_pending(&self, seq: u64) -> bool {
         if self.count.load(Ordering::Relaxed) == 0 {
             return false;

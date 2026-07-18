@@ -175,7 +175,7 @@ fn env_usize(k: &str, default: usize) -> usize {
 fn env_list<T>(k: &str, default: Vec<T>, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
     match std::env::var(k) {
         Ok(s) => {
-            let v: Vec<T> = s.split(',').filter_map(|p| parse(p)).collect();
+            let v: Vec<T> = s.split(',').filter_map(parse).collect();
             if v.is_empty() {
                 default
             } else {
