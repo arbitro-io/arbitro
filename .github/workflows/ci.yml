@@ -10,6 +10,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Debug test builds construct the client write-pool rings (16 x 4096 x ~136 B
+  # WriteFrame) on the stack; the 2 MB default test-thread stack overflows in
+  # debug (release elides the copy). Give test threads a large stack so the
+  # unit + e2e suites don't abort. Verified locally: 47/47 client lib tests green.
+  RUST_MIN_STACK: "67108864"
 
 # arbitro-kit lives as a sibling crate (path = "../arbitro-kit"). The
 # checkout step pulls it into a parallel path so the workspace builds.
