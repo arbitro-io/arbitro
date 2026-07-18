@@ -790,6 +790,21 @@ impl TcpRaftTransport {
         conns.insert(peer, s.clone());
         Ok(s)
     }
+
+    /// Drop a peer's cached outbound connection after a write fails, so the
+    /// next send re-dials. Without this a restarted peer is never reconnected
+    /// (the dead socket lingers in the map forever). Evicts only if the map
+    /// still holds this exact stream, so a concurrent reconnect is untouched.
+    async fn evict_dead(
+        connections: &Mutex<HashMap<PeerId, Arc<tokio::sync::Mutex<PeerStream>>>>,
+        peer: PeerId,
+        dead: &Arc<tokio::sync::Mutex<PeerStream>>,
+    ) {
+        let mut conns = connections.lock().await;
+        if conns.get(&peer).is_some_and(|c| Arc::ptr_eq(c, dead)) {
+            conns.remove(&peer);
+        }
+    }
 }
 
 impl RaftTransport for TcpRaftTransport {
@@ -810,28 +825,32 @@ impl RaftTransport for TcpRaftTransport {
             let stream =
                 Self::get_or_connect(&connections, &peers, &security, peer).await?;
 
-            let mut s = stream.lock().await;
-
-            // True vectored write — one writev syscall for all iovecs.
-            let mut io_bufs: Vec<IoSlice<'_>> =
-                slices_static.iter().map(|s| IoSlice::new(s)).collect();
-            let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
-            while !bufs.is_empty() {
-                let n = s.write_vectored(bufs).await.map_err(|e| {
-                    // Don't hold the lock while removing — just flag for cleanup.
-                    RaftError::Transport(format!("write to peer {}: {e}", peer.0))
-                })?;
-                if n == 0 {
-                    return Err(RaftError::Transport("write_vectored returned 0".into()));
+            let result = async {
+                let mut s = stream.lock().await;
+                // True vectored write — one writev syscall for all iovecs.
+                let mut io_bufs: Vec<IoSlice<'_>> =
+                    slices_static.iter().map(|s| IoSlice::new(s)).collect();
+                let mut bufs: &mut [IoSlice<'_>] = &mut io_bufs;
+                while !bufs.is_empty() {
+                    let n = s.write_vectored(bufs).await.map_err(|e| {
+                        RaftError::Transport(format!("write to peer {}: {e}", peer.0))
+                    })?;
+                    if n == 0 {
+                        return Err(RaftError::Transport("write_vectored returned 0".into()));
+                    }
+                    IoSlice::advance_slices(&mut bufs, n);
                 }
-                IoSlice::advance_slices(&mut bufs, n);
+                // No-op on plain TCP; on TLS this drains rustls' internal buffer.
+                s.flush()
+                    .await
+                    .map_err(|e| RaftError::Transport(format!("flush to peer {}: {e}", peer.0)))
             }
-            // No-op on plain TCP; on TLS this drains rustls' internal buffer
-            // to the socket so the frame is actually on the wire.
-            s.flush()
-                .await
-                .map_err(|e| RaftError::Transport(format!("flush to peer {}: {e}", peer.0)))?;
-            Ok(())
+            .await;
+
+            if result.is_err() {
+                Self::evict_dead(&connections, peer, &stream).await;
+            }
+            result
         }
     }
 
@@ -847,14 +866,21 @@ impl RaftTransport for TcpRaftTransport {
             let stream =
                 Self::get_or_connect(&connections, &peers, &security, peer).await?;
 
-            let mut s = stream.lock().await;
-            s.write_all(&frame)
-                .await
-                .map_err(|e| RaftError::Transport(format!("write to peer {}: {e}", peer.0)))?;
-            s.flush()
-                .await
-                .map_err(|e| RaftError::Transport(format!("flush to peer {}: {e}", peer.0)))?;
-            Ok(())
+            let result = async {
+                let mut s = stream.lock().await;
+                s.write_all(&frame)
+                    .await
+                    .map_err(|e| RaftError::Transport(format!("write to peer {}: {e}", peer.0)))?;
+                s.flush()
+                    .await
+                    .map_err(|e| RaftError::Transport(format!("flush to peer {}: {e}", peer.0)))
+            }
+            .await;
+
+            if result.is_err() {
+                Self::evict_dead(&connections, peer, &stream).await;
+            }
+            result
         }
     }
 
