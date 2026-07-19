@@ -108,6 +108,19 @@ async fn main() -> std::io::Result<()> {
 
     let config = Config::from_env();
     config.validate();
+
+    // Startup banner — printed unconditionally (not gated by the log
+    // level) so operators always see what is running. It goes to stderr:
+    // the tracing subscriber owns stdout, and with ARBITRO_LOG_FORMAT=json
+    // stdout is a machine-parsed stream the banner must not corrupt.
+    eprintln!(
+        "{}",
+        arbitro_server::banner::render(
+            &config,
+            &arbitro_server::banner::BannerContext::from_env()
+        )
+    );
+
     let mut server = ArbitroServer::new(config);
 
     // Wire command log if data_dir is configured
