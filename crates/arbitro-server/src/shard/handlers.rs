@@ -335,37 +335,24 @@ impl CommandWorker {
             }
 
             if !dlq_seqs.is_empty() {
-                // Ack the DLQ entries from the original stream.
-                self.drain_notifications();
-                let delta = self.engine.execute(&Command::Ack {
-                    consumer_id: cmd.consumer_id,
-                    entries: &dlq_seqs,
-                });
-                let acked = dlq_seqs.len() as u32;
-                if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
-                    if acked > 0 {
-                        self.counters.dec_inflight_bulk(
-                            cmd.consumer_id.0,
-                            consumer.queue_id.0,
-                            acked,
-                        );
-                    }
-                }
-                self.apply_delta_and_sync(&delta);
-
-                // Best-effort publish to DLQ stream. Read from store
-                // and re-append with a DLQ tag. For the skeleton, log
-                // the event — full wiring requires DLQ stream creation
-                // and registry integration.
+                // HOTFIX (silent data loss): the broker-native DLQ publish path
+                // is NOT wired. The previous code acked these entries off the
+                // stream (destroying them) and only logged at debug — while the
+                // NackReply told the client they were "requeued". Until a real
+                // move-to-DLQ primitive exists (durable publish-then-ack to a
+                // DLQ stream), a message that exceeds max_nack MUST NOT be
+                // dropped. Redeliver it (equivalent to max_nack==0) and warn.
+                // The full DLQ implementation will replace this branch.
                 for dlq_entry in &dlq_seqs {
-                    tracing::debug!(
+                    tracing::warn!(
                         consumer_id = cmd.consumer_id.0,
                         seq = dlq_entry.seq,
-                        "message moved to DLQ after exceeding max_nack={}",
                         max_nack,
+                        "max_nack exceeded but broker DLQ is not implemented; \
+                         redelivering instead of dropping (no data loss)"
                     );
                 }
-                self.gate.release();
+                keep.extend(dlq_seqs.drain(..));
             }
 
             if keep.is_empty() {

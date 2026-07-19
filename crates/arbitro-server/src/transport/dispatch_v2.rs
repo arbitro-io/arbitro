@@ -1666,7 +1666,11 @@ async fn v2_create_consumer(
                     effective_max_inflight as u32
                 },
                 ack_wait_ms: body.ack_wait_ms,
-                max_nack: body.max_nack.unwrap_or(5),
+                // DLQ is disabled by default. The broker-native DLQ publish
+                // path is not yet wired (see handle_nack), so a non-zero
+                // default would silently drop poison messages. Keep it opt-in
+                // (0 = redeliver forever) until the DLQ is fully implemented.
+                max_nack: body.max_nack.unwrap_or(0),
             },
             subject_limits,
         )
