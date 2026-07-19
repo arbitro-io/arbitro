@@ -31,6 +31,7 @@ jobs:
   fmt:
     name: rustfmt (informational)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     continue-on-error: true
     defaults:
       run:
@@ -58,6 +59,7 @@ jobs:
   clippy:
     name: clippy (required, -D warnings)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -86,6 +88,7 @@ jobs:
   unit-tests:
     name: unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -109,6 +112,7 @@ jobs:
   e2e-integration:
     name: e2e integration
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -126,21 +130,24 @@ jobs:
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # E2E tests spin up a real broker per test and are NOT parallel-safe
+      # (port/broker contention → hangs). Run serial, like the persistence job.
       - name: Integration tests
-        run: cargo test -p arbitro-e2e --test integration
+        run: cargo test -p arbitro-e2e --test integration -- --test-threads=1
       - name: Client ack invariants
-        run: cargo test -p arbitro-e2e --test client_ack_invariants
+        run: cargo test -p arbitro-e2e --test client_ack_invariants -- --test-threads=1
       - name: Invariants
-        run: cargo test -p arbitro-e2e --test invariants
+        run: cargo test -p arbitro-e2e --test invariants -- --test-threads=1
       - name: Lifecycle flow
-        run: cargo test -p arbitro-e2e --test lifecycle_flow
+        run: cargo test -p arbitro-e2e --test lifecycle_flow -- --test-threads=1
       - name: Shutdown
-        run: cargo test -p arbitro-e2e --test shutdown
+        run: cargo test -p arbitro-e2e --test shutdown -- --test-threads=1
 
   # ── Persistence tests (separate: disk I/O, longer, isolated) ──────────
   e2e-persistence:
     name: e2e persistence
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -166,6 +173,7 @@ jobs:
   bench-compile:
     name: benches compile
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -189,6 +197,7 @@ jobs:
   cluster-build:
     name: cluster build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -212,6 +221,7 @@ jobs:
   audit:
     name: cargo audit + deny
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ${{ github.workspace }}/arbitro
@@ -241,6 +251,7 @@ jobs:
   docker:
     name: docker image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [unit-tests, e2e-integration, e2e-persistence]
     permissions:
       contents: read
