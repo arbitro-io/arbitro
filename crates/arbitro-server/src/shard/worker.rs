@@ -175,6 +175,19 @@ impl DrainWorker {
             }
 
             loop {
+                // Shutdown liveness: when any entry is capacity-blocked,
+                // `more_pending` re-opens the gate every cycle so this inner
+                // loop never parks on `acquire()` — making the outer loop's
+                // `running` check (above) unreachable. If the acks that would
+                // free that capacity never arrive (e.g. the command worker has
+                // already processed Shutdown), the drain would spin until the
+                // process dies and `ShardRouter::shutdown()`'s JoinHandle await
+                // would deadlock. One relaxed load per cycle guarantees the
+                // drain always terminates within a cycle on shutdown.
+                if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+
                 crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
 
                 // ── Clear the gate BEFORE reading the store ───────────────
