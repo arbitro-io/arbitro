@@ -242,6 +242,31 @@ impl CommandWorker {
         // Process pending drain notifications first so pending list is current.
         self.drain_notifications();
 
+        // Temporal-isolation floor: advance the consumer's contiguous-
+        // acked floor with the entries that will actually match a
+        // pending delivery — the engine's exact ack criterion, checked
+        // BEFORE `Command::Ack` removes them from `pending`. Feeding raw
+        // client seqs instead would let a bogus/double ack advance the
+        // floor past an owed (undelivered or nacked) seq and lose it.
+        // The updated floor rides the `DrainEvent::Ack` events emitted
+        // in `apply_delta_and_sync` below. See `shard/ack_floor.rs`.
+        {
+            let catalog = &self.engine.ctx().catalog;
+            let floors = &mut self.ack_floors;
+            for entry in &cmd.entries {
+                for &bid in catalog.bindings_for_consumer(cmd.consumer_id) {
+                    if let Some(b) = catalog.binding(bid) {
+                        if b.stream_id == entry.stream_id
+                            && b.pending.contains_key(&entry.seq)
+                        {
+                            floors.record_acked(cmd.consumer_id.0, entry.seq);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let delta = self.engine.execute(&Command::Ack {
             consumer_id: cmd.consumer_id,
             entries: &cmd.entries,

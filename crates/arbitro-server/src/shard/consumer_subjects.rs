@@ -26,6 +26,12 @@ use std::collections::HashMap;
 pub struct ConsumerSubjects {
     inflight: HashMap<u32, u32, BuildNoHashHasher<u32>>,
     total: u32,
+    /// Contiguous-acked floor mirrored from the command thread's
+    /// `AckFloors` (see `shard/ack_floor.rs`) via `DrainEvent::Ack`.
+    /// All seqs `<= ack_floor` are acked by this consumer, gap-free —
+    /// the drain skips re-delivering them on a cursor rewind. Monotonic
+    /// (only raised), so a dropped ring event is merely conservative.
+    ack_floor: u64,
 }
 
 impl ConsumerSubjects {
@@ -50,6 +56,20 @@ impl ConsumerSubjects {
     #[inline]
     pub fn total(&self) -> u32 {
         self.total
+    }
+
+    /// Contiguous-acked floor. Seqs `<= floor` must not be re-delivered.
+    #[inline]
+    pub fn ack_floor(&self) -> u64 {
+        self.ack_floor
+    }
+
+    /// Raise the floor (monotonic max — stale/reordered values are no-ops).
+    #[inline]
+    pub fn raise_ack_floor(&mut self, floor: u64) {
+        if floor > self.ack_floor {
+            self.ack_floor = floor;
+        }
     }
 
     /// Number of distinct subjects currently tracked. O(1).
@@ -190,6 +210,18 @@ mod tests {
         let mut snap = s.snapshot();
         snap.sort();
         assert_eq!(snap, vec![(0x1, 2), (0x2, 1)]);
+    }
+
+    #[test]
+    fn ack_floor_is_monotonic() {
+        let mut s = ConsumerSubjects::new();
+        assert_eq!(s.ack_floor(), 0);
+        s.raise_ack_floor(5);
+        assert_eq!(s.ack_floor(), 5);
+        s.raise_ack_floor(3); // stale/reordered value — no-op
+        assert_eq!(s.ack_floor(), 5);
+        s.raise_ack_floor(9);
+        assert_eq!(s.ack_floor(), 9);
     }
 
     #[test]

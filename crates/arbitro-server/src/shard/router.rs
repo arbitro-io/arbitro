@@ -305,6 +305,7 @@ impl ShardRouter {
                 flush_stream_ids: Vec::new(),
                 silent_drops: Arc::clone(&silent_drops),
                 pending_consumer_remove: Vec::new(),
+                ack_floors: crate::shard::ack_floor::AckFloors::new(),
                 last_wheel_tick: None,
                 evict_resume_seq: 0,
                 stream_oldest_ts: HashMap::default(),

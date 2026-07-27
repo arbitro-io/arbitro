@@ -9,6 +9,7 @@
 //! * `worker` — `DrainWorker` (pure drain) + `CommandWorker` (owns engine).
 
 pub mod accumulator;
+pub mod ack_floor;
 pub mod command;
 pub mod consumer_subjects;
 pub mod drain;

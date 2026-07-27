@@ -309,10 +309,12 @@ fn drain_event_ring(
             DrainEvent::Ack {
                 consumer_id,
                 subject_hash,
+                ack_floor,
             } => {
                 let idx = consumer_id.raw() as usize;
                 if let Some(Some(cs)) = consumer_subjects.get_mut(idx) {
                     cs.dec(subject_hash);
+                    cs.raise_ack_floor(ack_floor);
                 }
             }
             DrainEvent::ConsumerRemoved { consumer_id } => {
@@ -455,6 +457,12 @@ pub struct CommandWorker {
     /// ring. Drained at the top of every command loop iteration so a
     /// transient ring-full doesn't leak the per-consumer subject slot.
     pub(super) pending_consumer_remove: Vec<ConsumerId>,
+    /// Per-consumer contiguous-acked floor (temporal isolation). Fed in
+    /// `handle_ack` with engine-matched seqs only; the current floor is
+    /// piggybacked on every `DrainEvent::Ack` so the drain-owned
+    /// `ConsumerSubjects` slot can skip re-delivering acked seqs on a
+    /// cursor rewind. See `shard/ack_floor.rs`.
+    pub(super) ack_floors: crate::shard::ack_floor::AckFloors,
     /// DLQ nack counter: `(consumer_id, seq) → nack_count`. Tracks how
     /// many times each message has been nacked by a given consumer. When
     /// the count exceeds the consumer's `max_nack` threshold, the message
@@ -694,12 +702,14 @@ impl CommandWorker {
                     // duplicate so the drain-owned `ConsumerSubjects` book
                     // reconciles in lock-step (same channel the real ack
                     // path uses in apply_delta_and_sync).
+                    let ack_floor = self.ack_floors.floor(consumer_id.raw());
                     for &sh in &dup_hashes {
                         if self
                             .drain_evt_tx
                             .try_send(DrainEvent::Ack {
                                 consumer_id,
                                 subject_hash: sh,
+                                ack_floor,
                             })
                             .is_err()
                         {
@@ -993,6 +1003,11 @@ impl CommandWorker {
                     .try_send(DrainEvent::Ack {
                         consumer_id: ConsumerId(cid),
                         subject_hash: sh,
+                        // Piggyback the contiguous-acked floor so the
+                        // drain slot stays current (handle_ack records
+                        // matched seqs BEFORE the engine execute whose
+                        // delta lands here, so the value is fresh).
+                        ack_floor: self.ack_floors.floor(cid),
                     })
                     .is_err()
                 {
@@ -1015,6 +1030,25 @@ impl CommandWorker {
             if let Some(&min_seq) = delta.pending_seqs_released.iter().min() {
                 rewind_released(&self.counters, min_seq);
                 self.gate.release();
+            }
+        }
+        // Consumer entities removed (explicit DeleteConsumer or a
+        // delete_stream cascade): drop the command-side ack-floor slot
+        // AND the drain-side `ConsumerSubjects` slot. Consumer ids are
+        // pool-recycled — a stale contiguous-acked floor inherited by a
+        // recycled id would silently skip delivery for the new consumer
+        // (message loss), so this cleanup is correctness-critical on
+        // every removal path (handle_delete_consumer only covers the
+        // explicit one). H11 retry on ring-full, same as the handler.
+        for &cid in &delta.consumers_removed {
+            self.ack_floors.remove(cid.raw());
+            if self
+                .drain_evt_tx
+                .try_send(DrainEvent::ConsumerRemoved { consumer_id: cid })
+                .is_err()
+            {
+                self.silent_drops.inc_drain_evt();
+                self.pending_consumer_remove.push(cid);
             }
         }
         // Remove retired bindings

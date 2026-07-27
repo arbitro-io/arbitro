@@ -661,6 +661,7 @@ fn dispatch_recipients(
     let mut dbg_tracked = false;
     let (mut dbg_conn0, mut dbg_qdedup, mut dbg_dead, mut dbg_unbound, mut dbg_wf) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut dbg_acked_floor = 0u32;
 
     for i in 0..n {
         let raw = start + i;
@@ -673,6 +674,26 @@ fn dispatch_recipients(
         if connection_id == ConnectionId(0) {
             dbg_conn0 += 1;
             continue;
+        }
+
+        // Temporal isolation (D5/A7): never re-deliver a seq this
+        // consumer has already acked. `ack_floor` is the contiguous-
+        // acked prefix (all seqs <= floor acked, gap-free) maintained by
+        // the command thread (`shard/ack_floor.rs`) and mirrored into
+        // the drain-owned slot via `DrainEvent::Ack` — any owed seq
+        // (pending, nacked, or never delivered) is unacked and therefore
+        // above the floor, so this skip can never suppress a legitimate
+        // (re)delivery. No `track_skipped`/`served_queues` side effects:
+        // the entry is not owed to this consumer, so the cursor must not
+        // be pinned on it and a queue sibling must not be starved of it.
+        // Steady-state cost: the cursor only moves forward, so
+        // `entry.seq > floor` always holds — one predicted-not-taken
+        // comparison against drain-local state (no atomics, no alloc).
+        if let Some(cs) = consumer_subjects_slot(consumer_subjects, consumer_id.0) {
+            if entry.seq <= cs.ack_floor() {
+                dbg_acked_floor += 1;
+                continue;
+            }
         }
 
         // Queue dedup: one entry per queue within the match set of this entry.
@@ -855,8 +876,8 @@ fn dispatch_recipients(
     // skip-track is the loss signature: the cursor will advance past it.
     if dbg_recipients == 0 && !dbg_tracked && chaos_debug() {
         eprintln!(
-            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={}",
-            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf
+            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={} acked_floor={}",
+            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf, dbg_acked_floor
         );
     }
 }

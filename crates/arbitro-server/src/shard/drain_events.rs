@@ -65,10 +65,15 @@ pub type DrainEventConsumer = Consumer<DrainEvent, DRAIN_EVENT_CAP, arbitro_kit:
 #[derive(Debug, Clone, Copy)]
 pub enum DrainEvent {
     /// One delivered message was acked or retired. Drain decrements
-    /// the per-consumer subject inflight by 1.
+    /// the per-consumer subject inflight by 1 and raises the consumer's
+    /// contiguous-acked floor to `ack_floor` (monotonic max — carrying
+    /// the current floor on every event makes a dropped ring event
+    /// self-healing on the next ack).
     Ack {
         consumer_id: ConsumerId,
         subject_hash: u32,
+        /// Contiguous-acked floor at send time (`shard/ack_floor.rs`).
+        ack_floor: u64,
     },
     /// Consumer was deleted / its bindings retired. Drain drops the
     /// per-consumer slot entirely so the subject map is freed.
