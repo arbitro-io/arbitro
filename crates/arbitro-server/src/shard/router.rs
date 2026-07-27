@@ -254,6 +254,7 @@ impl ShardRouter {
                     max_feed: config.max_feed_per_cycle,
                     max_age_ms: 0,
                     batch_size: config.drain_batch_size,
+                    stall_evict_ms: config.drain_stall_evict_ms,
                 },
                 drain_scratch: super::drain::DrainScratch::new(),
                 running: Arc::clone(&running),

@@ -57,6 +57,7 @@ docker compose up -d   # default port: 9898
 | `ARBITRO_LISTEN` | `0.0.0.0:9898` | TCP listen address |
 | `ARBITRO_MAX_CONNECTIONS` | `10000` | Max concurrent TCP connections |
 | `ARBITRO_WRITE_BUFFER_CAP` | `8192` | Write channel capacity per connection |
+| `ARBITRO_DRAIN_STALL_EVICT_MS` | `5000` | Evict a connection whose delivery writer channel has been continuously full (client not reading) for this long. Unpins the shard cursor so healthy consumers keep flowing; no stored message is deleted. `0` disables. |
 | `ARBITRO_IDLE_TIMEOUT` | `300` | Idle timeout (s) |
 | `ARBITRO_KEEPALIVE_INTERVAL` | `30` | Keepalive ping interval (s) |
 | `ARBITRO_METRICS_INTERVAL` | `5` | Periodic metrics log interval (s). `0` disables. |

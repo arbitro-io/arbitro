@@ -41,6 +41,11 @@ pub(in crate::shard) struct DrainConfig {
     pub max_feed: usize,
     pub max_age_ms: u64,
     pub batch_size: u16,
+    /// ROB-23: evict a connection whose writer channel has been
+    /// continuously full (`Backpressured` on every flush, zero `Ok`)
+    /// for this many milliseconds. 0 = never evict. See
+    /// `Config::drain_stall_evict_ms`.
+    pub stall_evict_ms: u64,
 }
 
 // ── Per-cycle ack-mode delivery record ──────────────────────────────────────
@@ -106,6 +111,16 @@ pub(in crate::shard) struct DrainScratch {
     flush_results: Vec<(ConnectionId, FlushOutcome)>,
     /// F12 — persistent buffer for the slow-path notify sort.
     sorted_notify: Vec<PendingNotify>,
+
+    /// ROB-23 — per-connection stall clock, persistent ACROSS cycles
+    /// (never cleared in `drain_read`). An entry `(conn, since)` means
+    /// every flush to `conn` has come back `Backpressured` (writer
+    /// channel full, zero progress) in every cycle since `since`. The
+    /// entry is dropped the moment a frame flushes `Ok` or the conn
+    /// stops producing backpressured frames (e.g. paused, retired), so
+    /// the clock only measures CONTINUOUS stall. Bounded: at most one
+    /// entry per connection with a currently-full writer channel.
+    stalled_conns: Vec<(ConnectionId, std::time::Instant)>,
 }
 
 impl DrainScratch {
@@ -131,6 +146,7 @@ impl DrainScratch {
             ),
             flush_results: Vec::with_capacity(16),
             sorted_notify: Vec::with_capacity(256),
+            stalled_conns: Vec::with_capacity(4),
         }
     }
 }
@@ -268,6 +284,10 @@ pub(in crate::shard) fn drain_read(
 /// Does NOT need the store. The store lock should be released before
 /// calling this. All entry data lives in `scratch.acc` (copied during
 /// Phase 1's `for_each`).
+///
+/// `stall_evict_ms` — ROB-23 slow-consumer eviction bound (0 = disabled),
+/// see `DrainConfig::stall_evict_ms`.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::shard) fn drain_deliver(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
@@ -277,6 +297,7 @@ pub(in crate::shard) fn drain_deliver(
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     notify_tx: &mut crate::shard::shared::NotifyProducer,
     silent_drops: &crate::common::SilentDrops,
+    stall_evict_ms: u64,
     mut result: DrainReadResult,
 ) {
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
@@ -398,6 +419,42 @@ pub(in crate::shard) fn drain_deliver(
                 // Treat as skipped — cursor won't advance past these entries.
                 track_skipped(&mut result.lowest_skipped, first_seq);
                 result.more_pending = true;
+                // ROB-23 (audit #7a): a full writer channel is transient
+                // ONLY for a bounded window. The reply path already ejects
+                // a non-reading connection the moment its queue fills
+                // (ROB-22, transport/registry.rs); mirror that policy here
+                // with a grace window: once `conn` has made ZERO flush
+                // progress for `stall_evict_ms`, treat it exactly like
+                // `WriterGone` — queue it for retirement so the command
+                // thread retires its bindings, the snapshot drops it, and
+                // the shared cursor can advance past it. Healthy sibling
+                // consumers on the shard stop being starved.
+                //
+                // No message loss: retirement never touches the store.
+                // The evicted consumer's undelivered seqs stay retained
+                // above its per-consumer ack floor and are replayed on
+                // its next subscribe; its delivered-but-unacked pending
+                // is released through the normal BUG2 retirement rewind.
+                if stall_evict_ms > 0 {
+                    let now = std::time::Instant::now();
+                    match scratch.stalled_conns.iter().find(|e| e.0 == conn) {
+                        None => scratch.stalled_conns.push((conn, now)),
+                        Some(&(_, since)) => {
+                            if now.duration_since(since).as_millis() as u64
+                                >= stall_evict_ms
+                                && !scratch.dead_connections.contains(&conn)
+                            {
+                                tracing::warn!(
+                                    conn_id = conn.0,
+                                    stall_ms = stall_evict_ms,
+                                    "delivery writer stalled past eviction \
+                                     window, retiring slow connection"
+                                );
+                                scratch.dead_connections.push(conn);
+                            }
+                        }
+                    }
+                }
             }
             FlushOutcome::WriterGone(first_seq) => {
                 // BUG1: the batch destined to this connection was never
@@ -410,6 +467,30 @@ pub(in crate::shard) fn drain_deliver(
             }
         }
     }
+
+    // ROB-23 maintenance — the stall clock survives ONLY across strictly
+    // consecutive zero-progress cycles. Drop the entry when the conn made
+    // any progress this cycle (a frame flushed `Ok` — the writer drained),
+    // or when it produced no backpressured frame at all (its work is done,
+    // paused, or its binding was retired). A stalled conn keeps re-framing
+    // every cycle while it pins the cursor, so absence == not stalling.
+    if !scratch.stalled_conns.is_empty() {
+        scratch.stalled_conns.retain(|&(c, _)| {
+            let mut backpressured = false;
+            let mut progressed = false;
+            for &(fc, o) in flush_results.iter() {
+                if fc == c {
+                    match o {
+                        FlushOutcome::Ok => progressed = true,
+                        FlushOutcome::Backpressured(_) => backpressured = true,
+                        FlushOutcome::WriterGone(_) => {}
+                    }
+                }
+            }
+            backpressured && !progressed
+        });
+    }
+
     for d in &scratch.deliveries {
         if frame_ok_for(&flush_results, d.conn) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
@@ -509,6 +590,7 @@ pub(in crate::shard) fn drain_cycle(
             consumer_subjects,
             notify_tx,
             silent_drops,
+            cfg.stall_evict_ms,
             result,
         ),
         None => {
@@ -1092,6 +1174,7 @@ mod tests {
             &mut consumer_subjects,
             &mut notify_tx,
             &silent,
+            0,
             result,
         );
 
@@ -1104,5 +1187,179 @@ mod tests {
         );
         // The conn was queued for retirement.
         assert!(gate.is_open(), "more_pending must re-open the gate for retry");
+    }
+
+    /// ROB-23 (audit #7a) — a connection whose writer channel stays full
+    /// past `stall_evict_ms` must be queued for retirement exactly like
+    /// `WriterGone`, so the shared cursor stops being pinned by a
+    /// dead-reading consumer. Before the fix, `Backpressured` was retried
+    /// forever and one non-reading client starved every sibling on the
+    /// shard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backpressured_conn_evicted_after_stall_window() {
+        let counters = SharedCounters::new();
+        let gate = Gate::new();
+        let names = Arc::new(NameRegistry::default());
+        let silent = SilentDrops::new();
+        let (mut producers, mut rx, _sd) = NotifyRing::new(1);
+        let mut notify_tx = producers.pop().unwrap();
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+
+        // Writer for conn 7 with a FULL channel (cap 1, pre-filled) →
+        // every flush comes back `Backpressured`.
+        let mut snap = DrainSnapshot::empty();
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        write_tx
+            .try_send(bytes::Bytes::from_static(b"plug"))
+            .unwrap();
+        snap.writers_by_conn.insert(
+            7,
+            crate::shard::shared::WriterIndexEntry {
+                write_tx,
+                write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        let run_cycle = |scratch: &mut DrainScratch,
+                         consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+                         notify_tx: &mut crate::shard::shared::NotifyProducer| {
+            // Re-arm the frame — a real stalled cycle re-reads the store
+            // and re-accumulates the same batch every cycle.
+            scratch.dead_connections.clear();
+            scratch.acc.clear();
+            scratch.acc.add(
+                ConnectionId(7),
+                StreamId(1),
+                ConsumerId(0),
+                10,
+                b"subj",
+                0,
+                &[],
+                b"payload",
+            );
+            drain_deliver(
+                &counters,
+                &snap,
+                &gate,
+                &names,
+                scratch,
+                consumer_subjects,
+                notify_tx,
+                &silent,
+                20, // stall_evict_ms
+                DrainReadResult {
+                    start: 1,
+                    end: 11,
+                    more_pending: false,
+                    lowest_skipped: None,
+                    last_seq: 10,
+                },
+            );
+        };
+
+        // Cycle 1 — arms the stall clock; NOT evicted yet.
+        run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
+        assert_eq!(counters.cursor(), 9, "cursor pinned before the stalled batch");
+        assert!(
+            rx.try_recv().is_none(),
+            "no ConnectionDead before the stall window elapses",
+        );
+
+        // Cycle 2, past the window — evicted like WriterGone.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
+        assert_eq!(counters.cursor(), 9, "cursor still pinned this cycle");
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Some(DrainNotification::ConnectionDead(ConnectionId(7)))
+            ),
+            "stalled conn must be reported dead after the eviction window",
+        );
+        assert!(gate.is_open(), "more_pending must re-open the gate");
+    }
+
+    /// ROB-23 guard — a flush that makes progress (`Ok`) resets the stall
+    /// clock, so a slow-but-alive consumer is never evicted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_progress_resets_stall_clock() {
+        let counters = SharedCounters::new();
+        let gate = Gate::new();
+        let names = Arc::new(NameRegistry::default());
+        let silent = SilentDrops::new();
+        let (mut producers, mut rx, _sd) = NotifyRing::new(1);
+        let mut notify_tx = producers.pop().unwrap();
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+
+        let mut snap = DrainSnapshot::empty();
+        // Cap 1, initially FULL.
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        write_tx
+            .try_send(bytes::Bytes::from_static(b"plug"))
+            .unwrap();
+        snap.writers_by_conn.insert(
+            7,
+            crate::shard::shared::WriterIndexEntry {
+                write_tx,
+                write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+
+        let run_cycle = |scratch: &mut DrainScratch,
+                         consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+                         notify_tx: &mut crate::shard::shared::NotifyProducer| {
+            scratch.dead_connections.clear();
+            scratch.acc.clear();
+            scratch.acc.add(
+                ConnectionId(7),
+                StreamId(1),
+                ConsumerId(0),
+                10,
+                b"subj",
+                0,
+                &[],
+                b"payload",
+            );
+            drain_deliver(
+                &counters,
+                &snap,
+                &gate,
+                &names,
+                scratch,
+                consumer_subjects,
+                notify_tx,
+                &silent,
+                20,
+                DrainReadResult {
+                    start: 1,
+                    end: 11,
+                    more_pending: false,
+                    lowest_skipped: None,
+                    last_seq: 10,
+                },
+            );
+        };
+
+        // Cycle 1 — backpressured, clock armed.
+        run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
+        assert_eq!(scratch.stalled_conns.len(), 1, "stall clock armed");
+
+        // The consumer drains its channel → next flush succeeds → clock reset.
+        let _ = write_rx.try_recv();
+        run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
+        assert!(
+            scratch.stalled_conns.is_empty(),
+            "flush progress must reset the stall clock",
+        );
+
+        // Even long past the window, a fresh stall starts a fresh clock.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
+        assert!(
+            rx.try_recv().is_none(),
+            "no eviction: the stall was never continuous for the window",
+        );
     }
 }

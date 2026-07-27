@@ -1596,3 +1596,172 @@ async fn mixed_ack_explicit_and_none_both_receive_all() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROB-23 (audit #7a) — a dead-reading consumer must not starve its shard
+//
+// The reply path already ejects a connection whose outbound queue is full
+// (ROB-22). Before ROB-23, the DELIVERY path treated a full writer channel
+// as transient forever: a live-but-not-reading consumer pinned the shared
+// shard cursor at its first undeliverable seq, permanently starving every
+// healthy sibling consumer on the same shard — the primary authenticated-
+// client DoS surface. Fix: after `drain_stall_evict_ms` of continuous
+// zero-progress backpressure, the drain retires the connection exactly
+// like a dead writer, and the cursor advances past it. No stored message
+// is deleted — an explicit-ack consumer can resubscribe and resume from
+// its ack floor.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
+    use arbitro_proto::v2::cold::{ColdBody, Subscribe};
+    use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
+    use tokio::io::AsyncWriteExt;
+    use zerocopy::IntoBytes;
+
+    // Single shard so A and B share one drain cursor. Tiny write channel +
+    // small per-cycle feed so the dead reader saturates its pipeline
+    // (channel + in-flight frame + TCP buffers) long before N messages.
+    let mut server = TestServerBuilder::new()
+        .shard_count(1)
+        .write_buffer_cap(4)
+        .max_feed_per_cycle(16)
+        .drain_stall_evict_ms(750)
+        .spawn()
+        .await;
+
+    // Separate connections: publisher/control vs healthy consumer B. Keeps
+    // B's delivery traffic off the publisher's (tiny) write channel.
+    let client = server.connect().await;
+    let client_b = server.connect().await;
+
+    let stream_id = create_stream(&client, b"starve", b">").await;
+
+    // A — fire-and-forget fanout consumer (no inflight cap, so frames keep
+    // flowing until its writer channel is full).
+    let consumer_a = create_consumer(
+        &client, stream_id, b"dead-reader", b"", b"", 100, 0, /* None */
+        0, 0, 0,
+    )
+    .await;
+    // B — healthy explicit-ack sibling.
+    let consumer_b = create_consumer(
+        &client, stream_id, b"healthy", b"", b"", 512, 1, /* Explicit */
+        0, 0, 0,
+    )
+    .await;
+
+    // Bind A from a RAW TCP connection that never reads a single byte —
+    // the truest "dead reading" client. Handshake + Subscribe only.
+    let mut raw = tokio::net::TcpStream::connect(&server.addr).await.unwrap();
+    raw.write_all(HelloFrame::new(Role::Client).as_bytes())
+        .await
+        .unwrap();
+    let sub = Subscribe {
+        consumer_id: consumer_a,
+        subscription_id: 0,
+        filters: Vec::new(),
+    }
+    .encode(1);
+    raw.write_all(&sub).await.unwrap();
+
+    let handle_b = client_b.subscribe(stream_id, consumer_b, b"").await.unwrap();
+
+    // Let both bindings register before publishing.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    const N: usize = 400;
+    // 64 KiB payloads fill A's TCP buffers within a few dozen messages.
+    let payload = Bytes::from(vec![0xABu8; 64 * 1024]);
+
+    // B drains + acks CONCURRENTLY with publishing so its own channel
+    // never fills and its ack floor keeps rising (suppresses the re-walk
+    // duplicates while A pins the cursor).
+    let collector = tokio::spawn(async move {
+        let mut handle_b = handle_b;
+        let mut seen = std::collections::HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while seen.len() < N {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, handle_b.recv()).await {
+                Ok(Some(m)) => {
+                    let seq = m.seq;
+                    m.ack();
+                    seen.insert(seq);
+                }
+                _ => break,
+            }
+        }
+        (seen, handle_b)
+    });
+
+    for i in 0..N {
+        client
+            .publish_wait(
+                stream_id,
+                format!("starve.msg.{i}").as_bytes(),
+                payload.clone(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // The invariant: B receives ALL N messages within the budget. While A
+    // pins the cursor this is impossible (B stalls ~max_feed past the pin);
+    // it only passes once A's stalled binding is evicted and the cursor
+    // advances — the starvation bound under test.
+    let (seen, mut handle_b) = collector.await.unwrap();
+    assert_eq!(
+        seen.len(),
+        N,
+        "healthy sibling starved: got {} of {N} unique messages — the \
+         dead-reading consumer still pins the shard cursor",
+        seen.len()
+    );
+
+    // Post-eviction liveness: new publishes keep flowing to B.
+    const M: usize = 20;
+    for i in 0..M {
+        client
+            .publish_wait(
+                stream_id,
+                format!("starve.tail.{i}").as_bytes(),
+                Bytes::from_static(b"tail"),
+            )
+            .await
+            .unwrap();
+    }
+    let max_phase1_seq = seen.iter().max().copied().unwrap_or(0);
+    let mut tail_unique = std::collections::HashSet::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while tail_unique.len() < M {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, handle_b.recv()).await {
+            Ok(Some(m)) => {
+                let seq = m.seq;
+                m.ack();
+                if seq > max_phase1_seq {
+                    tail_unique.insert(seq);
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        tail_unique.len(),
+        M,
+        "shard not live after eviction: got {} of {M} tail messages",
+        tail_unique.len()
+    );
+
+    // Close the dead reader BEFORE shutdown so the server's blocked writer
+    // task errors out instead of blocking the graceful drain.
+    drop(raw);
+    server.shutdown().await;
+}

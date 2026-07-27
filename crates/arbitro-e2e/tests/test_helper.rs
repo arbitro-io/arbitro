@@ -13,6 +13,9 @@ pub struct TestServerBuilder {
     max_frame_size: Option<usize>,
     idle_timeout: Option<Duration>,
     keepalive_interval: Option<Duration>,
+    write_buffer_cap: Option<usize>,
+    drain_stall_evict_ms: Option<u64>,
+    max_feed_per_cycle: Option<usize>,
 }
 
 impl Default for TestServerBuilder {
@@ -31,6 +34,9 @@ impl TestServerBuilder {
             max_frame_size: None,
             idle_timeout: None,
             keepalive_interval: None,
+            write_buffer_cap: None,
+            drain_stall_evict_ms: None,
+            max_feed_per_cycle: None,
         }
     }
 
@@ -64,6 +70,25 @@ impl TestServerBuilder {
         self
     }
 
+    /// Per-connection write channel capacity in frames (ROB-23 tests use
+    /// a tiny cap so a non-reading consumer backpressures the drain fast).
+    pub fn write_buffer_cap(mut self, cap: usize) -> Self {
+        self.write_buffer_cap = Some(cap);
+        self
+    }
+
+    /// ROB-23: delivery-stall eviction window in milliseconds.
+    pub fn drain_stall_evict_ms(mut self, ms: u64) -> Self {
+        self.drain_stall_evict_ms = Some(ms);
+        self
+    }
+
+    /// Max store entries fed into the drain per cycle (frame batching cap).
+    pub fn max_feed_per_cycle(mut self, cap: usize) -> Self {
+        self.max_feed_per_cycle = Some(cap);
+        self
+    }
+
     pub async fn spawn(self) -> TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -87,6 +112,15 @@ impl TestServerBuilder {
         }
         if let Some(interval) = self.keepalive_interval {
             config = config.keepalive_interval(interval);
+        }
+        if let Some(cap) = self.write_buffer_cap {
+            config = config.write_buffer_cap(cap);
+        }
+        if let Some(ms) = self.drain_stall_evict_ms {
+            config = config.drain_stall_evict_ms(ms);
+        }
+        if let Some(cap) = self.max_feed_per_cycle {
+            config = config.max_feed_per_cycle(cap);
         }
 
         if let Some(ref dir) = self.data_dir {

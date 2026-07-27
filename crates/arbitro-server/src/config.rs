@@ -33,6 +33,21 @@ pub struct Config {
     /// Batching reduces frames from N to N/batch_size, cutting try_send
     /// calls and TCP writes proportionally.
     pub drain_batch_size: u16,
+    /// ROB-23: evict a delivery-stalled connection after its writer channel
+    /// has been continuously full for this many milliseconds (default: 5000,
+    /// 0 = never evict).
+    ///
+    /// Mirror of ROB-22 (reply path) on the DELIVERY path: a connected
+    /// client that stops reading its socket fills its outbound channel and
+    /// would otherwise pin the shard's drain cursor at its first
+    /// undeliverable seq forever — starving every healthy sibling consumer
+    /// on the same shard (the primary authenticated-client DoS surface).
+    /// After the window elapses with zero flush progress, the drain treats
+    /// the connection like a dead writer: its bindings are retired and the
+    /// cursor advances past it. No stored message is lost — an evicted
+    /// consumer's undelivered entries stay in the store, gated by its
+    /// per-consumer ack floor for redelivery on resubscribe.
+    pub drain_stall_evict_ms: u64,
     /// Data directory for persistence (default: "./data").
     pub data_dir: Option<String>,
     /// TLS certificate PEM file path (None = plaintext TCP).
@@ -99,6 +114,7 @@ impl Config {
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
             max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
             drain_batch_size: env_parse("ARBITRO_DRAIN_BATCH_SIZE", 256),
+            drain_stall_evict_ms: env_parse("ARBITRO_DRAIN_STALL_EVICT_MS", 5000),
             max_connections: env_parse("ARBITRO_MAX_CONNECTIONS", 10_000),
             write_buffer_cap: env_parse("ARBITRO_WRITE_BUFFER_CAP", 8192),
             idle_timeout: Duration::from_secs(env_parse("ARBITRO_IDLE_TIMEOUT", 300)),
@@ -195,6 +211,11 @@ impl Config {
         self
     }
 
+    pub fn drain_stall_evict_ms(mut self, ms: u64) -> Self {
+        self.drain_stall_evict_ms = ms;
+        self
+    }
+
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
         self
@@ -261,6 +282,7 @@ impl Default for Config {
             channel_capacity: 4096,
             max_feed_per_cycle: 256,
             drain_batch_size: 256,
+            drain_stall_evict_ms: 5000,
             max_connections: 10_000,
             write_buffer_cap: 8192,
             idle_timeout: Duration::from_secs(300),

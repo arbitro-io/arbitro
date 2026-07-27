@@ -270,6 +270,7 @@ impl DrainWorker {
                         &mut self.consumer_subjects,
                         &mut self.notify_ring,
                         &self.silent_drops,
+                        self.drain_config.stall_evict_ms,
                         result,
                     );
                 }
