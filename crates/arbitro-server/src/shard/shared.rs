@@ -98,19 +98,39 @@ impl SharedCounters {
         self.queue[queue_id as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Saturating atomic subtract — clamps at 0 instead of wrapping.
+    ///
+    /// A4 defense in depth: a decrement below zero (double-ack, ack raced
+    /// with a wheel auto-nack, dropped Delivered notification) must never
+    /// wrap the u32 — a wrapped counter makes `consumer_has_capacity`
+    /// false forever and wedges the consumer plus its whole queue group.
+    /// Single uncontended CAS on the common path; alloc-free.
+    #[inline]
+    fn saturating_dec(slot: &AtomicU32, count: u32) {
+        let mut cur = slot.load(Ordering::Relaxed);
+        loop {
+            let new = cur.saturating_sub(count);
+            match slot.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// Decrement consumer + queue inflight after ack.
-    /// Called by command thread.
+    /// Called by command thread. Saturates at 0 (never wraps).
     #[inline]
     pub fn dec_inflight(&self, consumer_id: u32, queue_id: u32) {
-        self.consumer[consumer_id as usize].fetch_sub(1, Ordering::Relaxed);
-        self.queue[queue_id as usize].fetch_sub(1, Ordering::Relaxed);
+        Self::saturating_dec(&self.consumer[consumer_id as usize], 1);
+        Self::saturating_dec(&self.queue[queue_id as usize], 1);
     }
 
     /// Bulk decrement consumer + queue inflight (for retire_binding).
+    /// Saturates at 0 (never wraps).
     #[inline]
     pub fn dec_inflight_bulk(&self, consumer_id: u32, queue_id: u32, count: u32) {
-        self.consumer[consumer_id as usize].fetch_sub(count, Ordering::Relaxed);
-        self.queue[queue_id as usize].fetch_sub(count, Ordering::Relaxed);
+        Self::saturating_dec(&self.consumer[consumer_id as usize], count);
+        Self::saturating_dec(&self.queue[queue_id as usize], count);
     }
 
     /// Current consumer inflight count.
@@ -381,6 +401,33 @@ pub enum DrainNotification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A4 defense-in-depth — decrementing below zero must clamp at 0,
+    /// never wrap to ~u32::MAX (a wrapped counter makes
+    /// `consumer_has_capacity` false forever, wedging the consumer and
+    /// its whole queue group until restart).
+    #[test]
+    fn dec_inflight_saturates_at_zero() {
+        let c = SharedCounters::new();
+        c.inc_inflight(1, 2);
+        c.dec_inflight(1, 2);
+        // Extra decrement (double-ack) — must clamp, not wrap.
+        c.dec_inflight(1, 2);
+        assert_eq!(
+            c.consumer_inflight(1),
+            0,
+            "underflow wrapped the consumer inflight counter"
+        );
+        assert!(c.consumer_has_capacity(1, 8));
+        // Bulk variant clamps too.
+        c.dec_inflight_bulk(1, 2, 5);
+        assert_eq!(
+            c.consumer_inflight(1),
+            0,
+            "bulk underflow wrapped the consumer inflight counter"
+        );
+        assert!(c.consumer_has_capacity(1, 8));
+    }
 
     /// T19 — `signal_rewind` takes the MIN of the existing pending
     /// value and the new target. The CAS loop must converge even under

@@ -261,6 +261,13 @@ impl CommandWorker {
             }
         }
 
+        // A4: decrement the shared atomics by what the engine actually
+        // matched against pending — one `subject_hashes_acked` event is
+        // emitted per matched entry (see engine execute.rs Command::Ack).
+        // Decrementing blindly by `entries.len()` let a double-ack or a
+        // never-delivered-seq ack drive the u32 below zero (wrap), which
+        // permanently wedged the consumer and its queue group.
+        let matched = delta.subject_hashes_acked.len() as u32;
         let accepted = cmd.entries.len() as u32;
         crate::lifecycle_trace!("a12_engine_ack_done", 0, accepted as u64, "shard");
 
@@ -269,14 +276,14 @@ impl CommandWorker {
         // Now sync the shared atomics so drain sees freed capacity.
         if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
             let queue_id = consumer.queue_id;
-            if accepted > 0 {
+            if matched > 0 {
                 self.counters
-                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, accepted);
+                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
             }
         }
         // Subject inflight decremented by apply_delta_and_sync below.
 
-        if accepted > 0 {
+        if matched > 0 {
             // Release gate so drain re-checks from current cursor.
             // Cursor already stopped at lowest_skipped in drain_cycle,
             // so freed capacity will be used on the next cycle.
@@ -389,12 +396,15 @@ impl CommandWorker {
 
             let requeued = cmd.entries.len() as u32;
 
-            // Decrement atomic inflight counters.
+            // A4: decrement by the engine's matched count (one
+            // `subject_hashes_acked` event per pending entry actually
+            // released), never blindly by request size — see handle_ack.
+            let matched = delta.subject_hashes_acked.len() as u32;
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
-                if requeued > 0 {
+                if matched > 0 {
                     self.counters
-                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
+                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
                 }
             }
 
@@ -434,12 +444,15 @@ impl CommandWorker {
 
             let requeued = cmd.entries.len() as u32;
 
-            // Decrement atomic inflight counters (nack releases inflight too).
+            // A4: decrement by the engine's matched count (one
+            // `subject_hashes_acked` event per pending entry actually
+            // released), never blindly by request size — see handle_ack.
+            let matched = delta.subject_hashes_acked.len() as u32;
             if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
                 let queue_id = consumer.queue_id;
-                if requeued > 0 {
+                if matched > 0 {
                     self.counters
-                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, requeued);
+                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
                 }
             }
 

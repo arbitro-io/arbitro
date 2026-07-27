@@ -314,6 +314,38 @@ impl ArbitroServer {
             }))
         };
 
+        // Consumer-cursor persistence sweep (A7): every 500 ms, append a
+        // CMD_CURSOR_UPDATE for each cursor that advanced. Runs on a
+        // background task — never on a shard worker thread — so the shard
+        // hot path pays zero cost. A final flush runs on graceful
+        // shutdown (see below) so restart tests are deterministic.
+        let cursor_persister = if let Some(ref log) = self.command_log {
+            let persister = std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::persistence::cursor_persist::CursorPersister::new(),
+            ));
+            let sweep_persister = std::sync::Arc::clone(&persister);
+            let sweep_log = log.clone();
+            let sweep_names = std::sync::Arc::clone(self.server.names());
+            let mut sweep_shutdown = shutdown_rx.clone();
+            background_tasks.lock().await.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = sweep_shutdown.changed() => return,
+                        _ = tick.tick() => {
+                            sweep_persister
+                                .lock()
+                                .persist_changed(&sweep_names, &sweep_log);
+                        }
+                    }
+                }
+            });
+            Some(persister)
+        } else {
+            None
+        };
+
         // Cron scheduler task — evaluates cron expressions every second
         // and fires jobs to registered worker connections.
         let cron_registry = std::sync::Arc::new(crate::cron::CronRegistry::new());
@@ -981,6 +1013,17 @@ impl ArbitroServer {
 
         // Shutdown shard workers
         self.server.shutdown().await;
+
+        // A7: final consumer-cursor flush. Shard workers have stopped, so
+        // every processed ack's cursor is visible in the NameRegistry.
+        // Record any cursor that advanced past the last periodic sweep so
+        // a restart resumes exactly where consumers left off.
+        if let (Some(persister), Some(log)) = (&cursor_persister, &self.command_log) {
+            let written = persister.lock().persist_changed(self.server.names(), log);
+            if written > 0 {
+                tracing::debug!(records = written, "final consumer-cursor flush");
+            }
+        }
 
         // Wait briefly for write loops to drain
         tokio::time::sleep(self.config.shutdown_timeout).await;

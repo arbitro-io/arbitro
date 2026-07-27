@@ -651,23 +651,65 @@ impl CommandWorker {
             DrainNotification::Delivered {
                 binding_id,
                 consumer_id,
+                queue_id,
                 entries,
-                ..
             } => {
                 // Update engine's pending list for future ack/retire.
                 use arbitro_engine_v2::command::Command;
-                let stream_id = self
-                    .engine
-                    .ctx()
-                    .catalog
-                    .binding(binding_id)
-                    .map(|b| b.stream_id)
-                    .unwrap_or(StreamId(0));
+                // A3/ROB-12 reconciliation: the drain incremented the shared
+                // inflight once per delivered entry, but the engine SKIPS
+                // re-adding a seq that is already pending on this binding
+                // (redelivery after a cursor rewind — nack, resubscribe,
+                // ack-timeout). Without correction those duplicates become
+                // phantom inflight and the consumer permanently loses
+                // capacity. Pre-scan the pending map with the exact check
+                // the engine uses and reverse the blind increments below.
+                // `dup_hashes` only allocates on an actual redelivery.
+                let mut stream_id = StreamId(0);
+                let mut dup_hashes: Vec<u32> = Vec::new();
+                if let Some(b) = self.engine.ctx().catalog.binding(binding_id) {
+                    stream_id = b.stream_id;
+                    if !b.fire_and_forget {
+                        for e in entries.iter() {
+                            if b.pending.contains_key(&e.seq) {
+                                dup_hashes.push(e.subject_hash);
+                            }
+                        }
+                    }
+                }
                 let _ = self.engine.execute(&Command::Delivered {
                     stream_id,
                     binding_id,
                     entries: &entries,
                 });
+
+                if !dup_hashes.is_empty() {
+                    self.counters.dec_inflight_bulk(
+                        consumer_id.0,
+                        queue_id.0,
+                        dup_hashes.len() as u32,
+                    );
+                    // The drain also bumped the per-(consumer, subject)
+                    // counter for each duplicate; send one Ack event per
+                    // duplicate so the drain-owned `ConsumerSubjects` book
+                    // reconciles in lock-step (same channel the real ack
+                    // path uses in apply_delta_and_sync).
+                    for &sh in &dup_hashes {
+                        if self
+                            .drain_evt_tx
+                            .try_send(DrainEvent::Ack {
+                                consumer_id,
+                                subject_hash: sh,
+                            })
+                            .is_err()
+                        {
+                            self.silent_drops.inc_drain_evt();
+                        }
+                    }
+                    // Capacity was freed — wake the drain so a
+                    // capacity-blocked cursor resumes promptly.
+                    self.gate.release();
+                }
 
                 // Insert delivered entries into the ack-timeout wheel.
                 self.wheel_insert_delivered(consumer_id, &entries);

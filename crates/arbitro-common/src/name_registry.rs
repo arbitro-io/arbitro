@@ -834,6 +834,21 @@ impl NameRegistry {
             .get(&consumer)
             .copied()
     }
+
+    /// Snapshot every consumer cursor as `(consumer_id, last_acked_seq)`.
+    ///
+    /// Used by the server's periodic cursor persister to append
+    /// `CMD_CURSOR_UPDATE` records for cursors that advanced. Cold path —
+    /// one short lock, one Vec allocation per sweep.
+    pub fn consumer_cursors_snapshot(&self) -> Vec<(ConsumerId, u64)> {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .consumer_cursors
+            .iter()
+            .map(|(&id, &seq)| (id, seq))
+            .collect()
+    }
 }
 
 #[cfg(test)]
