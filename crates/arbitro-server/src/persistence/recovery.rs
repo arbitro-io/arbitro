@@ -217,6 +217,17 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_stream_replicas(stream_id, sv.replicas());
+                // AUDIT-6a: restore the stream quota — same call
+                // `v2_create_stream` makes on the live path. Without
+                // this, the publish pre-check sees no quota after a
+                // restart and a DiscardPolicy::New stream silently
+                // flips from reject-new to truncate-oldest.
+                self.server.names().set_stream_quota(
+                    stream_id,
+                    sv.max_msgs(),
+                    sv.max_bytes(),
+                    sv.discard(),
+                );
                 self.commands.push(ReplayCommand::CreateStream {
                     stream_id,
                     config: StreamConfig {
@@ -288,6 +299,16 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_consumer_stream(consumer_id, stream_id);
+                // AUDIT-6b: restore (deliver_policy, start_seq) — same
+                // call `v2_create_consumer` makes on the live path.
+                // Without this, `v2_subscribe` falls back to (0, 0) =
+                // DeliverPolicy::All and a DeliverPolicy::New consumer
+                // becomes a full history replay after a restart.
+                self.server.names().set_consumer_deliver_policy(
+                    consumer_id,
+                    cv.deliver_policy(),
+                    cv.start_seq(),
+                );
 
                 let ack_policy = match cv.ack_policy() {
                     0 => AckPolicy::None,

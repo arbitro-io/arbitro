@@ -1110,6 +1110,201 @@ async fn command_log_skips_mid_log_corruption_and_continues_replay() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// AUDIT-6a: DiscardPolicy::New quota survives a restart.
+//
+// The publish pre-check (dispatch_v2 `stream_quota`) rejects with
+// StreamFull when a DiscardPolicy::New stream is at its max_msgs quota.
+// The quota is stored in NameRegistry by `v2_create_stream`
+// (`set_stream_quota`) — but recovery replay never restored it, so after
+// a restart the stream silently flipped from reject-new to
+// truncate-oldest, dropping head entries. This test fills a
+// DiscardPolicy::New stream to quota, restarts against the same data
+// dir, and asserts one more publish is still REJECTED.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_new_quota_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    const CAP: u64 = 5;
+
+    {
+        // Pre-restart: DiscardPolicy::New (discard=1) + disk store
+        // (journal_kind=1) so entries survive the restart.
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client
+            .create_stream(
+                b"quota_new",
+                b"quota_new.>",
+                CAP, // max_msgs
+                0,   // max_bytes
+                0,   // max_age_secs
+                1,   // replicas
+                1,   // journal_kind = disk
+                0,   // retention
+                1,   // discard = DiscardPolicy::New (reject when full)
+                0,   // idempotency_window_ms
+            )
+            .await
+            .expect("create_stream");
+        let sid = TestServer::parse_id(&resp);
+
+        // Fill to quota.
+        for i in 0u64..CAP {
+            let p = format!("msg-{i}");
+            client
+                .publish_wait(sid, b"quota_new.ev", Bytes::copy_from_slice(p.as_bytes()))
+                .await
+                .expect("fill publish");
+        }
+        // Sanity (live path): one more must be rejected.
+        assert!(
+            client
+                .publish_wait(sid, b"quota_new.ev", Bytes::from_static(b"overflow-pre"))
+                .await
+                .is_err(),
+            "pre-restart: publish beyond quota must be rejected (StreamFull)"
+        );
+        server.shutdown().await;
+    }
+
+    {
+        // Post-restart: quota must still be enforced — publish REJECTED,
+        // not silently accepted (which would truncate the oldest entry).
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let sid = TestServer::find_stream_id(&resp, b"quota_new")
+            .expect("quota_new stream missing after restart");
+
+        assert!(
+            client
+                .publish_wait(sid, b"quota_new.ev", Bytes::from_static(b"overflow-post"))
+                .await
+                .is_err(),
+            "post-restart: DiscardPolicy::New quota must survive recovery — \
+             publish beyond max_msgs must still be rejected, not accepted"
+        );
+        server.shutdown().await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIT-6b: deliver_policy (New) survives a restart.
+//
+// `v2_create_consumer` stores (deliver_policy, start_seq) in NameRegistry
+// (`set_consumer_deliver_policy`); `v2_subscribe` reads it back and falls
+// back to (0, 0) = DeliverPolicy::All when absent. Recovery replay never
+// restored it, so a DeliverPolicy::New consumer became full-replay after
+// a restart. This test publishes history, creates a New consumer WITHOUT
+// subscribing, restarts, then subscribes and asserts only messages
+// published after the subscribe are delivered.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deliver_policy_new_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    const HISTORY: u32 = 10;
+    const NEW: u32 = 3;
+
+    {
+        // Pre-restart: disk stream + 10 history entries + a
+        // DeliverPolicy::New consumer that never subscribes (so no
+        // cursor is ever persisted for it — the fallback-to-All bug is
+        // then fully observable as a history replay).
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client
+            .create_stream(b"dpnew", b"dpnew.>", 0, 0, 0, 1, 1, 0, 0, 0)
+            .await
+            .expect("create_stream");
+        let sid = TestServer::parse_id(&resp);
+
+        for i in 0u32..HISTORY {
+            let p = format!("old-{i}");
+            client
+                .publish_wait(sid, b"dpnew.ev", Bytes::copy_from_slice(p.as_bytes()))
+                .await
+                .expect("history publish");
+        }
+
+        client
+            .create_consumer(
+                sid, b"tail", b"", b"", 100u16, 1u8, /* Explicit */
+                1u8, /* DeliverPolicy::New */ 0u8, 30_000u32, 0u64,
+            )
+            .await
+            .expect("create_consumer");
+        server.shutdown().await;
+    }
+
+    {
+        // Post-restart: look the consumer up (get_consumer — NOT
+        // create_consumer, which would re-store the deliver policy on
+        // the live path and mask the recovery bug), subscribe, publish
+        // NEW messages, and assert only those arrive.
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let sid =
+            TestServer::find_stream_id(&resp, b"dpnew").expect("dpnew stream missing after restart");
+
+        let resp = client
+            .get_consumer(sid, b"tail")
+            .await
+            .expect("recovered consumer must resolve via get_consumer");
+        let cid = TestServer::parse_id(&resp);
+
+        let mut sub = client.subscribe(sid, cid, b"").await.unwrap();
+
+        for i in 0u32..NEW {
+            let p = format!("new-{i}");
+            client
+                .publish_wait(sid, b"dpnew.ev", Bytes::copy_from_slice(p.as_bytes()))
+                .await
+                .expect("new publish");
+        }
+
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
+                Ok(Some(msg)) => {
+                    received.push(msg.payload().to_vec());
+                    msg.ack();
+                    if received.len() > (HISTORY + NEW) as usize {
+                        break; // already failed — bail early
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            received.len(),
+            NEW as usize,
+            "DeliverPolicy::New must survive restart — expected only the {NEW} \
+             new messages, got {} (a count of {} means the policy fell back to \
+             DeliverPolicy::All and replayed history)",
+            received.len(),
+            HISTORY + NEW
+        );
+        for (i, payload) in received.iter().enumerate() {
+            let expected = format!("new-{i}");
+            assert_eq!(
+                &payload[..],
+                expected.as_bytes(),
+                "message {i} must be a post-subscribe message, not history"
+            );
+        }
+        server.shutdown().await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // created_at_seq filters old entries after stream_id recycle
 // ═══════════════════════════════════════════════════════════════════════════
 
