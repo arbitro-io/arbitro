@@ -1725,6 +1725,18 @@ async fn v2_create_consumer(
         return;
     }
 
+    // GAP-5: Fanout mode (deliver_mode == 0) has no queue, so the group is
+    // meaningless there — the drain only load-balances a non-zero queue_id.
+    // The old code silently dropped the group and delivered fanout, so a
+    // caller who set `.group("workers")` but left deliver_mode at its Fanout
+    // default THOUGHT they built a queue and instead got a full-copy fanout.
+    // Reject the incompatible pair up front (the InvalidConsumerConfig doc
+    // already lists this exact combination) instead of failing silently.
+    if body.deliver_mode == 0 && !group.is_empty() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+        return;
+    }
+
     let ack_policy = match body.ack_policy {
         0 => AckPolicy::None,
         _ => AckPolicy::Explicit,
@@ -2430,6 +2442,13 @@ async fn v2_create_consumer_raft(
             return;
         }
     };
+    // GAP-5: reject Fanout + non-empty group BEFORE proposing through Raft,
+    // so a doomed create never enters the replicated log. Mirrors the guard
+    // in the single-node v2_create_consumer path.
+    if body.deliver_mode == 0 && !body.group.is_empty() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+        return;
+    }
     let cmd = crate::cluster::state_machine::ClusterCommand::CreateConsumer {
         stream_name: format!("{}", body.stream_id),
         name: String::from_utf8_lossy(&body.name).to_string(),
