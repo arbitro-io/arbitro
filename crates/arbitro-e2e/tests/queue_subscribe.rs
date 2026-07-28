@@ -129,6 +129,64 @@ async fn queue_subscribe_load_balances_across_workers() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 1b. How many consumers does queue_subscribe actually create?
+//
+// Counted against the broker's own ListConsumers, not inferred: N workers on
+// the SAME queue name must collapse to exactly ONE durable consumer (the
+// create is idempotent), and each DISTINCT queue name must add exactly one
+// more. So it is one consumer per QUEUE NAME — not per subscription, and not
+// per connection.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_consumer_per_queue_name_not_per_subscription() {
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    let setup = server.connect().await;
+    let stream_id = create_stream(&setup, b"qs_count").await;
+
+    let n0 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
+    assert_eq!(n0, 0, "no consumers before any queue_subscribe");
+
+    // Three workers, three connections, SAME queue name.
+    let w1 = server.connect().await;
+    let w2 = server.connect().await;
+    let w3 = server.connect().await;
+    let _s1 = w1.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+    let _s2 = w2.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+    let _s3 = w3.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+
+    let n1 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
+    assert_eq!(
+        n1, 1,
+        "3 workers on the same queue name must share ONE durable consumer, \
+         got {n1} — a consumer per subscription would report 3"
+    );
+
+    // A fourth worker on a DIFFERENT queue name.
+    let w4 = server.connect().await;
+    let _s4 = w4.queue_subscribe(stream_id, b"audit", b"").await.unwrap();
+
+    let n2 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
+    assert_eq!(
+        n2, 2,
+        "a distinct queue name must add exactly one more durable consumer, got {n2}"
+    );
+
+    // Re-joining an existing queue from yet another connection adds nothing.
+    let w5 = server.connect().await;
+    let _s5 = w5.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+
+    let n3 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
+    assert_eq!(
+        n3, 2,
+        "re-joining an existing queue must not create another consumer, got {n3}"
+    );
+
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 2. A DIFFERENT queue name is a separate durable queue — its own cursor,
 //    its own full copy of the stream. This is the fan-out axis.
 // ═══════════════════════════════════════════════════════════════════════════
