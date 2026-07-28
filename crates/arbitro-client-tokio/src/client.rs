@@ -14,6 +14,7 @@ use crate::config::ClientConfig;
 use crate::conn::session::spawn_connection;
 use crate::consume::SubscriptionHandle;
 use crate::error::ClientError;
+use crate::queue::QueueOptions;
 use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::state::subscriptions::Subscriptions;
@@ -520,20 +521,71 @@ impl Client {
         queue: &[u8],
         filter: &[u8],
     ) -> Result<SubscriptionHandle, ClientError> {
+        self.queue_subscribe_with(stream_id, queue, QueueOptions::new().filter(filter))
+            .await
+    }
+
+    /// [`Client::queue_subscribe`] with tuning knobs — redelivery deadline,
+    /// in-flight cap, where a brand-new queue starts reading.
+    ///
+    /// [`QueueOptions`] is a value, so it can be built conditionally or
+    /// reused across queues:
+    ///
+    /// ```ignore
+    /// let mut opts = QueueOptions::new().filter(b"orders.>");
+    /// if slow_worker { opts = opts.ack_wait_ms(120_000); }
+    /// client.queue_subscribe_with(stream_id, b"workers", opts).await?;
+    /// ```
+    ///
+    /// `deliver_policy` / `start_seq` only take effect the first time the
+    /// queue is created — a later join finds the durable cursor already in
+    /// place and resumes from it.
+    pub async fn queue_subscribe_with(
+        &self,
+        stream_id: u32,
+        queue: &[u8],
+        opts: QueueOptions,
+    ) -> Result<SubscriptionHandle, ClientError> {
         use arbitro_proto::config::{AckPolicy, DeliverMode};
 
+        let limits: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> = opts
+            .subject_limits
+            .iter()
+            .map(|(pattern, limit)| arbitro_proto::v2::manager::SubjectLimit {
+                pattern: pattern.as_slice(),
+                limit: *limit,
+            })
+            .collect();
+
         // name == group is the invariant that makes concurrent joins
-        // idempotent rather than a config clash.
-        let consumer_id = crate::consumer_builder::ConsumerBuilder::new(queue)
-            .group(queue)
-            .deliver_mode(DeliverMode::Queue)
-            .ack_policy(AckPolicy::Explicit)
-            .create(self, stream_id)
+        // idempotent rather than a config clash: both always move together,
+        // so two workers can never disagree on the consumer config.
+        let resp = self
+            .create_consumer_with_limits(
+                stream_id,
+                queue,
+                queue,
+                b"", // the subject filter belongs to the subscription
+                opts.max_inflight,
+                AckPolicy::Explicit as u8,
+                opts.deliver_policy as u8,
+                DeliverMode::Queue as u8,
+                opts.ack_wait_ms,
+                opts.start_seq,
+                &limits,
+            )
             .await?;
+        if resp.len() < 8 {
+            return Err(ClientError::InvalidConfig(
+                "broker reply shorter than expected u64 consumer_id".into(),
+            ));
+        }
+        let consumer_id = u64::from_le_bytes(resp[..8].try_into().expect("8 bytes")) as u32;
 
         // The subject filter is applied on the subscription, not on the
-        // consumer — matching how every other call site scopes delivery.
-        self.subscribe(stream_id, consumer_id, filter).await
+        // consumer — matching how every other call site scopes delivery, and
+        // letting workers on one queue narrow independently.
+        self.subscribe(stream_id, consumer_id, &opts.filter).await
     }
 
     // ── manage ────────────────────────────────────────────────────────────────

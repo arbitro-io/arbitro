@@ -39,6 +39,7 @@ pub mod consumer_builder;
 pub mod cron;
 pub mod error;
 pub mod metrics;
+pub mod queue;
 pub mod service;
 pub mod workflow;
 
@@ -83,6 +84,11 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronContext, CronHandle};
+
+/// Optional settings for [`Client::queue_subscribe_with`] — redelivery
+/// deadline, in-flight cap, where a brand-new queue starts reading. A plain
+/// value, so it can be reused or assembled conditionally.
+pub use queue::QueueOptions;
 pub use service::{HandlerError, HandlerResult, Request, Service, ServiceBuilder, ServiceHandle};
 pub use workflow::{
     ResumeContext, StepContext, StepOutcome, StepResult, TimeoutContext, WorkflowBuilder,

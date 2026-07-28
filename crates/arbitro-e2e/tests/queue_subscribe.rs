@@ -238,6 +238,56 @@ async fn unacked_message_is_redelivered() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 1d. `ack_wait_ms` — the crashed-worker path. `unacked_message_is_redelivered`
+// covers a worker that explicitly refuses (nack); this covers the worse case:
+// a worker that takes the job and then goes silent without nacking and without
+// disconnecting. Only the ack deadline can rescue that job.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_wait_redelivers_a_silently_dropped_job() {
+    use arbitro_client_tokio::QueueOptions;
+
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    let setup = server.connect().await;
+    let stream_id = create_stream(&setup, b"qs_ackwait").await;
+
+    let worker = server.connect().await;
+    let mut sub = worker
+        .queue_subscribe_with(stream_id, b"workers", QueueOptions::new().ack_wait_ms(1_000))
+        .await
+        .expect("queue join with ack_wait");
+
+    setup
+        .publish_wait(stream_id, b"qs_ackwait.job", Bytes::from_static(b"job-1"))
+        .await
+        .expect("publish");
+
+    // Take the job and then do nothing at all — no ack, no nack, no
+    // disconnect. Exactly what a hung or crashed handler looks like.
+    let first = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+        .await
+        .expect("first delivery must arrive")
+        .expect("subscription must yield");
+    assert_eq!(&first.payload()[..], b"job-1");
+    std::mem::forget(first); // never acked, never nacked
+
+    // Past the 1s deadline the broker must hand the job back.
+    let second = tokio::time::timeout(Duration::from_secs(8), sub.recv())
+        .await
+        .expect(
+            "a job held past ack_wait_ms MUST be redelivered — without this a \
+             hung worker silently swallows the job forever",
+        )
+        .expect("subscription must yield the redelivery");
+    assert_eq!(&second.payload()[..], b"job-1");
+    second.ack();
+
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 2. A DIFFERENT queue name is a separate durable queue — its own cursor,
 //    its own full copy of the stream. This is the fan-out axis.
 // ═══════════════════════════════════════════════════════════════════════════
