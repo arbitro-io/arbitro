@@ -1241,6 +1241,20 @@ async fn v2_create_stream(
             server
                 .names()
                 .set_stream_replicas(seq_stream, body.replicas);
+            // Honesty: replicas > 1 does NOT yet mean acknowledged-durable
+            // replication (ROBUSTNESS_AUDIT.md §2.5 / action #8).
+            #[cfg(feature = "cluster")]
+            if body.replicas > 1 {
+                tracing::warn!(
+                    stream = %String::from_utf8_lossy(name),
+                    replicas = body.replicas,
+                    "stream requests replicas > 1, but replication is \
+                     best-effort: publishers are acknowledged before \
+                     replication and ISR/high-watermark are not enforced — \
+                     a leader failover may lose acknowledged data until \
+                     catch-up + ISR enforcement land"
+                );
+            }
 
             // Store stream quota limits so the publish hot path can
             // pre-check and reject with StreamFull for DiscardPolicy::New.

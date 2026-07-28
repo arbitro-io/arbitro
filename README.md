@@ -342,6 +342,17 @@ client.create_stream(b"orders", b"orders.>", 0, 0, 0, 3, 0, 0, 0, 0).await?;
 
 Replication is transparent to clients. Publish, subscribe, ack, and nack work identically regardless of the replica count.
 
+> **Limitation — replication is best-effort today.** Publishers receive their
+> acknowledgment (RepOk) *before* the message is replicated, replication
+> batches dropped under load or on a TCP error are not caught up, and
+> in-sync-replica / high-watermark tracking is not enforced. As a result,
+> `replicas > 1` does **not** yet guarantee acknowledged messages survive a
+> leader failover — acknowledged-but-unreplicated data can be lost. The
+> server logs a warning at startup and at stream creation when `replicas > 1`
+> is requested. Full self-healing replication (catch-up protocol + ISR
+> enforcement) is tracked in the cluster workstream
+> (`crates/arbitro-server/ROBUSTNESS_AUDIT.md`, action #8).
+
 ## License
 
 MIT

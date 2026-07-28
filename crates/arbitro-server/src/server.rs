@@ -722,6 +722,17 @@ impl ArbitroServer {
                         node_id = node_id.0,
                         "data-plane replication tasks started"
                     );
+                    // Honesty: replication is best-effort today. See
+                    // ROBUSTNESS_AUDIT.md §2.5 / action #8.
+                    tracing::warn!(
+                        node_id = node_id.0,
+                        "cluster replication is BEST-EFFORT: publishers are \
+                         acknowledged (RepOk) before replication, dropped \
+                         batches are not caught up, and ISR/high-watermark \
+                         are not enforced — a leader failover may lose \
+                         acknowledged data even with replicas > 1, until \
+                         catch-up + ISR enforcement land"
+                    );
                 }
 
                 tracing::info!(node_id = node_id.0, "raft node started");

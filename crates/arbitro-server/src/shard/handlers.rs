@@ -130,6 +130,16 @@ impl CommandWorker {
                     self.gate.release();
 
                     // ── Async replication: fire-and-forget to followers ───
+                    // LIMITATION (audit §2.5 / action #8): RepOk was already
+                    // sent above, BEFORE this replication attempt — the
+                    // publisher's ack does not imply the message reached any
+                    // follower. Dropped batches (channel-full below, or TCP
+                    // error in replication_loop) are never caught up, and
+                    // ISR/high-watermark are not enforced, so replicas > 1
+                    // is best-effort: a leader failover may lose
+                    // acknowledged data. Fixing this (catch-up wire + ISR
+                    // record_ack + HW visibility gate) is deferred to the
+                    // arbitro-raft / cluster workstream.
                     #[cfg(feature = "cluster")]
                     {
                         let replicas = self.names.stream_replicas(stream_id);

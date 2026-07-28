@@ -87,8 +87,8 @@ No `unsafe` outside the two cluster sites above (`grep unsafe src/` → storage.
 
 | Sev | Location | Finding / failure scenario |
 |-----|----------|----------------------------|
-| P1 | `src/cluster/replication.rs:512-532` + `:659-746` (TODO, no caller sends catch-up) | **No working catch-up → one dropped batch desyncs a follower forever.** The leader drops batches on channel-full without retry (`handlers.rs:160-164` `try_send` comment) and on TCP error (replication.rs:397-406). The follower's BUG-4 guard then rejects every subsequent batch ("catch-up required"), but `KIND_REPLICATE_CATCH_UP_REQ` is never sent by anyone and `handle_catch_up_request`'s frames are never transmitted (replication.rs:733-736 TODO). Worse: an **empty** follower accepts *any* `first_seq` (replication.rs:521 `expected = leader_first_seq` when `messages == 0`) and stores it at local seq 1 → silent seq divergence. |
-| P1 | `src/server.rs:669-687` + `src/cluster/replication.rs:582-602` | **ISR / high-watermark not enforced.** The ISR tracker is spawned with a fresh, never-fed instance (`record_ack` has no caller on the ack-receive path — the handler at replication.rs:594-601 is explicitly "informational"); `HighWatermarks` (replication.rs:169-193) is wired to nothing. Publishers get RepOk before any replication (`handlers.rs:122-131` reply precedes the fire-and-forget replication at 133-167), and consumers on the leader see unreplicated messages → leader kill loses acknowledged-to-publisher data even with replicas > 1. Cluster e2e (`arbitro-e2e/tests/cluster.rs:564`) exists; whether it truly pins this down is **UNVERIFIED — needs run**. |
+| P1 | `src/cluster/replication.rs:512-532` + `:659-746` (TODO, no caller sends catch-up) | **No working catch-up → one dropped batch desyncs a follower forever.** The leader drops batches on channel-full without retry (`handlers.rs:160-164` `try_send` comment) and on TCP error (replication.rs:397-406). The follower's BUG-4 guard then rejects every subsequent batch ("catch-up required"), but `KIND_REPLICATE_CATCH_UP_REQ` is never sent by anyone and `handle_catch_up_request`'s frames are never transmitted (replication.rs:733-736 TODO). ~~Worse: an **empty** follower accepts *any* `first_seq` (replication.rs:521 `expected = leader_first_seq` when `messages == 0`) and stores it at local seq 1 → silent seq divergence.~~ **Empty-follower half FIXED** (see action #8): the guard now requires `first_seq == last_seq + 1` unconditionally (`follower_expected_first_seq`), so an empty follower rejects gapped batches loudly instead of silently renumbering. The no-catch-up half remains (deferred to the cluster workstream). |
+| P1 | `src/server.rs:669-687` + `src/cluster/replication.rs:582-602` | **ISR / high-watermark not enforced.** The ISR tracker is spawned with a fresh, never-fed instance (`record_ack` has no caller on the ack-receive path — the handler at replication.rs:594-601 is explicitly "informational"); `HighWatermarks` (replication.rs:169-193) is wired to nothing. Publishers get RepOk before any replication (`handlers.rs:122-131` reply precedes the fire-and-forget replication at 133-167), and consumers on the leader see unreplicated messages → leader kill loses acknowledged-to-publisher data even with replicas > 1. Cluster e2e (`arbitro-e2e/tests/cluster.rs:564`) exists; whether it truly pins this down is **UNVERIFIED — needs run**. **Update (action #8): now HONEST — best-effort status is warned at cluster startup and on `replicas > 1` stream creation, and documented in README; ISR/HW enforcement itself remains deferred to the cluster workstream.** |
 | P2 | `src/server.rs:556-560` + `src/cluster/apply_loop.rs:12-15` | Leader double-apply by design (dispatch executes locally after propose AND the apply loop applies the committed entry). Idempotent creates make it mostly benign, but the two paths build *different* configs (see next row), so the winner depends on timing. |
 | P2 | `src/cluster/state_machine.rs:110-128` (destructures `..`), `:348` | Replicated CreateStream drops `replicas`, `discard`/quota, and retention on followers (only idempotency window is set, state_machine.rs:213-216); replicated CreateConsumer drops subject limits (`Vec::new()`, :348). Follower state silently diverges from leader config. |
 | P2 | `src/transport/dispatch_v2.rs:2297` vs `src/cluster/state_machine.rs:272-283` | CreateConsumer replicates the stream as `format!("{}", body.stream_id)` (a numeric wire-hash string) that the follower re-parses; DeleteConsumer replicates real names (BUG-7 fix). Two conventions for the same concept — fragile, and it breaks if the wire-id ever stops being the name hash. |
@@ -195,11 +195,27 @@ which is the point.
    shutdown-liveness deadlock (0.6.2), the busy-poll is left untouched; ROB-23 bounds it to at
    most `drain_stall_evict_ms` per stalled conn. Proper fix needs writer→gate wake plumbing
    (e.g. a per-shard waker registered in `WriterIndexEntry`) designed and proven separately.
-8. **Cluster: make replication self-healing or honest (P1).** Wire catch-up send
-   (`src/cluster/replication.rs:659-746`), reject batches on an empty follower whose
-   `first_seq > 1` (`replication.rs:521`), and either wire ISR `record_ack` + gate consumer
-   visibility on the high watermark or document/log replicas>1 as best-effort
-   (`src/server.rs:669-687`, `replication.rs:582-602`).
+8. **Cluster: make replication self-healing or honest (P1).**
+   **PARTIALLY DONE (honest half): empty-follower silent-divergence FIXED + best-effort now
+   logged/documented.** The follower guard no longer special-cases `messages == 0`
+   (`replication.rs`, `follower_expected_first_seq`): an empty follower accepts only
+   `first_seq == local last_seq + 1` (seq 1 for a fresh store, the true continuation for a
+   store emptied by retention) and rejects any gapped batch with the same "catch-up required"
+   warn as the non-empty BUG-4 case — divergence is now loud, never silent renumbering.
+   Unit-pinned by `empty_follower_rejects_gap_first_seq` (a real 2-node divergence e2e is
+   impractical: no batch-drop injection hook, no late-join membership). Best-effort status is
+   now stated at cluster startup (`server.rs` warn after "data-plane replication tasks
+   started"), at stream creation when `replicas > 1` (`dispatch_v2.rs` create-stream path),
+   at the RepOk/fire-and-forget site (`shard/handlers.rs` comment), and in `README.md`
+   ("Message Replication" limitation note).
+   **DEFERRED (feature half → arbitro-raft / cluster workstream):** catch-up send is still
+   unwired — `KIND_REPLICATE_CATCH_UP_REQ` is never sent by anyone and
+   `handle_catch_up_request`'s frames are never transmitted (`TODO(cluster)` markers in
+   `replication.rs`), so a dropped batch still leaves a follower behind until rebuilt; ISR
+   `record_ack` has no caller and `HighWatermarks` gates nothing, so publisher acks precede
+   replication and consumer visibility ignores the HW. Wiring catch-up + ISR/HW is a feature
+   project overlapping the arbitro-raft audit (see `AUDIT_REPORT.md` in the `arbitro-raft`
+   crate/workstream) and is intentionally NOT attempted in this audit-fix pass.
 9. **Fix batch-publish HAS_HEADERS storage flags (P2)** — set `arbitro_store::flags::HAS_HEADERS`
    on batch entries when the frame carries it (`src/transport/dispatch_v2.rs:651-660`), and apply
    idempotency + quota to the delayed path (`dispatch_v2.rs:679-768`).

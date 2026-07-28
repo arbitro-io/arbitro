@@ -410,6 +410,22 @@ pub async fn replication_loop(
 
 // ── Follower receive loop ───────────────────────────────────────────────
 
+/// The only `first_seq` a follower may accept for its next replicated
+/// batch: exactly `local_last_seq + 1`.
+///
+/// This invariant holds for an EMPTY store too. A fresh store has
+/// `last_seq == 0` (`next_seq` starts at 1), so it accepts only a batch
+/// starting at seq 1 — a genuinely-empty stream start. A store emptied by
+/// retention keeps its monotonic `next_seq`, so it accepts only the true
+/// continuation. Accepting anything else on an empty follower (the
+/// pre-fix behaviour: `expected = leader_first_seq` when `messages == 0`)
+/// let the store renumber the leader's entries from local seq 1 — silent
+/// seq divergence (ROBUSTNESS_AUDIT.md §2.5 / action #8). A follower that
+/// missed a batch must instead be caught up from the leader's journal.
+pub(crate) fn follower_expected_first_seq(local_last_seq: u64) -> u64 {
+    local_last_seq.saturating_add(1)
+}
+
 /// Follower-side replication handler. Spawned as a tokio task in
 /// `server.rs` when the cluster boots. Receives `ReplicateEntries`
 /// frames from the transport's replication channel (extracted via
@@ -512,19 +528,29 @@ pub async fn follower_replication_loop(
                 // BUG-4 guard: verify the leader's first_seq aligns with our
                 // local next-seq (last_seq + 1). If not, the follower is
                 // out-of-sync — DROP this batch so seqs don't diverge
-                // silently. Catch-up will refill the gap.
+                // silently. This applies to an EMPTY store too: a fresh
+                // store has last_seq == 0 and may only accept a batch
+                // starting at seq 1; accepting an arbitrary first_seq and
+                // renumbering it from local seq 1 (the pre-fix behaviour
+                // when messages == 0) was silent seq divergence (audit
+                // §2.5 / action #8). NOTE: catch-up frames are not yet
+                // transmitted (see TODO(cluster) below), so a rejected
+                // follower stays behind — loudly, not silently — until the
+                // cluster catch-up workstream lands.
                 let stream_id = arbitro_engine_v2::types::StreamId(stream_id_raw);
                 let store = store_lookup.store_for(stream_id);
                 {
                     let guard = store.lock();
                     let info = guard.info();
-                    let expected = if info.messages == 0 { leader_first_seq } else { info.last_seq + 1 };
+                    let expected = follower_expected_first_seq(info.last_seq);
                     if expected != leader_first_seq {
                         tracing::warn!(
                             stream_id = stream_id_raw,
                             leader_first_seq,
                             local_next_seq = expected,
-                            "replication: seq divergence, dropping batch — catch-up required"
+                            local_messages = info.messages,
+                            "replication: seq divergence, dropping batch — catch-up required \
+                             (catch-up transport not wired yet; follower will stay behind)"
                         );
                         drop(guard);
                         continue;
@@ -597,8 +623,12 @@ pub async fn follower_replication_loop(
                     last_seq = ack.last_seq.get(),
                     "replication: received ack from follower"
                 );
-                // ISR tracking is informational for v1 — quorum wait
-                // will be added in a follow-up.
+                // TODO(cluster): ISR tracking is informational only —
+                // `IsrTracker::record_ack` is never called here and
+                // `HighWatermarks` is wired to nothing, so acks have no
+                // effect on durability or visibility. Quorum wait / HW
+                // gating is deferred to the arbitro-raft / cluster
+                // workstream (ROBUSTNESS_AUDIT.md §2.5, action #8).
             }
             _ => {
                 tracing::debug!(kind, "replication: ignoring unknown frame kind");
@@ -654,8 +684,18 @@ pub async fn isr_tick_loop(
 /// frame(s) that can be sent to the requesting peer.
 ///
 /// Returns the built frame bytes. The caller is responsible for sending
-/// them over the transport connection to the peer (transport wiring is
-/// a follow-up — for now this is a skeleton that reads and builds).
+/// them over the transport connection to the peer.
+///
+/// TODO(cluster): this is a DEAD-END skeleton today — no caller ever
+/// sends `KIND_REPLICATE_CATCH_UP_REQ`, so this handler is never invoked
+/// and the frames it builds are never transmitted. A follower that misses
+/// a batch (leader channel-full drop or TCP error) therefore stays behind
+/// until it is rebuilt; the empty-follower/BUG-4 guard in
+/// `follower_replication_loop` only guarantees the desync is LOUD, not
+/// self-healing. Wiring the catch-up request/response over the transport
+/// (plus ISR `record_ack` and high-watermark visibility gating) is
+/// deferred to the arbitro-raft / cluster workstream
+/// (ROBUSTNESS_AUDIT.md §2.5, action #8).
 pub fn handle_catch_up_request(
     request: &CatchUpRequest,
     server: &crate::shard::router::ShardRouter,
@@ -730,9 +770,9 @@ pub fn handle_catch_up_request(
         frames.push(build_replicate_entries_frame(&batch, my_peer_id));
     }
 
-    // TODO: Send frames to the requesting peer over the transport
-    // connection. For now the caller receives the built frames and
-    // can wire the sending once the transport API is available.
+    // TODO(cluster): send frames to the requesting peer over the
+    // transport connection. Never happens today — see the function-level
+    // TODO above; deferred to the arbitro-raft / cluster workstream.
 
     tracing::debug!(
         stream_id = stream_id_raw,
@@ -825,6 +865,37 @@ mod tests {
         let slen = u16::from_le_bytes([entry[0], entry[1]]) as usize;
         assert_eq!(&entry[2..2 + slen], b"x");
         assert_eq!(&entry[2 + slen..], b"world");
+    }
+
+    /// Audit action #8 regression: an empty follower must NOT accept a
+    /// batch whose `first_seq` gaps past its local next-seq. Pre-fix, the
+    /// guard computed `expected = leader_first_seq` whenever
+    /// `messages == 0`, so an empty follower accepted ANY first_seq and
+    /// stored it at local seq 1 — silent divergence. A real 2-node
+    /// divergence e2e is impractical in the current harness (no
+    /// batch-drop injection hook and no late-join membership, so a
+    /// follower can never legitimately observe a gapped first batch), so
+    /// the accept/reject decision is pinned here on the extracted guard.
+    #[test]
+    fn empty_follower_rejects_gap_first_seq() {
+        // Mirrors the guard in follower_replication_loop.
+        fn accepts(local_last_seq: u64, leader_first_seq: u64) -> bool {
+            leader_first_seq == follower_expected_first_seq(local_last_seq)
+        }
+
+        // Genuinely-empty stream start: fresh store (last_seq == 0)
+        // accepts a batch starting at seq 1.
+        assert!(accepts(0, 1));
+        // THE BUG: pre-fix, an empty follower accepted this gapped batch
+        // (leader already at seq 5) and renumbered it from local seq 1.
+        assert!(!accepts(0, 5));
+        // Store emptied by retention keeps monotonic seqs: only the true
+        // continuation is accepted.
+        assert!(accepts(10, 11));
+        assert!(!accepts(10, 1)); // leader restarted from 1 → reject
+        // Non-empty divergence (original BUG-4 case) still rejected.
+        assert!(!accepts(10, 12)); // gap
+        assert!(!accepts(10, 10)); // replay/duplicate
     }
 
     #[test]
