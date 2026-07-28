@@ -791,6 +791,15 @@ impl CommandWorker {
         let events = self.engine.delete_consumer(cmd.consumer_id);
         self.apply_delta_and_sync(&events);
 
+        // Audit #10: drop this consumer's per-(consumer, seq) DLQ nack
+        // counters. They were only removed on ack or on reaching the
+        // max_nack threshold, so deleting a nack-heavy consumer leaked
+        // its entries forever.
+        crate::shard::worker::clear_consumer_nack_counts(
+            &mut self.dlq_nack_counts,
+            cmd.consumer_id.0,
+        );
+
         // Tell the drain to release this consumer's per-subject state.
         // H11: if the ring is full now, queue the cleanup on
         // `pending_consumer_remove` so the worker's main loop retries

@@ -737,6 +737,156 @@ async fn publish_with_headers_roundtrip() {
     server.shutdown().await;
 }
 
+/// I4 (audit #9) — BATCH publish with `entry_flags = HAS_HEADERS` (payloads
+/// are pre-encoded ExtendedPayloads carrying `msg-id` headers). The broker
+/// used to store batch entries with `flags: 0`, so:
+///   (a) consumers received the raw TLV ExtendedPayload wrapper as payload
+///       (the drain only unwraps when the stored HAS_HEADERS flag is set);
+///   (b) the restart dedup rebuild (which scans for HAS_HEADERS entries)
+///       missed the batch's msg-ids, so a duplicate landed after reboot.
+/// The reference client only sets HAS_HEADERS on single publish, so the
+/// batch frame is built raw in-test (what a foreign client would send).
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_restart() {
+    use arbitro_proto::v2::header::entry_flag;
+    use arbitro_proto::v2::ingress::batch_pub_frame::{
+        BatchPubFrame, BATCH_PUB_ENTRY_HEADER_SIZE,
+    };
+    use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
+    use arbitro_proto::wire::msg_headers::{encode_extended_payload_vec, HDR_MSG_ID};
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    // ── First boot: raw batch-with-headers publish, clean delivery ──────
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        let stream_id = TestServer::parse_id(
+            &client
+                .create_stream(b"batch_hdrs", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+                .await
+                .unwrap(),
+        );
+        let consumer_id = TestServer::parse_id(
+            &client
+                .create_consumer(
+                    stream_id, b"bh_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
+                )
+                .await
+                .unwrap(),
+        );
+        let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+        // Build two pre-encoded ExtendedPayloads with msg-id headers —
+        // ids live in the TLV block, NOT the per-entry msg_id field.
+        let ext1 = encode_extended_payload_vec(
+            b"clean-payload-1",
+            &[(HDR_MSG_ID, b"batch-hdr-id-1")],
+        );
+        let ext2 = encode_extended_payload_vec(
+            b"clean-payload-2",
+            &[(HDR_MSG_ID, b"batch-hdr-id-2")],
+        );
+        let entries: [(&[u8], &[u8], &[u8]); 2] =
+            [(b"k.a", b"", &ext1), (b"k.b", b"", &ext2)];
+        let mut tail_bytes = 0usize;
+        for (s, m, p) in &entries {
+            tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
+        }
+        let mut frame = vec![0u8; BatchPubFrame::wire_size(tail_bytes)];
+        BatchPubFrame::encode_into(
+            &mut frame,
+            1,
+            stream_id,
+            0,
+            entry_flag::HAS_HEADERS,
+            &entries,
+        );
+
+        // Raw socket — HELLO + the batch frame (foreign-client path).
+        let mut sock = tokio::net::TcpStream::connect(&server.addr)
+            .await
+            .expect("raw connect");
+        let mut hello = Vec::with_capacity(8);
+        hello.extend_from_slice(&ARBITRO_MAGIC_V2.to_le_bytes());
+        hello.extend_from_slice(&[0u8; 4]);
+        sock.write_all(&hello).await.expect("write HELLO");
+        sock.write_all(&frame).await.expect("write batch frame");
+        sock.flush().await.expect("flush");
+
+        // Delivery is the sync point. Payloads must be the CLEAN user
+        // payloads — no TLV wrapper (pre-fix: raw ExtendedPayload bytes).
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(3), handle.recv())
+                .await
+                .expect("batch message should arrive within 3s")
+                .expect("subscription open");
+            got.push(msg.payload().to_vec());
+            msg.ack();
+        }
+        got.sort();
+        assert_eq!(
+            got,
+            vec![b"clean-payload-1".to_vec(), b"clean-payload-2".to_vec()],
+            "consumer must receive only the user payloads — HAS_HEADERS \
+             metadata must be stripped (stored flags must carry HAS_HEADERS)"
+        );
+
+        // In-session dedup of the header-carried ids already worked
+        // pre-fix; sanity-check it still does.
+        let err = client
+            .publish_wait_with_id(
+                stream_id,
+                b"k.a",
+                b"batch-hdr-id-1",
+                Bytes::from_static(b"same-session-dup"),
+            )
+            .await
+            .expect_err("same-session duplicate of a batch header id");
+        assert!(is_duplicate(&err));
+
+        drop(sock);
+        server.shutdown().await;
+    }
+
+    // ── Second boot: dedup rebuild must find the batch msg-ids ─────────
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+
+        let resp = client.list_streams(0, 1000).await.unwrap();
+        let stream_id = TestServer::find_stream_id(&resp, b"batch_hdrs")
+            .expect("stream must survive restart");
+
+        // Pre-fix the rebuild skipped flags:0 entries → this landed.
+        let err = client
+            .publish_wait_with_id(
+                stream_id,
+                b"k.a",
+                b"batch-hdr-id-2",
+                Bytes::from_static(b"post-restart-dup"),
+            )
+            .await
+            .expect_err("batch msg-id must survive restart in the dedup window");
+        assert!(
+            is_duplicate(&err),
+            "expected IdempotencyDuplicate after restart, got {err:?}"
+        );
+
+        // A fresh id must still be accepted.
+        client
+            .publish_wait_with_id(stream_id, b"k.a", b"fresh-after-restart", Bytes::from_static(b"v"))
+            .await
+            .expect("fresh id accepted after restart");
+
+        server.shutdown().await;
+    }
+}
+
 /// publish_with_headers with a `msg-id` header entry enables idempotency
 /// dedup. A second publish with the same msg-id must be rejected.
 #[tokio::test(flavor = "multi_thread")]

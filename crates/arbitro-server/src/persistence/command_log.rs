@@ -27,6 +27,15 @@ use tracing::{info, warn};
 
 use crate::config::FsyncPolicy;
 
+/// Audit #10: maximum accepted length for a single replayed metadata
+/// command. Metadata commands (create/delete stream/consumer, cursor
+/// updates) are tiny — names and subject filters are validated to short
+/// lengths at the dispatch boundary, so the largest legitimate record is
+/// a CreateConsumer with subject limits, well under this cap. The replay
+/// loop used to trust the length prefix and allocate up to 4 GiB before
+/// reading; anything above this cap is treated as a corrupt tail.
+pub const MAX_REPLAY_ENTRY_LEN: usize = 1 << 20; // 1 MiB
+
 /// Append-only command log with length-prefix framing.
 ///
 /// Thread safety: the server ensures only one thread writes metadata
@@ -73,6 +82,20 @@ impl CommandLog {
     ///
     /// Flushes after each write for durability. Cold path only.
     pub fn record(&mut self, command: &[u8]) -> std::io::Result<()> {
+        // Keep write and replay symmetric: a command the replay loop
+        // would reject as corrupt must never be written in the first
+        // place (it would silently truncate replay of everything after
+        // it on the next boot).
+        if command.len() > MAX_REPLAY_ENTRY_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "metadata command too large: {} bytes (max {})",
+                    command.len(),
+                    MAX_REPLAY_ENTRY_LEN
+                ),
+            ));
+        }
         let len = command.len() as u32;
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(command);
@@ -126,6 +149,22 @@ impl CommandLog {
             if len == 0 {
                 warn!("Zero-length entry at offset, skipping");
                 continue;
+            }
+
+            // Audit #10: the length prefix is untrusted — a corrupted or
+            // hostile log could declare up to 4 GiB and OOM the broker at
+            // boot via the `vec![0u8; len]` below. Metadata commands are
+            // tiny (largest legitimate record is a CreateConsumer with
+            // subject limits, well under 1 MiB); an over-cap length means
+            // the framing itself is corrupt, so the byte stream cannot be
+            // resynchronized — stop replay like the truncated-tail path.
+            if len > MAX_REPLAY_ENTRY_LEN {
+                warn!(
+                    len,
+                    max = MAX_REPLAY_ENTRY_LEN,
+                    "Over-cap entry length in metadata log (corrupt tail). Stopping replay."
+                );
+                break;
             }
 
             // Read CRC32
@@ -343,6 +382,60 @@ mod tests {
         let count = log.replay(&mut applier).unwrap();
         assert_eq!(count, 0);
         assert!(applier.commands.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Audit #10: a corrupted/hostile length prefix (up to 4 GiB) must
+    /// not be trusted — replay used to allocate `vec![0u8; len]` before
+    /// reading. An over-cap length is a corrupt tail: replay stops there
+    /// (like the truncated-entry path) and keeps every entry before it.
+    #[test]
+    fn over_cap_entry_length_stops_replay_without_alloc() {
+        let path = tmp_path();
+
+        // One valid entry, then a poisoned header declaring ~4 GiB.
+        {
+            let del = DeleteConsumerAction {
+                consumer_id: U32::new(7),
+                _pad: U32::new(0),
+            };
+            let cmd = build_delete_consumer(del.as_bytes());
+
+            let mut log = CommandLog::open(&path).unwrap();
+            log.record(&cmd).unwrap();
+
+            use std::io::Write;
+            log.file.write_all(&u32::MAX.to_le_bytes()).unwrap(); // len ≈ 4 GiB
+            log.file.write_all(&0xDEAD_BEEFu32.to_le_bytes()).unwrap(); // dummy CRC
+            log.file.write_all(&[0xAA; 32]).unwrap(); // garbage "payload"
+            log.file.flush().unwrap();
+        }
+
+        // Replay: the valid entry is applied, the poisoned tail stops
+        // replay cleanly (no OOM, no error).
+        {
+            let log = CommandLog::open(&path).unwrap();
+            let mut applier = CollectApplier::new();
+            let count = log.replay(&mut applier).unwrap();
+            assert_eq!(count, 1, "valid prefix must replay; corrupt tail must stop");
+
+            let view = MetadataCommandView::new(&applier.commands[0]).unwrap();
+            assert_eq!(view.command_type(), CMD_DELETE_CONSUMER);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Write-side symmetry: a command the replay guard would reject as
+    /// corrupt must be refused at record() time instead of poisoning the
+    /// log tail.
+    #[test]
+    fn record_rejects_over_cap_command() {
+        let path = tmp_path();
+        let mut log = CommandLog::open(&path).unwrap();
+        let huge = vec![0u8; MAX_REPLAY_ENTRY_LEN + 1];
+        let err = log.record(&huge).expect_err("over-cap record must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&path);
     }
 

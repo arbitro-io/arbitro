@@ -346,6 +346,19 @@ pub(in crate::shard) fn rewind_released(counters: &SharedCounters, min_seq: u64)
     counters.signal_rewind(min_seq);
 }
 
+/// Audit #10: drop every per-(consumer, seq) DLQ nack counter belonging to
+/// `consumer_id`. Entries are removed on ack and on reaching the max_nack
+/// threshold, but a consumer deleted mid-flight left its counters behind
+/// forever — unbounded growth under nack-heavy churn when `max_nack > 0`.
+/// Called from `handle_delete_consumer`. Cold path.
+#[inline]
+pub(in crate::shard) fn clear_consumer_nack_counts(
+    counts: &mut HashMap<(u32, u64), u32, foldhash::fast::FixedState>,
+    consumer_id: u32,
+) {
+    counts.retain(|(cid, _), _| *cid != consumer_id);
+}
+
 /// Mutable accessor for a consumer's subject inflight, creating the slot
 /// on demand. Slot index = `ConsumerId.raw() as usize`.
 #[inline]
@@ -1256,5 +1269,31 @@ mod tests {
         rewind_released(&counters, 0);
         assert_eq!(counters.cursor(), 5);
         assert_eq!(counters.take_rewind(), None);
+    }
+
+    /// Audit #10 — deleting a consumer must drop ALL of its per-(consumer,
+    /// seq) DLQ nack counters and none of its siblings'. Before the fix,
+    /// `handle_delete_consumer` never touched the map, so a nack-heavy
+    /// consumer that was deleted leaked its entries forever.
+    #[test]
+    fn delete_consumer_clears_its_dlq_nack_counts() {
+        let mut counts: HashMap<(u32, u64), u32, foldhash::fast::FixedState> =
+            HashMap::with_hasher(foldhash::fast::FixedState::default());
+        // Consumer 7: three tracked seqs. Consumer 9: two tracked seqs.
+        counts.insert((7, 100), 2);
+        counts.insert((7, 101), 1);
+        counts.insert((7, 250), 4);
+        counts.insert((9, 100), 1);
+        counts.insert((9, 300), 3);
+
+        clear_consumer_nack_counts(&mut counts, 7);
+
+        assert!(
+            counts.keys().all(|(cid, _)| *cid != 7),
+            "all consumer-7 entries must be gone"
+        );
+        assert_eq!(counts.len(), 2, "consumer-9 entries must be untouched");
+        assert_eq!(counts.get(&(9, 100)), Some(&1));
+        assert_eq!(counts.get(&(9, 300)), Some(&3));
     }
 }

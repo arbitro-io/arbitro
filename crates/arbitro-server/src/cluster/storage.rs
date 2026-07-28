@@ -824,6 +824,14 @@ impl RaftStorage for FileRaftStorage {
         for e in inner.entries[start..].iter().take_while(|e| e.index < to) {
             let len = e.payload.len();
             if offset + len > payload_buf.len() {
+                // Audit #10: entries already pushed into `out` hold
+                // transmuted `&'a` views into `payload_buf`. The caller's
+                // recovery path resizes `payload_buf` and retries — if the
+                // partial fill survived this error, those views would
+                // dangle into the old allocation (invalidated-reference
+                // UB, one refactor away from a use-after-free). Clear the
+                // partial fill so an Err never leaks borrowed views.
+                out.clear();
                 return Err(RaftError::Storage("payload_buf too small".into()));
             }
             payload_buf[offset..offset + len].copy_from_slice(&e.payload);
@@ -1108,6 +1116,44 @@ mod tests {
             assert_eq!(e.term.0, *t);
             assert_eq!(e.payload.0, &p[..]);
         }
+    }
+
+    /// Audit #10 — `read_entries` must not leak partially-filled views on
+    /// the "payload_buf too small" error path. The pushed `LogEntry<'a>`
+    /// views are transmuted borrows into `payload_buf`; the caller
+    /// (apply_loop) resizes the buffer and retries after this error, so a
+    /// surviving partial fill would dangle into the old allocation.
+    #[test]
+    fn read_entries_error_path_clears_partial_fill() {
+        let dir = TempDir::new("readclear");
+        let storage = FileRaftStorage::new(&dir.0).expect("open");
+        storage
+            .append_entries(&[
+                entry(1, 1, b"small"),
+                entry(2, 1, &[0xBB; 128]), // won't fit after entry 1
+            ])
+            .expect("append");
+
+        let mut out = Vec::new();
+        // Big enough for entry 1 (5 B) but not entry 2 (128 B).
+        let mut buf = vec![0u8; 16];
+        let err = storage
+            .read_entries(LogIndex(1), LogIndex(3), &mut out, &mut buf)
+            .expect_err("undersized payload_buf must error");
+        assert!(matches!(err, RaftError::Storage(_)));
+        assert!(
+            out.is_empty(),
+            "error path must clear the partial fill (no dangling views)"
+        );
+
+        // Retry with a big-enough buffer must succeed cleanly.
+        let mut big = vec![0u8; 4096];
+        storage
+            .read_entries(LogIndex(1), LogIndex(3), &mut out, &mut big)
+            .expect("retry with resized buffer");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].payload.0, b"small");
+        assert_eq!(out[1].payload.0, &[0xBB; 128][..]);
     }
 
     /// truncate_suffix must be durable: after dropping a suffix and

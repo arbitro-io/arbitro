@@ -70,6 +70,14 @@ pub enum ClusterCommand {
 /// snapshot/restore.
 #[derive(Default)]
 pub struct ArbitroStateMachine {
+    // TODO(cluster): `applied` retains every committed metadata command
+    // forever and `snapshot()` serializes the full history — unbounded RAM
+    // and ever-growing snapshots on long-lived clusters (audit #10). A
+    // correct bound requires real snapshot/compaction (replace the retained
+    // prefix with a state snapshot and truncate the raft log accordingly);
+    // a naive cap would silently corrupt `restore()`. Deferred to the
+    // cluster/raft workstream — see ROBUSTNESS_AUDIT.md action #10 and the
+    // arbitro-raft audit.
     applied: Vec<ClusterCommand>,
     cmd_tx: Option<mpsc::UnboundedSender<ClusterCommand>>,
 }

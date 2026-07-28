@@ -527,3 +527,88 @@ async fn malformed_create_consumer_does_not_leak_slot() {
     );
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F1 (audit Part B): stale-config rejection — re-creating an existing
+// durable consumer with a DIFFERENT config must be rejected with
+// InvalidConsumerConfig, and the ORIGINAL config must stay in force.
+// The wire path existed (Ok(2) → InvalidConsumerConfig) but had zero e2e
+// coverage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_consumer_config_mismatch_rejected() {
+    use arbitro_client_tokio::ClientError;
+    use arbitro_proto::error::ErrorCode;
+
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let stream_id = create_stream(&client, b"f1_cfg").await;
+
+    // Original: max_inflight = 10, AckPolicy::Explicit.
+    let consumer_id = TestServer::parse_id(
+        &client
+            .create_consumer(
+                stream_id, b"f1_worker", b"", b"", 10u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+            )
+            .await
+            .expect("original create must succeed"),
+    );
+
+    // Re-create the SAME name with max_inflight = 20 → must be rejected,
+    // not silently merged or updated.
+    let err = client
+        .create_consumer(
+            stream_id, b"f1_worker", b"", b"", 20u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+        )
+        .await
+        .expect_err("re-create with different max_inflight must be rejected");
+    assert!(
+        matches!(
+            err,
+            ClientError::Broker {
+                code: ErrorCode::InvalidConsumerConfig
+            }
+        ),
+        "expected InvalidConsumerConfig, got {err:?}"
+    );
+
+    // Idempotent re-create with the ORIGINAL config still works and
+    // returns the same consumer id — the registration was not disturbed.
+    let same_id = TestServer::parse_id(
+        &client
+            .create_consumer(
+                stream_id, b"f1_worker", b"", b"", 10u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+            )
+            .await
+            .expect("idempotent re-create with the original config must succeed"),
+    );
+    assert_eq!(same_id, consumer_id, "same durable name must keep its id");
+
+    // Behavioral proof the ORIGINAL max_inflight=10 is in force (not the
+    // rejected 20): publish 15, ack nothing → exactly 10 are delivered.
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    for i in 0..15u8 {
+        client
+            .publish_wait(stream_id, b"f1_cfg.k", Bytes::from(vec![i]))
+            .await
+            .expect("publish");
+    }
+    let mut delivered = 0usize;
+    while let Ok(Some(_msg)) =
+        tokio::time::timeout(Duration::from_secs(2), handle.recv()).await
+    {
+        delivered += 1;
+        // Do NOT ack — pin the inflight window at the configured cap.
+        if delivered > 10 {
+            break;
+        }
+    }
+    assert_eq!(
+        delivered, 10,
+        "exactly max_inflight=10 unacked deliveries must arrive — the \
+         rejected max_inflight=20 config must NOT be in force"
+    );
+    server.shutdown().await;
+}

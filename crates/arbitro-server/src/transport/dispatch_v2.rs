@@ -648,14 +648,57 @@ fn v2_publish_batch(
 
     // Stream-build EntryRef vec — one allocation, no intermediate
     // entry_views Vec. SmallVec inline storage absorbs small batches.
+    //
+    // Storage flags mirror the single-publish resolution (audit #9 —
+    // entries used to be stored with `flags: 0` unconditionally, so a
+    // HAS_HEADERS batch delivered the raw ExtendedPayload TLV bytes to
+    // consumers and the restart dedup rebuild missed its msg-ids):
+    //  1. Batch carries HAS_HEADERS → every payload is a pre-encoded
+    //     ExtendedPayload; store as-is WITH the HAS_HEADERS flag so the
+    //     drain unwraps it and recovery finds the msg-ids.
+    //  2. Entry carries a dedicated-field msg_id → server wraps
+    //     payload + msg-id header into ExtendedPayload (same as the
+    //     single-publish case 2) so dedup survives restart.
+    //  3. Neither → raw payload, no flags.
+    // The wrap buffers are only allocated when at least one entry
+    // actually carries a dedicated-field msg_id (cold, dedup-only path).
+    let wrapped_payloads: Vec<Option<Vec<u8>>> = if !batch_has_headers
+        && f.iter().any(|v| !v.msg_id().is_empty())
+    {
+        f.iter()
+            .map(|v| {
+                let id = v.msg_id();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
+                        v.payload(),
+                        &[(arbitro_proto::wire::msg_headers::HDR_MSG_ID, id)],
+                    ))
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let entries: smallvec::SmallVec<[arbitro_store::EntryRef<'_>; 16]> = f
         .iter()
-        .map(|v| arbitro_store::EntryRef {
-            stream_id: seq_stream.raw(),
-            subject: v.subject(),
-            payload: v.payload(),
-            flags: 0,
-            deliver_at_ms: 0,
+        .enumerate()
+        .map(|(i, v)| {
+            let (payload, flags): (&[u8], u8) = if batch_has_headers {
+                (v.payload(), arbitro_store::flags::HAS_HEADERS)
+            } else if let Some(Some(w)) = wrapped_payloads.get(i) {
+                (w.as_slice(), arbitro_store::flags::HAS_HEADERS)
+            } else {
+                (v.payload(), 0)
+            };
+            arbitro_store::EntryRef {
+                stream_id: seq_stream.raw(),
+                subject: v.subject(),
+                payload,
+                flags,
+                deliver_at_ms: 0,
+            }
         })
         .collect();
 
@@ -706,13 +749,83 @@ fn v2_publish_delayed(
 
     let delay_ms = f.delay_ms();
 
+    // ── Idempotency check (audit #9 — the delayed path used to bypass
+    // the dedup window entirely, so a duplicate msg-id delayed publish
+    // was accepted and matured into a second copy). Same per-stream
+    // window check as v2_publish, applied BEFORE any journal/store
+    // mutation. Note: the msg-id is recorded in the in-RAM tracker at
+    // PUBLISH time; a broker restart before maturation loses it (the
+    // rebuild only scans the main store) — documented in
+    // ROBUSTNESS_AUDIT.md.
+    let msg_id = f.msg_id();
+    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    if window_ms > 0 && !msg_id.is_empty() {
+        let hash = idempotency_hash(msg_id);
+        let shared = server.idempotency_for(seq_stream);
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
+        let mut t = tracker_arc.lock();
+        server.mark_idempotency_allocated(seq_stream);
+        if !t.record(seq_stream, hash, msg_id, window_ms) {
+            drop(t);
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            return;
+        }
+        drop(t);
+    }
+
+    // ── Stream quota pre-check (DiscardPolicy::New) — mirror of the
+    // immediate path (audit #9: the delayed path used to skip it, so a
+    // discard=1 stream silently accepted over-quota delayed publishes).
+    // Semantics: the quota is evaluated at PUBLISH time against the
+    // store's current occupancy, exactly like v2_publish. A delayed
+    // message that passes here may still mature into a store that has
+    // since filled up — maturation appends without re-checking
+    // (documented in ROBUSTNESS_AUDIT.md).
+    if let Some(quota) = server.names().stream_quota(seq_stream) {
+        if quota.discard == 1 {
+            let shared_store = server.store_for(seq_stream);
+            let info = shared_store.lock().info();
+            if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+            let entry_bytes = (f.subject().len() + f.payload().len()) as u64;
+            if quota.max_bytes > 0 && info.bytes + entry_bytes > quota.max_bytes {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                return;
+            }
+        }
+    }
+
+    // ── msg-id wrap (mirror of the single-publish case 2) ─────────────
+    // When the frame carries a msg_id, wrap payload + msg-id header into
+    // an ExtendedPayload and stamp HAS_HEADERS so (a) the drain strips
+    // the metadata before delivery and (b) the restart dedup rebuild
+    // finds the id once the entry reaches the main store. Cold path —
+    // the owned Vec allocation is fine here.
+    let (store_payload, store_flags): (std::borrow::Cow<'_, [u8]>, u8) = if !msg_id.is_empty() {
+        let hdrs: [(&[u8], &[u8]); 1] =
+            [(arbitro_proto::wire::msg_headers::HDR_MSG_ID, msg_id)];
+        (
+            std::borrow::Cow::Owned(
+                arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
+                    f.payload(),
+                    &hdrs,
+                ),
+            ),
+            arbitro_store::flags::HAS_HEADERS,
+        )
+    } else {
+        (std::borrow::Cow::Borrowed(f.payload()), 0)
+    };
+
     // If delay_ms == 0, treat as a normal publish (bypass the journal).
     if delay_ms == 0 {
         let entries = [arbitro_store::EntryRef {
             stream_id: seq_stream.raw(),
             subject: f.subject(),
-            payload: f.payload(),
-            flags: 0,
+            payload: &store_payload,
+            flags: store_flags,
             deliver_at_ms: 0,
         }];
         let now_ms = server.now_ms();
@@ -748,8 +861,8 @@ fn v2_publish_delayed(
         deliver_at_ms,
         seq_stream.raw(),
         f.subject(),
-        f.payload(),
-        0,
+        &store_payload,
+        store_flags,
     ) {
         Ok(()) => {
             // Reply with RepOk (ref_seq = 0 since there's no store sequence yet).
