@@ -1683,11 +1683,11 @@ async fn v2_create_consumer(
     registry: &ConnectionRegistry,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
-    // SEC-6: bound how many consumers a single connection may create.
-    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Consumer) {
-        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
-        return;
-    }
+    // The SEC-6 reservation happens further down, right before the engine
+    // call, and is released again unless the create actually allocated a new
+    // consumer. Reserving up here charged a unit for every malformed request
+    // and for every idempotent re-join, so a worker that restarts often would
+    // eventually be refused creates it is entitled to.
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {
@@ -1772,9 +1772,19 @@ async fn v2_create_consumer(
         Vec::new()
     };
 
+    // SEC-6: bound how many consumers a single connection may create. Taken
+    // here, after validation, so only a request that reaches the engine can
+    // spend it.
+    use crate::transport::registry::QuotaKind;
+    if !registry.check_and_incr_quota(conn_id, QuotaKind::Consumer) {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
+        return;
+    }
+
     let (seq_consumer, _created) = server.names().get_or_create_consumer(seq_stream, name);
     // B1: registry refused — consumer slot pool exhausted.
     if seq_consumer.raw() == u32::MAX {
+        registry.release_quota(conn_id, QuotaKind::Consumer);
         send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
         return;
     }
@@ -1808,6 +1818,13 @@ async fn v2_create_consumer(
             subject_limits,
         )
         .await;
+
+    // Quota counts consumers this connection actually brought into being.
+    // An idempotent re-join (Ok(0)), a config-mismatch rejection (Ok(2)) and
+    // a dead shard all give the reserved unit back.
+    if !matches!(create_res, Ok(1)) {
+        registry.release_quota(conn_id, QuotaKind::Consumer);
+    }
 
     // AUDIT-10 follow-up: mutate the NameRegistry ONLY after the engine
     // accepts the create (Ok(1) = new, Ok(0) = idempotent same-config).
@@ -2430,11 +2447,9 @@ async fn v2_create_consumer_raft(
     cluster: &std::sync::Arc<crate::cluster::ClusterState>,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateConsumer as CreateConsumerCold};
-    // SEC-6: bound how many consumers a single connection may create.
-    if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Consumer) {
-        send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
-        return;
-    }
+    // No SEC-6 reservation here: on success this delegates to
+    // `v2_create_consumer`, which takes its own. Charging one here too made
+    // every clustered create cost two units of the connection's quota.
     let body = match CreateConsumerCold::decode_body(&frame[HEADER_SIZE..]) {
         Ok(b) => b,
         Err(_) => {

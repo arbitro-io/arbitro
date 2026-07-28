@@ -231,6 +231,26 @@ impl ConnectionRegistry {
         true
     }
 
+    /// Give back a unit reserved by [`Self::check_and_incr_quota`] when the
+    /// creation it was reserved for did not happen.
+    ///
+    /// Without this a rejected create still burns quota, so a connection that
+    /// retries a malformed request — or simply re-joins an existing queue on
+    /// every worker restart — eventually gets spurious quota errors for
+    /// creates that would otherwise be fine.
+    pub fn release_quota(&self, conn_id: u64, kind: QuotaKind) {
+        let mut quotas = self.inner.quotas.lock();
+        let Some(q) = quotas.get_mut(&conn_id) else {
+            return;
+        };
+        let counter = match kind {
+            QuotaKind::Stream => &mut q.streams,
+            QuotaKind::Consumer => &mut q.consumers,
+            QuotaKind::Cron => &mut q.crons,
+        };
+        *counter = counter.saturating_sub(1);
+    }
+
     /// H10: wire the silent-drop counters. Called by the server after
     /// construction so the registry can bump `conn_write` on every
     /// dropped outbound frame.
