@@ -479,6 +479,63 @@ impl Client {
         )
     }
 
+    /// Join the durable work queue `queue` on `stream_id` in ONE call.
+    ///
+    /// The NATS-style convenience: instead of creating a consumer and then
+    /// subscribing to it, every worker calls `queue_subscribe` with the same
+    /// queue name and the broker load-balances between them — each message is
+    /// delivered to exactly ONE member of the queue.
+    ///
+    /// The queue name doubles as the durable consumer name AND the queue
+    /// group, which is what makes this safe to call concurrently from N
+    /// workers: they all resolve to the same durable consumer (the create is
+    /// idempotent) and therefore the same round-robin queue. Because the two
+    /// names always move together, two workers can never disagree on the
+    /// config and trip `InvalidConsumerConfig`.
+    ///
+    /// Passing a DIFFERENT queue name gives you a separate, independent
+    /// durable queue over the same stream — its own cursor, its own pending
+    /// set, its own copy of the messages.
+    ///
+    /// The consumer is **durable** (`AckPolicy::Explicit`): it survives broker
+    /// restarts and worker disconnects, keeps its cursor, and redelivers any
+    /// message a worker took but never acked. Messages must be acked —
+    /// that is the point of a work queue.
+    ///
+    /// This is pure client-side sugar over
+    /// [`Client::create_consumer_with_limits`] + [`Client::subscribe`]; it
+    /// sends the exact same two frames and adds no broker-side concepts.
+    ///
+    /// ```ignore
+    /// // Run this from as many workers as you like:
+    /// let mut sub = client.queue_subscribe(stream_id, b"workers", b"orders.>").await?;
+    /// while let Some(msg) = sub.recv().await {
+    ///     handle(&msg);
+    ///     msg.ack();
+    /// }
+    /// ```
+    pub async fn queue_subscribe(
+        &self,
+        stream_id: u32,
+        queue: &[u8],
+        filter: &[u8],
+    ) -> Result<SubscriptionHandle, ClientError> {
+        use arbitro_proto::config::{AckPolicy, DeliverMode};
+
+        // name == group is the invariant that makes concurrent joins
+        // idempotent rather than a config clash.
+        let consumer_id = crate::consumer_builder::ConsumerBuilder::new(queue)
+            .group(queue)
+            .deliver_mode(DeliverMode::Queue)
+            .ack_policy(AckPolicy::Explicit)
+            .create(self, stream_id)
+            .await?;
+
+        // The subject filter is applied on the subscription, not on the
+        // consumer — matching how every other call site scopes delivery.
+        self.subscribe(stream_id, consumer_id, filter).await
+    }
+
     // ── manage ────────────────────────────────────────────────────────────────
 
     /// Create a stream.
