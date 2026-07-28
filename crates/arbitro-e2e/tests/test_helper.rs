@@ -90,14 +90,26 @@ impl TestServerBuilder {
     }
 
     pub async fn spawn(self) -> TestServer {
+        // Bind `:0` and hand the LIVE listener to the server. Dropping the
+        // listener and letting the server re-bind the port opened a TOCTOU
+        // window where a parallel test could grab the port in the gap
+        // (intermittent "Failed to connect" / cross-server flakes under
+        // full-suite parallel load).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        self.spawn_on(&addr).await
+        self.spawn_inner(&addr, Some(listener)).await
     }
 
     /// Spawn a server on a specific address (for reconnect tests).
     pub async fn spawn_on(self, addr: &str) -> TestServer {
+        self.spawn_inner(addr, None).await
+    }
+
+    async fn spawn_inner(
+        self,
+        addr: &str,
+        listener: Option<tokio::net::TcpListener>,
+    ) -> TestServer {
         let (tx, rx) = watch::channel(false);
         let mut config = Config::default()
             .listen_addr(addr)
@@ -128,6 +140,11 @@ impl TestServerBuilder {
         }
 
         let mut server = ArbitroServer::new(config);
+
+        // Hand over the pre-bound accept socket (no drop-and-rebind gap).
+        if let Some(listener) = listener {
+            server.set_listener(listener);
+        }
 
         // Enable command-log persistence when data_dir is set.
         if let Some(ref data_dir) = self.data_dir {

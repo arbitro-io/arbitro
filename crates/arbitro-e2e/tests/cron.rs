@@ -100,13 +100,11 @@ async fn cron_10_workers_single_delivery() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cron_survives_server_restart() {
-    // Bind a port we'll reuse across restarts.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
-    // Phase 1: start server, register cron, verify it fires.
-    let mut server = TestServerBuilder::new().spawn_on(&addr).await;
+    // Phase 1: start server, register cron, verify it fires. `spawn()`
+    // binds `:0` and hands the live listener to the server (no
+    // drop-and-rebind TOCTOU); the restart reuses the reported address.
+    let mut server = TestServerBuilder::new().spawn().await;
+    let addr = server.addr.clone();
 
     let fire_count = Arc::new(AtomicU64::new(0));
     let fc = fire_count.clone();

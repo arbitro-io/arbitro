@@ -612,3 +612,110 @@ async fn create_consumer_config_mismatch_rejected() {
     );
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// F1b (audit #10 follow-up): a REJECTED re-create must not corrupt the
+// NameRegistry either. Pre-fix, `v2_create_consumer` wrote deliver_policy /
+// queue / stream into the NameRegistry BEFORE the engine's config-mismatch
+// check — so a rejected re-create with deliver_policy=All silently flipped
+// the registry copy of a DeliverPolicy::New consumer, and the next
+// subscribe replayed the full history despite the create having errored.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_reconsumer_does_not_corrupt_registry() {
+    use arbitro_client_tokio::ClientError;
+    use arbitro_proto::error::ErrorCode;
+
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let stream_id = create_stream(&client, b"reg_guard").await;
+
+    // A sibling consumer drains 5 history messages first, so the stream
+    // has advanced past the backlog before the victim joins (same
+    // late-join setup as temporal_isolation_repro.rs).
+    let sib_id = TestServer::parse_id(
+        &client
+            .create_consumer(
+                stream_id, b"sibling", b"", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
+            )
+            .await
+            .expect("sibling create must succeed"),
+    );
+    let mut sib = client.subscribe(stream_id, sib_id, b"").await.unwrap();
+    for i in 0..5u8 {
+        client
+            .publish_wait(stream_id, b"reg_guard.hist", Bytes::from(vec![b'h', i]))
+            .await
+            .expect("history publish");
+    }
+    for _ in 0..5 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), sib.recv())
+            .await
+            .expect("sibling must drain the history")
+            .expect("sibling subscription must yield");
+        msg.ack();
+    }
+
+    // Victim: DeliverPolicy::New (1) — a late joiner that must NOT replay.
+    let victim_id = TestServer::parse_id(
+        &client
+            .create_consumer(
+                stream_id, b"victim", b"", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
+            )
+            .await
+            .expect("victim create must succeed"),
+    );
+
+    // Rejected re-create: deliver_policy=All (0) AND max_inflight=50 (the
+    // engine-visible mismatch). Must be rejected with InvalidConsumerConfig.
+    let err = client
+        .create_consumer(
+            stream_id, b"victim", b"", b"", 50u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
+        .await
+        .expect_err("re-create with different config must be rejected");
+    assert!(
+        matches!(
+            err,
+            ClientError::Broker {
+                code: ErrorCode::InvalidConsumerConfig
+            }
+        ),
+        "expected InvalidConsumerConfig, got {err:?}"
+    );
+
+    // Subscribe the victim AFTER the rejected re-create, then publish 3
+    // new messages. With deliver_policy=New intact it must see ONLY the
+    // 3 new ones. Pre-fix the registry already held the rejected All
+    // policy, so the subscribe rewound and replayed the 5 history
+    // messages too.
+    let mut sub = client.subscribe(stream_id, victim_id, b"").await.unwrap();
+    for i in 0..3u8 {
+        client
+            .publish_wait(stream_id, b"reg_guard.live", Bytes::from(vec![b'n', i]))
+            .await
+            .expect("live publish");
+    }
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
+        got.push(msg.payload().to_vec());
+        msg.ack();
+        if got.len() > 3 {
+            break; // already corrupt — no need to drain the full replay
+        }
+    }
+    assert!(
+        got.iter().all(|p| p.first() == Some(&b'n')),
+        "victim (DeliverPolicy::New) must not replay history after a \
+         REJECTED re-create with DeliverPolicy::All; got payloads {got:?}"
+    );
+    assert_eq!(
+        got.len(),
+        3,
+        "victim must receive exactly the 3 post-subscribe messages; a \
+         rejected re-create must leave the registry deliver_policy intact"
+    );
+    server.shutdown().await;
+}

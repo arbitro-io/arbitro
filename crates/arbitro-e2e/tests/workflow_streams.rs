@@ -461,20 +461,16 @@ async fn workflow_survives_broker_restart() {
     let dir = tempfile::tempdir().unwrap();
     let dir_str = dir.path().to_str().unwrap();
 
-    // Reserve a fixed address so the second boot can bind the same port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
     let step0_started = Arc::new(AtomicBool::new(false));
     let step1_completed = Arc::new(AtomicBool::new(false));
 
     // ── First boot ───────────────────────────────────────────────────────
+    // `spawn()` binds `:0` and hands the live listener to the server (no
+    // drop-and-rebind TOCTOU); the second boot reuses the reported address.
+    let addr;
     {
-        let mut server = TestServerBuilder::new()
-            .data_dir(dir_str)
-            .spawn_on(&addr)
-            .await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        addr = server.addr.clone();
         let client = server.connect().await;
 
         // Create a user-facing stream (to prove metadata survives).

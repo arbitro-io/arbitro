@@ -83,16 +83,13 @@ async fn delayed_publish_survives_broker_restart() {
     let dir_str = dir.path().to_str().unwrap();
 
     // Phase 1: Start server, publish a delayed message, then shut down
-    // before the message matures.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-
+    // before the message matures. `spawn()` binds `:0` and hands the live
+    // listener to the server (no drop-and-rebind TOCTOU); the restart
+    // reuses the address it reported.
+    let addr;
     {
-        let mut server = TestServerBuilder::new()
-            .data_dir(dir_str)
-            .spawn_on(&addr)
-            .await;
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        addr = server.addr.clone();
         let client = server.connect().await;
 
         // Create stream.

@@ -1773,13 +1773,7 @@ async fn v2_create_consumer(
     } else {
         server.names().get_or_create_queue(seq_stream, group)
     };
-    server.names().set_consumer_queue(seq_consumer, queue_id);
-    server.names().set_consumer_stream(seq_consumer, seq_stream);
-    server
-        .names()
-        .set_consumer_deliver_policy(seq_consumer, body.deliver_policy, body.start_seq);
-
-    match shard
+    let create_res = shard
         .create_consumer(
             ConsumerConfig {
                 id: seq_consumer,
@@ -1801,8 +1795,24 @@ async fn v2_create_consumer(
             },
             subject_limits,
         )
-        .await
-    {
+        .await;
+
+    // AUDIT-10 follow-up: mutate the NameRegistry ONLY after the engine
+    // accepts the create (Ok(1) = new, Ok(0) = idempotent same-config).
+    // These writes used to happen BEFORE the engine's config-mismatch
+    // check, so a REJECTED re-create (Ok(2) → InvalidConsumerConfig)
+    // silently overwrote deliver_policy/queue/stream for the existing
+    // consumer — durable registry state diverged from the engine and a
+    // later subscribe (or restart replay) used the rejected config.
+    if matches!(create_res, Ok(0) | Ok(1)) {
+        server.names().set_consumer_queue(seq_consumer, queue_id);
+        server.names().set_consumer_stream(seq_consumer, seq_stream);
+        server
+            .names()
+            .set_consumer_deliver_policy(seq_consumer, body.deliver_policy, body.start_seq);
+    }
+
+    match create_res {
         Ok(1) => {
             // F37: a new consumer must show up in list_consumers reply.
             server.invalidate_list_cache();

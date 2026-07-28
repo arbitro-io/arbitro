@@ -331,13 +331,7 @@ impl ArbitroStateMachine {
         } else {
             router.names().get_or_create_queue(seq_stream, group_bytes)
         };
-        router.names().set_consumer_queue(seq_consumer, queue_id);
-        router.names().set_consumer_stream(seq_consumer, seq_stream);
-        router
-            .names()
-            .set_consumer_deliver_policy(seq_consumer, deliver_policy, start_seq);
-
-        match shard
+        let create_res = shard
             .create_consumer(
                 ConsumerConfig {
                     id: seq_consumer,
@@ -355,8 +349,21 @@ impl ArbitroStateMachine {
                 },
                 Vec::new(), // no subject limits on replicated path
             )
-            .await
-        {
+            .await;
+
+        // AUDIT-10 follow-up (same as v2_create_consumer): only mutate the
+        // NameRegistry after the engine accepts the create. A rejected
+        // re-create (config mismatch) must not overwrite the registry copy
+        // of deliver_policy/queue/stream for the existing consumer.
+        if matches!(create_res, Ok(0) | Ok(1)) {
+            router.names().set_consumer_queue(seq_consumer, queue_id);
+            router.names().set_consumer_stream(seq_consumer, seq_stream);
+            router
+                .names()
+                .set_consumer_deliver_policy(seq_consumer, deliver_policy, start_seq);
+        }
+
+        match create_res {
             Ok(1) => {
                 router.invalidate_list_cache();
                 tracing::debug!(name, "state_machine: consumer created");

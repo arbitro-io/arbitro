@@ -131,6 +131,12 @@ pub struct ArbitroServer {
     registry: ConnectionRegistry,
     services: Vec<Box<dyn LifeCycle>>,
     command_log: Option<SharedCommandLog>,
+    /// Optional pre-bound accept socket. When set, `run_with_shutdown`
+    /// uses it instead of binding `config.listen_addr`. This lets a
+    /// caller (e.g. the e2e harness) bind `:0`, read the real port, and
+    /// hand the live listener over — closing the drop-and-rebind TOCTOU
+    /// window where another process could grab the port in between.
+    listener: Option<TcpListener>,
 }
 
 impl ArbitroServer {
@@ -159,12 +165,21 @@ impl ArbitroServer {
             registry,
             services,
             command_log: None,
+            listener: None,
         }
     }
 
     /// Register a lifecycle service. Called before `run()`.
     pub fn register(&mut self, service: Box<dyn LifeCycle>) {
         self.services.push(service);
+    }
+
+    /// Hand over a pre-bound accept socket. `run_with_shutdown` will use
+    /// it instead of binding `config.listen_addr`, so the port picked by
+    /// the caller (typically via a `:0` bind) is never released between
+    /// selection and serving.
+    pub fn set_listener(&mut self, listener: TcpListener) {
+        self.listener = Some(listener);
     }
 
     /// Set the shared command log for metadata persistence.
@@ -235,8 +250,15 @@ impl ArbitroServer {
         // makes idempotency survive restarts.
         crate::persistence::recovery::rebuild_idempotency(&self.server).await;
 
-        let listener = TcpListener::bind(&self.config.listen_addr).await?;
-        tracing::info!(addr = %self.config.listen_addr, "listening");
+        let listener = match self.listener.take() {
+            // Pre-bound socket handed over by the caller (no re-bind gap).
+            Some(l) => l,
+            None => TcpListener::bind(&self.config.listen_addr).await?,
+        };
+        match listener.local_addr() {
+            Ok(addr) => tracing::info!(addr = %addr, "listening"),
+            Err(_) => tracing::info!(addr = %self.config.listen_addr, "listening"),
+        }
 
         // ── Startup state snapshot ─────────────────────────────────────
         // Always log post-replay state so operators see clean restarts
