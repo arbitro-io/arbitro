@@ -13,7 +13,7 @@ use arbitro_store::EntryRef;
 
 use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::command::*;
-use crate::shard::worker::{AccumCaller, ActiveBinding, CommandWorker, StreamAccum};
+use crate::shard::worker::{rewind_released, AccumCaller, ActiveBinding, CommandWorker, StreamAccum};
 
 impl CommandWorker {
     // ── Hot path — accumulator ──────────────────────────────────────────
@@ -485,12 +485,20 @@ impl CommandWorker {
 
             if requeued > 0 {
                 // Rewind cursor to re-scan nacked entries.
+                //
+                // BUG3/M3: same protocol as handle_bind / retirement
+                // (`rewind_released`: set_cursor + signal_rewind), NOT a
+                // bare set_cursor + clear_rewind. A drain cycle already
+                // past its top-of-cycle `take_rewind` writes `new_cursor`
+                // forward at cycle end, clobbering a bare set_cursor — and
+                // the old unconditional `clear_rewind()` wiped any
+                // co-pending rewind signalled by a retirement or
+                // resubscribe, skipping those seqs forever (message loss).
+                // `signal_rewind` is durable (consumed at the top of the
+                // drain's next cycle) and min-composes with concurrent
+                // signals.
                 let min_seq = cmd.entries.iter().map(|e| e.seq).min().unwrap_or(0);
-                if min_seq > 0 {
-                    let cur = self.counters.cursor();
-                    self.counters.set_cursor(cur.min(min_seq - 1));
-                }
-                self.counters.clear_rewind();
+                rewind_released(&self.counters, min_seq);
                 self.gate.release();
             }
 
@@ -618,13 +626,28 @@ impl CommandWorker {
                     // consumer with cursor=0 asking for start_seq=6 was
                     // served from seq=1, not seq=6.
                     let target = cmd.start_seq.saturating_sub(1);
+                    //
+                    // BUG3/M3: same protocol as handle_bind (set_cursor +
+                    // signal_rewind), NOT set_cursor + clear_rewind. The
+                    // old `clear_rewind()` wiped a co-pending rewind
+                    // (retirement/resubscribe) → those seqs were never
+                    // redelivered; and in the rewind direction a bare
+                    // set_cursor is clobbered by a mid-flight drain
+                    // cycle's end-of-cycle `set_cursor(new_cursor)`.
+                    // `signal_rewind` is durable and min-composes: a
+                    // smaller co-pending rewind still wins (redelivery is
+                    // safe, loss is not). The forward-skip case keeps its
+                    // bare set_cursor semantics — the signal is a no-op
+                    // there (drain only rewinds backward).
                     self.counters.set_cursor(target);
-                    self.counters.clear_rewind();
+                    self.counters.signal_rewind(target.saturating_add(1));
                 }
                 _ => {
-                    // Unknown — default to All for safety.
+                    // Unknown — default to All for safety. Same
+                    // set_cursor + signal_rewind protocol as handle_bind
+                    // (see BUG3 note above).
                     self.counters.set_cursor(0);
-                    self.counters.clear_rewind();
+                    self.counters.signal_rewind(1);
                 }
             }
 

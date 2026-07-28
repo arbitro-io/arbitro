@@ -1765,3 +1765,124 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     drop(raw);
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Nack racing an ACTIVE drain → the nacked seq must always be redelivered
+//
+// BUG3/M3 regression gate. `handle_nack` used to rewind the cursor with a
+// bare `set_cursor(min-1)` + unconditional `clear_rewind()`. A drain cycle
+// already past its top-of-cycle `take_rewind` writes `new_cursor` forward
+// at cycle end, clobbering the bare set_cursor — and the `clear_rewind()`
+// wiped any co-pending rewind signal — so a nacked message could silently
+// never be redelivered until an unrelated rewind happened to occur. The
+// fix mirrors handle_bind's protocol (`set_cursor` + durable
+// `signal_rewind`), which a mid-flight cycle cannot erase.
+//
+// This is a RACE with no deterministic repro: the test's job is to hammer
+// the interleaving (small max_inflight so drain cycles constantly overlap
+// the client's nacks, publisher running concurrently) and lock in
+// no-regression — every nacked message must eventually come back.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nack_during_active_drain_always_redelivers() {
+    const ITERATIONS: usize = 8;
+    const N: u32 = 80; // messages per iteration
+    const NACK_STRIDE: u32 = 7; // nack payload indices where i % 7 == 3
+
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    for iter in 0..ITERATIONS {
+        let stream_name = format!("nackrace{iter}");
+        let stream_id = create_stream(&client, stream_name.as_bytes(), b">").await;
+        // Small window: the drain pauses/resumes on every few acks, so
+        // cycles are guaranteed to be mid-flight while nacks land.
+        let consumer_id = create_consumer(
+            &client, stream_id, b"racer", b"", b"", 4, /* max_inflight */
+            1, /* Explicit */
+            0, /* All */
+            30_000, /* ack_wait_ms — keep the wheel out of this test */
+            0,
+        )
+        .await;
+        let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+        // Publish CONCURRENTLY with consumption so the drain is actively
+        // cycling (publish → gate release → drain) while nacks arrive.
+        let pub_client = client.clone();
+        let subject = format!("nackrace{iter}.msg");
+        let publisher = tokio::spawn(async move {
+            for i in 0u32..N {
+                pub_client
+                    .publish_wait(
+                        stream_id,
+                        subject.as_bytes(),
+                        Bytes::copy_from_slice(&i.to_le_bytes()),
+                    )
+                    .await
+                    .expect("publish must succeed");
+            }
+        });
+
+        // deliveries[i] = number of times payload index i was delivered.
+        let mut deliveries = vec![0u32; N as usize];
+        let is_nack_target = |i: u32| i % NACK_STRIDE == 3;
+        let done = |deliveries: &[u32]| {
+            (0..N).all(|i| {
+                let d = deliveries[i as usize];
+                if is_nack_target(i) { d >= 2 } else { d >= 1 }
+            })
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !done(&deliveries) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, handle.recv()).await {
+                Ok(Some(m)) => {
+                    let mut idx_bytes = [0u8; 4];
+                    idx_bytes.copy_from_slice(&m.payload()[..4]);
+                    let i = u32::from_le_bytes(idx_bytes);
+                    let count = &mut deliveries[i as usize];
+                    *count += 1;
+                    if is_nack_target(i) && *count == 1 {
+                        // First sight of a target: nack WHILE the drain is
+                        // actively delivering the rest of the backlog.
+                        m.nack();
+                    } else {
+                        // Everything else (and redeliveries) acks inline so
+                        // the max_inflight window keeps cycling.
+                        m.ack();
+                    }
+                }
+                _ => break,
+            }
+        }
+        publisher.await.unwrap();
+
+        // At-least-once: nothing lost, every nacked seq redelivered.
+        for i in 0..N {
+            let d = deliveries[i as usize];
+            if is_nack_target(i) {
+                assert!(
+                    d >= 2,
+                    "iter {iter}: nacked payload {i} was never redelivered \
+                     (delivered {d} time(s)) — nack rewind lost to a \
+                     concurrent drain cycle (BUG3)",
+                );
+            } else {
+                assert!(
+                    d >= 1,
+                    "iter {iter}: payload {i} was never delivered — message loss",
+                );
+            }
+        }
+
+        client.delete_stream(stream_name.as_bytes()).await.unwrap();
+    }
+
+    server.shutdown().await;
+}

@@ -335,7 +335,7 @@ fn drain_event_ring(
 /// end of its cycle. `signal_rewind` takes the min, so a smaller pending
 /// rewind (more replay) still wins — redelivery is safe, message loss is not.
 #[inline]
-fn rewind_released(counters: &SharedCounters, min_seq: u64) {
+pub(in crate::shard) fn rewind_released(counters: &SharedCounters, min_seq: u64) {
     if min_seq == 0 {
         return;
     }
@@ -860,10 +860,19 @@ impl CommandWorker {
 
         if expired_count > 0 {
             // Rewind cursor and wake drain for redelivery.
+            //
+            // BUG3/M3: same protocol as handle_bind / retirement
+            // (`rewind_released`: set_cursor + signal_rewind), NOT a bare
+            // set_cursor + clear_rewind. A drain cycle already past its
+            // top-of-cycle `take_rewind` writes `new_cursor` forward at
+            // cycle end, clobbering a bare set_cursor — and the old
+            // unconditional `clear_rewind()` wiped any co-pending rewind
+            // signalled by a retirement or resubscribe, skipping those
+            // seqs forever (message loss). `signal_rewind` is durable
+            // (consumed at the top of the drain's next cycle) and
+            // min-composes with concurrent signals.
             if let Some(min_seq) = min_rewind {
-                let cur = self.counters.cursor();
-                self.counters.set_cursor(cur.min(min_seq.saturating_sub(1)));
-                self.counters.clear_rewind();
+                rewind_released(&self.counters, min_seq);
             }
             self.gate.release();
         }
