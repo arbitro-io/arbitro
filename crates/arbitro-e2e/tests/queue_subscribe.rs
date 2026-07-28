@@ -187,6 +187,57 @@ async fn one_consumer_per_queue_name_not_per_subscription() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 1c. The other half of the ack contract: a message a worker did NOT ack
+// must come back. `queue_survives_broker_restart` proves acks take effect
+// (acked messages stay gone); this proves the failure path — nack it and the
+// queue redelivers instead of silently dropping the job.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unacked_message_is_redelivered() {
+    let mut server = TestServerBuilder::new().spawn().await;
+
+    let setup = server.connect().await;
+    let stream_id = create_stream(&setup, b"qs_redeliver").await;
+
+    let worker = server.connect().await;
+    let mut sub = worker
+        .queue_subscribe(stream_id, b"workers", b"")
+        .await
+        .expect("queue join");
+
+    setup
+        .publish_wait(stream_id, b"qs_redeliver.job", Bytes::from_static(b"job-1"))
+        .await
+        .expect("publish");
+
+    // First delivery — refuse the job instead of acking it.
+    let first = tokio::time::timeout(Duration::from_secs(3), sub.recv())
+        .await
+        .expect("first delivery must arrive")
+        .expect("subscription must yield");
+    assert_eq!(&first.payload()[..], b"job-1");
+    first.nack();
+
+    // The queue must hand the job back, not drop it.
+    let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+        .await
+        .expect(
+            "an un-acked (nacked) job MUST be redelivered — without this the \
+             queue silently loses work whenever a worker fails",
+        )
+        .expect("subscription must yield the redelivery");
+    assert_eq!(
+        &second.payload()[..],
+        b"job-1",
+        "the redelivered message must be the same job"
+    );
+    second.ack();
+
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 2. A DIFFERENT queue name is a separate durable queue — its own cursor,
 //    its own full copy of the stream. This is the fan-out axis.
 // ═══════════════════════════════════════════════════════════════════════════
