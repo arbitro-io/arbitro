@@ -837,6 +837,16 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_drain_connection(&mut self, cmd: DrainConnectionCmd) {
+        // Apply queued `Delivered` notifications BEFORE retiring the
+        // connection's bindings, so `binding.pending` is complete when
+        // `mark_connection_dead`'s retirement walk emits the `Released`
+        // events (same pattern as `handle_ack`). This keeps the common
+        // case on the mainline retirement path; deliveries that land in
+        // the notify ring after this point (the drain can be mid-cycle)
+        // are caught by the retired-binding reversal in
+        // `handle_notification`.
+        self.drain_notifications();
+
         // Decrement demand for all bindings of this connection.
         let conn_bindings: Vec<_> = self
             .bindings

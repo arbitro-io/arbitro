@@ -765,6 +765,76 @@ impl CommandWorker {
             } => {
                 // Update engine's pending list for future ack/retire.
                 use arbitro_engine_v2::command::Command;
+                // Retired-binding reversal: the binding died (connection
+                // death, unsubscribe, delete-consumer/stream cascade)
+                // BETWEEN the drain's flush and this notification being
+                // applied. At flush time the drain already recorded the
+                // delivery — `inc_inflight` on the shared counters,
+                // `cs.inc(subject)` + `cs.suppress(seq)` in its own book —
+                // but the engine never registered a pending for these seqs
+                // (`Command::Delivered` no-ops on an unknown binding), so
+                // the retirement walk over `binding.pending` could not have
+                // released them, and no ack / nack / ack-timeout ever will
+                // (nothing matches a pending that does not exist). Without
+                // this reversal the suppression holds forever: every future
+                // walk skips the seq via `is_suppressed` WITHOUT
+                // `track_skipped`, the cursor advances past it, and the
+                // message is permanently starved for this consumer —
+                // measured as the chaos bench losing exactly the seq in
+                // flight at a consumer force-disconnect. Reverse everything
+                // the drain did and re-arm redelivery.
+                if self.engine.ctx().catalog.binding(binding_id).is_none() {
+                    // 1. Reverse the drain's blind shared-counter
+                    //    increments — no pending was registered, so no
+                    //    ack/nack/retire path will ever decrement these.
+                    self.counters.dec_inflight_bulk(
+                        consumer_id.0,
+                        queue_id.0,
+                        entries.len() as u32,
+                    );
+                    // 2. Reverse the drain-side per-subject counters AND
+                    //    un-suppress each seq (`SuppressOp::Released`) so a
+                    //    rewound walk may redeliver it — to a queue-group
+                    //    sibling now, or to this consumer when it
+                    //    resubscribes. Same channel + ring-full handling as
+                    //    `apply_delta_and_sync`; the retry flush at the top
+                    //    of the command loop re-signals the rewind for any
+                    //    queued event. A stale event for a removed consumer
+                    //    is harmless: `drain_event_ring` ignores events for
+                    //    a dropped slot, and `apply_delta_and_sync` purges
+                    //    queued events when a `ConsumerRemoved` is emitted.
+                    let ack_floor = self.ack_floors.floor(consumer_id.raw());
+                    let mut min_seq: Option<u64> = None;
+                    for e in entries.iter() {
+                        min_seq = Some(min_seq.map_or(e.seq, |m: u64| m.min(e.seq)));
+                        let evt = DrainEvent::Ack {
+                            consumer_id,
+                            subject_hash: e.subject_hash,
+                            ack_floor,
+                            seq: e.seq,
+                            op: crate::shard::drain_events::SuppressOp::Released,
+                        };
+                        if self.drain_evt_tx.try_send(evt).is_err() {
+                            self.silent_drops.inc_drain_evt();
+                            self.pending_drain_acks.push(evt);
+                        }
+                    }
+                    // 3. Rewind so the drain re-walks the released seqs.
+                    //    Ordering contract (see the drain's `take_rewind`
+                    //    comment): Released events are pushed BEFORE the
+                    //    rewind is signalled, and the drain consumes the
+                    //    rewind before draining the event ring, so a
+                    //    visible signal implies the releases are visible
+                    //    too.
+                    if let Some(min_seq) = min_seq {
+                        rewind_released(&self.counters, min_seq);
+                    }
+                    self.gate.release();
+                    // 4. NO wheel insert — there is no pending to time
+                    //    out, and a stale ack-timeout entry would only
+                    //    lazy-cancel later without releasing anything.
+                    return;
+                }
                 // A3/ROB-12 reconciliation: the drain incremented the shared
                 // inflight once per delivered entry, but the engine SKIPS
                 // re-adding a seq that is already pending on this binding
@@ -1419,6 +1489,148 @@ mod tests {
         rewind_released(&counters, 0);
         assert_eq!(counters.cursor(), 5);
         assert_eq!(counters.take_rewind(), None);
+    }
+
+    /// Build a bare CommandWorker for direct handler-level tests, plus
+    /// the drain-side consumer half of the drain-event ring so a test
+    /// can observe exactly what the drain thread would apply. Mirrors
+    /// `ShardRouter::spawn` field-for-field with in-memory defaults.
+    fn test_worker() -> (
+        CommandWorker,
+        crate::shard::drain_events::DrainEventConsumer,
+    ) {
+        let (_tx, rx) = mpsc::channel(4);
+        let (mut notify_producers, notify_rx, _notify_shutdown) =
+            crate::shard::shared::NotifyRing::new(1);
+        let _notify_tx = notify_producers.pop();
+        let (drain_evt_tx, drain_evt_rx) = crate::shard::drain_events::DrainEventRing::new();
+        let worker = CommandWorker {
+            engine: ArbitroEngine::new(),
+            counters: Arc::new(SharedCounters::new()),
+            snapshot: Arc::new(SnapshotSwap::new(DrainSnapshot::empty())),
+            store: Arc::new(parking_lot::Mutex::new(Box::new(
+                arbitro_store::MemoryStore::new(),
+            ))),
+            gate: Arc::new(Gate::new()),
+            registry: crate::transport::ConnectionRegistry::new(64),
+            names: Arc::new(crate::common::NameRegistry::new()),
+            rx,
+            notify_ring: notify_rx,
+            drain_evt_tx,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            flusher_config: FlusherConfig::default(),
+            accum_streams: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            accum_deadline: None,
+            accum_total: 0,
+            accum_bytes: 0,
+            drain_config_batch_size: 64,
+            stream_retention: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            bindings: Vec::new(),
+            next_eviction: None,
+            wheel: None,
+            wheel_buf: Vec::new(),
+            next_wheel_tick: None,
+            idempotency_tracker: crate::shard::idempotency::new_shared_idempotency(),
+            has_idempotency: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flush_stream_ids: Vec::new(),
+            silent_drops: Arc::new(crate::common::SilentDrops::new()),
+            pending_consumer_remove: Vec::new(),
+            pending_drain_acks: Vec::new(),
+            ack_floors: crate::shard::ack_floor::AckFloors::new(),
+            last_wheel_tick: None,
+            evict_resume_seq: 0,
+            stream_oldest_ts: HashMap::default(),
+            dlq_nack_counts: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            data_path: None,
+            replay_mode: false,
+            #[cfg(feature = "cluster")]
+            replication_tx: Arc::new(parking_lot::Mutex::new(None)),
+        };
+        (worker, drain_evt_rx)
+    }
+
+    /// Chaos regression — a `Delivered` notification whose binding was
+    /// retired before it applied (consumer force-disconnect while the
+    /// delivery was in flight on the notify ring) must REVERSE the
+    /// drain's flush-time bookkeeping and re-arm redelivery.
+    ///
+    /// The race: the drain suppresses the seq synchronously at flush
+    /// (`cs.suppress`), but `binding.pending` — what retirement walks
+    /// to emit `Released` — is only registered when the notification is
+    /// applied. If `mark_connection_dead` runs in that window, the late
+    /// notification meets a retired binding: before the fix it fell
+    /// through as a no-op (engine `Command::Delivered` skips unknown
+    /// bindings), so nothing ever released the suppression — every
+    /// future walk skipped the seq without `track_skipped` and the
+    /// message was permanently starved (chaos bench: drain stalls one
+    /// short, always the seq in flight at the force-disconnect).
+    ///
+    /// This drives `handle_notification` directly with the exact
+    /// post-race state (catalog has no such binding), which is
+    /// identical no matter how the binding disappeared — connection
+    /// death, unsubscribe, or delete cascade.
+    #[test]
+    fn late_delivered_for_retired_binding_reverses_and_releases() {
+        let (mut w, mut drain_evt_rx) = test_worker();
+        let consumer_raw = 3u32;
+        let subject_hash = 0xABCDu32;
+        let seq = 7u64;
+
+        // Simulate the drain's flush-time bookkeeping for one ack-mode
+        // delivery (drain.rs Phase 3): shared inflight inc + drain-side
+        // subject inc + suppression.
+        w.counters.inc_inflight(consumer_raw, 0);
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+        {
+            let cs = consumer_subjects_slot_mut(&mut consumer_subjects, consumer_raw);
+            cs.inc(subject_hash);
+            cs.suppress(seq);
+            assert!(cs.is_suppressed(seq), "delivery memory recorded at flush");
+        }
+        // Drain cursor has moved on past the seq.
+        w.counters.set_cursor(42);
+
+        // The binding retired before the notification applied — the
+        // catalog knows no binding 99.
+        w.handle_notification(DrainNotification::Delivered {
+            binding_id: arbitro_engine_v2::types::BindingId(99),
+            consumer_id: ConsumerId(consumer_raw),
+            queue_id: QueueId(0),
+            entries: vec![arbitro_engine_v2::command::DeliveredEntry {
+                seq,
+                subject_hash,
+                _pad: 0,
+            }],
+        });
+
+        // 1. The drain's blind shared-counter increment was reversed —
+        //    nothing else will ever decrement it (no pending exists).
+        assert_eq!(
+            w.counters.consumer_inflight(consumer_raw),
+            0,
+            "shared inflight must be reversed for a retired binding"
+        );
+
+        // 2. A `Released` reached the drain ring: applying the ring
+        //    decrements the subject counter AND un-suppresses the seq,
+        //    so a rewound walk may redeliver it.
+        drain_event_ring(&mut drain_evt_rx, &mut consumer_subjects);
+        let cs = consumer_subjects_slot(&consumer_subjects, consumer_raw)
+            .expect("slot still exists");
+        assert!(
+            !cs.is_suppressed(seq),
+            "suppression must be released — otherwise the seq is starved forever"
+        );
+        assert_eq!(cs.get(subject_hash), 0, "subject inflight reversed");
+
+        // 3. The cursor was rewound with a durable signal so the drain
+        //    actually re-walks the released seq.
+        assert_eq!(w.counters.cursor(), seq - 1, "cursor rewound to seq - 1");
+        assert_eq!(w.counters.take_rewind(), Some(seq), "durable rewind signal");
+
+        // 4. No pending was registered, so nothing may sit in the
+        //    ack-timeout wheel (a stale entry would only lazy-cancel).
+        assert!(w.wheel.is_none(), "no wheel entry for a reversed delivery");
     }
 
     /// Audit #10 — deleting a consumer must drop ALL of its per-(consumer,
