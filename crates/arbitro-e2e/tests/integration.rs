@@ -28,7 +28,7 @@ async fn test_create_consumer() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     client
-        .create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+        .create_consumer(sid, b"worker", b"worker", b"", u16::MAX, 0, 0, 0, 0, 0)
         .await
         .unwrap();
     server.shutdown().await;
@@ -69,7 +69,7 @@ async fn test_publish_ack_cycle() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"worker", b"", b"", 1000, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"worker", b"worker", b"", 1000, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);
@@ -175,7 +175,7 @@ async fn test_nack_redelivery() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"nacker", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"nacker", b"nacker", b"", 100, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);
@@ -213,7 +213,7 @@ async fn test_replay_publish_then_subscribe() {
         .expect("publish_batch");
 
     let resp = client
-        .create_consumer(sid, b"replayer", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+        .create_consumer(sid, b"replayer", b"replayer", b"", u16::MAX, 0, 0, 0, 0, 0)
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);
@@ -243,7 +243,7 @@ async fn test_gate_auto_delivery_smoke() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"gater", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"gater", b"gater", b"", 100, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);
@@ -462,7 +462,7 @@ async fn test_publish_with_reply_delivers_reply_to() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"rpc-worker", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(sid, b"rpc-worker", b"rpc-worker", b"", 100, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);
@@ -503,7 +503,18 @@ async fn test_publish_without_reply_has_empty_reply_to() {
         .unwrap();
     let sid = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(sid, b"norpc-worker", b"", b"", 100, 1, 0, 0, 0, 0)
+        .create_consumer(
+            sid,
+            b"norpc-worker",
+            b"norpc-worker",
+            b"",
+            100,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
         .await
         .unwrap();
     let cid = TestServer::parse_id(&resp);

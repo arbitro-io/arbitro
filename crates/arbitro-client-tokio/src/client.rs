@@ -554,6 +554,19 @@ impl Client {
     ) -> Result<SubscriptionHandle, ClientError> {
         use arbitro_proto::config::{AckPolicy, DeliverMode};
 
+        // `queue` is both the durable consumer name AND the queue group,
+        // so an empty one would send an empty name and an empty group.
+        // There is no stream name here to fall back to (the API is keyed
+        // by `stream_id`), and an empty group means "the anonymous shared
+        // queue" broker-side — fail locally instead.
+        if queue.is_empty() {
+            return Err(ClientError::InvalidConfig(
+                "queue_subscribe requires a non-empty queue name — it is \
+                 both the durable consumer name and the queue group"
+                    .into(),
+            ));
+        }
+
         let limits: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> = opts
             .subject_limits
             .iter()
@@ -713,6 +726,12 @@ impl Client {
     /// only enforced by the server with `ack_policy == AckPolicy::Explicit
     /// (1)`; setting them on a fire-and-forget consumer is silently
     /// dropped server-side.
+    ///
+    /// `group` must be non-empty — it is passed through verbatim and the
+    /// broker rejects an empty one. See
+    /// [`Client::create_consumer_with_limits`] for why the default is not
+    /// applied here, and [`crate::ConsumerBuilder`] for the path that does
+    /// apply it.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer(
         &self,
@@ -749,6 +768,19 @@ impl Client {
     /// (delivered, unacked) messages per subject matching `pattern`. Wildcards
     /// (`*`, `>`) are supported. Only effective with `ack_policy ==
     /// AckPolicy::Explicit (1)`; otherwise silently ignored by the server.
+    ///
+    /// **`group` is mandatory and is NOT defaulted here.** This method is
+    /// the raw wire-level escape hatch: every argument is encoded
+    /// verbatim, so `b""` really does put an empty group on the wire, and
+    /// the broker rejects it with `InvalidConsumerConfig`. Filling the
+    /// group in is the client's job — use [`crate::ConsumerBuilder`],
+    /// which applies the shared rule (group, else consumer name, else
+    /// stream name), or pass a group explicitly.
+    ///
+    /// The rule cannot live here without also making the broker's
+    /// empty-group guard unreachable from Rust, and the default it would
+    /// apply (`name`) is exactly what `ConsumerBuilder` already does one
+    /// layer up.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_consumer_with_limits(
         &self,
@@ -919,6 +951,9 @@ impl Client {
     /// L13: create-or-return-existing variant of `create_consumer`. Same
     /// `Ok(true)`/`Ok(false)` semantics as `upsert_stream`. Treats
     /// `ConsumerAlreadyExists` as the idempotent path.
+    ///
+    /// Like [`Client::create_consumer`], `group` is passed through
+    /// verbatim and must be non-empty.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_consumer(
         &self,

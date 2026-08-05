@@ -73,7 +73,7 @@ async fn persistent_dedup_survives_restart() {
         .create_consumer(
             stream_id,
             CONSUMER.as_bytes(),
-            b"",  // group
+            CONSUMER.as_bytes(), // group = consumer name (empty group is rejected)
             b"",  // subject = catch-all
             1000, // max_inflight
             0,    // ack_policy = None
@@ -143,7 +143,7 @@ async fn persistent_dedup_survives_restart() {
         .create_consumer(
             stream_id,
             CONSUMER.as_bytes(),
-            b"",
+            CONSUMER.as_bytes(), // group = consumer name
             b"",
             1000,
             0, // ack_policy = None

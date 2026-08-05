@@ -17,7 +17,9 @@ async fn create_stream(client: &Client, name: &[u8]) -> u32 {
 
 async fn create_consumer(client: &Client, stream_id: u32, name: &[u8]) -> u32 {
     let resp = client
-        .create_consumer(stream_id, name, b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+        .create_consumer(
+            stream_id, name, name, b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
         .await
         .expect("create_consumer must succeed");
     TestServer::parse_id(&resp)
@@ -384,7 +386,7 @@ async fn create_4097_consumers_does_not_panic() {
             .create_consumer(
                 stream_id,
                 name.as_bytes(),
-                b"",
+                name.as_bytes(),
                 b"",
                 100u16,
                 1u8,
@@ -408,7 +410,7 @@ async fn create_4097_consumers_does_not_panic() {
         .create_consumer(
             stream_id,
             b"c-overflow",
-            b"",
+            b"c-overflow",
             b"",
             100u16,
             1u8,
@@ -495,7 +497,7 @@ async fn malformed_create_consumer_does_not_leak_slot() {
     for &bad_name in invalid_names {
         let result = client
             .create_consumer(
-                stream_id, bad_name, b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+                stream_id, bad_name, bad_name, b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
             )
             .await;
         assert!(
@@ -552,7 +554,7 @@ async fn create_consumer_config_mismatch_rejected() {
             .create_consumer(
                 stream_id,
                 b"f1_worker",
-                b"",
+                b"f1_worker",
                 b"",
                 10u16,
                 1u8,
@@ -571,7 +573,7 @@ async fn create_consumer_config_mismatch_rejected() {
         .create_consumer(
             stream_id,
             b"f1_worker",
-            b"",
+            b"f1_worker",
             b"",
             20u16,
             1u8,
@@ -599,7 +601,7 @@ async fn create_consumer_config_mismatch_rejected() {
             .create_consumer(
                 stream_id,
                 b"f1_worker",
-                b"",
+                b"f1_worker",
                 b"",
                 10u16,
                 1u8,
@@ -663,7 +665,7 @@ async fn rejected_reconsumer_does_not_corrupt_registry() {
     let sib_id = TestServer::parse_id(
         &client
             .create_consumer(
-                stream_id, b"sibling", b"", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
+                stream_id, b"sibling", b"sibling", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
             )
             .await
             .expect("sibling create must succeed"),
@@ -687,7 +689,7 @@ async fn rejected_reconsumer_does_not_corrupt_registry() {
     let victim_id = TestServer::parse_id(
         &client
             .create_consumer(
-                stream_id, b"victim", b"", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
+                stream_id, b"victim", b"victim", b"", 100u16, 1u8, 1u8, 0u8, 0u32, 0u64,
             )
             .await
             .expect("victim create must succeed"),
@@ -697,7 +699,7 @@ async fn rejected_reconsumer_does_not_corrupt_registry() {
     // engine-visible mismatch). Must be rejected with InvalidConsumerConfig.
     let err = client
         .create_consumer(
-            stream_id, b"victim", b"", b"", 50u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"victim", b"victim", b"", 50u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .expect_err("re-create with different config must be rejected");
@@ -742,5 +744,152 @@ async fn rejected_reconsumer_does_not_corrupt_registry() {
         "victim must receive exactly the 3 post-subscribe messages; a \
          rejected re-create must leave the registry deliver_policy intact"
     );
+    server.shutdown().await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GROUP-1: an EMPTY group must be rejected by the BROKER at CreateConsumer.
+//
+// Pre-fix the broker accepted it and, in Queue mode, ran the group through
+// `get_or_create_queue(stream_id, b"")` — allocating a real queue keyed
+// `(stream_id, "")`, a single anonymous queue silently shared by every
+// no-group queue consumer on that stream, so unrelated workers round-robined
+// each other's messages.
+//
+// Every client now fills the group in (group, else consumer name, else
+// stream name), so a CreateConsumer arriving without one is a client bug and
+// must fail loudly. Because the Rust client defaults the group before it
+// encodes the frame, this test talks RAW WIRE — it is the only way to put a
+// genuinely empty group in front of the dispatcher and prove the SERVER-side
+// guard, not the client-side one.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Send one cold-path frame on a raw socket and return `(action, body)` of
+/// the reply. Frames a HELLO first, so each call is a fresh connection that
+/// bypasses the client's group defaulting entirely.
+async fn raw_roundtrip(addr: &str, frame: Bytes) -> (u16, Vec<u8>) {
+    use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut sock = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("raw connect");
+
+    let mut hello = Vec::with_capacity(8);
+    hello.extend_from_slice(&ARBITRO_MAGIC_V2.to_le_bytes());
+    hello.extend_from_slice(&[0u8; 4]);
+    sock.write_all(&hello).await.expect("write HELLO");
+    sock.write_all(&frame).await.expect("write frame");
+
+    let mut header = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut header))
+        .await
+        .expect("reply must arrive")
+        .expect("reply header");
+    let action = u16::from_le_bytes(header[0..2].try_into().unwrap());
+    let msg_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; msg_len];
+    if msg_len > 0 {
+        tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut body))
+            .await
+            .expect("reply body must arrive")
+            .expect("reply body");
+    }
+    (action, body)
+}
+
+fn create_consumer_frame(stream_id: u32, name: &[u8], group: &[u8], deliver_mode: u8) -> Bytes {
+    use arbitro_proto::v2::cold::{ColdBody, CreateConsumer};
+    CreateConsumer {
+        stream_id,
+        name: name.to_vec(),
+        group: group.to_vec(),
+        subject: Vec::new(),
+        max_inflight: 100,
+        ack_policy: 1,
+        deliver_policy: 0,
+        deliver_mode,
+        ack_wait_ms: 30_000,
+        start_seq: 0,
+        subject_limits: Vec::new(),
+        max_nack: None,
+    }
+    .encode(1)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_consumer_empty_group_rejected_by_broker() {
+    use arbitro_proto::action::Action;
+    use arbitro_proto::error::ErrorCode;
+
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"group_guard").await;
+
+    // Queue mode (deliver_mode = 1) — the case that used to land every
+    // group-less consumer in the shared anonymous `(stream, "")` queue.
+    let (action, body) = raw_roundtrip(
+        &server.addr,
+        create_consumer_frame(stream_id, b"no_group_q", b"", 1),
+    )
+    .await;
+    assert_eq!(
+        action,
+        Action::RepError.as_u16(),
+        "empty group in Queue mode must come back as RepError"
+    );
+    assert_eq!(
+        u16::from_le_bytes(body[8..10].try_into().unwrap()),
+        ErrorCode::InvalidConsumerConfig.as_u16(),
+        "expected InvalidConsumerConfig"
+    );
+
+    // Fanout mode (deliver_mode = 0) — same rule. The group is mandatory
+    // regardless of delivery mode, so a client cannot dodge the guard by
+    // leaving the mode at its default.
+    let (action, body) = raw_roundtrip(
+        &server.addr,
+        create_consumer_frame(stream_id, b"no_group_f", b"", 0),
+    )
+    .await;
+    assert_eq!(
+        action,
+        Action::RepError.as_u16(),
+        "empty group in Fanout mode must come back as RepError"
+    );
+    assert_eq!(
+        u16::from_le_bytes(body[8..10].try_into().unwrap()),
+        ErrorCode::InvalidConsumerConfig.as_u16(),
+        "expected InvalidConsumerConfig"
+    );
+
+    // Neither rejected create may have left anything behind — no name
+    // registration, no anonymous queue.
+    assert!(
+        !consumer_exists(&client, stream_id, b"no_group_q").await,
+        "a rejected create must not register the consumer"
+    );
+    assert!(
+        !consumer_exists(&client, stream_id, b"no_group_f").await,
+        "a rejected create must not register the consumer"
+    );
+
+    // The byte-identical request WITH a group succeeds on the same raw
+    // path — the rejection is about the empty group and nothing else.
+    let (action, _) = raw_roundtrip(
+        &server.addr,
+        create_consumer_frame(stream_id, b"with_group", b"workers", 1),
+    )
+    .await;
+    assert_ne!(
+        action,
+        Action::RepError.as_u16(),
+        "the same frame with a non-empty group must be accepted"
+    );
+    assert!(
+        consumer_exists(&client, stream_id, b"with_group").await,
+        "the accepted create must be registered"
+    );
+
     server.shutdown().await;
 }

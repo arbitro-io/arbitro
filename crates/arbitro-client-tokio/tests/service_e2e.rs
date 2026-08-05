@@ -7,7 +7,10 @@
 //! - cross-connection (two clients)
 //! - requester disconnect
 //! - service crash → requester timeout
+//! - two instances SHARE requests (queue-grouped worker consumer)
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arbitro_client_tokio::{Client, ClientConfig};
@@ -164,6 +167,132 @@ async fn service_multiple_handlers_concurrent() {
     assert_eq!(sum2, 300);
 
     svc.close();
+}
+
+/// Two instances of the SAME service must SHARE the request load, not
+/// each receive every request.
+///
+/// Regression test for two independent defects in `ServiceBuilder::build`,
+/// each of which alone breaks multi-instance services:
+///
+///   1. `deliver_mode` was hardcoded to 0 (Fanout) on the worker consumer.
+///      The broker treats that byte as the sole determinant of fan-out and
+///      discards the group under Fanout, so every instance ran every
+///      handler and published every reply — `a + b == 2 * N`.
+///   2. The worker consumer NAME was service-wide, so every instance
+///      resolved to the same consumer id and therefore the same
+///      subscription id. The broker's binding table is keyed by
+///      subscription id, so each new instance's `subscribe` retired the
+///      previous one's binding: only the last instance to start received
+///      anything — `a == 0, b == N`.
+///
+/// Both failure modes are visible in the two assertions below, so this
+/// test pins the fix rather than one half of it:
+///   * `a + b == N` — no request handled twice (catches defect 1),
+///   * `a > 0 && b > 0` — work actually spread (catches defect 2).
+///
+/// The reply consumer is deliberately NOT changed: it stays per-instance
+/// and Fanout (`_svc-<service>-reply-<instance_id>`, filtered to that
+/// instance's own subjects), which is why every request below still gets
+/// exactly one reply back on the instance that issued it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_two_instances_share_requests() {
+    const N: usize = 20;
+
+    let addr = start_server().await;
+
+    let hits_a = Arc::new(AtomicUsize::new(0));
+    let hits_b = Arc::new(AtomicUsize::new(0));
+
+    // Instance A — its own connection, like a separate process would have.
+    let client_a = connect(&addr).await;
+    let svc_a = client_a
+        .service("sharing")
+        .build()
+        .await
+        .expect("instance A build");
+    {
+        let hits = Arc::clone(&hits_a);
+        svc_a.handle(b"work", move |_req| {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(b"a".to_vec())
+            }
+        });
+    }
+
+    // Instance B — same service name, second connection.
+    let client_b = connect(&addr).await;
+    let svc_b = client_b
+        .service("sharing")
+        .build()
+        .await
+        .expect("instance B build");
+    {
+        let hits = Arc::clone(&hits_b);
+        svc_b.handle(b"work", move |_req| {
+            let hits = Arc::clone(&hits);
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Ok(b"b".to_vec())
+            }
+        });
+    }
+
+    // Let both dispatch loops register their handlers.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Requester on a third connection.
+    let client_c = connect(&addr).await;
+    let requester = client_c
+        .service("sharing-caller")
+        .build()
+        .await
+        .expect("requester build");
+
+    for i in 0..N {
+        let reply = requester
+            .request(
+                "sharing",
+                b"work",
+                Bytes::from(format!("req-{i}")),
+                5_000,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("request {i} failed: {e:?}"));
+        // Whichever instance took it, exactly one reply comes back.
+        assert!(
+            &reply[..] == b"a" || &reply[..] == b"b",
+            "unexpected reply body for request {i}: {reply:?}"
+        );
+    }
+
+    // Handlers run in spawned tasks; a duplicate delivery would land here
+    // shortly after the reply the requester already accepted. Wait long
+    // enough that a Fanout regression cannot hide behind the race.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let a = hits_a.load(Ordering::SeqCst);
+    let b = hits_b.load(Ordering::SeqCst);
+
+    assert_eq!(
+        a + b,
+        N,
+        "each request must be handled exactly once across the two \
+         instances (got a={a}, b={b}, expected total {N}). A total of \
+         {} means the worker consumer is fanning out instead of \
+         queue-sharing.",
+        2 * N
+    );
+    assert!(
+        a > 0 && b > 0,
+        "load must be spread across both instances, got a={a}, b={b}"
+    );
+
+    svc_a.close();
+    svc_b.close();
+    requester.close();
 }
 
 /// #175: Service across different connections (two clients).

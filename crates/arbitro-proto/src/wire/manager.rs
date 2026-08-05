@@ -10,7 +10,14 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// ```
 ///
 /// Variable data layout: `[name (name_len)][group (group_len)][subject (subj_len)]`
-/// If `group_len == 0`, the server uses the stream name as default group.
+///
+/// `group_len == 0` is REJECTED by the broker with
+/// [`crate::error::ErrorCode::InvalidConsumerConfig`] (GROUP-1). There is no
+/// server-side default: the group the client sends is the group it gets, so
+/// every client must resolve it locally to `group`, else the consumer name,
+/// else the stream name. An empty group used to allocate a real queue keyed
+/// `(stream_id, "")` — one anonymous queue shared by every group-less
+/// consumer on the stream.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct CreateConsumerFixed {
@@ -137,7 +144,8 @@ impl<'a> CreateConsumerView<'a> {
             .get(CREATE_CONSUMER_FIXED_SIZE..CREATE_CONSUMER_FIXED_SIZE.checked_add(nl)?)
     }
 
-    /// Queue group name. Empty slice means "use stream name as default".
+    /// Queue group name. Mandatory — an empty slice is rejected by the
+    /// broker (GROUP-1); there is no server-side stream-name default.
     #[inline(always)]
     pub fn group(&self) -> &'a [u8] {
         let nl = self.fixed().name_len.get() as usize;

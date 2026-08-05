@@ -179,7 +179,7 @@ async fn consumer_survives_restart() {
             .unwrap();
         let sid = TestServer::parse_id(&resp);
         client
-            .create_consumer(sid, b"worker1", b"", b"", u16::MAX, 1, 0, 0, 0, 0)
+            .create_consumer(sid, b"worker1", b"worker1", b"", u16::MAX, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         assert_eq!(
@@ -249,7 +249,7 @@ async fn messages_survive_restart_with_disk_store() {
         let sid = TestServer::find_stream_id(&resp, b"durable").expect("durable stream not found");
 
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"reader", b"reader", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -431,7 +431,7 @@ async fn deleted_disk_stream_data_does_not_leak() {
         let sid =
             TestServer::find_stream_id(&resp, b"recycled").expect("recycled stream not found");
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"reader", b"reader", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -474,7 +474,7 @@ async fn consumer_and_messages_survive_together() {
             .unwrap();
         let sid = TestServer::parse_id(&resp);
         client
-            .create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"worker", b"worker", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         for i in 0u32..5 {
@@ -506,7 +506,7 @@ async fn consumer_and_messages_survive_together() {
         let resp = client.list_streams(0, 1000).await.unwrap();
         let sid = TestServer::find_stream_id(&resp, b"durable").expect("durable stream not found");
         let resp = client
-            .create_consumer(sid, b"worker", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"worker", b"worker", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -564,7 +564,7 @@ async fn publish_after_restart_continues() {
         let sid = TestServer::find_stream_id(&resp, b"seq").expect("seq stream not found");
 
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"reader", b"reader", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -655,7 +655,7 @@ async fn messages_survive_multiple_restarts() {
         let resp = client.list_streams(0, 1000).await.unwrap();
         let sid = TestServer::find_stream_id(&resp, b"multi").expect("multi stream not found");
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(sid, b"reader", b"reader", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -700,7 +700,7 @@ async fn consumer_survives_restart_with_same_id() {
         let stream_id = TestServer::parse_id(&resp);
         let resp = client
             .create_consumer(
-                stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+                stream_id, b"worker", b"worker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
             )
             .await
             .unwrap();
@@ -756,7 +756,7 @@ async fn deleted_consumer_stays_deleted_after_restart() {
         let stream_id = TestServer::parse_id(&resp);
         let resp = client
             .create_consumer(
-                stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+                stream_id, b"worker", b"worker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
             )
             .await
             .unwrap();
@@ -804,7 +804,7 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
                 .create_consumer(
                     stream_id,
                     name.as_bytes(),
-                    b"",
+                    name.as_bytes(),
                     b"",
                     100u16,
                     1u8,
@@ -832,7 +832,7 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
             .create_consumer(
                 stream_id,
                 b"worker-new",
-                b"",
+                b"worker-new",
                 b"",
                 100u16,
                 1u8,
@@ -909,7 +909,7 @@ async fn t8_retention_max_msgs_survives_restart() {
 
         let resp = client
             .create_consumer(
-                stream_id, b"reader", b"", b"", 100u16, 1u8, /* Explicit */
+                stream_id, b"reader", b"reader", b"", 100u16, 1u8, /* Explicit */
                 0u8, /* All */ 0u8, 30_000u32, 0u64,
             )
             .await
@@ -1234,7 +1234,7 @@ async fn deliver_policy_new_survives_restart() {
 
         client
             .create_consumer(
-                sid, b"tail", b"", b"", 100u16, 1u8, /* Explicit */
+                sid, b"tail", b"tail", b"", 100u16, 1u8, /* Explicit */
                 1u8, /* DeliverPolicy::New */ 0u8, 30_000u32, 0u64,
             )
             .await
@@ -1380,7 +1380,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
 
         // Consume from new stream A — should see exactly 5 messages.
         let resp = client
-            .create_consumer(a_sid2, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(a_sid2, b"reader", b"reader", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -1413,7 +1413,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
             .expect("stream_a not found after restart");
 
         let resp = client
-            .create_consumer(a_sid, b"reader2", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+            .create_consumer(a_sid, b"reader2", b"reader2", b"", u16::MAX, 0, 0, 0, 0, 0)
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);

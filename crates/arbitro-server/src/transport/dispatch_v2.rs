@@ -1701,7 +1701,18 @@ async fn v2_create_consumer(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
-    if !group.is_empty() && arbitro_proto::validate::validate_name(group).is_err() {
+    // GROUP-1: the group is MANDATORY. An empty group used to be accepted
+    // and, in Queue mode, allocated a real queue keyed `(stream_id, "")` —
+    // one anonymous queue silently shared by every no-group queue consumer
+    // on that stream, so unrelated workers round-robined each other's
+    // messages. Every client now fills the group in (group, else consumer
+    // name, else stream name), so a CreateConsumer arriving without one is
+    // a client bug: fail loudly instead of papering over it.
+    if group.is_empty() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+        return;
+    }
+    if arbitro_proto::validate::validate_name(group).is_err() {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
         return;
     }
@@ -2442,6 +2453,14 @@ async fn v2_create_consumer_raft(
             return;
         }
     };
+    // GROUP-1: reject the empty group BEFORE proposing. Without this the
+    // invalid create would be replicated to every follower and only then
+    // rejected by the local `v2_create_consumer` below, leaving a committed
+    // Raft entry that no node can apply.
+    if body.group.is_empty() {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+        return;
+    }
     let cmd = crate::cluster::state_machine::ClusterCommand::CreateConsumer {
         stream_name: format!("{}", body.stream_id),
         name: String::from_utf8_lossy(&body.name).to_string(),

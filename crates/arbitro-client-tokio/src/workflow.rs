@@ -451,15 +451,21 @@ impl WorkflowBuilder {
         )
         .await?;
 
-        // Fanout consumer on state stream — unique per worker (no group).
+        // Fanout consumer on state stream — unique per worker.
         // DeliverPolicy::All replays all park/remove events to build the map.
+        //
+        // The group is the consumer name, which is already per-worker
+        // unique (`..._state_w{uid}`), so this stays a group of one and
+        // every worker still sees every event. An empty group is not an
+        // option: it is rejected client-side (and by the broker) because
+        // it would key the shared anonymous queue `(stream_id, "")`.
         let state_consumer_name = format!("_wf_{name_str}_state_w{worker_uid}");
         let state_consumer_resp = self
             .client
             .create_consumer(
                 state_stream_id,
                 state_consumer_name.as_bytes(),
-                b"", // no group → fanout
+                state_consumer_name.as_bytes(), // group of one — per-worker fanout
                 state_subject.as_bytes(),
                 100,    // max_inflight
                 1,      // AckPolicy::Explicit

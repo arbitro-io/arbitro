@@ -210,7 +210,7 @@ async fn ack_sync_and_publish_wait_share_registry_without_crosstalk() {
         .create_consumer(
             stream_id,
             b"mix_c",
-            b"",
+            b"mix_c",
             b"",
             (N as u16) + 10,
             1u8,
@@ -307,7 +307,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"stale_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"stale_c", b"stale_c", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -435,7 +435,7 @@ async fn t11_reconnect_resumes_unacked_tail() {
             .create_consumer(
                 stream_id,
                 consumer_name,
-                b"",
+                consumer_name,
                 b"",
                 100u16,
                 1u8,
@@ -543,7 +543,7 @@ async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
     let resp = owner
-        .create_consumer(stream_id, b"t7_c", b"", b"", 100, 1, 0, 0, 30_000, 0)
+        .create_consumer(stream_id, b"t7_c", b"t7_c", b"", 100, 1, 0, 0, 30_000, 0)
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);

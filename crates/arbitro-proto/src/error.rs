@@ -31,9 +31,10 @@ pub enum ErrorCode {
     ConsumerNotFound = 0x0301,
     ConsumerAlreadyExists = 0x0302,
     // 0x0303 reserved (deleted ConsumerFilterOverlap) — §5.2.
-    /// The CreateConsumer request carries mutually incompatible fields
-    /// (e.g. `AckPolicy::None` + `max_inflight`, or `Fanout` + non-empty
-    /// `group`). The consumer was NOT created.
+    /// The CreateConsumer request carries an unusable configuration — most
+    /// commonly an **empty `group`**, which is mandatory (GROUP-1): clients
+    /// must default it to `group`, else the consumer name, else the stream
+    /// name. The consumer was NOT created.
     InvalidConsumerConfig = 0x0304,
 
     // 0x04xx — Delivery

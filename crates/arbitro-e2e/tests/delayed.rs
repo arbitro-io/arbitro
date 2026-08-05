@@ -27,7 +27,18 @@ async fn delayed_publish_arrives_after_delay() {
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"delayed_worker", b"", b"", 10, 1, 0, 0, 0, 0)
+        .create_consumer(
+            stream_id,
+            b"delayed_worker",
+            b"delayed_worker",
+            b"",
+            10,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -136,7 +147,18 @@ async fn delayed_publish_survives_broker_restart() {
 
         // Create a fresh consumer + subscribe.
         let resp = client
-            .create_consumer(stream_id, b"delayed_restart_c", b"", b"", 10, 1, 0, 0, 0, 0)
+            .create_consumer(
+                stream_id,
+                b"delayed_restart_c",
+                b"delayed_restart_c",
+                b"",
+                10,
+                1,
+                0,
+                0,
+                0,
+                0,
+            )
             .await
             .unwrap();
         let consumer_id = TestServer::parse_id(&resp);
@@ -201,7 +223,7 @@ async fn delayed_publish_duplicate_msg_id_is_deduped() {
     );
     let consumer_id = TestServer::parse_id(
         &client
-            .create_consumer(stream_id, b"dd_c", b"", b"", 100, 1, 0, 0, 5000, 0)
+            .create_consumer(stream_id, b"dd_c", b"dd_c", b"", 100, 1, 0, 0, 5000, 0)
             .await
             .unwrap(),
     );

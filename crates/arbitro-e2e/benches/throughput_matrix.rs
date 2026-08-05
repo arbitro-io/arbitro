@@ -519,7 +519,18 @@ async fn run_replay(
         let sid = stream_ids[i];
         let name = format!("replay_{tag}_{i}");
         let resp = setup
-            .create_consumer(sid, name.as_bytes(), b"", b"", u16::MAX, 0, 0, 0, 30_000, 0)
+            .create_consumer(
+                sid,
+                name.as_bytes(),
+                name.as_bytes(),
+                b"",
+                u16::MAX,
+                0,
+                0,
+                0,
+                30_000,
+                0,
+            )
             .await
             .expect("create consumer");
         let cid = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

@@ -66,7 +66,7 @@ async fn wildcard_subject_fanout_correct() {
         .create_consumer(
             stream_id,
             b"deliver-consumer",
-            b"", // group
+            b"deliver-consumer", // group = consumer name (empty group is rejected)
             b"", // subject = catch-all
             256, // max_inflight
             0,   // ack_policy = None
@@ -157,7 +157,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
     let stream_a = u64::from_le_bytes(resp_sa[..8].try_into().unwrap()) as u32;
 
     let resp_ca = client
-        .create_consumer(stream_a, b"cons-a", b"", b"", 256, 0, 0, 0, 30_000, 0)
+        .create_consumer(stream_a, b"cons-a", b"cons-a", b"", 256, 0, 0, 0, 30_000, 0)
         .await
         .expect("create consumer A");
     let cons_a = u64::from_le_bytes(resp_ca[..8].try_into().unwrap()) as u32;
@@ -170,7 +170,7 @@ async fn two_consumers_independent_streams_no_crosstalk() {
     let stream_b = u64::from_le_bytes(resp_sb[..8].try_into().unwrap()) as u32;
 
     let resp_cb = client
-        .create_consumer(stream_b, b"cons-b", b"", b"", 256, 0, 0, 0, 30_000, 0)
+        .create_consumer(stream_b, b"cons-b", b"cons-b", b"", 256, 0, 0, 0, 30_000, 0)
         .await
         .expect("create consumer B");
     let cons_b = u64::from_le_bytes(resp_cb[..8].try_into().unwrap()) as u32;

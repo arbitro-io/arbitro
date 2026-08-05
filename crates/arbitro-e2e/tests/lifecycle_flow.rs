@@ -18,7 +18,18 @@ async fn trace_publish_subscribe_ack_flow() {
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
-        .create_consumer(stream_id, b"trace_worker", b"", b"", 10, 1, 0, 0, 0, 0)
+        .create_consumer(
+            stream_id,
+            b"trace_worker",
+            b"trace_worker",
+            b"",
+            10,
+            1,
+            0,
+            0,
+            0,
+            0,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
@@ -90,7 +101,18 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
         .unwrap();
     let old_stream_id = TestServer::parse_id(&resp);
     let resp = client
-        .create_consumer(old_stream_id, b"t12_c", b"", b"", 100, 1, 0, 0, 30_000, 0)
+        .create_consumer(
+            old_stream_id,
+            b"t12_c",
+            b"t12_c",
+            b"",
+            100,
+            1,
+            0,
+            0,
+            30_000,
+            0,
+        )
         .await
         .unwrap();
     let old_consumer_id = TestServer::parse_id(&resp);
@@ -175,7 +197,7 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
         .create_consumer(
             new_stream_id,
             b"t12_fresh",
-            b"",
+            b"t12_fresh",
             b"",
             100,
             1,

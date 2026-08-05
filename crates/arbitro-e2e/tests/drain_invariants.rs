@@ -124,7 +124,7 @@ async fn ack_wait_timeout_redelivers() {
 
     // 500 ms wait window — short enough to keep the test fast.
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"", 100, 1,   /* Explicit */
+        &client, stream_id, b"worker", b"worker", b"", 100, 1,   /* Explicit */
         0,   /* All */
         500, /* ack_wait_ms */
         0,
@@ -176,7 +176,7 @@ async fn max_inflight_pauses_then_resumes_on_ack() {
 
     const K: u16 = 4;
     let consumer_id = create_consumer(
-        &client, stream_id, b"slow", b"", b"", K, 1, /* Explicit */
+        &client, stream_id, b"slow", b"slow", b"", K, 1, /* Explicit */
         0, /* All */
         30_000, 0,
     )
@@ -257,7 +257,7 @@ async fn wildcard_single_token_filter_matches_correctly() {
         &client,
         stream_id,
         b"reader",
-        b"",
+        b"reader",
         b"wcsingle.*.event",
         100,
         1,
@@ -332,7 +332,7 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
         &client,
         stream_id,
         b"reader",
-        b"",
+        b"reader",
         b"wcmulti.>",
         100,
         1,
@@ -389,7 +389,7 @@ async fn delete_consumer_mid_drain_stops_delivery() {
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"mid", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"", 100, 1, 0, 30_000, 0,
+        &client, stream_id, b"worker", b"worker", b"", 100, 1, 0, 30_000, 0,
     )
     .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
@@ -448,7 +448,7 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
         &client,
         stream_id,
         b"worker-a",
-        b"",
+        b"worker-a",
         b"",
         100,
         1,
@@ -461,7 +461,7 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
         &client,
         stream_id,
         b"worker-b",
-        b"",
+        b"worker-b",
         b"",
         100,
         1,
@@ -530,7 +530,7 @@ async fn ack_policy_none_drains_without_acks() {
         &client,
         stream_id,
         b"firehose",
-        b"",
+        b"firehose",
         b"",
         100,
         0, /* None */
@@ -615,7 +615,7 @@ async fn ack_policy_none_ignores_max_inflight() {
         &client,
         stream_id,
         b"firehose",
-        b"",
+        b"firehose",
         b"",
         2, /* max_inflight = tiny */
         0, /* AckPolicy::None */
@@ -669,7 +669,7 @@ async fn ack_policy_explicit_does_enforce_max_inflight() {
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"explicit-cap", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"worker", b"", b"", 2, /* max_inflight = tiny */
+        &client, stream_id, b"worker", b"worker", b"", 2, /* max_inflight = tiny */
         1, /* AckPolicy::Explicit */
         0, /* DeliverPolicy::All */
         30_000, 0,
@@ -731,7 +731,7 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
         .create_consumer_with_limits(
             stream_id,
             b"firehose",
-            b"",
+            b"firehose",
             b"",
             u16::MAX, // max_inflight unlimited
             0,        /* AckPolicy::None */
@@ -800,7 +800,7 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
 
     // Consumer that starts at seq 6 (deliver_policy=2 = ByStartSeq).
     let consumer_id = create_consumer(
-        &client, stream_id, b"late", b"", b"", 100, 1, 2, /* ByStartSeq */
+        &client, stream_id, b"late", b"late", b"", 100, 1, 2, /* ByStartSeq */
         30_000, 6,
     )
     .await;
@@ -837,7 +837,7 @@ async fn empty_stream_subscribe_produces_no_deliveries() {
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"empty", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"", 100, 1, 0, 30_000, 0,
+        &client, stream_id, b"reader", b"reader", b"", 100, 1, 0, 30_000, 0,
     )
     .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
@@ -865,7 +865,7 @@ async fn slow_consumer_fast_publisher_is_lossless() {
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"pace", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"slow", b"", b"", 16, /* tight inflight */
+        &client, stream_id, b"slow", b"slow", b"", 16, /* tight inflight */
         1, 0, 30_000, 0,
     )
     .await;
@@ -918,8 +918,10 @@ async fn recycle_subject_after_ack_drains_fresh_batch() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"recycle", b">").await;
-    let consumer_id =
-        create_consumer(&client, stream_id, b"worker", b"", b"", 10, 1, 0, 30_000, 0).await;
+    let consumer_id = create_consumer(
+        &client, stream_id, b"worker", b"worker", b"", 10, 1, 0, 30_000, 0,
+    )
+    .await;
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
     // Cycle 1 — publish_wait so the broker has confirmed acceptance
@@ -1070,7 +1072,7 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
         &sub_client,
         stream_id,
         b"reader",
-        b"",
+        b"reader",
         b"",
         u16::MAX,
         1,
@@ -1163,7 +1165,7 @@ async fn resubscribe_continues_from_cursor() {
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"cursor", b">").await;
     let consumer_id = create_consumer(
-        &client, stream_id, b"reader", b"", b"", 100, 1, 0, 30_000, 0,
+        &client, stream_id, b"reader", b"reader", b"", 100, 1, 0, 30_000, 0,
     )
     .await;
 
@@ -1245,7 +1247,7 @@ async fn t13_single_shard_saturation_no_silent_drops() {
     const TOTAL: usize = 1024;
     const INFLIGHT: u16 = 32;
     let consumer_id = create_consumer(
-        &client, stream_id, b"c1", b"", b"", INFLIGHT, 1, /* Explicit */
+        &client, stream_id, b"c1", b"c1", b"", INFLIGHT, 1, /* Explicit */
         0, /* All */
         30_000, 0,
     )
@@ -1379,8 +1381,10 @@ async fn partial_write_recovery_redelivers_unacked() {
     let stream_id = create_stream(&client, b"pw_recover", b">").await;
 
     // ack_wait_ms = 500ms — short enough for the test to be fast.
-    let consumer_id =
-        create_consumer(&client, stream_id, b"pw_sub", b"", b"", 10, 1, 0, 500, 0).await;
+    let consumer_id = create_consumer(
+        &client, stream_id, b"pw_sub", b"pw_sub", b"", 10, 1, 0, 500, 0,
+    )
+    .await;
 
     // Publish 5 messages before subscribing.
     for i in 0u32..5 {
@@ -1643,7 +1647,7 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
         &client,
         stream_id,
         b"dead-reader",
-        b"",
+        b"dead-reader",
         b"",
         100,
         0, /* None */
@@ -1654,7 +1658,7 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     .await;
     // B — healthy explicit-ack sibling.
     let consumer_b = create_consumer(
-        &client, stream_id, b"healthy", b"", b"", 512, 1, /* Explicit */
+        &client, stream_id, b"healthy", b"healthy", b"", 512, 1, /* Explicit */
         0, 0, 0,
     )
     .await;
@@ -1810,7 +1814,7 @@ async fn nack_during_active_drain_always_redelivers() {
         // Small window: the drain pauses/resumes on every few acks, so
         // cycles are guaranteed to be mid-flight while nacks land.
         let consumer_id = create_consumer(
-            &client, stream_id, b"racer", b"", b"", 4,      /* max_inflight */
+            &client, stream_id, b"racer", b"racer", b"", 4,      /* max_inflight */
             1,      /* Explicit */
             0,      /* All */
             30_000, /* ack_wait_ms — keep the wheel out of this test */

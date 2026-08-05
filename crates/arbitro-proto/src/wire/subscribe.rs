@@ -8,7 +8,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// ```
 ///
 /// Variable data layout: `[group (group_len)][subject (subj_len)]`
-/// If `group_len == 0`, the server uses the stream name as default group.
+///
+/// There is no server-side stream-name default for `group` — the broker
+/// resolves a subscribing consumer's queue from the group it was CREATED
+/// with (`CreateConsumer`, where an empty group is rejected outright —
+/// GROUP-1), not from this field.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct SubscribeFixed {
@@ -80,7 +84,8 @@ impl<'a> SubscribeView<'a> {
         self.fixed().group_len.get()
     }
 
-    /// Queue group name. Empty slice means "use stream name as default".
+    /// Queue group name. No server-side default — the queue comes from the
+    /// group recorded at `CreateConsumer` time (GROUP-1).
     #[inline(always)]
     pub fn group(&self) -> &'a [u8] {
         let gl = self.fixed().group_len.get() as usize;

@@ -376,7 +376,7 @@ async fn workflow_across_cluster_nodes() {
             create_client.create_consumer(
                 stream_id,
                 b"wf_worker", // consumer name
-                b"",          // group (empty = no load-balancing group)
+                b"wf_worker", // group (mandatory — defaults to the consumer name)
                 b"",          // subject filter (empty = all)
                 10,           // max_inflight
                 1,            // ack_policy = Explicit

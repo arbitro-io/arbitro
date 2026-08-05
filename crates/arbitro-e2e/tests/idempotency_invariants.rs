@@ -487,7 +487,7 @@ async fn delivery_with_headers_strips_metadata() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"strip_c", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+            stream_id, b"strip_c", b"strip_c", b"", 100u16, 1u8,     // AckPolicy::Explicit
             0u8,     // DeliverPolicy::All
             0u8,     // DeliverMode::default
             5000u32, // ack_wait_ms
@@ -557,7 +557,7 @@ async fn cross_restart_idempotency_with_consumer() {
 
         let resp = client
             .create_consumer(
-                stream_id, b"worker", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+                stream_id, b"worker", b"worker", b"", 100u16, 1u8,     // AckPolicy::Explicit
                 0u8,     // DeliverPolicy::All
                 0u8,     // DeliverMode::default
                 5000u32, // ack_wait_ms
@@ -638,7 +638,7 @@ async fn cross_restart_idempotency_with_consumer() {
         // Re-create consumer (same name returns same id) and subscribe.
         let resp = client
             .create_consumer(
-                stream_id, b"worker", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+                stream_id, b"worker", b"worker", b"", 100u16, 1u8,     // AckPolicy::Explicit
                 0u8,     // DeliverPolicy::All
                 0u8,     // DeliverMode::default
                 5000u32, // ack_wait_ms
@@ -707,7 +707,7 @@ async fn publish_with_headers_roundtrip() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"c_hdrs", b"", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
+            stream_id, b"c_hdrs", b"c_hdrs", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
         )
         .await
         .unwrap();
@@ -773,7 +773,7 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
         let consumer_id = TestServer::parse_id(
             &client
                 .create_consumer(
-                    stream_id, b"bh_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
+                    stream_id, b"bh_c", b"bh_c", b"", 100u16, 1u8, 0u8, 0u8, 5000u32, 0u64,
                 )
                 .await
                 .unwrap(),

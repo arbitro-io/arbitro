@@ -303,6 +303,19 @@ impl ArbitroStateMachine {
         let name_bytes = name.as_bytes();
         let group_bytes = group.as_bytes();
 
+        // GROUP-1 (mirrored from `v2_create_consumer`): the group is
+        // mandatory. The proposing dispatch rejects an empty group before it
+        // ever reaches Raft, so this is a defensive apply-side guard — a
+        // follower must never materialise the anonymous `(stream, "")` queue
+        // from a malformed or legacy log entry.
+        if group_bytes.is_empty() {
+            tracing::warn!(
+                name,
+                "state_machine: create_consumer — empty group, rejected (GROUP-1)"
+            );
+            return;
+        }
+
         let ack_pol = match ack_policy {
             0 => AckPolicy::None,
             _ => AckPolicy::Explicit,

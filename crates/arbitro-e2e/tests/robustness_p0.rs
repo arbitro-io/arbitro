@@ -40,7 +40,7 @@ async fn double_ack_does_not_wedge_consumer() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"worker", b"worker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -109,7 +109,7 @@ async fn redelivery_does_not_leak_inflight_capacity() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"worker", b"", b"", 8u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"worker", b"worker", b"", 8u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -224,7 +224,9 @@ async fn acked_cursor_survives_restart() {
             .unwrap();
         let sid = TestServer::parse_id(&resp);
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .create_consumer(
+                sid, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            )
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);
@@ -258,7 +260,9 @@ async fn acked_cursor_survives_restart() {
 
         // Same durable name — resolves to the replayed consumer.
         let resp = client
-            .create_consumer(sid, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64)
+            .create_consumer(
+                sid, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            )
             .await
             .unwrap();
         let cid = TestServer::parse_id(&resp);

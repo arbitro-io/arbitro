@@ -103,7 +103,7 @@ async fn create_consumer_and_delete() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"worker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"worker", b"worker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -134,7 +134,7 @@ async fn publish_single_delivers_correctly() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -171,7 +171,7 @@ async fn publish_batch_delivers_all() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"sink", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"sink", b"sink", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -263,7 +263,7 @@ async fn replay_deliver_all_historical() {
         .create_consumer(
             stream_id,
             b"replayer",
-            b"",
+            b"replayer",
             b"",
             200u16,
             1u8,
@@ -311,7 +311,7 @@ async fn ack_prevents_redelivery() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"acker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"acker", b"acker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -349,7 +349,7 @@ async fn nack_causes_redelivery() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"nacker", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"nacker", b"nacker", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn delivery_preserves_order() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"reader", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -728,7 +728,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
     let cli_a = server.connect().await;
     let resp = cli_a
         .create_consumer(
-            stream_id, b"qfa", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"qfa", b"qfa", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -741,7 +741,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
     let cli_b = server.connect().await;
     let resp = cli_b
         .create_consumer(
-            stream_id, b"qfb", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"qfb", b"qfb", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -941,7 +941,7 @@ async fn consumers_on_different_streams_isolated() {
         .create_consumer(
             stream_id1,
             b"log_sink",
-            b"",
+            b"log_sink",
             b"",
             100u16,
             1u8,
@@ -958,7 +958,7 @@ async fn consumers_on_different_streams_isolated() {
         .create_consumer(
             stream_id2,
             b"metric_sink",
-            b"",
+            b"metric_sink",
             b"",
             100u16,
             1u8,
@@ -1339,7 +1339,7 @@ async fn streams_are_isolated() {
         .create_consumer(
             stream_id_b,
             b"beta_reader",
-            b"",
+            b"beta_reader",
             b"",
             100u16,
             1u8,
@@ -1383,7 +1383,7 @@ async fn ack_sync_returns_ok() {
 
     let resp = client
         .create_consumer(
-            stream_id, b"syncer", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"syncer", b"syncer", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
@@ -1434,7 +1434,7 @@ async fn max_inflight_caps_delivery() {
         .create_consumer(
             stream_id,
             b"inf_consumer",
-            b"",
+            b"inf_consumer",
             b"",
             2u16,
             1u8,
@@ -1519,7 +1519,7 @@ async fn max_subject_inflight_multiple_patterns() {
     ];
     let resp = client
         .create_consumer_with_limits(
-            stream_id, b"msi_c", b"", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64, &limits,
+            stream_id, b"msi_c", b"msi_c", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64, &limits,
         )
         .await
         .unwrap();

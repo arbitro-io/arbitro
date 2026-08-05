@@ -130,7 +130,18 @@ async fn multi_mb_payload_round_trips() {
     let stream_id = TestServer::parse_id(&resp);
 
     let consumer_resp = client
-        .create_consumer(stream_id, b"reader", b"", b"", u16::MAX, 0, 0, 0, 0, 0)
+        .create_consumer(
+            stream_id,
+            b"reader",
+            b"reader",
+            b"",
+            u16::MAX,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&consumer_resp);

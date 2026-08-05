@@ -269,6 +269,21 @@ impl MetadataApplier for ReplayApplier {
             }
             CMD_CREATE_CONSUMER => {
                 let cv = CreateConsumerView::new(view.body());
+                // GROUP-1 (mirrored from `v2_create_consumer`): the group is
+                // mandatory. The live dispatch rejects an empty group before
+                // the record is ever written, so a record without one is
+                // legacy (or corrupt). Replaying it would rebuild the
+                // anonymous `(stream, "")` queue that GROUP-1 exists to kill,
+                // so skip it — the consumer comes back the moment its client
+                // re-creates it with a real group. Warn loudly so an operator
+                // can see exactly which consumer was dropped.
+                if cv.group().is_empty() {
+                    tracing::warn!(
+                        consumer = %String::from_utf8_lossy(cv.name()),
+                        "replay CreateConsumer with empty group — skipping (GROUP-1)"
+                    );
+                    return;
+                }
                 // Translate the client-supplied wire stream id.
                 let wire_stream = cv.stream_id();
                 let (stream_id, _) = self.server.names().get_or_create_stream(wire_stream);

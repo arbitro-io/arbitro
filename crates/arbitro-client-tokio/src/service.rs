@@ -470,18 +470,49 @@ impl ServiceBuilder {
         let stream_id = parse_stream_id_from_response(&resp)?;
 
         // Worker consumer: queue-grouped so N instances share request load.
-        let worker_consumer_name = format!("_svc-{}-worker", self.name);
+        //
+        // Two things have to be true for that to actually happen, and only
+        // one of them used to be:
+        //
+        // 1. `deliver_mode` must be Queue. The broker treats the byte as
+        //    the SOLE determinant of fan-out: under Fanout it discards the
+        //    group and forces QueueId(0), i.e. plain broadcast. This was
+        //    hardcoded to 0, so the queue group was decorative.
+        //
+        // 2. The consumer NAME must be per-instance while the GROUP stays
+        //    service-wide. Queue membership is keyed by group, but the
+        //    broker's binding table is keyed by subscription id, which
+        //    defaults to the consumer id. A service-wide consumer name
+        //    means every instance resolves to the SAME consumer id and
+        //    therefore the same subscription id, so each new instance's
+        //    `subscribe` RETIRED the previous instance's binding
+        //    (`Catalog::bind` → `by_subscription` takeover). Only the
+        //    last instance to start received anything at all — under
+        //    Fanout as much as under Queue.
+        //
+        // Per-instance name + shared group is the same shape the workflow
+        // runner already uses for its task consumers, and the shape the
+        // reply consumer below has always used. Distinct consumer ids give
+        // each instance its own binding; the shared group gives them one
+        // queue id, and the drain's per-queue dedup hands each request to
+        // exactly one of them.
+        //
+        // No replay cost for a late-joining instance: the delivery cursor
+        // is per-stream, not per-consumer, so a fresh worker consumer does
+        // not re-walk requests its siblings already handled.
+        let worker_group = format!("_svc-{}-worker", self.name);
+        let worker_consumer_name = format!("{worker_group}-{instance_str}");
         let worker_resp = self
             .client
             .create_consumer(
                 stream_id,
-                worker_consumer_name.as_bytes(),
-                worker_consumer_name.as_bytes(), // group = same name (load balanced)
+                worker_consumer_name.as_bytes(), // per-instance → own binding
+                worker_group.as_bytes(),         // service-wide → shared queue
                 &worker_filter,
                 self.max_inflight as u16,
                 1,      // ack_policy: explicit
                 0,      // deliver_policy: all
-                0,      // deliver_mode: push
+                1,      // deliver_mode: Queue — share requests across instances
                 30_000, // ack_wait_ms
                 0,      // start_seq
             )
@@ -492,20 +523,31 @@ impl ServiceBuilder {
             .subscribe(stream_id, consumer_id, &worker_filter)
             .await?;
 
-        // Reply consumer: private per-instance, NOT queue-grouped so
-        // replies are never load-balanced away. Fixes BUG-2.
+        // Reply consumer: private per-instance, so replies are never
+        // load-balanced away. Fixes BUG-2.
+        //
+        // deliver_mode stays Fanout ON PURPOSE — this is the one consumer
+        // that must NOT share. Every instance needs its own replies, and
+        // the per-instance subject filter (`_svc.<name>._r.<instance>.>`)
+        // is what keeps them apart, not the queue. Fanout under a filter
+        // that only this instance can match delivers exactly the replies
+        // this instance is waiting for.
+        //
+        // The group is still filled in (the consumer name, which already
+        // carries the per-instance id) because the broker rejects an empty
+        // group outright; under Fanout it is discarded server-side anyway.
         let reply_consumer_name = format!("_svc-{}-reply-{}", self.name, instance_str);
         let reply_resp = self
             .client
             .create_consumer(
                 stream_id,
                 reply_consumer_name.as_bytes(),
-                b"", // no group — solo delivery
+                reply_consumer_name.as_bytes(), // group of one — solo delivery
                 &reply_filter,
                 self.max_inflight as u16,
                 1,      // ack_policy: explicit
                 0,      // deliver_policy: all
-                0,      // deliver_mode: push
+                0,      // deliver_mode: Fanout — per-instance, never shared
                 30_000, // ack_wait_ms
                 0,      // start_seq
             )

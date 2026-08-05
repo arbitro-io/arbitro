@@ -91,7 +91,7 @@ async fn setup(
         .create_consumer(
             stream_id,
             b"ack_worker",
-            b"",
+            b"ack_worker",
             b"",
             max_inflight,
             1, // ack_policy = Explicit
@@ -275,7 +275,7 @@ async fn correctness_probe(client: &Client, probe_count: u32) -> u32 {
         .create_consumer(
             stream_id,
             b"probe_worker",
-            b"",
+            b"probe_worker",
             b"",
             1024,
             0, // ack_policy = None

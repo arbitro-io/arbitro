@@ -70,7 +70,7 @@ async fn full_management_crud_roundtrip() {
         .create_consumer(
             stream_wire_id,
             b"worker",
-            b"",
+            b"worker", // group = consumer name (empty group is rejected)
             b"",
             16, // max_inflight
             0,  // ack_policy = None
@@ -105,6 +105,67 @@ async fn full_management_crud_roundtrip() {
         .delete_stream(b"orders")
         .await
         .expect("delete_stream");
+
+    client.close();
+}
+
+/// The `ConsumerBuilder` group default, proven against a live broker.
+///
+/// The broker rejects an empty group with `InvalidConsumerConfig`, so a
+/// builder that stopped defaulting would fail here — this test cannot pass
+/// unless the group actually arrives filled in (group → name → stream
+/// name). The exact byte sent is asserted separately, on the encoded
+/// frame, in `consumer_builder`'s unit tests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consumer_builder_defaults_group_so_broker_accepts_it() {
+    use arbitro_client_tokio::{AckPolicy, ConsumerBuilder, ClientError, DeliverMode};
+    use arbitro_proto::error::ErrorCode;
+
+    let addr = start_server().await;
+    let client = connect(&addr).await;
+
+    let resp = client
+        .create_stream(b"grp_default", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .expect("create_stream");
+    let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+
+    // No `.group(..)` anywhere, and Queue mode — the shape that used to
+    // land every group-less worker in the shared anonymous queue.
+    let consumer_id = ConsumerBuilder::new(b"grp_default_worker")
+        .ack_policy(AckPolicy::Explicit)
+        .deliver_mode(DeliverMode::Queue)
+        .create(&client, stream_id)
+        .await
+        .expect("unset group must default to the consumer name, not stay empty");
+    assert_ne!(consumer_id, 0);
+
+    // Same via the raw wire method: NOT defaulted (it is the verbatim
+    // escape hatch), so the broker's guard is what answers.
+    let err = client
+        .create_consumer(
+            stream_id,
+            b"grp_raw_worker",
+            b"", // empty group, sent as-is
+            b"",
+            16,
+            1,
+            0,
+            1,
+            30_000,
+            0,
+        )
+        .await
+        .expect_err("raw create_consumer must not default the group");
+    assert!(
+        matches!(
+            err,
+            ClientError::Broker {
+                code: ErrorCode::InvalidConsumerConfig
+            }
+        ),
+        "expected InvalidConsumerConfig, got {err:?}"
+    );
 
     client.close();
 }

@@ -253,14 +253,14 @@ fn main() {
             .create_consumer(
                 stream_id,
                 b"mem_consumer",
-                b"",      // queue group (unique → fanout group of 1)
-                b"",      // no filter override
-                u16::MAX, // max_inflight
-                1u8,      // AckPolicy::Explicit
-                0u8,      // DeliverPolicy::All
-                0u8,      // DeliverMode::Push
-                30_000,   // ack_wait_ms
-                0,        // start_seq
+                b"mem_consumer", // queue group (mandatory — defaults to the consumer name)
+                b"",             // no filter override
+                u16::MAX,        // max_inflight
+                1u8,             // AckPolicy::Explicit
+                0u8,             // DeliverPolicy::All
+                0u8,             // DeliverMode::Push
+                30_000,          // ack_wait_ms
+                0,               // start_seq
             )
             .await
             .expect("create_consumer");

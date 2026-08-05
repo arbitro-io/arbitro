@@ -368,7 +368,7 @@ async fn run_replay(
             .create_consumer(
                 stream_id,
                 name.as_bytes(),
-                b"",
+                name.as_bytes(),
                 b"",
                 u16::MAX,
                 0, // ack_policy = None
