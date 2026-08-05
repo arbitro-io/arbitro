@@ -22,11 +22,14 @@ pub struct DeltaEvents {
     /// Bindings retired by `delete_stream`, `delete_consumer`, or
     /// `mark_connection_dead`.
     pub bindings_retired: Vec<BindingId>,
-    /// (consumer_id, subject_hash) pairs whose pending entries were
-    /// released by ack/nack/retire. The server forwards each as a
-    /// `DrainEvent::Ack` so the drain-owned
-    /// `ConsumerSubjects` slot decrements in lock-step.
-    pub subject_hashes_acked: Vec<(u32, u32)>,
+    /// (consumer_id, subject_hash, seq) triples whose pending entries
+    /// were released by ack/nack/retire. The server forwards each as a
+    /// `DrainEvent::Ack` so the drain-owned `ConsumerSubjects` slot
+    /// decrements in lock-step. The seq drives the drain's redelivery
+    /// suppression set: an ack keeps the seq suppressed forever, while
+    /// a nack/timeout/retirement release removes it so the seq becomes
+    /// deliverable again (the server distinguishes by call-site).
+    pub subject_hashes_acked: Vec<(u32, u32, u64)>,
     /// Consumer ids whose entities were removed as part of this
     /// mutation. Populated by `delete_consumer` (single id) and by
     /// `delete_stream` (every consumer attached to the stream).

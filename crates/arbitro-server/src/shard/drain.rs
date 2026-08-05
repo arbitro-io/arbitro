@@ -502,7 +502,14 @@ pub(in crate::shard) fn drain_deliver(
             counters.inc_inflight(d.consumer_id, d.queue_id);
             // Drain owns the per-(consumer, subject) inflight map; this
             // is a local HashMap mutation, no atomics, no contention.
-            consumer_subjects_slot_mut(consumer_subjects, d.consumer_id).inc(d.subject_hash);
+            let cs = consumer_subjects_slot_mut(consumer_subjects, d.consumer_id);
+            cs.inc(d.subject_hash);
+            // Delivery memory: this seq is now in flight for this
+            // consumer — a re-walk (pinned cursor, rewind) must not
+            // re-send it unless the command thread explicitly releases
+            // it (ack absorbs it into the floor; nack/ack-timeout/
+            // retirement remove it so redelivery re-arms).
+            cs.suppress(d.seq);
         }
     }
 
@@ -768,21 +775,29 @@ fn dispatch_recipients(
             continue;
         }
 
-        // Temporal isolation (D5/A7): never re-deliver a seq this
-        // consumer has already acked. `ack_floor` is the contiguous-
-        // acked prefix (all seqs <= floor acked, gap-free) maintained by
-        // the command thread (`shard/ack_floor.rs`) and mirrored into
-        // the drain-owned slot via `DrainEvent::Ack` — any owed seq
-        // (pending, nacked, or never delivered) is unacked and therefore
-        // above the floor, so this skip can never suppress a legitimate
-        // (re)delivery. No `track_skipped`/`served_queues` side effects:
-        // the entry is not owed to this consumer, so the cursor must not
-        // be pinned on it and a queue sibling must not be starved of it.
-        // Steady-state cost: the cursor only moves forward, so
-        // `entry.seq > floor` always holds — one predicted-not-taken
-        // comparison against drain-local state (no atomics, no alloc).
+        // Temporal isolation (D5/A7) + delivery memory: never send a seq
+        // this consumer has already acked OR already has in flight.
+        // `is_suppressed` covers the contiguous-acked floor (all seqs
+        // <= floor acked, gap-free — maintained by the command thread in
+        // `shard/ack_floor.rs` and mirrored via `DrainEvent::Ack`) PLUS
+        // the delivered-or-acked set above it (fed by Phase 3 on every
+        // successful ack-mode delivery, re-armed by explicit releases:
+        // nack, ack-timeout, retirement). The set is what breaks the
+        // redelivery livelock: a capacity-capped low seq pins the cursor
+        // AND freezes the floor, so without delivery memory every cycle
+        // re-walked the pinned window re-sending in-flight and acked
+        // seqs without bound (measured: 911k deliveries for 300
+        // published). Every owed seq (never delivered, nacked, timed
+        // out, or released by retirement) is absent from both parts, so
+        // this skip can never suppress a legitimate (re)delivery. No
+        // `track_skipped`/`served_queues` side effects: the entry is not
+        // owed to this consumer, so the cursor must not be pinned on it
+        // and a queue sibling must not be starved of it. Steady-state
+        // cost for the forward-moving cursor: one compare (seq > floor)
+        // + one is_empty/contains check against drain-local state — no
+        // atomics, no alloc.
         if let Some(cs) = consumer_subjects_slot(consumer_subjects, consumer_id.0) {
-            if entry.seq <= cs.ack_floor() {
+            if cs.is_suppressed(entry.seq) {
                 dbg_acked_floor += 1;
                 continue;
             }

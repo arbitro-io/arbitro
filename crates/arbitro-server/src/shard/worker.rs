@@ -212,10 +212,36 @@ impl DrainWorker {
                 // `more_pending`); it never clears it. Clearing is owned here.
                 self.gate.lock();
 
+                // Consume the rewind signal BEFORE draining the event ring.
+                // The command thread orders: (C1) push `Released` events
+                // into the ring inside `apply_delta_and_sync`, THEN (C2)
+                // `signal_rewind` (nack / ack-timeout / retirement). With
+                // the old order — ring first, rewind second — the
+                // interleaving T(drain ring) < C1 < C2 < T(take_rewind)
+                // consumed the rewind while the `Released` was still in the
+                // ring: the rewound walk saw the seq suppressed, skipped it
+                // WITHOUT `track_skipped`, the cursor re-advanced, and the
+                // event was applied on a later cycle with no rewind left —
+                // a nacked or timed-out message was never redelivered on a
+                // quiescent workload. Taking the rewind FIRST restores the
+                // implication "signal visible ⇒ its Released events are in
+                // the ring": `signal_rewind` is a Release store sequenced
+                // after the ring push (itself a Release store on the ring
+                // head), and `take_rewind` is an Acquire swap, so observing
+                // the signal happens-after C1's push and the ring drain
+                // below must see the event.
+                if let Some(rw) = self.counters.take_rewind() {
+                    let cur = self.counters.cursor();
+                    if rw > 0 && rw - 1 < cur {
+                        self.counters.set_cursor(rw - 1);
+                    }
+                }
+
                 // Drain the command→drain event ring before deciding any
                 // delivery. This applies acks (subject inflight decs) and
                 // consumer removals so the upcoming dispatch sees current
-                // per-consumer state.
+                // per-consumer state. Must run AFTER `take_rewind` above —
+                // see the ordering-race comment there.
                 drain_event_ring(&mut self.drain_evt_rx, &mut self.consumer_subjects);
 
                 let now_ms = if self.drain_config.max_age_ms > 0 {
@@ -230,14 +256,6 @@ impl DrainWorker {
                 // Load snapshot — Arc clone (~3ns), no lock on engine.
                 let snap = self.snapshot.load();
                 let prev_cursor = self.counters.cursor();
-
-                // Check for rewind signal from command thread.
-                if let Some(rw) = self.counters.take_rewind() {
-                    let cur = self.counters.cursor();
-                    if rw > 0 && rw - 1 < cur {
-                        self.counters.set_cursor(rw - 1);
-                    }
-                }
 
                 // Split drain into two phases so the store lock is held
                 // ONLY during the for_each walk (Phase 1). TCP delivery
@@ -309,11 +327,20 @@ fn drain_event_ring(
                 consumer_id,
                 subject_hash,
                 ack_floor,
+                seq,
+                op,
             } => {
                 let idx = consumer_id.raw() as usize;
                 if let Some(Some(cs)) = consumer_subjects.get_mut(idx) {
                     cs.dec(subject_hash);
+                    // Raise first: an in-order ack is absorbed by the
+                    // floor and never touches the suppression set.
                     cs.raise_ack_floor(ack_floor);
+                    match op {
+                        crate::shard::drain_events::SuppressOp::Acked => cs.suppress(seq),
+                        crate::shard::drain_events::SuppressOp::Released => cs.release(seq),
+                        crate::shard::drain_events::SuppressOp::None => {}
+                    }
                 }
             }
             DrainEvent::ConsumerRemoved { consumer_id } => {
@@ -469,6 +496,21 @@ pub struct CommandWorker {
     /// ring. Drained at the top of every command loop iteration so a
     /// transient ring-full doesn't leak the per-consumer subject slot.
     pub(super) pending_consumer_remove: Vec<ConsumerId>,
+    /// `DrainEvent::Ack`s that lost a `try_send` because the drain-event
+    /// ring was full — reachable deterministically by a bulk nack or a
+    /// connection death with more than `DRAIN_EVENT_CAP` pendings while
+    /// the drain is parked (`apply_delta_and_sync` pushes the whole
+    /// delta before `gate.release()`, so nothing drains mid-loop).
+    /// Retried at the top of every command-loop iteration, same pattern
+    /// as `pending_consumer_remove`. These events are correctness-
+    /// critical, NOT droppable: a lost `Released` leaves its seq in the
+    /// drain's suppression set forever — the contiguous floor can never
+    /// rise past it (it is unacked) and resubscribe replays from above
+    /// it — permanent starvation of that message for that consumer. A
+    /// lost `Acked` leaks a subject-inflight credit. Entries for a
+    /// consumer are purged when its `ConsumerRemoved` is emitted, so a
+    /// stale event can never be applied to a pool-recycled consumer id.
+    pub(super) pending_drain_acks: Vec<crate::shard::drain_events::DrainEvent>,
     /// Per-consumer contiguous-acked floor (temporal isolation). Fed in
     /// `handle_ack` with engine-matched seqs only; the current floor is
     /// piggybacked on every `DrainEvent::Ack` so the drain-owned
@@ -536,6 +578,49 @@ impl CommandWorker {
         loop {
             // Process any pending drain notifications first (non-blocking).
             self.drain_notifications();
+
+            // Retry `DrainEvent::Ack`s that lost a `try_send` because the
+            // drain-event ring was full (bulk nack / connection death with
+            // > DRAIN_EVENT_CAP pendings). Retained until the ring accepts
+            // them — a lost `Released` permanently starves its seq (see
+            // the `pending_drain_acks` field doc). For every re-sent
+            // `Released` the cursor rewind is re-signalled: the rewind
+            // signalled alongside the original (overflowed) push may have
+            // been consumed by a drain cycle that ran before the event
+            // reached the ring — that walk skipped the still-suppressed
+            // seq without `track_skipped`, so without a fresh rewind the
+            // cursor never comes back to it. Retry order within the queue
+            // is irrelevant: `dec` is commutative, the floor is a
+            // monotonic max, and per-seq suppress/release inversions are
+            // impossible while an event is queued (an `Acked` for a seq
+            // requires a redelivery, which requires its `Released` to have
+            // been applied first).
+            if !self.pending_drain_acks.is_empty() {
+                let mut sent_any = false;
+                let mut min_released: Option<u64> = None;
+                while let Some(&evt) = self.pending_drain_acks.first() {
+                    if self.drain_evt_tx.try_send(evt).is_err() {
+                        // Ring full again — keep the rest for the next pass.
+                        break;
+                    }
+                    if let crate::shard::drain_events::DrainEvent::Ack {
+                        seq,
+                        op: crate::shard::drain_events::SuppressOp::Released,
+                        ..
+                    } = evt
+                    {
+                        min_released = Some(min_released.map_or(seq, |m| m.min(seq)));
+                    }
+                    sent_any = true;
+                    self.pending_drain_acks.swap_remove(0);
+                }
+                if let Some(min_seq) = min_released {
+                    rewind_released(&self.counters, min_seq);
+                }
+                if sent_any {
+                    self.gate.release();
+                }
+            }
 
             // H11: retry any ConsumerRemoved events the previous cycle
             // couldn't push because the drain-event ring was full. We
@@ -726,6 +811,12 @@ impl CommandWorker {
                                 consumer_id,
                                 subject_hash: sh,
                                 ack_floor,
+                                // Counter reconciliation for a duplicate
+                                // redelivery — nothing was acked and
+                                // nothing was released: the suppression
+                                // set must not change.
+                                seq: 0,
+                                op: crate::shard::drain_events::SuppressOp::None,
                             })
                             .is_err()
                         {
@@ -742,7 +833,7 @@ impl CommandWorker {
             }
             DrainNotification::ConnectionDead(conn_id) => {
                 let delta = self.engine.mark_connection_dead(conn_id);
-                self.apply_delta_and_sync(&delta);
+                self.apply_delta_and_sync(&delta, false);
             }
         }
     }
@@ -814,6 +905,14 @@ impl CommandWorker {
         // M5: explicit `entry.kind` tag distinguishes the two paths.
         let mut min_rewind: Option<u64> = None;
         let mut expired_count: u32 = 0;
+        // Auto-nack deltas accumulated across the expired batch. They
+        // MUST reach `apply_delta_and_sync` (previously the delta was
+        // discarded): each released pending emits a `DrainEvent::Ack`
+        // that (a) decrements the drain-owned per-subject inflight —
+        // dropping it leaked the subject cap forever — and (b) removes
+        // the seq from the drain's delivered-suppression set so the
+        // rewind below can actually redeliver it.
+        let mut merged_delta = arbitro_engine_v2::DeltaEvents::default();
 
         for entry in &self.wheel_buf {
             let consumer_id = ConsumerId(entry.consumer_id);
@@ -857,10 +956,11 @@ impl CommandWorker {
                 stream_id,
                 seq: entry.seq,
             };
-            let _ = self.engine.execute(&Command::Nack {
+            let delta = self.engine.execute(&Command::Nack {
                 consumer_id,
                 entries: &[ack_entry],
             });
+            merged_delta.merge(delta);
 
             // Decrement atomic inflight.
             if let Some(consumer) = self.engine.consumer(consumer_id) {
@@ -871,6 +971,12 @@ impl CommandWorker {
             // Track minimum seq for cursor rewind.
             min_rewind = Some(min_rewind.map_or(entry.seq, |m: u64| m.min(entry.seq)));
             expired_count += 1;
+        }
+
+        if !merged_delta.is_empty() {
+            // Auto-nack releases: sync drain-side subject counters and
+            // un-suppress the timed-out seqs (false = not acks).
+            self.apply_delta_and_sync(&merged_delta, false);
         }
 
         if expired_count > 0 {
@@ -1013,30 +1119,56 @@ impl CommandWorker {
 
     /// Apply engine delta events and sync shared state.
     /// Called after engine mutations that may retire bindings.
-    pub(super) fn apply_delta_and_sync(&mut self, delta: &arbitro_engine_v2::DeltaEvents) {
+    ///
+    /// `releases_are_acks` — true ONLY when the delta comes from
+    /// `Command::Ack` (handle_ack / ack_term): every released pending
+    /// entry was genuinely acked, so its seq rides the `DrainEvent::Ack`
+    /// as `SuppressOp::Acked` and stays in the drain's redelivery-
+    /// suppression set. Nack, ack-timeout and retirement releases pass
+    /// false (`SuppressOp::Released`) — those seqs are owed again and
+    /// must become deliverable.
+    pub(super) fn apply_delta_and_sync(
+        &mut self,
+        delta: &arbitro_engine_v2::DeltaEvents,
+        releases_are_acks: bool,
+    ) {
         if !delta.demand_became_available.is_empty() {
             self.gate.release();
         }
         // Push subject-inflight decs to the drain via SPSC ring. Drain
         // owns the per-(consumer, subject) counters (`ConsumerSubjects`)
         // and applies these at the top of its next cycle. Ring overflow
-        // is silently dropped — see `drain_events.rs` overflow policy.
+        // queues the event on `pending_drain_acks` for retry — these
+        // events are correctness-critical (a lost `Released` starves its
+        // seq forever), see `drain_events.rs` overflow policy.
         if !delta.subject_hashes_acked.is_empty() {
-            for &(cid, sh) in &delta.subject_hashes_acked {
-                if self
-                    .drain_evt_tx
-                    .try_send(DrainEvent::Ack {
-                        consumer_id: ConsumerId(cid),
-                        subject_hash: sh,
-                        // Piggyback the contiguous-acked floor so the
-                        // drain slot stays current (handle_ack records
-                        // matched seqs BEFORE the engine execute whose
-                        // delta lands here, so the value is fresh).
-                        ack_floor: self.ack_floors.floor(cid),
-                    })
-                    .is_err()
-                {
+            for &(cid, sh, seq) in &delta.subject_hashes_acked {
+                let evt = DrainEvent::Ack {
+                    consumer_id: ConsumerId(cid),
+                    subject_hash: sh,
+                    // Piggyback the contiguous-acked floor so the
+                    // drain slot stays current (handle_ack records
+                    // matched seqs BEFORE the engine execute whose
+                    // delta lands here, so the value is fresh).
+                    ack_floor: self.ack_floors.floor(cid),
+                    seq,
+                    // A true ack marks the seq done forever; a
+                    // nack / ack-timeout / retirement release makes
+                    // it owed (deliverable) again.
+                    op: if releases_are_acks {
+                        crate::shard::drain_events::SuppressOp::Acked
+                    } else {
+                        crate::shard::drain_events::SuppressOp::Released
+                    },
+                };
+                if self.drain_evt_tx.try_send(evt).is_err() {
+                    // Ring full (drain parked + bulk release > cap).
+                    // Queue for retry at the top of the command loop —
+                    // same pattern as `pending_consumer_remove` (H11).
+                    // The counter stays as the ring-overflow degradation
+                    // signal even though the event is no longer lost.
                     self.silent_drops.inc_drain_evt();
+                    self.pending_drain_acks.push(evt);
                 }
             }
             // Wake drain so it processes the ring even if no new publishes
@@ -1067,6 +1199,16 @@ impl CommandWorker {
         // explicit one). H11 retry on ring-full, same as the handler.
         for &cid in &delta.consumers_removed {
             self.ack_floors.remove(cid.raw());
+            // A removed consumer's queued Ack retries are moot — and must
+            // never be applied AFTER its ConsumerRemoved lands: consumer
+            // ids are pool-recycled, and a stale floor-raise or dec on the
+            // recycled id would silently corrupt the new consumer's slot.
+            // Purge before queueing/sending the removal (the ring is SPSC
+            // FIFO, so events already IN the ring are safely ordered
+            // before the removal).
+            self.pending_drain_acks.retain(|e| {
+                !matches!(e, DrainEvent::Ack { consumer_id, .. } if consumer_id.raw() == cid.raw())
+            });
             if self
                 .drain_evt_tx
                 .try_send(DrainEvent::ConsumerRemoved { consumer_id: cid })

@@ -91,9 +91,11 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                         }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {
                             let queue_raw = binding.queue_id.raw();
-                            events
-                                .subject_hashes_acked
-                                .push((consumer_id.raw(), pending.subject_hash));
+                            events.subject_hashes_acked.push((
+                                consumer_id.raw(),
+                                pending.subject_hash,
+                                pending.seq,
+                            ));
                             ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
                             break;
@@ -127,9 +129,11 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                         }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {
                             let queue_raw = binding.queue_id.raw();
-                            events
-                                .subject_hashes_acked
-                                .push((consumer_id.raw(), pending.subject_hash));
+                            events.subject_hashes_acked.push((
+                                consumer_id.raw(),
+                                pending.subject_hash,
+                                pending.seq,
+                            ));
                             ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
                             matched += 1;
                             break;

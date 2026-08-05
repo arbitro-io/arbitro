@@ -330,7 +330,10 @@ impl CommandWorker {
         }
 
         // Handle delta (demand changes, binding retirements).
-        self.apply_delta_and_sync(&delta);
+        // `true`: this delta comes from `Command::Ack` — every released
+        // seq was genuinely acked and enters the drain's redelivery-
+        // suppression set (see `drain_events::SuppressOp::Acked`).
+        self.apply_delta_and_sync(&delta, true);
 
         let _ = cmd.reply.send(AckReply {
             accepted,
@@ -445,7 +448,7 @@ impl CommandWorker {
                 }
             }
 
-            self.apply_delta_and_sync(&delta);
+            self.apply_delta_and_sync(&delta, false);
 
             // Insert into wheel — delay_ms converted to ticks (1 tick = 1s).
             // M6: clamp to `WHEEL_BUCKETS - 1` so a caller passing
@@ -493,7 +496,7 @@ impl CommandWorker {
                 }
             }
 
-            self.apply_delta_and_sync(&delta);
+            self.apply_delta_and_sync(&delta, false);
 
             if requeued > 0 {
                 // Rewind cursor to re-scan nacked entries.
@@ -686,7 +689,7 @@ impl CommandWorker {
             let events = self.engine.unsubscribe(bid);
             // Decrement demand.
             self.counters.dec_demand(stream_id.raw());
-            self.apply_delta_and_sync(&events);
+            self.apply_delta_and_sync(&events, false);
         }
 
         self.rebuild_and_swap_snapshot();
@@ -738,7 +741,7 @@ impl CommandWorker {
         }
 
         let events = self.engine.delete_stream(cmd.stream_id);
-        self.apply_delta_and_sync(&events);
+        self.apply_delta_and_sync(&events, false);
         self.stream_retention.remove(&cmd.stream_id);
         self.idempotency_tracker
             .write()
@@ -793,7 +796,7 @@ impl CommandWorker {
         }
 
         let events = self.engine.delete_consumer(cmd.consumer_id);
-        self.apply_delta_and_sync(&events);
+        self.apply_delta_and_sync(&events, false);
 
         // Audit #10: drop this consumer's per-(consumer, seq) DLQ nack
         // counters. They were only removed on ack or on reaching the
@@ -846,7 +849,7 @@ impl CommandWorker {
         }
 
         let events = self.engine.mark_connection_dead(cmd.connection_id);
-        self.apply_delta_and_sync(&events);
+        self.apply_delta_and_sync(&events, false);
         self.rebuild_and_swap_snapshot();
         let _ = cmd.reply.send(());
     }

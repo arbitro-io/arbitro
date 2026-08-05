@@ -203,17 +203,32 @@ impl SharedCounters {
 
     /// Signal drain to rewind to `target`. Takes the min of current
     /// rewind and target (CAS loop for concurrent safety).
+    ///
+    /// Release ordering on the successful CAS: callers push `Released`
+    /// drain events into the SPSC ring BEFORE signalling the rewind, and
+    /// the drain consumes the signal (`take_rewind`, Acquire) BEFORE
+    /// draining the ring. The Release/Acquire pair on this slot makes
+    /// the ring push happen-before the ring drain whenever the signal is
+    /// observed — so a rewound walk can never see a released seq still
+    /// suppressed. Relaxed here would leave that guarantee to x86 TSO
+    /// only.
+    /// The CAS is performed even when `new == current` (no early break):
+    /// the RMW is what publishes the edge. Skipping it when a smaller
+    /// signal is already pending left THIS caller's ring events with no
+    /// ordering (and no surviving signal) if the drain consumed the older
+    /// value concurrently. An RMW always reads the latest value in the
+    /// slot's modification order, so either the drain's consuming swap
+    /// happens-after this store (and must see the caller's ring events),
+    /// or this store lands after the swap and the signal stays pending
+    /// for the next cycle. One extra uncontended RMW on a cold path.
     pub fn signal_rewind(&self, target: u64) {
         loop {
             let current = self.rewind.load(Ordering::Relaxed);
             let new = current.min(target);
-            if new == current {
-                break;
-            }
             match self.rewind.compare_exchange_weak(
                 current,
                 new,
-                Ordering::Relaxed,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break,
@@ -223,9 +238,10 @@ impl SharedCounters {
     }
 
     /// Consume the rewind signal. Returns `Some(target)` if a rewind
-    /// was requested, `None` otherwise.
+    /// was requested, `None` otherwise. Acquire pairs with
+    /// `signal_rewind`'s Release — see the ordering note there.
     pub fn take_rewind(&self) -> Option<u64> {
-        let val = self.rewind.swap(NO_REWIND, Ordering::Relaxed);
+        let val = self.rewind.swap(NO_REWIND, Ordering::Acquire);
         if val == NO_REWIND {
             None
         } else {

@@ -13,7 +13,19 @@
 //! (e.g. ahash, slot table, intrusive list) without touching callers.
 
 use nohash_hasher::BuildNoHashHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+
+/// Cap on the delivered-or-acked suppression set. Bounds worst-case
+/// memory when a consumer's contiguous floor is pinned for a long time
+/// (a permanently unacked / capacity-capped low seq) while deliveries
+/// and acks keep landing above it. When full, the LOWEST seq is
+/// evicted: the drain re-walks the window just above the pinned cursor
+/// every cycle, so the HIGH seqs are the ones that must stay covered to
+/// prevent a redelivery livelock; forgetting a low seq is merely
+/// conservative (one extra duplicate delivery after a rewind — the
+/// engine reconciles it as a dup — never message loss). Sized ≥ 4× the
+/// default drain window (`max_feed_per_cycle` = 256).
+const SUPPRESS_CAP: usize = 4096;
 
 /// Per-consumer subject inflight counters.
 ///
@@ -32,6 +44,30 @@ pub struct ConsumerSubjects {
     /// the drain skips re-delivering them on a cursor rewind. Monotonic
     /// (only raised), so a dropped ring event is merely conservative.
     ack_floor: u64,
+    /// Delivered-or-acked seqs ABOVE the contiguous floor. A member
+    /// must not be (re)delivered; it leaves the set only when the
+    /// command thread explicitly RELEASES it for redelivery (nack,
+    /// ack-timeout auto-nack, binding retirement — via
+    /// `DrainEvent::Ack { op: Released }`) or when the rising floor
+    /// absorbs it.
+    ///
+    /// Two feeders, both exact:
+    ///  * the drain itself, on every successful ack-mode delivery
+    ///    (`suppress()` in `drain_deliver` Phase 3) — this is what
+    ///    breaks the redelivery livelock: a capacity-capped low seq
+    ///    pins both the drain cursor and the contiguous floor, and
+    ///    without delivery memory every cycle re-walked the pinned
+    ///    window re-sending in-flight and acked seqs without bound
+    ///    (measured: 911k deliveries for 300 published);
+    ///  * the command thread, on every engine-matched ack
+    ///    (`op: Acked`) — re-asserts membership in case the delivery
+    ///    insert was evicted.
+    ///
+    /// Pruned as the floor rises; size tracks the in-flight window in
+    /// steady state. Bounded by `SUPPRESS_CAP` (evict-lowest,
+    /// conservative: an evicted seq can only cause a duplicate
+    /// delivery, which the engine reconciles — never message loss).
+    suppressed: BTreeSet<u64>,
 }
 
 impl ConsumerSubjects {
@@ -65,11 +101,56 @@ impl ConsumerSubjects {
     }
 
     /// Raise the floor (monotonic max — stale/reordered values are no-ops).
+    /// Prunes the suppression set: everything at or below the new floor
+    /// is already covered by the floor check.
     #[inline]
     pub fn raise_ack_floor(&mut self, floor: u64) {
         if floor > self.ack_floor {
             self.ack_floor = floor;
+            if !self.suppressed.is_empty() {
+                // Keep only seqs strictly above the new floor.
+                self.suppressed = self.suppressed.split_off(&(floor + 1));
+            }
         }
+    }
+
+    /// Mark `seq` delivered-or-acked: it must not be (re)delivered until
+    /// explicitly released. Called by the drain on every successful
+    /// ack-mode delivery and by the ack event path. Seqs at or below the
+    /// floor are already covered. At capacity the LOWEST seq is evicted
+    /// — the redelivery-livelock window sits just above the pinned
+    /// cursor, so the high seqs must stay covered; forgetting a low one
+    /// is conservative (a duplicate delivery the engine reconciles,
+    /// never loss).
+    #[inline]
+    pub fn suppress(&mut self, seq: u64) {
+        if seq <= self.ack_floor {
+            return;
+        }
+        if self.suppressed.len() >= SUPPRESS_CAP {
+            self.suppressed.pop_first();
+        }
+        self.suppressed.insert(seq);
+    }
+
+    /// Release `seq` for redelivery: its pending delivery was abandoned
+    /// without an ack (nack, ack-timeout auto-nack, binding retirement).
+    /// The seq is owed again and the drain may re-send it on the next
+    /// walk.
+    #[inline]
+    pub fn release(&mut self, seq: u64) {
+        if !self.suppressed.is_empty() {
+            self.suppressed.remove(&seq);
+        }
+    }
+
+    /// True if `seq` must not be delivered to this consumer: it is
+    /// either acked contiguously (`<= floor`) or delivered-or-acked
+    /// above the floor and not released. Steady-state cost for a
+    /// forward-moving cursor: one u64 compare + one `is_empty` check.
+    #[inline]
+    pub fn is_suppressed(&self, seq: u64) -> bool {
+        seq <= self.ack_floor || (!self.suppressed.is_empty() && self.suppressed.contains(&seq))
     }
 
     /// Number of distinct subjects currently tracked. O(1).
@@ -222,6 +303,84 @@ mod tests {
         assert_eq!(s.ack_floor(), 5);
         s.raise_ack_floor(9);
         assert_eq!(s.ack_floor(), 9);
+    }
+
+    /// Requirement: a delivered/acked seq ABOVE a gapped (frozen) floor
+    /// must be reported suppressed — this is the drain's only shield
+    /// against re-sending it when the cursor is pinned below.
+    #[test]
+    fn delivered_above_frozen_floor_is_suppressed() {
+        let mut s = ConsumerSubjects::new();
+        // Floor frozen at 0 (seq 1 unacked); seqs 3..=7 delivered.
+        for seq in 3..=7u64 {
+            s.suppress(seq);
+        }
+        assert!(!s.is_suppressed(1), "undelivered gap seq stays deliverable");
+        assert!(!s.is_suppressed(2), "undelivered seq stays deliverable");
+        for seq in 3..=7u64 {
+            assert!(s.is_suppressed(seq), "delivered seq {seq} must be suppressed");
+        }
+        assert!(!s.is_suppressed(8), "never-delivered seq stays deliverable");
+    }
+
+    /// A release (nack / ack-timeout / retirement) re-arms delivery for
+    /// exactly that seq — the others stay suppressed.
+    #[test]
+    fn release_rearms_only_that_seq() {
+        let mut s = ConsumerSubjects::new();
+        for seq in 3..=7u64 {
+            s.suppress(seq);
+        }
+        s.release(5);
+        assert!(!s.is_suppressed(5), "released seq is owed again");
+        for seq in [3u64, 4, 6, 7] {
+            assert!(s.is_suppressed(seq), "seq {seq} stays suppressed");
+        }
+        // Redelivery re-suppresses it.
+        s.suppress(5);
+        assert!(s.is_suppressed(5));
+    }
+
+    /// Raising the floor absorbs (prunes) the set without changing the
+    /// is_suppressed answer.
+    #[test]
+    fn floor_raise_prunes_suppress_set() {
+        let mut s = ConsumerSubjects::new();
+        for seq in 3..=7u64 {
+            s.suppress(seq);
+        }
+        s.raise_ack_floor(5);
+        assert!(s.suppressed.len() == 2, "seqs <= 5 pruned, 6 and 7 remain");
+        for seq in 1..=7u64 {
+            let expect = seq <= 5 || (6..=7).contains(&seq);
+            assert_eq!(s.is_suppressed(seq), expect, "seq {seq}");
+        }
+    }
+
+    /// Seqs at or below the floor never enter the set (already covered).
+    #[test]
+    fn suppress_below_floor_is_noop() {
+        let mut s = ConsumerSubjects::new();
+        s.raise_ack_floor(10);
+        s.suppress(7);
+        assert!(s.suppressed.is_empty());
+        assert!(s.is_suppressed(7), "covered by the floor");
+    }
+
+    /// At capacity the LOWEST seq is evicted — the pinned-window (high)
+    /// seqs stay covered, and the forgotten seq is merely conservative.
+    #[test]
+    fn cap_evicts_lowest_keeps_highest() {
+        let mut s = ConsumerSubjects::new();
+        for seq in 2..(2 + SUPPRESS_CAP as u64 + 10) {
+            s.suppress(seq);
+        }
+        assert_eq!(s.suppressed.len(), SUPPRESS_CAP);
+        assert!(!s.is_suppressed(2), "lowest evicted (conservative)");
+        assert!(
+            s.is_suppressed(2 + SUPPRESS_CAP as u64 + 9),
+            "highest must stay covered"
+        );
     }
 
     #[test]

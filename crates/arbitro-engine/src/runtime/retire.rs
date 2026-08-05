@@ -27,7 +27,7 @@ pub fn retire_binding(ctx: &mut EngineContext, binding_id: BindingId, events: &m
     for pending in binding.pending.values() {
         events
             .subject_hashes_acked
-            .push((consumer_raw, pending.subject_hash));
+            .push((consumer_raw, pending.subject_hash, pending.seq));
         events.pending_seqs_released.push(pending.seq);
         ctx.inflight.dec_pending(consumer_raw, queue_raw);
     }
