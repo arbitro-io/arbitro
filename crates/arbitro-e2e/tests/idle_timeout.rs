@@ -31,7 +31,6 @@ fn no_reconnect_config(addr: &str) -> ClientConfig {
     }
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_client_disconnected_active_client_stays_connected() {
     let mut server = TestServerBuilder::new()
@@ -40,8 +39,12 @@ async fn idle_client_disconnected_active_client_stays_connected() {
         .spawn()
         .await;
 
-    let idle_client = server.connect_with_config(no_reconnect_config(&server.addr)).await;
-    let active_client = server.connect_with_config(no_reconnect_config(&server.addr)).await;
+    let idle_client = server
+        .connect_with_config(no_reconnect_config(&server.addr))
+        .await;
+    let active_client = server
+        .connect_with_config(no_reconnect_config(&server.addr))
+        .await;
 
     // Touch both once at t=0 via a real request (registry.touch runs on
     // every dispatched frame), then let the idle client go completely
@@ -66,14 +69,11 @@ async fn idle_client_disconnected_active_client_stays_connected() {
     // the next request must fail because the server evicted it.
     // On some platforms (WSL) the TCP close isn't propagated promptly,
     // so a timeout is also valid evidence of eviction.
-    let idle_result = tokio::time::timeout(
-        Duration::from_secs(3),
-        idle_client.list_streams(0, 10),
-    )
-    .await;
+    let idle_result =
+        tokio::time::timeout(Duration::from_secs(3), idle_client.list_streams(0, 10)).await;
     match idle_result {
-        Err(_timeout) => {}       // no response — server evicted (WSL)
-        Ok(Err(_)) => {}          // error — server evicted (native)
+        Err(_timeout) => {} // no response — server evicted (WSL)
+        Ok(Err(_)) => {}    // error — server evicted (native)
         Ok(Ok(_)) => panic!(
             "idle client should have been disconnected after {:?} of inactivity",
             IDLE_TIMEOUT
@@ -91,7 +91,9 @@ async fn active_client_survives_past_idle_timeout_with_steady_traffic() {
         .spawn()
         .await;
 
-    let client = server.connect_with_config(no_reconnect_config(&server.addr)).await;
+    let client = server
+        .connect_with_config(no_reconnect_config(&server.addr))
+        .await;
 
     client
         .create_stream(b"steady", b">", 0, 0, 0, 1, 0, 0, 0, 0)
@@ -104,10 +106,9 @@ async fn active_client_survives_past_idle_timeout_with_steady_traffic() {
     let rounds = 12; // 12 * 400ms = 4.8s, > 2x IDLE_TIMEOUT
     for i in 0..rounds {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        client
-            .list_streams(0, 10)
-            .await
-            .unwrap_or_else(|e| panic!("round {i} failed, active client was wrongly evicted: {e:?}"));
+        client.list_streams(0, 10).await.unwrap_or_else(|e| {
+            panic!("round {i} failed, active client was wrongly evicted: {e:?}")
+        });
     }
 
     let resp = client.list_streams(0, 1000).await.unwrap();

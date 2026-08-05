@@ -79,12 +79,10 @@ async fn run() -> i32 {
     eprintln!("6 workers launched, waiting for all subscriptions to stabilize...");
 
     // ── Connect a trigger client ──────────────────────────────────────
-    let client = arbitro_client_tokio::Client::connect(
-        arbitro_client_tokio::ClientConfig {
-            addr: broker_addr.clone(),
-            ..Default::default()
-        },
-    )
+    let client = arbitro_client_tokio::Client::connect(arbitro_client_tokio::ClientConfig {
+        addr: broker_addr.clone(),
+        ..Default::default()
+    })
     .await
     .expect("trigger client connect");
 
@@ -154,7 +152,11 @@ async fn run() -> i32 {
 
     broker_handle.abort();
 
-    if ok { 0 } else { 1 }
+    if ok {
+        0
+    } else {
+        1
+    }
 }
 
 fn count_completed_instances(log: &str, _num_instances: u32) -> u32 {

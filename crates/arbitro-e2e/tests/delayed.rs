@@ -184,7 +184,18 @@ async fn delayed_publish_duplicate_msg_id_is_deduped() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"delay_dedup", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+            .create_stream(
+                b"delay_dedup",
+                b">",
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                /*window_ms*/ 60_000,
+            )
             .await
             .unwrap(),
     );
@@ -224,7 +235,12 @@ async fn delayed_publish_duplicate_msg_id_is_deduped() {
     // same id is rejected.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let err = client
-        .publish_wait_with_id(stream_id, subject, msg_id, Bytes::from_static(b"immediate-dup"))
+        .publish_wait_with_id(
+            stream_id,
+            subject,
+            msg_id,
+            Bytes::from_static(b"immediate-dup"),
+        )
         .await
         .expect_err("delayed publish must record its msg-id in the dedup window");
     assert!(
@@ -279,7 +295,16 @@ async fn delayed_publish_respects_discard_new_quota() {
     let stream_id = TestServer::parse_id(
         &client
             .create_stream(
-                b"delay_quota", b">", /*max_msgs*/ 2, 0, 0, 1, 0, 0, /*discard*/ 1, 0,
+                b"delay_quota",
+                b">",
+                /*max_msgs*/ 2,
+                0,
+                0,
+                1,
+                0,
+                0,
+                /*discard*/ 1,
+                0,
             )
             .await
             .unwrap(),

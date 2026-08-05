@@ -173,7 +173,7 @@ fn payload_len_helper_matches_wire_size() {
 
     let target = 64 * 1024usize;
     let payload_len = payload_len_for_msg_len(target);
-    let msg_len = PubFrame::wire_size(SUBJECT.len(), 0, payload_len)
-        - arbitro_proto::v2::header::HEADER_SIZE;
+    let msg_len =
+        PubFrame::wire_size(SUBJECT.len(), 0, payload_len) - arbitro_proto::v2::header::HEADER_SIZE;
     assert_eq!(msg_len, target);
 }

@@ -334,7 +334,9 @@ async fn workflow_across_cluster_nodes() {
         match result {
             Ok(Ok(resp)) => {
                 stream_id = TestServer::parse_id(&resp);
-                eprintln!("node 1 create_stream _wf_cluster-test_tasks succeeded, stream_id={stream_id}");
+                eprintln!(
+                    "node 1 create_stream _wf_cluster-test_tasks succeeded, stream_id={stream_id}"
+                );
             }
             Ok(Err(e)) => {
                 eprintln!("node 1 create_stream error: {e:?}");
@@ -373,15 +375,15 @@ async fn workflow_across_cluster_nodes() {
             Duration::from_secs(5),
             create_client.create_consumer(
                 stream_id,
-                b"wf_worker",     // consumer name
-                b"",              // group (empty = no load-balancing group)
-                b"",              // subject filter (empty = all)
-                10,               // max_inflight
-                1,                // ack_policy = Explicit
-                0,                // deliver_policy = All
-                0,                // deliver_mode = Push
-                0,                // ack_wait_ms (0 = server default)
-                0,                // start_seq
+                b"wf_worker", // consumer name
+                b"",          // group (empty = no load-balancing group)
+                b"",          // subject filter (empty = all)
+                10,           // max_inflight
+                1,            // ack_policy = Explicit
+                0,            // deliver_policy = All
+                0,            // deliver_mode = Push
+                0,            // ack_wait_ms (0 = server default)
+                0,            // start_seq
             ),
         )
         .await;
@@ -516,11 +518,10 @@ async fn workflow_across_cluster_nodes() {
                 "subject must match the workflow pattern, got {:?}",
                 String::from_utf8_lossy(msg.subject()),
             );
-            assert!(
-                !msg.payload().is_empty(),
-                "payload must not be empty",
+            assert!(!msg.payload().is_empty(), "payload must not be empty",);
+            eprintln!(
+                "workflow_across_cluster_nodes: PASSED — workflow stream replicated across nodes"
             );
-            eprintln!("workflow_across_cluster_nodes: PASSED — workflow stream replicated across nodes");
         }
         Ok(None) => {
             eprintln!("node 1 recv returned None (subscription closed)");
@@ -629,14 +630,14 @@ async fn message_replication_survives_leader_kill() {
             create_client.create_stream(
                 b"repl_test",
                 b">",
-                0,  // max_msgs
-                0,  // max_bytes
-                0,  // max_age_secs
-                3,  // replicas
-                0,  // journal_kind
-                0,  // retention
-                0,  // discard
-                0,  // idempotency_window_ms
+                0, // max_msgs
+                0, // max_bytes
+                0, // max_age_secs
+                3, // replicas
+                0, // journal_kind
+                0, // retention
+                0, // discard
+                0, // idempotency_window_ms
             ),
         )
         .await;
@@ -655,7 +656,9 @@ async fn message_replication_survives_leader_kill() {
                     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
                     eprintln!("node {} shut down (early exit)", i + 1);
                 }
-                eprintln!("message_replication_survives_leader_kill: skipped — create_stream failed");
+                eprintln!(
+                    "message_replication_survives_leader_kill: skipped — create_stream failed"
+                );
                 return;
             }
             Err(_) => {
@@ -667,7 +670,9 @@ async fn message_replication_survives_leader_kill() {
                     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
                     eprintln!("node {} shut down (early exit)", i + 1);
                 }
-                eprintln!("message_replication_survives_leader_kill: skipped — create_stream timed out");
+                eprintln!(
+                    "message_replication_survives_leader_kill: skipped — create_stream timed out"
+                );
                 return;
             }
         }
@@ -681,11 +686,7 @@ async fn message_replication_survives_leader_kill() {
             let payload = format!("msg-{i}");
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                pub_client.publish_wait(
-                    stream_id,
-                    b"test.repl",
-                    Bytes::from(payload),
-                ),
+                pub_client.publish_wait(stream_id, b"test.repl", Bytes::from(payload)),
             )
             .await;
 
@@ -709,11 +710,8 @@ async fn message_replication_survives_leader_kill() {
     // ── Step 8: Verify stream exists on node 2 ──────────────────────
     {
         let verify_client = TestServer::connect_to(&client_addrs[1]).await;
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            verify_client.list_streams(0, 1000),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), verify_client.list_streams(0, 1000)).await;
 
         match result {
             Ok(Ok(resp)) => {

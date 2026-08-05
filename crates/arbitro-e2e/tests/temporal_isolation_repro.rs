@@ -93,7 +93,11 @@ async fn distinct_names_each_get_own_copy() {
 
     for i in 0..5u32 {
         client
-            .publish_wait(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_wait(
+                stream_id,
+                b"events_tick",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -125,7 +129,11 @@ async fn late_join_all_does_not_redeliver_to_acked_sibling() {
 
     for i in 0..5u32 {
         client
-            .publish_wait(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_wait(
+                stream_id,
+                b"events_tick",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -169,7 +177,11 @@ async fn late_join_by_start_seq_does_not_redeliver_to_acked_sibling() {
     let mut ha = client.subscribe(stream_id, cid_a, b"").await.unwrap();
     for i in 0..5u32 {
         client
-            .publish_wait(stream_id, b"events_tick", Bytes::copy_from_slice(&i.to_le_bytes()))
+            .publish_wait(
+                stream_id,
+                b"events_tick",
+                Bytes::copy_from_slice(&i.to_le_bytes()),
+            )
             .await
             .expect("publish");
     }
@@ -178,7 +190,9 @@ async fn late_join_by_start_seq_does_not_redeliver_to_acked_sibling() {
 
     // B: DeliverPolicy::ByStartSeq(start_seq = 2) — replays 2..=5 for itself.
     let resp = client
-        .create_consumer(stream_id, b"svc_b", b"group_b", b"", 100, 1u8, 2u8, 0u8, 0u32, 2u64)
+        .create_consumer(
+            stream_id, b"svc_b", b"group_b", b"", 100, 1u8, 2u8, 0u8, 0u32, 2u64,
+        )
         .await
         .expect("create_consumer");
     let cid_b = TestServer::parse_id(&resp);

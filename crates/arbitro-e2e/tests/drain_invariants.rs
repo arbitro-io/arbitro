@@ -1640,8 +1640,16 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     // A — fire-and-forget fanout consumer (no inflight cap, so frames keep
     // flowing until its writer channel is full).
     let consumer_a = create_consumer(
-        &client, stream_id, b"dead-reader", b"", b"", 100, 0, /* None */
-        0, 0, 0,
+        &client,
+        stream_id,
+        b"dead-reader",
+        b"",
+        b"",
+        100,
+        0, /* None */
+        0,
+        0,
+        0,
     )
     .await;
     // B — healthy explicit-ack sibling.
@@ -1665,7 +1673,10 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     .encode(1);
     raw.write_all(&sub).await.unwrap();
 
-    let handle_b = client_b.subscribe(stream_id, consumer_b, b"").await.unwrap();
+    let handle_b = client_b
+        .subscribe(stream_id, consumer_b, b"")
+        .await
+        .unwrap();
 
     // Let both bindings register before publishing.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1799,9 +1810,9 @@ async fn nack_during_active_drain_always_redelivers() {
         // Small window: the drain pauses/resumes on every few acks, so
         // cycles are guaranteed to be mid-flight while nacks land.
         let consumer_id = create_consumer(
-            &client, stream_id, b"racer", b"", b"", 4, /* max_inflight */
-            1, /* Explicit */
-            0, /* All */
+            &client, stream_id, b"racer", b"", b"", 4,      /* max_inflight */
+            1,      /* Explicit */
+            0,      /* All */
             30_000, /* ack_wait_ms — keep the wheel out of this test */
             0,
         )
@@ -1831,7 +1842,11 @@ async fn nack_during_active_drain_always_redelivers() {
         let done = |deliveries: &[u32]| {
             (0..N).all(|i| {
                 let d = deliveries[i as usize];
-                if is_nack_target(i) { d >= 2 } else { d >= 1 }
+                if is_nack_target(i) {
+                    d >= 2
+                } else {
+                    d >= 1
+                }
             })
         };
 

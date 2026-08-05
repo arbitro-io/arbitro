@@ -468,7 +468,9 @@ async fn prefill(
     let batches = total.div_ceil(BATCH_SIZE);
     for b in 0..batches {
         let size = BATCH_SIZE.min(total - b * BATCH_SIZE);
-        client.publish_batch_wait(stream_id, &entries[..size]).await?;
+        client
+            .publish_batch_wait(stream_id, &entries[..size])
+            .await?;
     }
     Ok(())
 }
@@ -627,11 +629,12 @@ fn run_category(
         };
 
         if scenario == Scenario::Replay {
-            println!(
-                "\n[ replay — {replay_msgs} msgs pre-loaded/stream, publish-all-then-drain ]"
-            );
+            println!("\n[ replay — {replay_msgs} msgs pre-loaded/stream, publish-all-then-drain ]");
         } else {
-            println!("\n[ {} — {scenario_total} msgs total/iter ]", scenario.label());
+            println!(
+                "\n[ {} — {scenario_total} msgs total/iter ]",
+                scenario.label()
+            );
         }
         print_header();
 
@@ -665,8 +668,7 @@ fn run_category(
             let stream_ids: Vec<u32> = rt.block_on(async {
                 let mut ids = Vec::with_capacity(n);
                 for i in 0..n {
-                    let name =
-                        format!("m_{run_tag}_{cat_label}_{}_{n}_{i}", scenario.label());
+                    let name = format!("m_{run_tag}_{cat_label}_{}_{n}_{i}", scenario.label());
                     ids.push(make_stream(&setup, name.as_bytes(), &mut created).await);
                 }
                 ids
@@ -748,7 +750,9 @@ async fn run_scenario(
 ) -> Duration {
     match scenario {
         Scenario::SingleFf => run_single_ff(clients, stream_ids, msgs_per_client, payload).await,
-        Scenario::SingleWait => run_single_wait(clients, stream_ids, msgs_per_client, payload).await,
+        Scenario::SingleWait => {
+            run_single_wait(clients, stream_ids, msgs_per_client, payload).await
+        }
         Scenario::BatchFf => {
             run_batch_ff(
                 clients,
@@ -938,7 +942,9 @@ fn main() {
             // Tear the server down before the next category so its retained
             // stores don't accumulate and skew the later categories.
             server.abort();
-            rt.block_on(async { let _ = server.await; });
+            rt.block_on(async {
+                let _ = server.await;
+            });
             // `tmp` drops here → temp data dir removed.
             drop(tmp);
         }

@@ -578,11 +578,10 @@ async fn main() {
             for seq in sorted.iter().take(40) {
                 let (ack_ms, prod) = atl.get(seq).copied().unwrap_or((0, u64::MAX));
                 let recv_ms = rtl.get(seq).copied().unwrap_or(0);
-                println!(
-                    "  seq={seq} acked_at_ms={ack_ms} producer={prod} recv_ms={recv_ms}"
-                );
+                println!("  seq={seq} acked_at_ms={ack_ms} producer={prod} recv_ms={recv_ms}");
             }
-            drop(atl); drop(rtl);
+            drop(atl);
+            drop(rtl);
             let mut ack_sorted: Vec<u64> = acked.iter().copied().collect();
             ack_sorted.sort_unstable();
             let ack_min = ack_sorted.first().copied().unwrap_or(0);

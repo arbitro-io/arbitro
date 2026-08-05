@@ -104,7 +104,8 @@ async fn queue_subscribe_load_balances_across_workers() {
 
     let total = g1.len() + g2.len() + g3.len();
     assert_eq!(
-        total, TOTAL,
+        total,
+        TOTAL,
         "queue must deliver every message exactly once across the group; \
          got {}+{}+{}={total} (a duplicate means queue dedup broke, a \
          shortfall means messages were dropped)",
@@ -152,9 +153,18 @@ async fn one_consumer_per_queue_name_not_per_subscription() {
     let w1 = server.connect().await;
     let w2 = server.connect().await;
     let w3 = server.connect().await;
-    let _s1 = w1.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
-    let _s2 = w2.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
-    let _s3 = w3.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+    let _s1 = w1
+        .queue_subscribe(stream_id, b"workers", b"")
+        .await
+        .unwrap();
+    let _s2 = w2
+        .queue_subscribe(stream_id, b"workers", b"")
+        .await
+        .unwrap();
+    let _s3 = w3
+        .queue_subscribe(stream_id, b"workers", b"")
+        .await
+        .unwrap();
 
     let n1 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
     assert_eq!(
@@ -175,7 +185,10 @@ async fn one_consumer_per_queue_name_not_per_subscription() {
 
     // Re-joining an existing queue from yet another connection adds nothing.
     let w5 = server.connect().await;
-    let _s5 = w5.queue_subscribe(stream_id, b"workers", b"").await.unwrap();
+    let _s5 = w5
+        .queue_subscribe(stream_id, b"workers", b"")
+        .await
+        .unwrap();
 
     let n3 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
     assert_eq!(
@@ -255,7 +268,11 @@ async fn ack_wait_redelivers_a_silently_dropped_job() {
 
     let worker = server.connect().await;
     let mut sub = worker
-        .queue_subscribe_with(stream_id, b"workers", QueueOptions::new().ack_wait_ms(1_000))
+        .queue_subscribe_with(
+            stream_id,
+            b"workers",
+            QueueOptions::new().ack_wait_ms(1_000),
+        )
         .await
         .expect("queue join with ack_wait");
 

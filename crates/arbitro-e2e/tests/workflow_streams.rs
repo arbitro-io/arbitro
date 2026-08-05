@@ -707,7 +707,10 @@ async fn workflow_6_workers_distribute_in_process() {
     let mut instance_steps: std::collections::HashMap<String, HashSet<u16>> =
         std::collections::HashMap::new();
     for (_, inst, step) in &entries {
-        instance_steps.entry(inst.clone()).or_default().insert(*step);
+        instance_steps
+            .entry(inst.clone())
+            .or_default()
+            .insert(*step);
     }
     assert_eq!(
         instance_steps.len(),
@@ -781,7 +784,10 @@ async fn workflow_trigger_with_id_explicit() {
     .expect("step did not complete");
 
     let id = received_id.lock().unwrap().clone().unwrap();
-    assert_eq!(id, "ord_42", "handler must receive the explicit instance_id");
+    assert_eq!(
+        id, "ord_42",
+        "handler must receive the explicit instance_id"
+    );
 
     handle.stop();
     server.shutdown().await;
@@ -815,7 +821,10 @@ async fn workflow_trigger_with_id_two_instances() {
         .await
         .expect("workflow start");
 
-    handle.trigger_with_id(&client, "alpha", b"a").await.unwrap();
+    handle
+        .trigger_with_id(&client, "alpha", b"a")
+        .await
+        .unwrap();
     handle.trigger_with_id(&client, "beta", b"b").await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -862,10 +871,7 @@ async fn workflow_trigger_returns_string_id() {
         .await
         .expect("workflow start");
 
-    let returned_id: String = handle
-        .trigger(&client, b"data")
-        .await
-        .expect("trigger");
+    let returned_id: String = handle.trigger(&client, b"data").await.expect("trigger");
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while !done.load(Ordering::Acquire) {
@@ -907,7 +913,9 @@ async fn workflow_trigger_with_id_idempotent() {
             let c = exec_clone.clone();
             async move {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()
@@ -915,7 +923,10 @@ async fn workflow_trigger_with_id_idempotent() {
         .expect("workflow start");
 
     // First trigger succeeds.
-    handle.trigger_with_id(&client, "dedup_1", b"x").await.unwrap();
+    handle
+        .trigger_with_id(&client, "dedup_1", b"x")
+        .await
+        .unwrap();
 
     // Second trigger with same ID — dedup rejects at broker.
     let dup = handle.trigger_with_id(&client, "dedup_1", b"x").await;
@@ -980,7 +991,9 @@ async fn workflow_source_basic() {
             async move {
                 *r.lock().unwrap() = Some(ctx.context.clone());
                 d.store(true, Ordering::Release);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()
@@ -989,7 +1002,11 @@ async fn workflow_source_basic() {
 
     // Publish to the source stream (NOT the workflow stream).
     client
-        .publish_wait(src_stream_id, b"payments.completed", Bytes::from_static(b"order_99"))
+        .publish_wait(
+            src_stream_id,
+            b"payments.completed",
+            Bytes::from_static(b"order_99"),
+        )
         .await
         .expect("publish to source");
 
@@ -1002,7 +1019,10 @@ async fn workflow_source_basic() {
     .expect("workflow did not trigger from source within 5s");
 
     let ctx = received_ctx.lock().unwrap().clone().unwrap();
-    assert_eq!(ctx, b"order_99", "source payload must become workflow context");
+    assert_eq!(
+        ctx, b"order_99",
+        "source payload must become workflow context"
+    );
 
     handle.stop();
     server.shutdown().await;
@@ -1044,15 +1064,23 @@ async fn workflow_source_multiple() {
             async move {
                 p.lock().unwrap().push(ctx.context.clone());
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()
         .await
         .expect("workflow start");
 
-    client.publish_wait(sid_a, b"orders.new", Bytes::from_static(b"from_orders")).await.unwrap();
-    client.publish_wait(sid_b, b"refunds.new", Bytes::from_static(b"from_refunds")).await.unwrap();
+    client
+        .publish_wait(sid_a, b"orders.new", Bytes::from_static(b"from_orders"))
+        .await
+        .unwrap();
+    client
+        .publish_wait(sid_b, b"refunds.new", Bytes::from_static(b"from_refunds"))
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while count.load(Ordering::SeqCst) < 2 {
@@ -1101,7 +1129,9 @@ async fn workflow_source_plus_trigger() {
             async move {
                 p.lock().unwrap().push(ctx.context.clone());
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             }
         })
         .start()
@@ -1111,7 +1141,10 @@ async fn workflow_source_plus_trigger() {
     // Manual trigger.
     handle.trigger(&client, b"manual").await.unwrap();
     // Source trigger.
-    client.publish_wait(src_sid, b"events.click", Bytes::from_static(b"source")).await.unwrap();
+    client
+        .publish_wait(src_sid, b"events.click", Bytes::from_static(b"source"))
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while count.load(Ordering::SeqCst) < 2 {
@@ -1123,10 +1156,7 @@ async fn workflow_source_plus_trigger() {
 
     let mut collected: Vec<Vec<u8>> = payloads.lock().unwrap().clone();
     collected.sort();
-    assert_eq!(
-        collected,
-        vec![b"manual".to_vec(), b"source".to_vec()],
-    );
+    assert_eq!(collected, vec![b"manual".to_vec(), b"source".to_vec()],);
 
     handle.stop();
     server.shutdown().await;
@@ -1134,7 +1164,7 @@ async fn workflow_source_plus_trigger() {
 
 // ── T9: suspend step — basic resume ─────────────────────────────────
 
-use arbitro_client_tokio::workflow::{StepOutcome, ResumeContext, TimeoutContext};
+use arbitro_client_tokio::workflow::{ResumeContext, StepOutcome, TimeoutContext};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_suspend_basic_resume() {
@@ -1164,7 +1194,9 @@ async fn workflow_suspend_basic_resume() {
                 async move {
                     *ev.lock().unwrap() = Some(rctx.event.clone());
                     d.store(true, Ordering::Release);
-                    Ok(StepResult { context: rctx.event })
+                    Ok(StepResult {
+                        context: rctx.event,
+                    })
                 }
             },
         )
@@ -1233,7 +1265,9 @@ async fn workflow_suspend_timeout() {
             async move {
                 *st.lock().unwrap() = Some(tctx.state.clone());
                 flag.store(true, Ordering::Release);
-                Ok(StepResult { context: b"timed-out".to_vec() })
+                Ok(StepResult {
+                    context: b"timed-out".to_vec(),
+                })
             }
         })
         .start()
@@ -1254,7 +1288,10 @@ async fn workflow_suspend_timeout() {
     .expect("on_timeout did not fire");
 
     let st = timeout_state.lock().unwrap().clone().unwrap();
-    assert_eq!(st, b"pending-payment", "timeout state must match suspended state");
+    assert_eq!(
+        st, b"pending-payment",
+        "timeout state must match suspended state"
+    );
 
     handle.stop();
     server.shutdown().await;
@@ -1303,7 +1340,10 @@ async fn workflow_suspend_resume_before_timeout() {
         .await
         .expect("workflow start");
 
-    handle.trigger_with_id(&client, "race_1", b"").await.unwrap();
+    handle
+        .trigger_with_id(&client, "race_1", b"")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     handle.resume(&client, "race_1", b"event").await.unwrap();
@@ -1428,10 +1468,16 @@ async fn workflow_suspend_full_chain() {
         .await
         .expect("workflow start");
 
-    handle.trigger_with_id(&client, "chain_1", b"init").await.unwrap();
+    handle
+        .trigger_with_id(&client, "chain_1", b"init")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    handle.resume(&client, "chain_1", b"approved").await.unwrap();
+    handle
+        .resume(&client, "chain_1", b"approved")
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while !done.load(Ordering::Acquire) {
@@ -1494,7 +1540,10 @@ async fn workflow_cancel_removes_suspended() {
         .await
         .expect("workflow start");
 
-    handle.trigger_with_id(&client, "cancel_1", b"").await.unwrap();
+    handle
+        .trigger_with_id(&client, "cancel_1", b"")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Cancel while suspended.
@@ -1527,7 +1576,9 @@ async fn workflow_cancel_nonexistent_noop() {
         .workflow(b"cancel-noop")
         .trigger(b"cancel-noop.>")
         .step(b"only", |ctx: StepContext| async move {
-            Ok(StepResult { context: ctx.context })
+            Ok(StepResult {
+                context: ctx.context,
+            })
         })
         .start()
         .await
@@ -1574,7 +1625,10 @@ async fn workflow_cancel_after_resume_noop() {
         .await
         .expect("workflow start");
 
-    handle.trigger_with_id(&client, "post_1", b"").await.unwrap();
+    handle
+        .trigger_with_id(&client, "post_1", b"")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Resume first.
@@ -1663,7 +1717,9 @@ async fn workflow_cancel_running_instance() {
         .trigger(b"cancel-run.>")
         .step(b"slow", |_ctx: StepContext| async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            Ok(StepResult { context: b"done".to_vec() })
+            Ok(StepResult {
+                context: b"done".to_vec(),
+            })
         })
         .step(b"finish", move |_ctx: StepContext| {
             let f = done_flag.clone();
@@ -1838,11 +1894,20 @@ async fn workflow_e2e_multi_suspend_selective_cancel() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Resume instances 1 and 3.
-    handle.resume(&client, "inst_1", b"resumed_1").await.unwrap();
-    handle.resume(&client, "inst_3", b"resumed_3").await.unwrap();
+    handle
+        .resume(&client, "inst_1", b"resumed_1")
+        .await
+        .unwrap();
+    handle
+        .resume(&client, "inst_3", b"resumed_3")
+        .await
+        .unwrap();
 
     // Resume instance 2 — should be no-op (already cancelled).
-    handle.resume(&client, "inst_2", b"resumed_2").await.unwrap();
+    handle
+        .resume(&client, "inst_2", b"resumed_2")
+        .await
+        .unwrap();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1997,8 +2062,14 @@ async fn workflow_e2e_cancel_blocks_resume() {
     handle.resume(&client, "cb_1", b"event").await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    assert!(!resumed.load(Ordering::Acquire), "on_resume must not fire after cancel");
-    assert!(!finished.load(Ordering::Acquire), "next step must not fire after cancel");
+    assert!(
+        !resumed.load(Ordering::Acquire),
+        "on_resume must not fire after cancel"
+    );
+    assert!(
+        !finished.load(Ordering::Acquire),
+        "next step must not fire after cancel"
+    );
 
     handle.stop();
     server.shutdown().await;
@@ -2153,7 +2224,9 @@ async fn workflow_distrib_suspend_done() {
                 let l = log0.clone();
                 let c = cnt0.clone();
                 async move {
-                    l.lock().unwrap().push((worker_id, ctx.instance_id.clone(), 0));
+                    l.lock()
+                        .unwrap()
+                        .push((worker_id, ctx.instance_id.clone(), 0));
                     c.fetch_add(1, Ordering::SeqCst);
                     let mut out = ctx.context.clone();
                     out.extend_from_slice(b"|prepared");
@@ -2169,7 +2242,9 @@ async fn workflow_distrib_suspend_done() {
                     let l = log1.clone();
                     let c = cnt1.clone();
                     async move {
-                        l.lock().unwrap().push((worker_id, ctx.instance_id.clone(), 1));
+                        l.lock()
+                            .unwrap()
+                            .push((worker_id, ctx.instance_id.clone(), 1));
                         c.fetch_add(1, Ordering::SeqCst);
                         let mut out = ctx.context.clone();
                         out.extend_from_slice(b"|checked");
@@ -2184,9 +2259,13 @@ async fn workflow_distrib_suspend_done() {
                 let l = log2.clone();
                 let c = cnt2.clone();
                 async move {
-                    l.lock().unwrap().push((worker_id, ctx.instance_id.clone(), 2));
+                    l.lock()
+                        .unwrap()
+                        .push((worker_id, ctx.instance_id.clone(), 2));
                     c.fetch_add(1, Ordering::SeqCst);
-                    Ok(StepResult { context: ctx.context })
+                    Ok(StepResult {
+                        context: ctx.context,
+                    })
                 }
             })
             .start()
@@ -2230,7 +2309,10 @@ async fn workflow_distrib_suspend_done() {
     let mut instance_steps: std::collections::HashMap<String, HashSet<u16>> =
         std::collections::HashMap::new();
     for (_, inst, step) in &entries {
-        instance_steps.entry(inst.clone()).or_default().insert(*step);
+        instance_steps
+            .entry(inst.clone())
+            .or_default()
+            .insert(*step);
     }
     assert_eq!(instance_steps.len(), 12);
     for (inst, steps) in &instance_steps {
@@ -2245,7 +2327,9 @@ async fn workflow_distrib_suspend_done() {
         unique_workers,
     );
 
-    for h in &handles { h.stop(); }
+    for h in &handles {
+        h.stop();
+    }
     server.shutdown().await;
 }
 
@@ -2354,7 +2438,9 @@ async fn workflow_distrib_suspend_done_context_pipeline() {
         assert_eq!(entry.unwrap().1, expected, "context mismatch for {id}");
     }
 
-    for h in &handles { h.stop(); }
+    for h in &handles {
+        h.stop();
+    }
     server.shutdown().await;
 }
 
@@ -2362,7 +2448,7 @@ async fn workflow_distrib_suspend_done_context_pipeline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_distrib_suspend_resume() {
-    use arbitro_client_tokio::workflow::{StepOutcome, ResumeContext};
+    use arbitro_client_tokio::workflow::{ResumeContext, StepOutcome};
 
     let mut server = TestServerBuilder::new().spawn().await;
 
@@ -2465,7 +2551,9 @@ async fn workflow_distrib_suspend_resume() {
         assert_eq!(entry.unwrap().1, expected, "context mismatch for {id}");
     }
 
-    for h in &handles { h.stop(); }
+    for h in &handles {
+        h.stop();
+    }
     server.shutdown().await;
 }
 
@@ -2473,7 +2561,7 @@ async fn workflow_distrib_suspend_resume() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_distrib_suspend_cancel() {
-    use arbitro_client_tokio::workflow::{StepOutcome, ResumeContext};
+    use arbitro_client_tokio::workflow::{ResumeContext, StepOutcome};
 
     let mut server = TestServerBuilder::new().spawn().await;
 
@@ -2491,7 +2579,9 @@ async fn workflow_distrib_suspend_cancel() {
             .trigger(b"distrib-sc.>")
             .ack_wait_ms(5000)
             .step(b"prep", |ctx: StepContext| async move {
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             })
             .suspend_step(
                 b"wait",
@@ -2506,12 +2596,16 @@ async fn workflow_distrib_suspend_cancel() {
                     let r2 = r.clone();
                     async move {
                         r2.fetch_add(1, Ordering::SeqCst);
-                        Ok(StepResult { context: Vec::new() })
+                        Ok(StepResult {
+                            context: Vec::new(),
+                        })
                     }
                 },
             )
             .step(b"never", |ctx: StepContext| async move {
-                Ok(StepResult { context: ctx.context })
+                Ok(StepResult {
+                    context: ctx.context,
+                })
             })
             .start()
             .await
@@ -2537,10 +2631,7 @@ async fn workflow_distrib_suspend_cancel() {
     // Cancel all — round-robined across workers.
     for i in 0..count {
         let id = format!("dsc_{i}");
-        handles[0]
-            .cancel(&clients[0], &id)
-            .await
-            .unwrap();
+        handles[0].cancel(&clients[0], &id).await.unwrap();
     }
 
     // Wait for cancel processing + state stream remove propagation.
@@ -2549,19 +2640,19 @@ async fn workflow_distrib_suspend_cancel() {
     // Resume all — should be no-ops (instances already cancelled).
     for i in 0..count {
         let id = format!("dsc_{i}");
-        handles[0]
-            .resume(&clients[0], &id, b"late")
-            .await
-            .unwrap();
+        handles[0].resume(&clients[0], &id, b"late").await.unwrap();
     }
 
     // Verify no resumes fired.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        resumed.load(Ordering::SeqCst), 0,
+        resumed.load(Ordering::SeqCst),
+        0,
         "resume should not fire after cancel"
     );
 
-    for h in &handles { h.stop(); }
+    for h in &handles {
+        h.stop();
+    }
     server.shutdown().await;
 }

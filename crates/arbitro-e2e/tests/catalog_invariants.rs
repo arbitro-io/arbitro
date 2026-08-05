@@ -550,7 +550,16 @@ async fn create_consumer_config_mismatch_rejected() {
     let consumer_id = TestServer::parse_id(
         &client
             .create_consumer(
-                stream_id, b"f1_worker", b"", b"", 10u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+                stream_id,
+                b"f1_worker",
+                b"",
+                b"",
+                10u16,
+                1u8,
+                0u8,
+                0u8,
+                30_000u32,
+                0u64,
             )
             .await
             .expect("original create must succeed"),
@@ -560,7 +569,16 @@ async fn create_consumer_config_mismatch_rejected() {
     // not silently merged or updated.
     let err = client
         .create_consumer(
-            stream_id, b"f1_worker", b"", b"", 20u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+            stream_id,
+            b"f1_worker",
+            b"",
+            b"",
+            20u16,
+            1u8,
+            0u8,
+            0u8,
+            30_000u32,
+            0u64,
         )
         .await
         .expect_err("re-create with different max_inflight must be rejected");
@@ -579,7 +597,16 @@ async fn create_consumer_config_mismatch_rejected() {
     let same_id = TestServer::parse_id(
         &client
             .create_consumer(
-                stream_id, b"f1_worker", b"", b"", 10u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+                stream_id,
+                b"f1_worker",
+                b"",
+                b"",
+                10u16,
+                1u8,
+                0u8,
+                0u8,
+                30_000u32,
+                0u64,
             )
             .await
             .expect("idempotent re-create with the original config must succeed"),
@@ -596,9 +623,7 @@ async fn create_consumer_config_mismatch_rejected() {
             .expect("publish");
     }
     let mut delivered = 0usize;
-    while let Ok(Some(_msg)) =
-        tokio::time::timeout(Duration::from_secs(2), handle.recv()).await
-    {
+    while let Ok(Some(_msg)) = tokio::time::timeout(Duration::from_secs(2), handle.recv()).await {
         delivered += 1;
         // Do NOT ack — pin the inflight window at the configured cap.
         if delivered > 10 {

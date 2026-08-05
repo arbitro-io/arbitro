@@ -390,12 +390,7 @@ async fn cross_restart_dedup_survives() {
 
         // A NEW msg_id must still be accepted.
         client
-            .publish_wait_with_id(
-                stream_id,
-                b"k",
-                b"fresh-id",
-                Bytes::from_static(b"v3"),
-            )
+            .publish_wait_with_id(stream_id, b"k", b"fresh-id", Bytes::from_static(b"v3"))
             .await
             .expect("new msg_id must be accepted after restart");
 
@@ -474,21 +469,27 @@ async fn delivery_with_headers_strips_metadata() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"strip_hdr", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+        .create_stream(
+            b"strip_hdr",
+            b">",
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            /*window_ms*/ 60_000,
+        )
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
     let resp = client
         .create_consumer(
-            stream_id,
-            b"strip_c",
-            b"",
-            b"",
-            100u16,
-            1u8,  // AckPolicy::Explicit
-            0u8,  // DeliverPolicy::All
-            0u8,  // DeliverMode::default
+            stream_id, b"strip_c", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+            0u8,     // DeliverPolicy::All
+            0u8,     // DeliverMode::default
             5000u32, // ack_wait_ms
             0u64,
         )
@@ -538,21 +539,27 @@ async fn cross_restart_idempotency_with_consumer() {
         let client = server.connect().await;
 
         let resp = client
-            .create_stream(b"restart_c", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000)
+            .create_stream(
+                b"restart_c",
+                b">",
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                /*window_ms*/ 60_000,
+            )
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);
 
         let resp = client
             .create_consumer(
-                stream_id,
-                b"worker",
-                b"",
-                b"",
-                100u16,
-                1u8,  // AckPolicy::Explicit
-                0u8,  // DeliverPolicy::All
-                0u8,  // DeliverMode::default
+                stream_id, b"worker", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+                0u8,     // DeliverPolicy::All
+                0u8,     // DeliverMode::default
                 5000u32, // ack_wait_ms
                 0u64,
             )
@@ -631,14 +638,9 @@ async fn cross_restart_idempotency_with_consumer() {
         // Re-create consumer (same name returns same id) and subscribe.
         let resp = client
             .create_consumer(
-                stream_id,
-                b"worker",
-                b"",
-                b"",
-                100u16,
-                1u8,  // AckPolicy::Explicit
-                0u8,  // DeliverPolicy::All
-                0u8,  // DeliverMode::default
+                stream_id, b"worker", b"", b"", 100u16, 1u8,     // AckPolicy::Explicit
+                0u8,     // DeliverPolicy::All
+                0u8,     // DeliverMode::default
                 5000u32, // ack_wait_ms
                 0u64,
             )
@@ -667,7 +669,10 @@ async fn cross_restart_idempotency_with_consumer() {
         assert!(
             payloads.iter().any(|p| p == b"second-payload"),
             "consumer must receive the new message (dedup-2); got: {:?}",
-            payloads.iter().map(|p| String::from_utf8_lossy(p)).collect::<Vec<_>>()
+            payloads
+                .iter()
+                .map(|p| String::from_utf8_lossy(p))
+                .collect::<Vec<_>>()
         );
         // The rejected duplicate "dedup-1" must NOT have produced a second
         // copy of "replay-attempt" in the store — only the original
@@ -709,10 +714,7 @@ async fn publish_with_headers_roundtrip() {
     let consumer_id = TestServer::parse_id(&resp);
     let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
 
-    let headers: &[(&[u8], &[u8])] = &[
-        (b"trace-id", b"abc-123"),
-        (b"source", b"checkout-svc"),
-    ];
+    let headers: &[(&[u8], &[u8])] = &[(b"trace-id", b"abc-123"), (b"source", b"checkout-svc")];
     client
         .publish_with_headers(
             stream_id,
@@ -749,9 +751,7 @@ async fn publish_with_headers_roundtrip() {
 #[tokio::test(flavor = "multi_thread")]
 async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_restart() {
     use arbitro_proto::v2::header::entry_flag;
-    use arbitro_proto::v2::ingress::batch_pub_frame::{
-        BatchPubFrame, BATCH_PUB_ENTRY_HEADER_SIZE,
-    };
+    use arbitro_proto::v2::ingress::batch_pub_frame::{BatchPubFrame, BATCH_PUB_ENTRY_HEADER_SIZE};
     use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
     use arbitro_proto::wire::msg_headers::{encode_extended_payload_vec, HDR_MSG_ID};
     use tokio::io::AsyncWriteExt;
@@ -782,16 +782,11 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
 
         // Build two pre-encoded ExtendedPayloads with msg-id headers —
         // ids live in the TLV block, NOT the per-entry msg_id field.
-        let ext1 = encode_extended_payload_vec(
-            b"clean-payload-1",
-            &[(HDR_MSG_ID, b"batch-hdr-id-1")],
-        );
-        let ext2 = encode_extended_payload_vec(
-            b"clean-payload-2",
-            &[(HDR_MSG_ID, b"batch-hdr-id-2")],
-        );
-        let entries: [(&[u8], &[u8], &[u8]); 2] =
-            [(b"k.a", b"", &ext1), (b"k.b", b"", &ext2)];
+        let ext1 =
+            encode_extended_payload_vec(b"clean-payload-1", &[(HDR_MSG_ID, b"batch-hdr-id-1")]);
+        let ext2 =
+            encode_extended_payload_vec(b"clean-payload-2", &[(HDR_MSG_ID, b"batch-hdr-id-2")]);
+        let entries: [(&[u8], &[u8], &[u8]); 2] = [(b"k.a", b"", &ext1), (b"k.b", b"", &ext2)];
         let mut tail_bytes = 0usize;
         for (s, m, p) in &entries {
             tail_bytes += BATCH_PUB_ENTRY_HEADER_SIZE + s.len() + m.len() + p.len();
@@ -859,8 +854,8 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
         let client = server.connect().await;
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let stream_id = TestServer::find_stream_id(&resp, b"batch_hdrs")
-            .expect("stream must survive restart");
+        let stream_id =
+            TestServer::find_stream_id(&resp, b"batch_hdrs").expect("stream must survive restart");
 
         // Pre-fix the rebuild skipped flags:0 entries → this landed.
         let err = client
@@ -879,7 +874,12 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
 
         // A fresh id must still be accepted.
         client
-            .publish_wait_with_id(stream_id, b"k.a", b"fresh-after-restart", Bytes::from_static(b"v"))
+            .publish_wait_with_id(
+                stream_id,
+                b"k.a",
+                b"fresh-after-restart",
+                Bytes::from_static(b"v"),
+            )
             .await
             .expect("fresh id accepted after restart");
 
@@ -900,10 +900,7 @@ async fn publish_with_headers_dedup() {
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
 
-    let headers: &[(&[u8], &[u8])] = &[
-        (b"msg-id", b"unique-order-42"),
-        (b"priority", b"high"),
-    ];
+    let headers: &[(&[u8], &[u8])] = &[(b"msg-id", b"unique-order-42"), (b"priority", b"high")];
 
     client
         .publish_with_headers(

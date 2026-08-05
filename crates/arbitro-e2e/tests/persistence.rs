@@ -1250,8 +1250,8 @@ async fn deliver_policy_new_survives_restart() {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let sid =
-            TestServer::find_stream_id(&resp, b"dpnew").expect("dpnew stream missing after restart");
+        let sid = TestServer::find_stream_id(&resp, b"dpnew")
+            .expect("dpnew stream missing after restart");
 
         let resp = client
             .get_consumer(sid, b"tail")
@@ -1329,11 +1329,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..99 {
             let payload = i.to_le_bytes();
             client
-                .publish_wait(
-                    filler_sid,
-                    b"filler.pad",
-                    Bytes::copy_from_slice(&payload),
-                )
+                .publish_wait(filler_sid, b"filler.pad", Bytes::copy_from_slice(&payload))
                 .await
                 .expect("filler pre-publish");
         }
@@ -1348,11 +1344,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..100 {
             let payload = (i as u64).to_le_bytes();
             client
-                .publish_wait(
-                    a_sid,
-                    b"stream_a.data",
-                    Bytes::copy_from_slice(&payload),
-                )
+                .publish_wait(a_sid, b"stream_a.data", Bytes::copy_from_slice(&payload))
                 .await
                 .expect("publish to A");
         }
@@ -1362,11 +1354,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for batch in 0..1000 {
             let payload = (batch as u64).to_le_bytes();
             client
-                .publish_wait(
-                    filler_sid,
-                    b"filler.bulk",
-                    Bytes::copy_from_slice(&payload),
-                )
+                .publish_wait(filler_sid, b"filler.bulk", Bytes::copy_from_slice(&payload))
                 .await
                 .expect("filler bulk publish");
         }
@@ -1385,11 +1373,7 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         for i in 0u32..5 {
             let payload = (1000 + i as u64).to_le_bytes();
             client
-                .publish_wait(
-                    a_sid2,
-                    b"stream_a.data",
-                    Bytes::copy_from_slice(&payload),
-                )
+                .publish_wait(a_sid2, b"stream_a.data", Bytes::copy_from_slice(&payload))
                 .await
                 .expect("publish to new A");
         }
@@ -1425,8 +1409,8 @@ async fn created_at_seq_filters_old_entries_after_recycle() {
         let client = server.connect().await;
 
         let resp = client.list_streams(0, 1000).await.unwrap();
-        let a_sid =
-            TestServer::find_stream_id(&resp, b"stream_a").expect("stream_a not found after restart");
+        let a_sid = TestServer::find_stream_id(&resp, b"stream_a")
+            .expect("stream_a not found after restart");
 
         let resp = client
             .create_consumer(a_sid, b"reader2", b"", b"", u16::MAX, 0, 0, 0, 0, 0)

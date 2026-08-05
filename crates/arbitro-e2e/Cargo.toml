@@ -58,7 +58,7 @@ name    = "throughput_matrix"
 harness = false
 
 [[bench]]
-name    = "limits"
+name    = "max_inflights"
 harness = false
 
 [[bench]]

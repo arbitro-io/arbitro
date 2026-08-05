@@ -193,9 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let a = total_acked.load(Ordering::Relaxed);
                 let elapsed = last_report.elapsed().as_secs_f64();
                 let rate = (p - last_pub) as f64 / elapsed;
-                println!(
-                    "  > Telemetry | Published: {p} (avg {rate:.0} msg/s), Acked: {a}"
-                );
+                println!("  > Telemetry | Published: {p} (avg {rate:.0} msg/s), Acked: {a}");
                 last_pub = p;
                 last_report = Instant::now();
             }
