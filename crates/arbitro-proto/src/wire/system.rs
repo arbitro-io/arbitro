@@ -238,7 +238,12 @@ impl<'a> DisconnectView<'a> {
     #[inline(always)]
     pub fn try_reason_code(&self) -> Option<u16> {
         let bytes = self.buf.get(..core::mem::size_of::<DisconnectAction>())?;
-        Some(DisconnectAction::ref_from_bytes(bytes).ok()?.reason_code.get())
+        Some(
+            DisconnectAction::ref_from_bytes(bytes)
+                .ok()?
+                .reason_code
+                .get(),
+        )
     }
 }
 

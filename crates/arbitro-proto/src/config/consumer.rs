@@ -137,8 +137,8 @@ impl ConsumerConfig {
         start_seq: u64,
         max_subject_inflights: Box<[MaxSubjectInflight]>,
     ) -> Result<ConsumerConfig, crate::error::ErrorCode> {
-        let ack_policy = AckPolicy::from_u8(ack_policy)
-            .ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
+        let ack_policy =
+            AckPolicy::from_u8(ack_policy).ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
         let deliver_policy = DeliverPolicy::from_u8(deliver_policy)
             .ok_or(crate::error::ErrorCode::InvalidConsumerConfig)?;
         let deliver_mode = DeliverMode::from_u8(deliver_mode)

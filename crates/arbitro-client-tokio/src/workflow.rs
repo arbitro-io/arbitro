@@ -281,10 +281,11 @@ impl WorkflowBuilder {
         F: Fn(StepContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<StepResult, String>> + Send + 'static,
     {
-        let handler: StepHandler =
-            Arc::new(move |ctx: StepContext| -> BoxFut<Result<StepResult, String>> {
+        let handler: StepHandler = Arc::new(
+            move |ctx: StepContext| -> BoxFut<Result<StepResult, String>> {
                 Box::pin(handler(ctx))
-            });
+            },
+        );
         self.steps.push(StepDef {
             name: name.to_vec(),
             kind: StepKind::Normal(handler),
@@ -319,7 +320,12 @@ impl WorkflowBuilder {
             Arc::new(move |ctx| -> BoxFut<Result<StepResult, String>> { Box::pin(on_resume(ctx)) });
         self.steps.push(StepDef {
             name: name.to_vec(),
-            kind: StepKind::Suspend { run: run_h, on_resume: resume_h, on_timeout: None, timeout_ms },
+            kind: StepKind::Suspend {
+                run: run_h,
+                on_resume: resume_h,
+                on_timeout: None,
+                timeout_ms,
+            },
         });
         self.compensations.push(None);
         self
@@ -349,10 +355,11 @@ impl WorkflowBuilder {
         F: Fn(StepContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<StepResult, String>> + Send + 'static,
     {
-        let h: StepHandler =
-            Arc::new(move |ctx: StepContext| -> BoxFut<Result<StepResult, String>> {
+        let h: StepHandler = Arc::new(
+            move |ctx: StepContext| -> BoxFut<Result<StepResult, String>> {
                 Box::pin(handler(ctx))
-            });
+            },
+        );
         if let Some(last) = self.compensations.last_mut() {
             *last = Some(h);
         }
@@ -390,10 +397,14 @@ impl WorkflowBuilder {
     /// Register the workflow and start processing tasks.
     pub async fn start(self) -> Result<WorkflowHandle, ClientError> {
         if self.trigger_subject.is_none() {
-            return Err(ClientError::InvalidConfig("trigger subject required".into()));
+            return Err(ClientError::InvalidConfig(
+                "trigger subject required".into(),
+            ));
         }
         if self.steps.is_empty() {
-            return Err(ClientError::InvalidConfig("at least one step required".into()));
+            return Err(ClientError::InvalidConfig(
+                "at least one step required".into(),
+            ));
         }
 
         let name_str = String::from_utf8_lossy(&self.name);
@@ -450,12 +461,12 @@ impl WorkflowBuilder {
                 state_consumer_name.as_bytes(),
                 b"", // no group → fanout
                 state_subject.as_bytes(),
-                100,  // max_inflight
-                1,    // AckPolicy::Explicit
-                0,    // DeliverPolicy::All
-                0,    // DeliverMode::Fanout
+                100,    // max_inflight
+                1,      // AckPolicy::Explicit
+                0,      // DeliverPolicy::All
+                0,      // DeliverMode::Fanout
                 30_000, // ack_wait_ms
-                0,    // start_seq
+                0,      // start_seq
             )
             .await?;
         let state_consumer_id =
@@ -508,8 +519,7 @@ impl WorkflowBuilder {
 
         // Tracks message seqs that were nacked once for cross-worker retry.
         // If the same seq is nacked again, we ack as stale instead of looping.
-        let nacked_seqs: Arc<TokioMutex<HashSet<u64>>> =
-            Arc::new(TokioMutex::new(HashSet::new()));
+        let nacked_seqs: Arc<TokioMutex<HashSet<u64>>> = Arc::new(TokioMutex::new(HashSet::new()));
 
         // ── State sync background task ──
         // Consumes park/remove events from the state stream and updates the
@@ -519,10 +529,8 @@ impl WorkflowBuilder {
             let suspended = Arc::clone(&suspended);
             let cancel_state = cancel.clone();
             let wf_name_str: Arc<str> = String::from_utf8_lossy(&self.name).into();
-            let park_prefix: Vec<u8> =
-                format!("_wf.{wf_name_str}.__state.park.").into_bytes();
-            let remove_prefix: Vec<u8> =
-                format!("_wf.{wf_name_str}.__state.remove.").into_bytes();
+            let park_prefix: Vec<u8> = format!("_wf.{wf_name_str}.__state.park.").into_bytes();
+            let remove_prefix: Vec<u8> = format!("_wf.{wf_name_str}.__state.remove.").into_bytes();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -1006,12 +1014,12 @@ impl WorkflowBuilder {
                     trigger_consumer_name.as_bytes(),
                     trigger_consumer_name.as_bytes(),
                     trigger_subject,
-                    1,  // max_inflight
-                    1,  // AckPolicy::Explicit
-                    0,  // DeliverPolicy::All
-                    1,  // DeliverMode::Queue
+                    1, // max_inflight
+                    1, // AckPolicy::Explicit
+                    0, // DeliverPolicy::All
+                    1, // DeliverMode::Queue
                     self.ack_wait_ms,
-                    0,  // start_seq
+                    0, // start_seq
                 )
                 .await?;
             let trigger_consumer_id =
@@ -1024,10 +1032,8 @@ impl WorkflowBuilder {
 
             let cancel_trigger = cancel.clone();
             // Pre-compute subject prefix — avoids per-message from_utf8_lossy + format.
-            let trigger_subject: Arc<str> = format!(
-                "_wf.{}.step.0",
-                String::from_utf8_lossy(&self.name),
-            ).into();
+            let trigger_subject: Arc<str> =
+                format!("_wf.{}.step.0", String::from_utf8_lossy(&self.name),).into();
             let trigger_client = self.client.clone();
 
             tokio::spawn(async move {
@@ -1061,8 +1067,7 @@ impl WorkflowBuilder {
         // ── Source subscriptions ──
         for (src_idx, src) in self.sources.iter().enumerate() {
             let src_stream_resp = self.client.get_stream(&src.stream_name).await?;
-            let src_stream_id =
-                u64::from_le_bytes(src_stream_resp[..8].try_into().unwrap()) as u32;
+            let src_stream_id = u64::from_le_bytes(src_stream_resp[..8].try_into().unwrap()) as u32;
 
             let src_consumer_name = format!("_wf_{name_str}_src_{src_idx}");
             let src_consumer_resp = self
@@ -1072,12 +1077,12 @@ impl WorkflowBuilder {
                     src_consumer_name.as_bytes(),
                     src_consumer_name.as_bytes(),
                     &src.subject,
-                    1,  // max_inflight
-                    1,  // AckPolicy::Explicit
-                    0,  // DeliverPolicy::All
-                    1,  // DeliverMode::Queue
+                    1, // max_inflight
+                    1, // AckPolicy::Explicit
+                    0, // DeliverPolicy::All
+                    1, // DeliverMode::Queue
                     self.ack_wait_ms,
-                    0,  // start_seq
+                    0, // start_seq
                 )
                 .await?;
             let src_consumer_id =
@@ -1089,11 +1094,8 @@ impl WorkflowBuilder {
                 .await?;
 
             let cancel_src = cancel.clone();
-            let step0_subject: Arc<str> = format!(
-                "_wf.{}.step.0",
-                String::from_utf8_lossy(&self.name),
-            )
-            .into();
+            let step0_subject: Arc<str> =
+                format!("_wf.{}.step.0", String::from_utf8_lossy(&self.name),).into();
             let src_client = self.client.clone();
 
             tokio::spawn(async move {
@@ -1173,10 +1175,7 @@ impl WorkflowHandle {
         context: &[u8],
     ) -> Result<(), ClientError> {
         let msg_id = format!("wf:{instance_id}:0:0");
-        let subject = format!(
-            "_wf.{}.step.0",
-            String::from_utf8_lossy(&self.name)
-        );
+        let subject = format!("_wf.{}.step.0", String::from_utf8_lossy(&self.name));
         let task = encode_task(instance_id, 0, 0, context);
         client
             .publish_wait_with_id(
@@ -1193,11 +1192,7 @@ impl WorkflowHandle {
     ///
     /// Returns the generated instance ID so the caller can track
     /// or correlate the workflow instance.
-    pub async fn trigger(
-        &self,
-        client: &Client,
-        context: &[u8],
-    ) -> Result<String, ClientError> {
+    pub async fn trigger(&self, client: &Client, context: &[u8]) -> Result<String, ClientError> {
         let instance_id = next_instance_id();
         self.trigger_with_id(client, &instance_id, context).await?;
         Ok(instance_id)
@@ -1208,11 +1203,7 @@ impl WorkflowHandle {
     /// If the instance is suspended, it is removed from the registry.
     /// If the instance is currently running or doesn't exist, the
     /// cancel message is a no-op (idempotent).
-    pub async fn cancel(
-        &self,
-        client: &Client,
-        instance_id: &str,
-    ) -> Result<(), ClientError> {
+    pub async fn cancel(&self, client: &Client, instance_id: &str) -> Result<(), ClientError> {
         let subject = format!(
             "_wf.{}.cancel.{instance_id}",
             String::from_utf8_lossy(&self.name),
@@ -1299,4 +1290,3 @@ async fn create_or_get_stream(
         Err(e) => Err(e),
     }
 }
-

@@ -83,7 +83,9 @@ pub struct ShardRouter {
     /// send `ReplicationBatch`es through this channel; the replication
     /// loop forwards them to followers via the cluster transport.
     #[cfg(feature = "cluster")]
-    replication_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>>,
+    replication_tx: Arc<
+        parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>,
+    >,
 }
 
 /// F37 — list_streams / list_consumers TTL cache. 1-second freshness
@@ -174,8 +176,9 @@ impl ShardRouter {
         // shard workers. Starts as None; `set_replication_tx` fills it
         // during cluster boot. Workers check it lazily on flush.
         #[cfg(feature = "cluster")]
-        let replication_tx: Arc<parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>> =
-            Arc::new(parking_lot::Mutex::new(None));
+        let replication_tx: Arc<
+            parking_lot::Mutex<Option<mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>,
+        > = Arc::new(parking_lot::Mutex::new(None));
 
         for id in 0..shard_count {
             let (tx, rx) = mpsc::channel(channel_capacity);
@@ -198,12 +201,8 @@ impl ShardRouter {
                     // command log + delayed journal — the actual
                     // message data was silently at OS-buffer mercy.
                     let store_fsync = match config.fsync_policy {
-                        crate::config::FsyncPolicy::Every => {
-                            arbitro_store::FsyncPolicy::EveryWrite
-                        }
-                        crate::config::FsyncPolicy::None => {
-                            arbitro_store::FsyncPolicy::None
-                        }
+                        crate::config::FsyncPolicy::Every => arbitro_store::FsyncPolicy::EveryWrite,
+                        crate::config::FsyncPolicy::None => arbitro_store::FsyncPolicy::None,
                     };
                     let mut tolerant = arbitro_store::TolerantStore::new(path.clone());
                     tolerant.set_fsync_policy(store_fsync);

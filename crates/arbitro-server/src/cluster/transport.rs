@@ -117,10 +117,7 @@ impl ClusterTransportLimits {
         }
         let d = Self::default();
         Self {
-            max_frame_body_bytes: parse(
-                "ARBITRO_CLUSTER_MAX_FRAME_SIZE",
-                d.max_frame_body_bytes,
-            ),
+            max_frame_body_bytes: parse("ARBITRO_CLUSTER_MAX_FRAME_SIZE", d.max_frame_body_bytes),
             max_inbound_connections: parse(
                 "ARBITRO_CLUSTER_MAX_INBOUND_CONNS",
                 d.max_inbound_connections,
@@ -165,9 +162,7 @@ impl InboundGuard {
             rate_limited_disconnects: AtomicU64::new(0),
             conns_rejected_over_cap: AtomicU64::new(0),
             jailed_accepts_rejected: AtomicU64::new(0),
-            conn_slots: Arc::new(tokio::sync::Semaphore::new(
-                limits.max_inbound_connections,
-            )),
+            conn_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_inbound_connections)),
             jail: parking_lot::Mutex::new(HashMap::new()),
         }
     }
@@ -344,8 +339,13 @@ impl TcpRaftTransport {
         peers: HashMap<PeerId, SocketAddr>,
         security: ClusterSecurityConfig,
     ) -> Result<Self, RaftError> {
-        Self::new_with_limits(bind_addr, peers, security, ClusterTransportLimits::default())
-            .await
+        Self::new_with_limits(
+            bind_addr,
+            peers,
+            security,
+            ClusterTransportLimits::default(),
+        )
+        .await
     }
 
     /// Create a transport with an explicit security posture AND explicit
@@ -449,9 +449,7 @@ impl TcpRaftTransport {
     /// `server.rs`) passes it to the `follower_replication_loop`.
     ///
     /// Returns `None` if already taken.
-    pub fn take_replication_rx(
-        &self,
-    ) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+    pub fn take_replication_rx(&self) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
         self.repl_incoming_rx.lock().take()
     }
 
@@ -472,7 +470,9 @@ impl TcpRaftTransport {
             // protocol offense (oversize frame, rate breach) is refused
             // outright — no task, no TLS handshake, no buffer.
             if guard.ip_jailed(remote.ip()) {
-                guard.jailed_accepts_rejected.fetch_add(1, Ordering::Relaxed);
+                guard
+                    .jailed_accepts_rejected
+                    .fetch_add(1, Ordering::Relaxed);
                 continue; // dropping `stream` closes the socket
             }
             // D3 connection cap: one permit per open inbound connection;
@@ -712,9 +712,7 @@ impl TcpRaftTransport {
             // identity. A mismatch is a spoof attempt (or a misconfigured
             // node); the frame is dropped so it can never be credited to
             // another member (vote grants, append acks, snapshot offers).
-            let from = u64::from_le_bytes(
-                frame[FROM_OFFSET..FROM_OFFSET + 8].try_into().unwrap(),
-            );
+            let from = u64::from_le_bytes(frame[FROM_OFFSET..FROM_OFFSET + 8].try_into().unwrap());
             if !allowed.permits(from) {
                 spoof.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
@@ -764,14 +762,11 @@ impl TcpRaftTransport {
         #[cfg(feature = "cluster-tls")]
         let stream = if let Some(tls_cfg) = &security.tls {
             // Rebuilt per dial so rotated PEM files take effect on reconnect.
-            let connector = super::security::tls::build_connector(tls_cfg)
-                .map_err(RaftError::Transport)?;
+            let connector =
+                super::security::tls::build_connector(tls_cfg).map_err(RaftError::Transport)?;
             let ident = super::security::identity_for_peer(tls_cfg, peer.0);
-            let server_name =
-                tokio_rustls::rustls::pki_types::ServerName::try_from(ident.clone())
-                    .map_err(|e| {
-                        RaftError::Transport(format!("bad peer identity {ident:?}: {e}"))
-                    })?;
+            let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(ident.clone())
+                .map_err(|e| RaftError::Transport(format!("bad peer identity {ident:?}: {e}")))?;
             let tls = connector
                 .connect(server_name, tcp)
                 .await
@@ -822,8 +817,7 @@ impl RaftTransport for TcpRaftTransport {
             unsafe { std::mem::transmute::<&[&[u8]], &'static [&'static [u8]]>(slices) };
 
         async move {
-            let stream =
-                Self::get_or_connect(&connections, &peers, &security, peer).await?;
+            let stream = Self::get_or_connect(&connections, &peers, &security, peer).await?;
 
             let result = async {
                 let mut s = stream.lock().await;
@@ -863,8 +857,7 @@ impl RaftTransport for TcpRaftTransport {
         let peers = self.peers.clone();
         let security = self.security.clone();
         async move {
-            let stream =
-                Self::get_or_connect(&connections, &peers, &security, peer).await?;
+            let stream = Self::get_or_connect(&connections, &peers, &security, peer).await?;
 
             let result = async {
                 let mut s = stream.lock().await;
@@ -884,10 +877,7 @@ impl RaftTransport for TcpRaftTransport {
         }
     }
 
-    async fn recv_frame(
-        &self,
-        out: &mut [u8],
-    ) -> Result<usize, RaftError> {
+    async fn recv_frame(&self, out: &mut [u8]) -> Result<usize, RaftError> {
         let mut rx = self.incoming_rx.lock().await;
         let frame = rx
             .recv()

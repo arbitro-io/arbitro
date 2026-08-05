@@ -117,9 +117,7 @@ impl HeadersBlock {
     /// Headers section size for a given set of entries.
     #[inline]
     pub fn section_size(entries: &[(&[u8], &[u8])]) -> usize {
-        let entries_len: usize = entries.iter()
-            .map(|(k, v)| 3 + k.len() + v.len())
-            .sum();
+        let entries_len: usize = entries.iter().map(|(k, v)| 3 + k.len() + v.len()).sum();
         6 + entries_len // headers_len(4) + count(2) + entries
     }
 }
@@ -207,9 +205,7 @@ pub fn encode_extended_payload<'a>(
     ext.data[..payload.len()].copy_from_slice(payload);
 
     let h_off = payload.len();
-    let entries_len: usize = entries.iter()
-        .map(|(k, v)| 3 + k.len() + v.len())
-        .sum();
+    let entries_len: usize = entries.iter().map(|(k, v)| 3 + k.len() + v.len()).sum();
 
     let hdr = HeadersBlock::mut_from_bytes(&mut ext.data[h_off..]).expect("headers block size");
     hdr.headers_len = U32::new((6 + entries_len) as u32);
@@ -218,8 +214,7 @@ pub fn encode_extended_payload<'a>(
     let mut o = 0;
     for (k, v) in entries {
         let total = 3 + k.len() + v.len();
-        let entry = HeaderEntry::mut_from_bytes(&mut hdr.data[o..o + total])
-            .expect("entry size");
+        let entry = HeaderEntry::mut_from_bytes(&mut hdr.data[o..o + total]).expect("entry size");
         entry.key_len = k.len() as u8;
         entry.val_len = U16::new(v.len() as u16);
         entry.data[..k.len()].copy_from_slice(k);
@@ -231,10 +226,7 @@ pub fn encode_extended_payload<'a>(
 }
 
 /// Convenience: allocate + encode. Returns owned `Vec<u8>`.
-pub fn encode_extended_payload_vec(
-    payload: &[u8],
-    entries: &[(&[u8], &[u8])],
-) -> Vec<u8> {
+pub fn encode_extended_payload_vec(payload: &[u8], entries: &[(&[u8], &[u8])]) -> Vec<u8> {
     let section = HeadersBlock::section_size(entries);
     let total = ExtendedPayload::wire_size(payload.len(), section);
     let mut buf = vec![0u8; total];
@@ -271,10 +263,7 @@ mod tests {
 
     #[test]
     fn headers_len_matches_section_size_roundtrip() {
-        let entries: &[(&[u8], &[u8])] = &[
-            (b"wf-id", b"order-process"),
-            (b"wf-step", &[2]),
-        ];
+        let entries: &[(&[u8], &[u8])] = &[(b"wf-id", b"order-process"), (b"wf-step", &[2])];
         let expected_section = HeadersBlock::section_size(entries);
         let buf = encode_extended_payload_vec(b"payload", entries);
 
@@ -308,11 +297,7 @@ mod tests {
 
     #[test]
     fn iterator_visits_all_entries() {
-        let entries: &[(&[u8], &[u8])] = &[
-            (b"a", b"1"),
-            (b"bb", b"22"),
-            (b"ccc", b"333"),
-        ];
+        let entries: &[(&[u8], &[u8])] = &[(b"a", b"1"), (b"bb", b"22"), (b"ccc", b"333")];
         let buf = encode_extended_payload_vec(b"", entries);
         let ext = ExtendedPayload::ref_from_bytes(&buf).unwrap();
         let hdr = ext.headers_block().unwrap();
@@ -339,10 +324,7 @@ mod tests {
 
     #[test]
     fn msg_id_key_convention() {
-        let entries: &[(&[u8], &[u8])] = &[
-            (HDR_MSG_ID, b"wf:123:0:0"),
-            (b"wf-step", &[0]),
-        ];
+        let entries: &[(&[u8], &[u8])] = &[(HDR_MSG_ID, b"wf:123:0:0"), (b"wf-step", &[0])];
         let buf = encode_extended_payload_vec(b"payload", entries);
         let ext = ExtendedPayload::ref_from_bytes(&buf).unwrap();
         let hdr = ext.headers_block().unwrap();

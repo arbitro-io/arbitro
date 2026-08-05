@@ -31,9 +31,7 @@ use crate::shard::command::*;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::drain_events::DrainEvent;
 use crate::shard::router::SharedStore;
-use crate::shard::shared::{
-    DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap,
-};
+use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
 
 // ── Per-stream retention config ──────────────────────────────────────────────
@@ -514,7 +512,11 @@ pub struct CommandWorker {
     /// flush that needs replication. The `Arc<Mutex<Option<Sender>>>` is
     /// the same instance stored in the router, so no manual propagation.
     #[cfg(feature = "cluster")]
-    pub(super) replication_tx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::cluster::replication::ReplicationBatch>>>>,
+    pub(super) replication_tx: std::sync::Arc<
+        parking_lot::Mutex<
+            Option<tokio::sync::mpsc::Sender<crate::cluster::replication::ReplicationBatch>>,
+        >,
+    >,
 }
 
 impl CommandWorker {
@@ -1191,7 +1193,9 @@ impl CommandWorker {
     /// file. Format: repeated `[stream_id: u32 LE][created_at_seq: u64 LE]`
     /// (12 bytes per entry). Called after create/delete stream.
     pub(super) fn save_stream_lifecycle(&self) {
-        let Some(ref dir) = self.data_path else { return };
+        let Some(ref dir) = self.data_path else {
+            return;
+        };
         let path = dir.join("stream_lifecycle.bin");
         let mut buf = Vec::with_capacity(self.stream_retention.len() * 12);
         for (sid, r) in &self.stream_retention {
@@ -1207,9 +1211,13 @@ impl CommandWorker {
     /// `stream_retention` entries with the persisted `created_at_seq`.
     /// Must be called AFTER command log replay has populated stream_retention.
     pub(super) fn load_stream_lifecycle(&mut self) {
-        let Some(ref dir) = self.data_path else { return };
+        let Some(ref dir) = self.data_path else {
+            return;
+        };
         let path = dir.join("stream_lifecycle.bin");
-        let Ok(bytes) = std::fs::read(&path) else { return };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
         if bytes.len() % 12 != 0 {
             return;
         }

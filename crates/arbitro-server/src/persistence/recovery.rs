@@ -443,41 +443,43 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
             let mut tracker = tracker_arc.lock();
 
             let mut stream_recovered = 0u64;
-            store.for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
-                // Skip entries older than the idempotency window.
-                if entry.timestamp < cutoff_ms {
-                    return;
-                }
+            store
+                .for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+                    // Skip entries older than the idempotency window.
+                    if entry.timestamp < cutoff_ms {
+                        return;
+                    }
 
-                // Only process entries with HAS_HEADERS flag.
-                if entry.flags & arbitro_store::flags::HAS_HEADERS == 0 {
-                    return;
-                }
+                    // Only process entries with HAS_HEADERS flag.
+                    if entry.flags & arbitro_store::flags::HAS_HEADERS == 0 {
+                        return;
+                    }
 
-                // Parse the extended payload to extract msg-id header.
-                let ext = match ExtendedPayload::ref_from_bytes(entry.payload) {
-                    Ok(e) => e,
-                    Err(_) => return,
-                };
-                let hdr = match ext.headers_block() {
-                    Some(h) => h,
-                    None => return,
-                };
-                let msg_id = match hdr.get(HDR_MSG_ID) {
-                    Some(id) if !id.is_empty() => id,
-                    _ => return,
-                };
+                    // Parse the extended payload to extract msg-id header.
+                    let ext = match ExtendedPayload::ref_from_bytes(entry.payload) {
+                        Ok(e) => e,
+                        Err(_) => return,
+                    };
+                    let hdr = match ext.headers_block() {
+                        Some(h) => h,
+                        None => return,
+                    };
+                    let msg_id = match hdr.get(HDR_MSG_ID) {
+                        Some(id) if !id.is_empty() => id,
+                        _ => return,
+                    };
 
-                // Repopulate the tracker.
-                let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
-                // Remaining window = window_ms - (now - entry.timestamp).
-                let elapsed = now_ms.saturating_sub(entry.timestamp);
-                let remaining_ms = (window_ms as u64).saturating_sub(elapsed);
-                if remaining_ms > 0 {
-                    tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
-                    stream_recovered += 1;
-                }
-            }).ok();
+                    // Repopulate the tracker.
+                    let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
+                    // Remaining window = window_ms - (now - entry.timestamp).
+                    let elapsed = now_ms.saturating_sub(entry.timestamp);
+                    let remaining_ms = (window_ms as u64).saturating_sub(elapsed);
+                    if remaining_ms > 0 {
+                        tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
+                        stream_recovered += 1;
+                    }
+                })
+                .ok();
 
             drop(tracker);
             if stream_recovered > 0 {

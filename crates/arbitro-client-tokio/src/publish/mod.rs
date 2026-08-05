@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use arbitro_proto::v2::header::entry_flag;
 use arbitro_proto::v2::ingress::pub_frame::PubFrame;
-use arbitro_proto::wire::msg_headers::{
-    encode_extended_payload_vec, HDR_MSG_ID,
-};
+use arbitro_proto::wire::msg_headers::{encode_extended_payload_vec, HDR_MSG_ID};
 use bytes::Bytes;
 
 use crate::error::ClientError;
@@ -26,7 +24,9 @@ pub const PUBLISH_BATCH_MAX: usize = 256;
 #[inline]
 pub(crate) fn enqueue(pool: &Arc<WritePool>, frame: WriteFrame) -> Result<(), ClientError> {
     let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
-    lease.try_send(frame).map_err(|_| ClientError::ChannelClosed)
+    lease
+        .try_send(frame)
+        .map_err(|_| ClientError::ChannelClosed)
 }
 
 /// Encode a single PubFrame into a `WriteFrame`.

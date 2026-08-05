@@ -202,14 +202,19 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
 
     inner.ackrel.purge_up_to(consumer_id, cursor);
     // Below the broker's retention floor — will never be confirmable.
-    inner.ackrel.purge_up_to(consumer_id, low_seq.saturating_sub(1));
+    inner
+        .ackrel
+        .purge_up_to(consumer_id, low_seq.saturating_sub(1));
 
     // Durable dedup: the broker's cursor is a cumulative ack floor — it never
     // redelivers at or below it, so drop those seqs from the WAL live set.
     // Keeps the set tiny with no periodic job (see `SlotRef::confirm_up_to`).
     if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
         if let Err(e) = slot.confirm_up_to(cursor) {
-            inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+            inner
+                .metrics
+                .ackstore_errors
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
         }
     }
@@ -217,7 +222,10 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
     let pending = inner.ackrel.drain_ascending(consumer_id, usize::MAX);
     if let Some(&max_seq) = pending.last() {
         if max_seq > high_seq {
-            inner.metrics.suspicious_seq_over_high.fetch_add(1, Ordering::Relaxed);
+            inner
+                .metrics
+                .suspicious_seq_over_high
+                .fetch_add(1, Ordering::Relaxed);
             warn_rate_limited(consumer_id, max_seq, high_seq);
         }
     }
@@ -243,13 +251,19 @@ fn dispatch_ack_batch_resp(inner: &Arc<Inner>, frame: &Bytes) {
     let new_cursor = rep.body.new_cursor.get();
 
     let purged = inner.ackrel.purge_up_to(consumer_id, new_cursor);
-    inner.metrics.acks_confirmed.fetch_add(purged as u64, Ordering::Relaxed);
+    inner
+        .metrics
+        .acks_confirmed
+        .fetch_add(purged as u64, Ordering::Relaxed);
 
     // Durable dedup cleanup: the broker confirmed cumulative ack up to
     // `new_cursor`, so those seqs are safe to drop from the WAL live set.
     if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
         if let Err(e) = slot.confirm_up_to(new_cursor) {
-            inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+            inner
+                .metrics
+                .ackstore_errors
+                .fetch_add(1, Ordering::Relaxed);
             tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
         }
     }
@@ -271,7 +285,10 @@ fn warn_rate_limited(consumer_id: u32, seq: u64, high_seq: u64) {
         .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok()
     {
-        warn!(consumer_id, seq, high_seq, "deferred ack seq above broker high-water mark");
+        warn!(
+            consumer_id,
+            seq, high_seq, "deferred ack seq above broker high-water mark"
+        );
     }
 }
 

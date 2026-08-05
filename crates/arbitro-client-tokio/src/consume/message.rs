@@ -171,11 +171,12 @@ impl Message {
     /// This is a fire-and-forget publish via a leased producer — it does
     /// not wait for broker confirmation.
     pub fn reply(&self, payload: &[u8]) -> Result<(), ClientError> {
-        let (target_stream_id, subject) = decode_reply_to(&self.reply_to)
-            .ok_or(ClientError::NoReplyAddress)?;
+        let (target_stream_id, subject) =
+            decode_reply_to(&self.reply_to).ok_or(ClientError::NoReplyAddress)?;
 
         let seq = self.inner.seq_alloc.next();
-        let frame = crate::publish::encode_pub_frame_for_reply(seq, target_stream_id, subject, payload);
+        let frame =
+            crate::publish::encode_pub_frame_for_reply(seq, target_stream_id, subject, payload);
         crate::publish::enqueue(&self.inner.pool, frame)
     }
 
@@ -193,10 +194,16 @@ impl Message {
         if let Some(slot) = &self.slot {
             match slot.record(self.seq) {
                 Ok(()) => {
-                    self.inner.metrics.ackstore_records.fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .metrics
+                        .ackstore_records
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    self.inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .metrics
+                        .ackstore_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(seq = self.seq, error = %e, "ackstore: record failed");
                 }
             }
@@ -211,7 +218,10 @@ impl Message {
             self.inner
                 .ackrel
                 .record_deferred(self.consumer_id, generation, self.seq, now_ms());
-            self.inner.metrics.acks_deferred.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .acks_deferred
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 

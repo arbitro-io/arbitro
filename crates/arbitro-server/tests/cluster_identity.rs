@@ -141,8 +141,7 @@ mod mtls {
         /// returning a TLS-enabled security config pointing at them.
         fn node_config(&self, dir: &Path, id: u64) -> ClusterSecurityConfig {
             let key = rcgen::KeyPair::generate().unwrap();
-            let params =
-                rcgen::CertificateParams::new(vec![format!("peer-{id}")]).unwrap();
+            let params = rcgen::CertificateParams::new(vec![format!("peer-{id}")]).unwrap();
             let cert = params.signed_by(&key, &self.ca, &self.ca_key).unwrap();
 
             let cert_path = dir.join(format!("node{id}.crt"));

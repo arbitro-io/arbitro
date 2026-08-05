@@ -275,8 +275,7 @@ impl FileRaftStorage {
             let index = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
             let term = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
             let len = u32::from_le_bytes(data[off + 16..off + 20].try_into().unwrap()) as usize;
-            let stored_crc =
-                u32::from_le_bytes(data[off + 20..off + 24].try_into().unwrap());
+            let stored_crc = u32::from_le_bytes(data[off + 20..off + 24].try_into().unwrap());
 
             if len > MAX_PAYLOAD_LEN {
                 // Garbage header (torn write or corruption): stop here.
@@ -447,9 +446,7 @@ impl FileRaftStorage {
         let index = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let term = u64::from_le_bytes(data[16..24].try_into().unwrap());
         let payload_len = u64::from_le_bytes(data[24..32].try_into().unwrap());
-        let stored_crc = u32::from_le_bytes(
-            data[SNAP_CRC_OFFSET..SNAP_HEADER].try_into().unwrap(),
-        );
+        let stored_crc = u32::from_le_bytes(data[SNAP_CRC_OFFSET..SNAP_HEADER].try_into().unwrap());
 
         // The payload must be exactly payload_len bytes: shorter = truncated
         // write, longer = trailing garbage — both are corruption.
@@ -509,7 +506,10 @@ fn storage_write_err(what: &str, e: std::io::Error) -> RaftError {
 /// "forget" its vote and could double-vote in the same term.
 fn write_file_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent directory")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
     })?;
 
     // Sibling temp file in the same directory so the rename is atomic
@@ -906,7 +906,10 @@ mod tests {
         let hs = storage.load_hard_state().expect("load");
         assert_eq!(hs.current_term, Term(0));
         assert_eq!(hs.voted_for, None);
-        assert_eq!(storage.last_log_position().expect("pos"), (LogIndex(0), Term(0)));
+        assert_eq!(
+            storage.last_log_position().expect("pos"),
+            (LogIndex(0), Term(0))
+        );
         assert!(storage.load_snapshot().expect("snap").is_none());
     }
 
@@ -1029,8 +1032,7 @@ mod tests {
                 voted_for: Some(PeerId(1)),
             })
             .expect("save");
-        std::fs::write(dir.0.join("hard_state.json.tmp"), b"{corrupt")
-            .expect("plant stale tmp");
+        std::fs::write(dir.0.join("hard_state.json.tmp"), b"{corrupt").expect("plant stale tmp");
         drop(storage);
 
         // Recovery ignores the temp file entirely.
@@ -1079,10 +1081,8 @@ mod tests {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
             // Append in three batches (as the raft node would).
             for chunk in expected.chunks(17) {
-                let batch: Vec<LogEntry<'_>> = chunk
-                    .iter()
-                    .map(|(i, t, p)| entry(*i, *t, p))
-                    .collect();
+                let batch: Vec<LogEntry<'_>> =
+                    chunk.iter().map(|(i, t, p)| entry(*i, *t, p)).collect();
                 storage.append_entries(&batch).expect("append");
             }
             assert_eq!(
@@ -1165,10 +1165,10 @@ mod tests {
 
         {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
-            let batch: Vec<(u64, Vec<u8>)> =
-                (1..=10u64).map(|i| (i, format!("v{i}").into_bytes())).collect();
-            let entries: Vec<LogEntry<'_>> =
-                batch.iter().map(|(i, p)| entry(*i, 1, p)).collect();
+            let batch: Vec<(u64, Vec<u8>)> = (1..=10u64)
+                .map(|i| (i, format!("v{i}").into_bytes()))
+                .collect();
+            let entries: Vec<LogEntry<'_>> = batch.iter().map(|(i, p)| entry(*i, 1, p)).collect();
             storage.append_entries(&entries).expect("append");
 
             storage.truncate_suffix(LogIndex(6)).expect("truncate");
@@ -1224,10 +1224,10 @@ mod tests {
         let snap_bytes = b"state-machine-through-6".to_vec();
         {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
-            let batch: Vec<(u64, Vec<u8>)> =
-                (1..=10u64).map(|i| (i, format!("p{i}").into_bytes())).collect();
-            let entries: Vec<LogEntry<'_>> =
-                batch.iter().map(|(i, p)| entry(*i, 1, p)).collect();
+            let batch: Vec<(u64, Vec<u8>)> = (1..=10u64)
+                .map(|i| (i, format!("p{i}").into_bytes()))
+                .collect();
+            let entries: Vec<LogEntry<'_>> = batch.iter().map(|(i, p)| entry(*i, 1, p)).collect();
             storage.append_entries(&entries).expect("append");
 
             storage
@@ -1244,7 +1244,10 @@ mod tests {
 
             // In-process: prefix gone, tail readable, tip unchanged.
             let mut buf = vec![0u8; 128];
-            assert!(storage.entry_at(LogIndex(6), &mut buf).expect("at").is_none());
+            assert!(storage
+                .entry_at(LogIndex(6), &mut buf)
+                .expect("at")
+                .is_none());
             assert_eq!(
                 storage.last_log_position().expect("pos"),
                 (LogIndex(10), Term(1))
@@ -1264,7 +1267,10 @@ mod tests {
         let mut buf = vec![0u8; 128];
         for i in 1..=6u64 {
             assert!(
-                reopened.entry_at(LogIndex(i), &mut buf).expect("at").is_none(),
+                reopened
+                    .entry_at(LogIndex(i), &mut buf)
+                    .expect("at")
+                    .is_none(),
                 "compacted entry {i} must not resurrect"
             );
         }
@@ -1300,8 +1306,9 @@ mod tests {
 
         {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
-            let payloads: Vec<(u64, Vec<u8>)> =
-                (1..=5u64).map(|i| (i, format!("ok{i}").into_bytes())).collect();
+            let payloads: Vec<(u64, Vec<u8>)> = (1..=5u64)
+                .map(|i| (i, format!("ok{i}").into_bytes()))
+                .collect();
             let entries: Vec<LogEntry<'_>> =
                 payloads.iter().map(|(i, p)| entry(*i, 1, p)).collect();
             storage.append_entries(&entries).expect("append");
@@ -1344,7 +1351,9 @@ mod tests {
 
         // The log stays appendable at a clean boundary and the new entry
         // survives another restart.
-        reopened.append_entries(&[entry(6, 1, b"ok6")]).expect("append");
+        reopened
+            .append_entries(&[entry(6, 1, b"ok6")])
+            .expect("append");
         drop(reopened);
         let again = FileRaftStorage::new(&dir.0).expect("reopen 2");
         let (t, p) = must_read(&again, 6);
@@ -1377,8 +1386,9 @@ mod tests {
 
         {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
-            let payloads: Vec<(u64, Vec<u8>)> =
-                (1..=5u64).map(|i| (i, format!("crc{i}").into_bytes())).collect();
+            let payloads: Vec<(u64, Vec<u8>)> = (1..=5u64)
+                .map(|i| (i, format!("crc{i}").into_bytes()))
+                .collect();
             let entries: Vec<LogEntry<'_>> =
                 payloads.iter().map(|(i, p)| entry(*i, 1, p)).collect();
             storage.append_entries(&entries).expect("append");
@@ -1401,7 +1411,10 @@ mod tests {
         }
         let mut buf = vec![0u8; 128];
         assert!(
-            reopened.entry_at(LogIndex(5), &mut buf).expect("at").is_none(),
+            reopened
+                .entry_at(LogIndex(5), &mut buf)
+                .expect("at")
+                .is_none(),
             "the bit-rotted entry must not be readable"
         );
 
@@ -1433,8 +1446,9 @@ mod tests {
 
         {
             let storage = FileRaftStorage::new(&dir.0).expect("open");
-            let payloads: Vec<(u64, Vec<u8>)> =
-                (1..=5u64).map(|i| (i, format!("mid{i}").into_bytes())).collect();
+            let payloads: Vec<(u64, Vec<u8>)> = (1..=5u64)
+                .map(|i| (i, format!("mid{i}").into_bytes()))
+                .collect();
             let entries: Vec<LogEntry<'_>> =
                 payloads.iter().map(|(i, p)| entry(*i, 1, p)).collect();
             storage.append_entries(&entries).expect("append");
@@ -1574,7 +1588,10 @@ mod tests {
         let data = std::fs::read(dir.0.join("snapshot.bin")).expect("read");
         assert_eq!(data.len(), SNAP_HEADER + payload.len());
         assert_eq!(&data[0..4], &SNAP_MAGIC);
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), SNAP_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            SNAP_VERSION
+        );
         assert_eq!(u64::from_le_bytes(data[8..16].try_into().unwrap()), 42);
         assert_eq!(u64::from_le_bytes(data[16..24].try_into().unwrap()), 7);
         assert_eq!(

@@ -114,7 +114,11 @@ async fn service_multiple_handlers_concurrent() {
     let addr = start_server().await;
     let client = connect(&addr).await;
 
-    let svc = client.service("multi").build().await.expect("service build");
+    let svc = client
+        .service("multi")
+        .build()
+        .await
+        .expect("service build");
 
     // Handler: "add" — parse two u32s from payload, return sum
     svc.handle(b"add", |req| async move {
@@ -142,12 +146,7 @@ async fn service_multiple_handlers_concurrent() {
             Bytes::from([3u32.to_le_bytes(), 7u32.to_le_bytes()].concat()),
             5000
         ),
-        svc.request(
-            "multi",
-            b"upper",
-            Bytes::from_static(b"hello"),
-            5000
-        ),
+        svc.request("multi", b"upper", Bytes::from_static(b"hello"), 5000),
         svc.request(
             "multi",
             b"add",
@@ -218,7 +217,11 @@ async fn service_requester_disconnect_graceful() {
     let client = connect(&addr).await;
 
     // Service that takes 500ms to respond
-    let svc = client.service("delayed").build().await.expect("service build");
+    let svc = client
+        .service("delayed")
+        .build()
+        .await
+        .expect("service build");
     svc.handle(b"slow", |_req| async move {
         tokio::time::sleep(Duration::from_millis(500)).await;
         Ok(b"done".to_vec())
@@ -277,9 +280,7 @@ async fn service_crash_requester_timeout() {
         .build()
         .await
         .expect("crashable build");
-    svc.handle(b"work", |_req| async move {
-        Ok(b"ok".to_vec())
-    });
+    svc.handle(b"work", |_req| async move { Ok(b"ok".to_vec()) });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

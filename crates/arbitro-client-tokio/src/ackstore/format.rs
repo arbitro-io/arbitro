@@ -254,7 +254,10 @@ mod tests {
         let plen = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         let payload = &buf[FRAME_LEN_SIZE..FRAME_LEN_SIZE + plen];
         let d = decode_payload(payload).unwrap();
-        assert_eq!((d.op, d.slot_id, d.ts_ms, d.seq), (OP_RECORD, 42, 1000, 777));
+        assert_eq!(
+            (d.op, d.slot_id, d.ts_ms, d.seq),
+            (OP_RECORD, 42, 1000, 777)
+        );
     }
 
     #[test]

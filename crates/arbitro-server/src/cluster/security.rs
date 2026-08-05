@@ -116,8 +116,7 @@ impl ClusterSecurityConfig {
                             key_path: _key,
                             ca_path: _ca,
                             peer_map: parse_peer_map(
-                                &std::env::var("ARBITRO_CLUSTER_TLS_PEER_MAP")
-                                    .unwrap_or_default(),
+                                &std::env::var("ARBITRO_CLUSTER_TLS_PEER_MAP").unwrap_or_default(),
                             )?,
                         }),
                         strict_from,
@@ -258,8 +257,8 @@ pub(crate) mod tls {
     ) -> Result<u64, String> {
         use x509_parser::prelude::*;
 
-        let (_, cert) = X509Certificate::from_der(cert_der)
-            .map_err(|e| format!("parse peer cert: {e}"))?;
+        let (_, cert) =
+            X509Certificate::from_der(cert_der).map_err(|e| format!("parse peer cert: {e}"))?;
 
         let mut candidates: Vec<String> = Vec::new();
         if let Ok(Some(san)) = cert.subject_alternative_name() {

@@ -239,7 +239,9 @@ where
     // If the client initiated close, send Disconnect so the server
     // retires bindings immediately rather than waiting for keepalive.
     if inner.cancel.is_cancelled() {
-        let _ = w.write_all(&crate::transport::writer::disconnect_frame()).await;
+        let _ = w
+            .write_all(&crate::transport::writer::disconnect_frame())
+            .await;
     }
     let _ = w.shutdown().await;
 

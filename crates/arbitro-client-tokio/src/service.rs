@@ -219,9 +219,8 @@ impl Service {
         let rx = self.reply_mux.register(corr_id);
 
         // Build subject: _svc.<target>.m.<method>
-        let mut subject = Vec::with_capacity(
-            SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len(),
-        );
+        let mut subject =
+            Vec::with_capacity(SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len());
         subject.extend_from_slice(SVC_PREFIX);
         subject.extend_from_slice(target.as_bytes());
         subject.extend_from_slice(METHOD_INFIX);
@@ -278,9 +277,8 @@ impl Service {
     ) -> Result<(), ClientError> {
         let target_stream_id = self.resolve_stream(target).await?;
 
-        let mut subject = Vec::with_capacity(
-            SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len(),
-        );
+        let mut subject =
+            Vec::with_capacity(SVC_PREFIX.len() + target.len() + METHOD_INFIX.len() + method.len());
         subject.extend_from_slice(SVC_PREFIX);
         subject.extend_from_slice(target.as_bytes());
         subject.extend_from_slice(METHOD_INFIX);
@@ -432,9 +430,8 @@ impl ServiceBuilder {
         stream_filter.extend_from_slice(b".>");
 
         // Worker filter: `_svc.<name>.m.>` — matches ONLY method calls.
-        let mut worker_filter = Vec::with_capacity(
-            SVC_PREFIX.len() + self.name.len() + METHOD_INFIX.len() + 1,
-        );
+        let mut worker_filter =
+            Vec::with_capacity(SVC_PREFIX.len() + self.name.len() + METHOD_INFIX.len() + 1);
         worker_filter.extend_from_slice(SVC_PREFIX);
         worker_filter.extend_from_slice(self.name.as_bytes());
         worker_filter.extend_from_slice(METHOD_INFIX);
@@ -445,11 +442,7 @@ impl ServiceBuilder {
         // consumer is not queue-grouped, no sibling instance can
         // steal these deliveries.
         let mut reply_filter = Vec::with_capacity(
-            SVC_PREFIX.len()
-                + self.name.len()
-                + REPLY_INFIX.len()
-                + instance_str.len()
-                + 2,
+            SVC_PREFIX.len() + self.name.len() + REPLY_INFIX.len() + instance_str.len() + 2,
         );
         reply_filter.extend_from_slice(SVC_PREFIX);
         reply_filter.extend_from_slice(self.name.as_bytes());
@@ -458,35 +451,41 @@ impl ServiceBuilder {
         reply_filter.extend_from_slice(b".>");
 
         // Create stream (idempotent — server returns existing if already created)
-        let resp = self.client.create_stream(
-            stream_name,
-            &stream_filter,
-            0,    // max_msgs (unlimited)
-            0,    // max_bytes (unlimited)
-            3600, // max_age_secs (1 hour default for RPC)
-            1,    // replicas
-            0,    // journal_kind (tolerant)
-            0,    // retention (limits)
-            0,    // discard (old)
-            0,    // idempotency_window_ms (disabled for RPC streams)
-        ).await?;
+        let resp = self
+            .client
+            .create_stream(
+                stream_name,
+                &stream_filter,
+                0,    // max_msgs (unlimited)
+                0,    // max_bytes (unlimited)
+                3600, // max_age_secs (1 hour default for RPC)
+                1,    // replicas
+                0,    // journal_kind (tolerant)
+                0,    // retention (limits)
+                0,    // discard (old)
+                0,    // idempotency_window_ms (disabled for RPC streams)
+            )
+            .await?;
 
         let stream_id = parse_stream_id_from_response(&resp)?;
 
         // Worker consumer: queue-grouped so N instances share request load.
         let worker_consumer_name = format!("_svc-{}-worker", self.name);
-        let worker_resp = self.client.create_consumer(
-            stream_id,
-            worker_consumer_name.as_bytes(),
-            worker_consumer_name.as_bytes(), // group = same name (load balanced)
-            &worker_filter,
-            self.max_inflight as u16,
-            1, // ack_policy: explicit
-            0, // deliver_policy: all
-            0, // deliver_mode: push
-            30_000, // ack_wait_ms
-            0,      // start_seq
-        ).await?;
+        let worker_resp = self
+            .client
+            .create_consumer(
+                stream_id,
+                worker_consumer_name.as_bytes(),
+                worker_consumer_name.as_bytes(), // group = same name (load balanced)
+                &worker_filter,
+                self.max_inflight as u16,
+                1,      // ack_policy: explicit
+                0,      // deliver_policy: all
+                0,      // deliver_mode: push
+                30_000, // ack_wait_ms
+                0,      // start_seq
+            )
+            .await?;
         let consumer_id = parse_consumer_id_from_response(&worker_resp)?;
         let mut worker_sub = self
             .client
@@ -496,18 +495,21 @@ impl ServiceBuilder {
         // Reply consumer: private per-instance, NOT queue-grouped so
         // replies are never load-balanced away. Fixes BUG-2.
         let reply_consumer_name = format!("_svc-{}-reply-{}", self.name, instance_str);
-        let reply_resp = self.client.create_consumer(
-            stream_id,
-            reply_consumer_name.as_bytes(),
-            b"", // no group — solo delivery
-            &reply_filter,
-            self.max_inflight as u16,
-            1,      // ack_policy: explicit
-            0,      // deliver_policy: all
-            0,      // deliver_mode: push
-            30_000, // ack_wait_ms
-            0,      // start_seq
-        ).await?;
+        let reply_resp = self
+            .client
+            .create_consumer(
+                stream_id,
+                reply_consumer_name.as_bytes(),
+                b"", // no group — solo delivery
+                &reply_filter,
+                self.max_inflight as u16,
+                1,      // ack_policy: explicit
+                0,      // deliver_policy: all
+                0,      // deliver_mode: push
+                30_000, // ack_wait_ms
+                0,      // start_seq
+            )
+            .await?;
         let reply_consumer_id = parse_consumer_id_from_response(&reply_resp)?;
         let mut reply_sub = self
             .client

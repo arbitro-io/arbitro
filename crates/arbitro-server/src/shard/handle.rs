@@ -253,8 +253,11 @@ impl ShardHandle {
     /// Tombstone a single message by sequence. Returns true if found.
     pub async fn delete_message(&self, seq: u64) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
-        self.send(ShardCommand::DeleteMessage(DeleteMessageCmd { seq, reply: tx }))
-            .await?;
+        self.send(ShardCommand::DeleteMessage(DeleteMessageCmd {
+            seq,
+            reply: tx,
+        }))
+        .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 

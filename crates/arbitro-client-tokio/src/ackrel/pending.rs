@@ -63,9 +63,9 @@ impl ConsumerPending {
             self.count.fetch_add(1, Ordering::Relaxed);
             atomic_min(&self.min_seq, seq);
             atomic_max(&self.max_seq, seq);
-            let _ = self
-                .oldest_ts_ms
-                .compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
+            let _ =
+                self.oldest_ts_ms
+                    .compare_exchange(0, now_ms, Ordering::Relaxed, Ordering::Relaxed);
         }
         newly_inserted
     }
@@ -110,7 +110,13 @@ impl ConsumerPending {
     /// Up to `max` smallest pending seqs, ascending. Non-destructive —
     /// removal only happens via [`Self::purge_up_to`] on broker confirm.
     pub fn drain_ascending(&self, max: usize) -> Vec<u64> {
-        self.pending.lock().unwrap().iter().take(max).copied().collect()
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .take(max)
+            .copied()
+            .collect()
     }
 
     /// TTL sweep. We only track the oldest timestamp in the set (not

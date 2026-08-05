@@ -80,14 +80,7 @@ impl Wal {
                 let mut seqs: Vec<u64> = live.keys().copied().collect();
                 seqs.sort_unstable();
                 let mut snap = vec![0u8; snapshot_frame_size(seqs.len())];
-                let m = encode_snapshot(
-                    &mut snap,
-                    id,
-                    now,
-                    seqs[0],
-                    seqs[seqs.len() - 1],
-                    &seqs,
-                );
+                let m = encode_snapshot(&mut snap, id, now, seqs[0], seqs[seqs.len() - 1], &seqs);
                 bw.write_all(&snap[..m])?;
                 size += m as i64;
             }
@@ -104,7 +97,10 @@ impl Wal {
         bw.get_mut().seek(SeekFrom::End(0))?;
         w.file = bw;
         w.size = new_size;
-        self.core.counters.recs_since_snap.store(0, Ordering::Relaxed);
+        self.core
+            .counters
+            .recs_since_snap
+            .store(0, Ordering::Relaxed);
         Ok(())
     }
 }

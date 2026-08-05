@@ -170,7 +170,6 @@ impl Action {
             0x0705 => Some(Self::CronAck),
 
             // 0x0901..=0x0908 reserved (workflow removed).
-
             0x0A01 => Some(Self::AckStateReq),
             0x0A02 => Some(Self::AckStateRep),
             0x0A03 => Some(Self::AckBatch),

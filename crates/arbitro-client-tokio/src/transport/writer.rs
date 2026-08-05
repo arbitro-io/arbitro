@@ -48,7 +48,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         tokio::spawn(async move {
-            writer_task(&mut consumer, &mut write_half, cancel2).await.ok();
+            writer_task(&mut consumer, &mut write_half, cancel2)
+                .await
+                .ok();
         });
 
         let mut buf = vec![0u8; total];

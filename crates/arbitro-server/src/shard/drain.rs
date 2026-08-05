@@ -21,17 +21,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::match_table::MatchEntry;
-use arbitro_engine_v2::common::wire_hash_32;
 use arbitro_engine_v2::command::DeliveredEntry;
+use arbitro_engine_v2::common::wire_hash_32;
 use arbitro_engine_v2::types::*;
 use arbitro_store::Store;
 
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
-use crate::shard::shared::{
-    find_writer, DrainNotification, DrainSnapshot, SharedCounters,
-};
+use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -340,7 +338,10 @@ pub(in crate::shard) fn drain_deliver(
                         frame.connection_id.0, frame.first_seq, frame.count
                     );
                 }
-                flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
+                flush_results.push((
+                    frame.connection_id,
+                    FlushOutcome::WriterGone(frame.first_seq),
+                ));
                 return false;
             };
             if writer
@@ -353,7 +354,10 @@ pub(in crate::shard) fn drain_deliver(
                         frame.connection_id.0, frame.first_seq, frame.count
                     );
                 }
-                flush_results.push((frame.connection_id, FlushOutcome::WriterGone(frame.first_seq)));
+                flush_results.push((
+                    frame.connection_id,
+                    FlushOutcome::WriterGone(frame.first_seq),
+                ));
                 return false;
             }
             crate::lifecycle_trace!(
@@ -377,7 +381,10 @@ pub(in crate::shard) fn drain_deliver(
                 if chaos_debug() {
                     eprintln!(
                         "[FLUSH-OK] conn={} first_seq={} last_seq={} count={}",
-                        conn.0, first_seq, first_seq + (count as u64).saturating_sub(1), count
+                        conn.0,
+                        first_seq,
+                        first_seq + (count as u64).saturating_sub(1),
+                        count
                     );
                 }
                 crate::lifecycle_trace!("30_send_bytes_done", conn.0, count as u64, "shard");
@@ -440,8 +447,7 @@ pub(in crate::shard) fn drain_deliver(
                     match scratch.stalled_conns.iter().find(|e| e.0 == conn) {
                         None => scratch.stalled_conns.push((conn, now)),
                         Some(&(_, since)) => {
-                            if now.duration_since(since).as_millis() as u64
-                                >= stall_evict_ms
+                            if now.duration_since(since).as_millis() as u64 >= stall_evict_ms
                                 && !scratch.dead_connections.contains(&conn)
                             {
                                 tracing::warn!(
@@ -524,8 +530,12 @@ pub(in crate::shard) fn drain_deliver(
     if chaos_debug() {
         eprintln!(
             "[chaos-debug] cursor {} -> {} (start={} end={} skipped={:?} more={})",
-            counters.cursor(), new_cursor, result.start, result.end,
-            result.lowest_skipped, result.more_pending
+            counters.cursor(),
+            new_cursor,
+            result.start,
+            result.end,
+            result.lowest_skipped,
+            result.more_pending
         );
     }
     counters.set_cursor(new_cursor);
@@ -887,20 +897,22 @@ fn dispatch_recipients(
         // Extract user payload from extended layout when HAS_HEADERS is set.
         // Store format: [payload_len:u32 LE][user_payload][headers...].
         // The consumer receives only the user payload — headers are broker-internal.
-        let raw_payload = if entry.flags & arbitro_store::flags::HAS_HEADERS != 0
-            && entry.payload.len() >= 4
-        {
-            let pay_len =
-                u32::from_le_bytes([entry.payload[0], entry.payload[1], entry.payload[2], entry.payload[3]])
-                    as usize;
-            if entry.payload.len() >= 4 + pay_len {
-                &entry.payload[4..4 + pay_len]
+        let raw_payload =
+            if entry.flags & arbitro_store::flags::HAS_HEADERS != 0 && entry.payload.len() >= 4 {
+                let pay_len = u32::from_le_bytes([
+                    entry.payload[0],
+                    entry.payload[1],
+                    entry.payload[2],
+                    entry.payload[3],
+                ]) as usize;
+                if entry.payload.len() >= 4 + pay_len {
+                    &entry.payload[4..4 + pay_len]
+                } else {
+                    entry.payload
+                }
             } else {
                 entry.payload
-            }
-        } else {
-            entry.payload
-        };
+            };
 
         // Extract reply_to from payload when HAS_REPLY_TO flag is set.
         // Store format: [reply_len:u16 LE][reply_to bytes][actual payload].
@@ -1186,7 +1198,10 @@ mod tests {
             "cursor must not advance past the undelivered WriterGone batch",
         );
         // The conn was queued for retirement.
-        assert!(gate.is_open(), "more_pending must re-open the gate for retry");
+        assert!(
+            gate.is_open(),
+            "more_pending must re-open the gate for retry"
+        );
     }
 
     /// ROB-23 (audit #7a) — a connection whose writer channel stays full
@@ -1221,46 +1236,51 @@ mod tests {
             },
         );
 
-        let run_cycle = |scratch: &mut DrainScratch,
-                         consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-                         notify_tx: &mut crate::shard::shared::NotifyProducer| {
-            // Re-arm the frame — a real stalled cycle re-reads the store
-            // and re-accumulates the same batch every cycle.
-            scratch.dead_connections.clear();
-            scratch.acc.clear();
-            scratch.acc.add(
-                ConnectionId(7),
-                StreamId(1),
-                ConsumerId(0),
-                10,
-                b"subj",
-                0,
-                &[],
-                b"payload",
-            );
-            drain_deliver(
-                &counters,
-                &snap,
-                &gate,
-                &names,
-                scratch,
-                consumer_subjects,
-                notify_tx,
-                &silent,
-                20, // stall_evict_ms
-                DrainReadResult {
-                    start: 1,
-                    end: 11,
-                    more_pending: false,
-                    lowest_skipped: None,
-                    last_seq: 10,
-                },
-            );
-        };
+        let run_cycle =
+            |scratch: &mut DrainScratch,
+             consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+             notify_tx: &mut crate::shard::shared::NotifyProducer| {
+                // Re-arm the frame — a real stalled cycle re-reads the store
+                // and re-accumulates the same batch every cycle.
+                scratch.dead_connections.clear();
+                scratch.acc.clear();
+                scratch.acc.add(
+                    ConnectionId(7),
+                    StreamId(1),
+                    ConsumerId(0),
+                    10,
+                    b"subj",
+                    0,
+                    &[],
+                    b"payload",
+                );
+                drain_deliver(
+                    &counters,
+                    &snap,
+                    &gate,
+                    &names,
+                    scratch,
+                    consumer_subjects,
+                    notify_tx,
+                    &silent,
+                    20, // stall_evict_ms
+                    DrainReadResult {
+                        start: 1,
+                        end: 11,
+                        more_pending: false,
+                        lowest_skipped: None,
+                        last_seq: 10,
+                    },
+                );
+            };
 
         // Cycle 1 — arms the stall clock; NOT evicted yet.
         run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
-        assert_eq!(counters.cursor(), 9, "cursor pinned before the stalled batch");
+        assert_eq!(
+            counters.cursor(),
+            9,
+            "cursor pinned before the stalled batch"
+        );
         assert!(
             rx.try_recv().is_none(),
             "no ConnectionDead before the stall window elapses",
@@ -1307,40 +1327,41 @@ mod tests {
             },
         );
 
-        let run_cycle = |scratch: &mut DrainScratch,
-                         consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-                         notify_tx: &mut crate::shard::shared::NotifyProducer| {
-            scratch.dead_connections.clear();
-            scratch.acc.clear();
-            scratch.acc.add(
-                ConnectionId(7),
-                StreamId(1),
-                ConsumerId(0),
-                10,
-                b"subj",
-                0,
-                &[],
-                b"payload",
-            );
-            drain_deliver(
-                &counters,
-                &snap,
-                &gate,
-                &names,
-                scratch,
-                consumer_subjects,
-                notify_tx,
-                &silent,
-                20,
-                DrainReadResult {
-                    start: 1,
-                    end: 11,
-                    more_pending: false,
-                    lowest_skipped: None,
-                    last_seq: 10,
-                },
-            );
-        };
+        let run_cycle =
+            |scratch: &mut DrainScratch,
+             consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+             notify_tx: &mut crate::shard::shared::NotifyProducer| {
+                scratch.dead_connections.clear();
+                scratch.acc.clear();
+                scratch.acc.add(
+                    ConnectionId(7),
+                    StreamId(1),
+                    ConsumerId(0),
+                    10,
+                    b"subj",
+                    0,
+                    &[],
+                    b"payload",
+                );
+                drain_deliver(
+                    &counters,
+                    &snap,
+                    &gate,
+                    &names,
+                    scratch,
+                    consumer_subjects,
+                    notify_tx,
+                    &silent,
+                    20,
+                    DrainReadResult {
+                        start: 1,
+                        end: 11,
+                        more_pending: false,
+                        lowest_skipped: None,
+                        last_seq: 10,
+                    },
+                );
+            };
 
         // Cycle 1 — backpressured, clock armed.
         run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);

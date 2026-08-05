@@ -478,10 +478,7 @@ impl ConnectionRegistry {
         // ends the writer task) so the read loop's next frame observes
         // a dead connection instead of quietly losing data forever.
         if full {
-            tracing::warn!(
-                conn_id,
-                "outbound queue full, closing slow connection"
-            );
+            tracing::warn!(conn_id, "outbound queue full, closing slow connection");
             self.remove(conn_id);
         }
         false

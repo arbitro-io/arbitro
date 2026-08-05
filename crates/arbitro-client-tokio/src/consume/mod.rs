@@ -93,7 +93,10 @@ pub(crate) fn subscribe_async(
         (Some(store), Some((stream, consumer))) => match store.slot(stream, consumer) {
             Ok(s) => Some(s),
             Err(e) => {
-                inner.metrics.ackstore_errors.fetch_add(1, Ordering::Relaxed);
+                inner
+                    .metrics
+                    .ackstore_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 warn!(stream, consumer, error = %e, "ackstore: slot resolve failed; dedup disabled for this sub");
                 None
             }

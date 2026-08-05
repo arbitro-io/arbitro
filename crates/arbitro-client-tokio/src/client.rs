@@ -445,7 +445,13 @@ impl Client {
         consumer_id: u32,
         filter: &[u8],
     ) -> impl std::future::Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
-        crate::consume::subscribe_async(Arc::clone(&self.inner), stream_id, consumer_id, filter, None)
+        crate::consume::subscribe_async(
+            Arc::clone(&self.inner),
+            stream_id,
+            consumer_id,
+            filter,
+            None,
+        )
     }
 
     /// Subscribe with durable redelivery dedup keyed by
@@ -551,10 +557,12 @@ impl Client {
         let limits: Vec<arbitro_proto::v2::manager::SubjectLimit<'_>> = opts
             .subject_limits
             .iter()
-            .map(|(pattern, limit)| arbitro_proto::v2::manager::SubjectLimit {
-                pattern: pattern.as_slice(),
-                limit: *limit,
-            })
+            .map(
+                |(pattern, limit)| arbitro_proto::v2::manager::SubjectLimit {
+                    pattern: pattern.as_slice(),
+                    limit: *limit,
+                },
+            )
             .collect();
 
         // name == group is the invariant that makes concurrent joins

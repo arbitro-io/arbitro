@@ -271,8 +271,15 @@ impl<'a> DeleteConsumerView<'a> {
     /// panicking on a truncated buffer.
     #[inline(always)]
     pub fn try_consumer_id(&self) -> Option<u32> {
-        let bytes = self.buf.get(..core::mem::size_of::<DeleteConsumerAction>())?;
-        Some(DeleteConsumerAction::ref_from_bytes(bytes).ok()?.consumer_id.get())
+        let bytes = self
+            .buf
+            .get(..core::mem::size_of::<DeleteConsumerAction>())?;
+        Some(
+            DeleteConsumerAction::ref_from_bytes(bytes)
+                .ok()?
+                .consumer_id
+                .get(),
+        )
     }
 }
 

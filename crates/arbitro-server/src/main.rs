@@ -46,9 +46,15 @@ async fn main() -> std::io::Result<()> {
         println!("  ARBITRO_MAX_STREAMS_PER_CONN   Max streams per connection (default: 1000)");
         println!("  ARBITRO_MAX_CONSUMERS_PER_CONN Max consumers per connection (default: 1000)");
         println!("  ARBITRO_MAX_CRONS_PER_CONN     Max crons per connection (default: 1000)");
-        println!("  ARBITRO_CLUSTER_MAX_FRAME_SIZE    Cluster inbound frame body cap (default: 64 MiB)");
-        println!("  ARBITRO_CLUSTER_MAX_INBOUND_CONNS Cluster inbound connection cap (default: 256)");
-        println!("  ARBITRO_CLUSTER_MAX_FRAMES_PER_SEC Cluster frames/sec per conn (0 = unlimited)");
+        println!(
+            "  ARBITRO_CLUSTER_MAX_FRAME_SIZE    Cluster inbound frame body cap (default: 64 MiB)"
+        );
+        println!(
+            "  ARBITRO_CLUSTER_MAX_INBOUND_CONNS Cluster inbound connection cap (default: 256)"
+        );
+        println!(
+            "  ARBITRO_CLUSTER_MAX_FRAMES_PER_SEC Cluster frames/sec per conn (0 = unlimited)"
+        );
         println!("  ARBITRO_CLUSTER_JAIL_COOLDOWN_MS  Accept-jail cooldown for offenders (default: 2000)");
         return Ok(());
     }
@@ -115,10 +121,7 @@ async fn main() -> std::io::Result<()> {
     // stdout is a machine-parsed stream the banner must not corrupt.
     eprintln!(
         "{}",
-        arbitro_server::banner::render(
-            &config,
-            &arbitro_server::banner::BannerContext::from_env()
-        )
+        arbitro_server::banner::render(&config, &arbitro_server::banner::BannerContext::from_env())
     );
 
     let mut server = ArbitroServer::new(config);

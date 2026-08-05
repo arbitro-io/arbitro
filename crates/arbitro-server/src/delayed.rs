@@ -72,7 +72,10 @@ impl std::fmt::Display for DelayedAppendError {
         match self {
             Self::DelayTooLarge => write!(f, "delay exceeds MAX_DELAY_MS ({MAX_DELAY_MS}ms)"),
             Self::TooManyPending => {
-                write!(f, "too many pending delayed entries (max {MAX_PENDING_DELAYED})")
+                write!(
+                    f,
+                    "too many pending delayed entries (max {MAX_PENDING_DELAYED})"
+                )
             }
             Self::Io(e) => write!(f, "{e}"),
         }

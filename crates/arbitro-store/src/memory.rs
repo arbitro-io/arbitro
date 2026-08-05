@@ -568,9 +568,7 @@ impl Store for MemoryStore {
     fn tombstone_stream(&mut self, stream_id: u32) -> u64 {
         let mut count = 0u64;
         for meta in self.index.iter_mut() {
-            if meta.stream_id == stream_id
-                && meta.flags & crate::store::flags::TOMBSTONE == 0
-            {
+            if meta.stream_id == stream_id && meta.flags & crate::store::flags::TOMBSTONE == 0 {
                 meta.flags |= crate::store::flags::TOMBSTONE;
                 count += 1;
             }
@@ -1005,7 +1003,10 @@ mod tests {
 
         // Read still returns the entry (tombstone is metadata)
         let e = s.read(3).unwrap().unwrap();
-        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+        assert_eq!(
+            e.flags & crate::store::flags::TOMBSTONE,
+            crate::store::flags::TOMBSTONE
+        );
 
         // Non-tombstoned entries are clean
         let e2 = s.read(2).unwrap().unwrap();
@@ -1035,11 +1036,17 @@ mod tests {
         // Tombstone entry in the first (sealed) segment
         assert!(s.tombstone_at(1));
         let e = s.read(1).unwrap().unwrap();
-        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+        assert_eq!(
+            e.flags & crate::store::flags::TOMBSTONE,
+            crate::store::flags::TOMBSTONE
+        );
 
         // Tombstone entry in the active segment
         assert!(s.tombstone_at(6));
         let e = s.read(6).unwrap().unwrap();
-        assert_eq!(e.flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+        assert_eq!(
+            e.flags & crate::store::flags::TOMBSTONE,
+            crate::store::flags::TOMBSTONE
+        );
     }
 }

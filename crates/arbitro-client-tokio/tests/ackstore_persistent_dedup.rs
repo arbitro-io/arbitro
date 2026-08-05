@@ -73,12 +73,12 @@ async fn persistent_dedup_survives_restart() {
         .create_consumer(
             stream_id,
             CONSUMER.as_bytes(),
-            b"",   // group
-            b"",   // subject = catch-all
-            1000,  // max_inflight
-            0,     // ack_policy = None
-            0,     // deliver_policy = All
-            0,     // deliver_mode = Push
+            b"",  // group
+            b"",  // subject = catch-all
+            1000, // max_inflight
+            0,    // ack_policy = None
+            0,    // deliver_policy = All
+            0,    // deliver_mode = Push
             30_000,
             0,
         )
@@ -88,9 +88,13 @@ async fn persistent_dedup_survives_restart() {
 
     // Publish BEFORE subscribing so all messages are on the stream.
     for i in 0u32..TOTAL {
-        c1.publish_wait(stream_id, b"ackstore-persist.job", Bytes::from(i.to_le_bytes().to_vec()))
-            .await
-            .expect("publish_wait");
+        c1.publish_wait(
+            stream_id,
+            b"ackstore-persist.job",
+            Bytes::from(i.to_le_bytes().to_vec()),
+        )
+        .await
+        .expect("publish_wait");
     }
 
     let mut sub1 = c1
@@ -122,7 +126,9 @@ async fn persistent_dedup_survives_restart() {
     // `(stream_name, consumer_name, seq)` is designed for: a consumer's
     // numeric id is ephemeral, but the WORK it represents is not. A worker
     // recreated under the SAME name must not redo already-completed jobs.
-    c1.delete_consumer(consumer_id).await.expect("delete consumer");
+    c1.delete_consumer(consumer_id)
+        .await
+        .expect("delete consumer");
     c1.close(); // final WAL sync + fsync + close
     tokio::time::sleep(Duration::from_millis(100)).await;
 

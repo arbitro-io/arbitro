@@ -337,7 +337,10 @@ fn confirm_up_to_survives_restart() {
     let w2 = open(&dir, false);
     let s = w2.slot("s", "c").unwrap();
     for seq in 1..=60 {
-        assert!(s.check_record(seq).unwrap(), "seq {seq} fresh after confirm");
+        assert!(
+            s.check_record(seq).unwrap(),
+            "seq {seq} fresh after confirm"
+        );
     }
     w2.close().unwrap();
     std::fs::remove_dir_all(&dir).ok();
@@ -385,7 +388,10 @@ fn compact_survives_restart() {
     let w2 = open(&dir, false);
     let s = w2.slot("orders", "worker").unwrap();
     for seq in 491..=500 {
-        assert!(!s.check_record(seq).unwrap(), "seq {seq} survives compact+restart");
+        assert!(
+            !s.check_record(seq).unwrap(),
+            "seq {seq} survives compact+restart"
+        );
     }
     assert!(s.check_record(100).unwrap(), "confirmed 100 fresh");
     w2.close().unwrap();
@@ -511,7 +517,10 @@ fn concurrent_stress_with_restart() {
             missing += 1;
         }
     }
-    assert_eq!(missing, 0, "no records lost across concurrent-write + restart");
+    assert_eq!(
+        missing, 0,
+        "no records lost across concurrent-write + restart"
+    );
     w2.close().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

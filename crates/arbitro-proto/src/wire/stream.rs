@@ -225,7 +225,8 @@ impl<'a> DeleteStreamView<'a> {
     /// on a truncated buffer.
     #[inline(always)]
     pub fn try_name(&self) -> Option<&'a [u8]> {
-        let f = DeleteStreamFixed::ref_from_bytes(self.buf.get(..DELETE_STREAM_FIXED_SIZE)?).ok()?;
+        let f =
+            DeleteStreamFixed::ref_from_bytes(self.buf.get(..DELETE_STREAM_FIXED_SIZE)?).ok()?;
         let nl = f.name_len.get() as usize;
         self.buf
             .get(DELETE_STREAM_FIXED_SIZE..DELETE_STREAM_FIXED_SIZE.checked_add(nl)?)

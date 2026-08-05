@@ -87,7 +87,10 @@ fn bench_inmem() {
 // which is even more optimistic than the real format (so this bench is a
 // lower bound on real recovery cost, not upper bound).
 fn bench_recovery(n_entries: usize) {
-    header(&format!("C. cold recovery scan — {} CMD_CURSOR_UPDATE entries", n_entries));
+    header(&format!(
+        "C. cold recovery scan — {} CMD_CURSOR_UPDATE entries",
+        n_entries
+    ));
 
     let path = format!("/tmp/arbitro/consumer_cursor_bench_{}.log", n_entries);
     let _ = std::fs::remove_file(&path);
@@ -109,7 +112,11 @@ fn bench_recovery(n_entries: usize) {
     }
 
     let file_size = std::fs::metadata(&path).unwrap().len();
-    println!("  log file size: {} bytes ({:.1} MB)", file_size, file_size as f64 / 1e6);
+    println!(
+        "  log file size: {} bytes ({:.1} MB)",
+        file_size,
+        file_size as f64 / 1e6
+    );
 
     // Scan: read all entries, keep last for each consumer_id
     {

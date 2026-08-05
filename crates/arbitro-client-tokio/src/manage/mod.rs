@@ -136,7 +136,13 @@ pub(crate) async fn delete_message(
     msg_seq: u64,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(pool, pending, seq, encode_delete_message_v2(seq, name, msg_seq)).await
+    request(
+        pool,
+        pending,
+        seq,
+        encode_delete_message_v2(seq, name, msg_seq),
+    )
+    .await
 }
 
 pub(crate) async fn list_streams(
@@ -147,7 +153,13 @@ pub(crate) async fn list_streams(
     limit: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(pool, pending, seq, encode_list_streams_v2(seq, offset, limit)).await
+    request(
+        pool,
+        pending,
+        seq,
+        encode_list_streams_v2(seq, offset, limit),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,7 +220,13 @@ pub(crate) async fn consumer_stats(
     consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(pool, pending, seq, encode_consumer_stats_v2(seq, consumer_id)).await
+    request(
+        pool,
+        pending,
+        seq,
+        encode_consumer_stats_v2(seq, consumer_id),
+    )
+    .await
 }
 
 pub(crate) async fn pause_consumer(
@@ -218,7 +236,13 @@ pub(crate) async fn pause_consumer(
     consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(pool, pending, seq, encode_pause_consumer_v2(seq, consumer_id)).await
+    request(
+        pool,
+        pending,
+        seq,
+        encode_pause_consumer_v2(seq, consumer_id),
+    )
+    .await
 }
 
 pub(crate) async fn resume_consumer(
@@ -228,7 +252,13 @@ pub(crate) async fn resume_consumer(
     consumer_id: u32,
 ) -> Result<Bytes, ClientError> {
     let seq = seq_alloc.next();
-    request(pool, pending, seq, encode_resume_consumer_v2(seq, consumer_id)).await
+    request(
+        pool,
+        pending,
+        seq,
+        encode_resume_consumer_v2(seq, consumer_id),
+    )
+    .await
 }
 
 pub(crate) async fn get_consumer(

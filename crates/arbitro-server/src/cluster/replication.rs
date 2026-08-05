@@ -57,8 +57,7 @@ pub struct ReplicateEntriesHeader {
     pub timestamp_ms: U64,
 }
 
-pub const REPLICATE_ENTRIES_HEADER_SIZE: usize =
-    core::mem::size_of::<ReplicateEntriesHeader>();
+pub const REPLICATE_ENTRIES_HEADER_SIZE: usize = core::mem::size_of::<ReplicateEntriesHeader>();
 const _: () = assert!(REPLICATE_ENTRIES_HEADER_SIZE == 28);
 
 // ── ReplicateAck body ─────────────────────────────────────────────────────
@@ -223,10 +222,7 @@ pub struct ReplicationBatch {
 /// `pub(crate)` to `arbitro-raft`. We fill the 32-byte header inline
 /// using the public constants (`RAFT_MAGIC`, `RAFT_VERSION`,
 /// `RAFT_FRAME_HEADER_SIZE`).
-pub fn build_replicate_entries_frame(
-    batch: &ReplicationBatch,
-    from_peer_id: u64,
-) -> Vec<u8> {
+pub fn build_replicate_entries_frame(batch: &ReplicationBatch, from_peer_id: u64) -> Vec<u8> {
     use arbitro_raft::{RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION};
     use zerocopy::IntoBytes;
 
@@ -243,14 +239,14 @@ pub fn build_replicate_entries_frame(
     // [16..20] body_len : U32 LE
     // [20..24] reserved : U32 LE
     // [24..32] _pad     : U64 LE
-    frame.extend_from_slice(&RAFT_MAGIC.to_le_bytes());       // [0..4]
-    frame.push(RAFT_VERSION);                                  // [4]
-    frame.push(KIND_REPLICATE_ENTRIES);                        // [5]
-    frame.extend_from_slice(&0u16.to_le_bytes());              // [6..8]
-    frame.extend_from_slice(&from_peer_id.to_le_bytes());      // [8..16]
+    frame.extend_from_slice(&RAFT_MAGIC.to_le_bytes()); // [0..4]
+    frame.push(RAFT_VERSION); // [4]
+    frame.push(KIND_REPLICATE_ENTRIES); // [5]
+    frame.extend_from_slice(&0u16.to_le_bytes()); // [6..8]
+    frame.extend_from_slice(&from_peer_id.to_le_bytes()); // [8..16]
     frame.extend_from_slice(&(body_len as u32).to_le_bytes()); // [16..20]
-    frame.extend_from_slice(&0u32.to_le_bytes());              // [20..24]
-    frame.extend_from_slice(&0u64.to_le_bytes());              // [24..32]
+    frame.extend_from_slice(&0u32.to_le_bytes()); // [20..24]
+    frame.extend_from_slice(&0u64.to_le_bytes()); // [24..32]
     debug_assert_eq!(frame.len(), RAFT_FRAME_HEADER_SIZE);
 
     // ── ReplicateEntriesHeader (28 bytes) ─────────────────────────────
@@ -271,11 +267,7 @@ pub fn build_replicate_entries_frame(
 }
 
 /// Build a ReplicateAck frame (RaftFrameHeader + ReplicateAckBody).
-pub fn build_replicate_ack_frame(
-    stream_id: u32,
-    last_seq: u64,
-    from_peer_id: u64,
-) -> Vec<u8> {
+pub fn build_replicate_ack_frame(stream_id: u32, last_seq: u64, from_peer_id: u64) -> Vec<u8> {
     use arbitro_raft::{RAFT_FRAME_HEADER_SIZE, RAFT_MAGIC, RAFT_VERSION};
     use zerocopy::IntoBytes;
 
@@ -473,10 +465,8 @@ pub async fn follower_replication_loop(
                 }
 
                 let Some(header) =
-                    ReplicateEntriesHeader::ref_from_bytes(
-                        &body[..REPLICATE_ENTRIES_HEADER_SIZE],
-                    )
-                    .ok()
+                    ReplicateEntriesHeader::ref_from_bytes(&body[..REPLICATE_ENTRIES_HEADER_SIZE])
+                        .ok()
                 else {
                     tracing::warn!("replication: failed to parse ReplicateEntriesHeader");
                     continue;
@@ -489,15 +479,16 @@ pub async fn follower_replication_loop(
                 let entries_data = &body[REPLICATE_ENTRIES_HEADER_SIZE..];
 
                 // Parse entries: each is [total_len:u32][subject_len:u16][subject][payload]
-                let mut refs: Vec<arbitro_store::EntryRef<'_>> = Vec::with_capacity(entry_count as usize);
+                let mut refs: Vec<arbitro_store::EntryRef<'_>> =
+                    Vec::with_capacity(entry_count as usize);
                 let mut offset = 0usize;
                 for _ in 0..entry_count {
                     if offset + 4 > entries_data.len() {
                         break;
                     }
-                    let total_len = u32::from_le_bytes(
-                        entries_data[offset..offset + 4].try_into().unwrap(),
-                    ) as usize;
+                    let total_len =
+                        u32::from_le_bytes(entries_data[offset..offset + 4].try_into().unwrap())
+                            as usize;
                     offset += 4;
                     if offset + total_len > entries_data.len() {
                         break;
@@ -508,8 +499,7 @@ pub async fn follower_replication_loop(
                     if entry_bytes.len() < 2 {
                         continue;
                     }
-                    let subj_len =
-                        u16::from_le_bytes([entry_bytes[0], entry_bytes[1]]) as usize;
+                    let subj_len = u16::from_le_bytes([entry_bytes[0], entry_bytes[1]]) as usize;
                     if 2 + subj_len > entry_bytes.len() {
                         continue;
                     }
@@ -582,11 +572,7 @@ pub async fn follower_replication_loop(
                 };
 
                 // Send ack back to leader.
-                let ack_frame = build_replicate_ack_frame(
-                    stream_id_raw,
-                    last_seq,
-                    my_peer_id,
-                );
+                let ack_frame = build_replicate_ack_frame(stream_id_raw, last_seq, my_peer_id);
                 let leader_peer = PeerId(from_peer);
                 if let Some(addr) = peer_addrs.get(&leader_peer) {
                     // Ensure we have a connection to the leader.
@@ -826,17 +812,20 @@ mod tests {
         let frame = build_replicate_entries_frame(&batch, 7);
 
         // Verify frame header.
-        assert_eq!(frame.len(), arbitro_raft::RAFT_FRAME_HEADER_SIZE + REPLICATE_ENTRIES_HEADER_SIZE + batch.entries_bytes.len());
+        assert_eq!(
+            frame.len(),
+            arbitro_raft::RAFT_FRAME_HEADER_SIZE
+                + REPLICATE_ENTRIES_HEADER_SIZE
+                + batch.entries_bytes.len()
+        );
         assert_eq!(frame[5], KIND_REPLICATE_ENTRIES);
         assert_eq!(frame_kind(&frame), Some(KIND_REPLICATE_ENTRIES));
         assert_eq!(frame_from_peer(&frame), 7);
 
         // Parse the ReplicateEntriesHeader from the body.
         let body = &frame[arbitro_raft::RAFT_FRAME_HEADER_SIZE..];
-        let header = ReplicateEntriesHeader::ref_from_bytes(
-            &body[..REPLICATE_ENTRIES_HEADER_SIZE],
-        )
-        .unwrap();
+        let header =
+            ReplicateEntriesHeader::ref_from_bytes(&body[..REPLICATE_ENTRIES_HEADER_SIZE]).unwrap();
         assert_eq!(header.stream_id.get(), 42);
         assert_eq!(header.first_seq.get(), 100);
         assert_eq!(header.entry_count.get(), 2);
@@ -846,9 +835,8 @@ mod tests {
         let entries_data = &body[REPLICATE_ENTRIES_HEADER_SIZE..];
         let mut offset = 0usize;
         // Entry 1
-        let total_len = u32::from_le_bytes(
-            entries_data[offset..offset + 4].try_into().unwrap(),
-        ) as usize;
+        let total_len =
+            u32::from_le_bytes(entries_data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         let entry = &entries_data[offset..offset + total_len];
         offset += total_len;
@@ -857,9 +845,8 @@ mod tests {
         assert_eq!(&entry[2 + slen..], b"hello");
 
         // Entry 2
-        let total_len = u32::from_le_bytes(
-            entries_data[offset..offset + 4].try_into().unwrap(),
-        ) as usize;
+        let total_len =
+            u32::from_le_bytes(entries_data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         let entry = &entries_data[offset..offset + total_len];
         let slen = u16::from_le_bytes([entry[0], entry[1]]) as usize;
@@ -893,7 +880,7 @@ mod tests {
         // continuation is accepted.
         assert!(accepts(10, 11));
         assert!(!accepts(10, 1)); // leader restarted from 1 → reject
-        // Non-empty divergence (original BUG-4 case) still rejected.
+                                  // Non-empty divergence (original BUG-4 case) still rejected.
         assert!(!accepts(10, 12)); // gap
         assert!(!accepts(10, 10)); // replay/duplicate
     }

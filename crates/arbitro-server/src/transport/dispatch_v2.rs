@@ -112,13 +112,7 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish => v2_publish(
-            conn_id,
-            req_seq,
-            &frame,
-            server,
-            registry,
-        ),
+        Action::Publish => v2_publish(conn_id, req_seq, &frame, server, registry),
         Action::PublishBatch => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
         Action::PublishWithReply => {
             v2_publish_with_reply(conn_id, req_seq, &frame, server, registry)
@@ -288,9 +282,8 @@ fn v2_publish(
     // msg-id via headers gets deduped just like a legacy publisher
     // that fills f.msg_id() directly.
     let frame_msg_id = f.msg_id();
-    let has_headers_flag = f.header.entry_flags
-        & arbitro_proto::v2::header::entry_flag::HAS_HEADERS
-        != 0;
+    let has_headers_flag =
+        f.header.entry_flags & arbitro_proto::v2::header::entry_flag::HAS_HEADERS != 0;
     let msg_id: &[u8] = if !frame_msg_id.is_empty() {
         frame_msg_id
     } else if has_headers_flag {
@@ -353,34 +346,33 @@ fn v2_publish(
     //     payload + msg_id header into ExtendedPayload for journal recovery.
     //  3. Neither → store raw payload, no flags.
     let mut ext_buf: smallvec::SmallVec<[u8; 256]> = smallvec::SmallVec::new();
-    let (store_payload, store_flags): (&[u8], u8) =
-        if f.header.entry_flags & arbitro_proto::v2::header::entry_flag::HAS_HEADERS != 0 {
-            (f.payload(), arbitro_store::flags::HAS_HEADERS)
-        } else if !msg_id.is_empty() {
-            let hdrs: [(&[u8], &[u8]); 1] = [(
-                arbitro_proto::wire::msg_headers::HDR_MSG_ID,
-                msg_id,
-            )];
-            let section = arbitro_proto::wire::msg_headers::HeadersBlock::section_size(&hdrs);
-            let wire_size = arbitro_proto::wire::msg_headers::ExtendedPayload::wire_size(
-                f.payload().len(),
-                section,
-            );
-            ext_buf.resize(wire_size, 0);
-            arbitro_proto::wire::msg_headers::encode_extended_payload(
-                &mut ext_buf,
-                f.payload(),
-                &hdrs,
-            );
-            (&ext_buf, arbitro_store::flags::HAS_HEADERS)
-        } else {
-            (&[], 0)
-        };
+    let (store_payload, store_flags): (&[u8], u8) = if f.header.entry_flags
+        & arbitro_proto::v2::header::entry_flag::HAS_HEADERS
+        != 0
+    {
+        (f.payload(), arbitro_store::flags::HAS_HEADERS)
+    } else if !msg_id.is_empty() {
+        let hdrs: [(&[u8], &[u8]); 1] = [(arbitro_proto::wire::msg_headers::HDR_MSG_ID, msg_id)];
+        let section = arbitro_proto::wire::msg_headers::HeadersBlock::section_size(&hdrs);
+        let wire_size = arbitro_proto::wire::msg_headers::ExtendedPayload::wire_size(
+            f.payload().len(),
+            section,
+        );
+        ext_buf.resize(wire_size, 0);
+        arbitro_proto::wire::msg_headers::encode_extended_payload(&mut ext_buf, f.payload(), &hdrs);
+        (&ext_buf, arbitro_store::flags::HAS_HEADERS)
+    } else {
+        (&[], 0)
+    };
 
     let entries = [arbitro_store::EntryRef {
         stream_id: seq_stream.raw(),
         subject: f.subject(),
-        payload: if store_flags != 0 { store_payload } else { f.payload() },
+        payload: if store_flags != 0 {
+            store_payload
+        } else {
+            f.payload()
+        },
         flags: store_flags,
         deliver_at_ms: 0,
     }];
@@ -583,9 +575,8 @@ fn v2_publish_batch(
     // dedicated msg_id field (same asymmetry as the single-publish path,
     // BUG-8). `msg_id_of_view` centralizes that lookup so both the
     // has-any pre-check and the record loop see the same effective id.
-    let batch_has_headers = f.header.entry_flags
-        & arbitro_proto::v2::header::entry_flag::HAS_HEADERS
-        != 0;
+    let batch_has_headers =
+        f.header.entry_flags & arbitro_proto::v2::header::entry_flag::HAS_HEADERS != 0;
     // Named fn instead of a closure because the msg_id / payload slices
     // borrow from the frame's `'a` lifetime, which closures can't express
     // with a higher-rank bound.
@@ -662,25 +653,26 @@ fn v2_publish_batch(
     //  3. Neither → raw payload, no flags.
     // The wrap buffers are only allocated when at least one entry
     // actually carries a dedicated-field msg_id (cold, dedup-only path).
-    let wrapped_payloads: Vec<Option<Vec<u8>>> = if !batch_has_headers
-        && f.iter().any(|v| !v.msg_id().is_empty())
-    {
-        f.iter()
-            .map(|v| {
-                let id = v.msg_id();
-                if id.is_empty() {
-                    None
-                } else {
-                    Some(arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
-                        v.payload(),
-                        &[(arbitro_proto::wire::msg_headers::HDR_MSG_ID, id)],
-                    ))
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let wrapped_payloads: Vec<Option<Vec<u8>>> =
+        if !batch_has_headers && f.iter().any(|v| !v.msg_id().is_empty()) {
+            f.iter()
+                .map(|v| {
+                    let id = v.msg_id();
+                    if id.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
+                                v.payload(),
+                                &[(arbitro_proto::wire::msg_headers::HDR_MSG_ID, id)],
+                            ),
+                        )
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
     let entries: smallvec::SmallVec<[arbitro_store::EntryRef<'_>; 16]> = f
         .iter()
         .enumerate()
@@ -804,14 +796,10 @@ fn v2_publish_delayed(
     // finds the id once the entry reaches the main store. Cold path —
     // the owned Vec allocation is fine here.
     let (store_payload, store_flags): (std::borrow::Cow<'_, [u8]>, u8) = if !msg_id.is_empty() {
-        let hdrs: [(&[u8], &[u8]); 1] =
-            [(arbitro_proto::wire::msg_headers::HDR_MSG_ID, msg_id)];
+        let hdrs: [(&[u8], &[u8]); 1] = [(arbitro_proto::wire::msg_headers::HDR_MSG_ID, msg_id)];
         (
             std::borrow::Cow::Owned(
-                arbitro_proto::wire::msg_headers::encode_extended_payload_vec(
-                    f.payload(),
-                    &hdrs,
-                ),
+                arbitro_proto::wire::msg_headers::encode_extended_payload_vec(f.payload(), &hdrs),
             ),
             arbitro_store::flags::HAS_HEADERS,
         )
@@ -1824,9 +1812,11 @@ async fn v2_create_consumer(
     if matches!(create_res, Ok(0) | Ok(1)) {
         server.names().set_consumer_queue(seq_consumer, queue_id);
         server.names().set_consumer_stream(seq_consumer, seq_stream);
-        server
-            .names()
-            .set_consumer_deliver_policy(seq_consumer, body.deliver_policy, body.start_seq);
+        server.names().set_consumer_deliver_policy(
+            seq_consumer,
+            body.deliver_policy,
+            body.start_seq,
+        );
     }
 
     match create_res {
@@ -2164,11 +2154,18 @@ async fn v2_list_consumers(
     // instead of cloning the whole vector just to iterate it again.
     let iter: Box<dyn Iterator<Item = &(u32, u32, u32, bool)>> = match seq_filter {
         None => Box::new(all_consumers.iter()),
-        Some(seq) => Box::new(all_consumers.iter().filter(move |(_, sid, _, _)| *sid == seq)),
+        Some(seq) => Box::new(
+            all_consumers
+                .iter()
+                .filter(move |(_, sid, _, _)| *sid == seq),
+        ),
     };
     let filtered_count = match seq_filter {
         None => all_consumers.len(),
-        Some(seq) => all_consumers.iter().filter(|(_, sid, _, _)| *sid == seq).count(),
+        Some(seq) => all_consumers
+            .iter()
+            .filter(|(_, sid, _, _)| *sid == seq)
+            .count(),
     };
 
     let entry_size = 13;
@@ -2545,4 +2542,3 @@ async fn v2_delete_consumer_raft(
         }
     }
 }
-

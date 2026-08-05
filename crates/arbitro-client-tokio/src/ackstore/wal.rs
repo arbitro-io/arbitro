@@ -247,7 +247,10 @@ impl WalCore {
         // Split-borrow so we can write the scratch slice directly — no per-ack
         // heap allocation on the hot path.
         let Writer {
-            file, scratch, size, ..
+            file,
+            scratch,
+            size,
+            ..
         } = &mut *w;
         let n = encode_seq_op(&mut scratch[..need], op, slot_id, ts_ms as u64, seq);
         file.write_all(&scratch[..n])?;
@@ -265,7 +268,10 @@ impl WalCore {
             w.scratch.resize(need, 0);
         }
         let Writer {
-            file, scratch, size, ..
+            file,
+            scratch,
+            size,
+            ..
         } = &mut *w;
         let n = encode_tombstone(&mut scratch[..need], slot_id, ts_ms as u64);
         file.write_all(&scratch[..n])?;
@@ -338,9 +344,18 @@ impl Store for Wal {
         // Persist the Register record.
         let now = (self.core.cfg.now)();
         let mut buf = vec![0u8; register_frame_size(stream.len(), consumer.len())];
-        let n = encode_register(&mut buf, id, now as u64, stream.as_bytes(), consumer.as_bytes());
+        let n = encode_register(
+            &mut buf,
+            id,
+            now as u64,
+            stream.as_bytes(),
+            consumer.as_bytes(),
+        );
         self.core.append_frame(&buf[..n])?;
-        self.core.counters.registered.fetch_add(1, Ordering::Relaxed);
+        self.core
+            .counters
+            .registered
+            .fetch_add(1, Ordering::Relaxed);
         Ok(slot as Arc<dyn SlotRef>)
     }
 
@@ -351,12 +366,18 @@ impl Store for Wal {
                 return Err(StoreError::Closed);
             }
             if let Err(e) = w.file.flush() {
-                self.core.counters.sync_errors.fetch_add(1, Ordering::Relaxed);
+                self.core
+                    .counters
+                    .sync_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(e.into());
             }
             if self.core.cfg.fsync {
                 if let Err(e) = w.file.get_ref().sync_all() {
-                    self.core.counters.sync_errors.fetch_add(1, Ordering::Relaxed);
+                    self.core
+                        .counters
+                        .sync_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(e.into());
                 }
             }
@@ -404,8 +425,7 @@ impl Store for Wal {
     }
 
     fn list_slots(&self) -> Vec<SlotInfo> {
-        let slots: Vec<Arc<WalSlot>> =
-            self.sym.read().unwrap().by_name.values().cloned().collect();
+        let slots: Vec<Arc<WalSlot>> = self.sym.read().unwrap().by_name.values().cloned().collect();
         let mut out: Vec<SlotInfo> = slots.iter().map(|s| s.info()).collect();
         out.sort_by_key(|i| i.slot_id);
         out
@@ -440,13 +460,15 @@ impl Store for Wal {
             let now = (self.core.cfg.now)();
             self.core.append_tombstone(slot.slot_id, now)?;
         }
-        self.core.counters.tombstoned.fetch_add(1, Ordering::Relaxed);
+        self.core
+            .counters
+            .tombstoned
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn metrics(&self) -> Metrics {
-        let slots: Vec<Arc<WalSlot>> =
-            self.sym.read().unwrap().by_name.values().cloned().collect();
+        let slots: Vec<Arc<WalSlot>> = self.sym.read().unwrap().by_name.values().cloned().collect();
         let mut live = 0u64;
         for s in &slots {
             live += s.inner.lock().unwrap().set.len() as u64;
@@ -540,7 +562,8 @@ impl SlotRef for WalSlot {
             g.oldest_ts = 0;
         }
         let now = (self.core.cfg.now)();
-        self.core.append_seq_op(OP_CONFIRM, self.slot_id, now, seq)?;
+        self.core
+            .append_seq_op(OP_CONFIRM, self.slot_id, now, seq)?;
         self.core.counters.confirmed.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -688,8 +711,7 @@ impl Wal {
     /// Restore and is auto-triggered by [`Store::sync`] after
     /// `snapshot_every_n` records.
     pub fn snapshot(&self) -> Result<(), StoreError> {
-        let slots: Vec<Arc<WalSlot>> =
-            self.sym.read().unwrap().by_name.values().cloned().collect();
+        let slots: Vec<Arc<WalSlot>> = self.sym.read().unwrap().by_name.values().cloned().collect();
         let now = (self.core.cfg.now)() as u64;
         for slot in slots {
             let g = slot.inner.lock().unwrap();
@@ -710,8 +732,14 @@ impl Wal {
             drop(g);
             self.core.append_frame(&buf[..n])?;
         }
-        self.core.counters.recs_since_snap.store(0, Ordering::Relaxed);
-        self.core.counters.last_snap_ms.store(now, Ordering::Relaxed);
+        self.core
+            .counters
+            .recs_since_snap
+            .store(0, Ordering::Relaxed);
+        self.core
+            .counters
+            .last_snap_ms
+            .store(now, Ordering::Relaxed);
         Ok(())
     }
 
@@ -790,7 +818,8 @@ impl Wal {
                     tombed: false,
                 }),
             });
-            sym.by_name.insert(slot_key(&stream, &consumer), slot.clone());
+            sym.by_name
+                .insert(slot_key(&stream, &consumer), slot.clone());
             while sym.by_id.len() <= id as usize {
                 sym.by_id.push(None);
             }
@@ -880,7 +909,10 @@ fn apply_replay(
             if ttl_cutoff > 0 && (d.ts_ms as i64) < ttl_cutoff {
                 return;
             }
-            slots.entry(d.slot_id).or_default().insert(d.seq, d.ts_ms as i64);
+            slots
+                .entry(d.slot_id)
+                .or_default()
+                .insert(d.seq, d.ts_ms as i64);
         }
         OP_CONFIRM | OP_EXPIRE => {
             slots.entry(d.slot_id).or_default().remove(&d.seq);

@@ -421,11 +421,7 @@ impl ArbitroStateMachine {
             Ok(_) => {
                 router.names().remove_consumer_by_id(consumer_id);
                 router.invalidate_list_cache();
-                tracing::debug!(
-                    stream_name,
-                    name,
-                    "state_machine: consumer deleted"
-                );
+                tracing::debug!(stream_name, name, "state_machine: consumer deleted");
             }
             Err(e) => {
                 tracing::warn!(

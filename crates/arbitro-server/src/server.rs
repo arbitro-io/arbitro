@@ -100,12 +100,19 @@ impl AuthConfig {
                         "admin" => Some(Permission::Admin),
                         "" => None,
                         other => {
-                            tracing::warn!(permission = other, "ARBITRO_AUTH_USERS: unknown permission, skipping");
+                            tracing::warn!(
+                                permission = other,
+                                "ARBITRO_AUTH_USERS: unknown permission, skipping"
+                            );
                             None
                         }
                     })
                     .collect();
-                Some(AuthUser { username, token, permissions: perms })
+                Some(AuthUser {
+                    username,
+                    token,
+                    permissions: perms,
+                })
             })
             .collect();
         Self { users }
@@ -482,9 +489,8 @@ impl ArbitroServer {
                     .iter()
                     .map(|(id, _)| PeerId(*id))
                     .collect();
-                let mut bootstrap_peers: Vec<BootstrapPeer> = Vec::with_capacity(
-                    self.config.cluster_peers.len(),
-                );
+                let mut bootstrap_peers: Vec<BootstrapPeer> =
+                    Vec::with_capacity(self.config.cluster_peers.len());
                 for (id, addr) in &self.config.cluster_peers {
                     let parsed = match addr.parse() {
                         Ok(a) => a,
@@ -639,8 +645,7 @@ impl ArbitroServer {
                     // never hang shutdown; on timeout or error the node is
                     // still cleanly stopped when `raft` drops below
                     // (Drop calls stop()).
-                    const DRAIN_TIMEOUT: std::time::Duration =
-                        std::time::Duration::from_secs(5);
+                    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
                     tracing::info!("raft node shutting down: draining (leadership handoff)");
                     match tokio::time::timeout(DRAIN_TIMEOUT, raft.drain()).await {
                         Ok(Ok(())) => tracing::info!("raft drain complete"),
@@ -686,23 +691,17 @@ impl ArbitroServer {
                     };
 
                     // Leader replication channel: shard workers push batches here.
-                    let (repl_tx, repl_loop_rx) =
-                        tokio::sync::mpsc::channel::<crate::cluster::replication::ReplicationBatch>(
-                            4096,
-                        );
+                    let (repl_tx, repl_loop_rx) = tokio::sync::mpsc::channel::<
+                        crate::cluster::replication::ReplicationBatch,
+                    >(4096);
                     self.server.set_replication_tx(repl_tx);
 
                     // Spawn leader-side replication loop.
                     let repl_peer_addrs = peer_addrs.clone();
                     let repl_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        replication_loop(
-                            repl_loop_rx,
-                            node_id.0,
-                            repl_peer_addrs,
-                            repl_shutdown,
-                        )
-                        .await;
+                        replication_loop(repl_loop_rx, node_id.0, repl_peer_addrs, repl_shutdown)
+                            .await;
                     });
 
                     // Spawn follower-side replication loop.
@@ -724,11 +723,9 @@ impl ArbitroServer {
                     // The tracker is wrapped in Arc<Mutex<>> so it can later be
                     // shared with the replication_loop (for record_ack on ack
                     // receipt). For now it runs standalone with a fresh tracker.
-                    let isr_tracker = std::sync::Arc::new(
-                        parking_lot::Mutex::new(
-                            IsrTracker::new(std::time::Duration::from_secs(10)),
-                        ),
-                    );
+                    let isr_tracker = std::sync::Arc::new(parking_lot::Mutex::new(
+                        IsrTracker::new(std::time::Duration::from_secs(10)),
+                    ));
                     let isr_shutdown = shutdown_rx.clone();
                     let isr_node_id = node_id.0;
                     tokio::spawn(async move {
@@ -740,10 +737,7 @@ impl ArbitroServer {
                         .await;
                     });
 
-                    tracing::info!(
-                        node_id = node_id.0,
-                        "data-plane replication tasks started"
-                    );
+                    tracing::info!(node_id = node_id.0, "data-plane replication tasks started");
                     // Honesty: replication is best-effort today. See
                     // ROBUSTNESS_AUDIT.md §2.5 / action #8.
                     tracing::warn!(
@@ -972,7 +966,10 @@ impl ArbitroServer {
                         #[cfg(unix)]
                         opts.mode(0o600);
 
-                        match opts.open(&path).and_then(|mut f| f.write_all(dump.as_bytes())) {
+                        match opts
+                            .open(&path)
+                            .and_then(|mut f| f.write_all(dump.as_bytes()))
+                        {
                             Ok(()) => {
                                 tracing::info!(path = %path.display(), "SIGUSR1 diagnostic dump written")
                             }
@@ -1027,9 +1024,7 @@ impl ArbitroServer {
         {
             let mut tasks = background_tasks.lock().await;
             tasks.abort_all();
-            let drain = async {
-                while tasks.join_next().await.is_some() {}
-            };
+            let drain = async { while tasks.join_next().await.is_some() {} };
             if tokio::time::timeout(std::time::Duration::from_secs(5), drain)
                 .await
                 .is_err()
@@ -1398,7 +1393,10 @@ async fn read_loop(
     for i in 0..server.shard_count() {
         let server = server.clone();
         drain_set.spawn(async move {
-            let _ = server.shard(i).drain_connection(ConnectionId(conn_id)).await;
+            let _ = server
+                .shard(i)
+                .drain_connection(ConnectionId(conn_id))
+                .await;
         });
     }
     while drain_set.join_next().await.is_some() {}

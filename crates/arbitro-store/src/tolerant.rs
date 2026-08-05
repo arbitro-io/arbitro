@@ -7,7 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::segment::{self, SegmentMetadata, MAX_SEGMENT_BYTES};
-use crate::store::{entry_matches, Entry, EntryRef, FsyncPolicy, RetentionLimits, Store, StoreError, StoreInfo};
+use crate::store::{
+    entry_matches, Entry, EntryRef, FsyncPolicy, RetentionLimits, Store, StoreError, StoreInfo,
+};
 use arbitro_engine_v2::common::wire_hash_32;
 
 #[derive(Debug, Clone, Copy)]
@@ -227,8 +229,14 @@ impl TolerantStore {
                 .filter(|m| m.segment_idx == sealed_idx)
                 .copied()
                 .collect();
-            let first_seq = seg_entries.first().map(|m| m.seq).unwrap_or(self.active_segment_id);
-            let last_seq = seg_entries.last().map(|m| m.seq).unwrap_or(self.active_segment_id);
+            let first_seq = seg_entries
+                .first()
+                .map(|m| m.seq)
+                .unwrap_or(self.active_segment_id);
+            let last_seq = seg_entries
+                .last()
+                .map(|m| m.seq)
+                .unwrap_or(self.active_segment_id);
             self.segments.push(SegmentMetadata {
                 path: path.clone(),
                 first_seq,
@@ -406,7 +414,8 @@ impl TolerantStore {
         } else if std::env::var("ARBITRO_CHAOS_DEBUG").is_ok() {
             eprintln!(
                 "[STORE-LOAD-SEG-EMPTY] path={:?} scan_end_off={}",
-                path.file_name().unwrap_or_default(), offset
+                path.file_name().unwrap_or_default(),
+                offset
             );
         }
         Ok(())
@@ -570,7 +579,11 @@ impl TolerantStore {
     /// FEAT-7: like `get`, but recomputes the CRC32 over the on-disk
     /// record and returns `StoreError::Io` (data corruption) on mismatch
     /// instead of silently handing back the (possibly corrupt) bytes.
-    pub fn get_verified(&self, seq: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<bool, StoreError> {
+    pub fn get_verified(
+        &self,
+        seq: u64,
+        f: &mut dyn FnMut(&Entry<'_>),
+    ) -> Result<bool, StoreError> {
         let Some(idx) = self.seq_to_idx(seq) else {
             return Ok(false);
         };
@@ -646,7 +659,8 @@ impl TolerantStore {
                 }
                 let src = &self.sealed_segments[seg_idx as usize][..];
                 let header_start = (m.offset as usize) - HEADER_SIZE;
-                let body_end = (m.offset as usize) + (m.subj_len as usize) + (m.payload_len as usize);
+                let body_end =
+                    (m.offset as usize) + (m.subj_len as usize) + (m.payload_len as usize);
                 let record_end = body_end + RECORD_CRC_SIZE;
                 let record = &src[header_start..record_end];
 
@@ -1112,8 +1126,7 @@ impl Store for TolerantStore {
                 mmap[flags_disk_offset] = m.flags;
                 // Recompute CRC over [header || subject || payload]
                 let crc = crc32fast::hash(&mmap[header_start..body_end]);
-                mmap[body_end..body_end + RECORD_CRC_SIZE]
-                    .copy_from_slice(&crc.to_le_bytes());
+                mmap[body_end..body_end + RECORD_CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
                 // Flush the modified region so it survives process exit.
                 let _ = mmap.flush();
             }
@@ -1140,10 +1153,7 @@ impl Store for TolerantStore {
         let seqs: Vec<u64> = self
             .index
             .iter()
-            .filter(|m| {
-                m.stream_id == stream_id
-                    && m.flags & crate::store::flags::TOMBSTONE == 0
-            })
+            .filter(|m| m.stream_id == stream_id && m.flags & crate::store::flags::TOMBSTONE == 0)
             .map(|m| m.seq)
             .collect();
         let mut count = 0u64;
@@ -1854,7 +1864,10 @@ mod tests {
                     flags = e.flags;
                 })
                 .unwrap();
-            assert_eq!(flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+            assert_eq!(
+                flags & crate::store::flags::TOMBSTONE,
+                crate::store::flags::TOMBSTONE
+            );
         }
 
         // Reopen and verify tombstone survives (active segment is mmap'd)
@@ -1868,7 +1881,10 @@ mod tests {
                     flags = e.flags;
                 })
                 .unwrap();
-            assert_eq!(flags & crate::store::flags::TOMBSTONE, crate::store::flags::TOMBSTONE);
+            assert_eq!(
+                flags & crate::store::flags::TOMBSTONE,
+                crate::store::flags::TOMBSTONE
+            );
 
             // Non-tombstoned entry is clean
             let mut flags2 = 0xff;

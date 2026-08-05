@@ -46,7 +46,15 @@ pub fn send_ack_state_rep_v2(
     high_seq: u64,
     status: u32,
 ) {
-    let f = AckStateRepFrame::new(req_seq, consumer_id, generation, cursor, low_seq, high_seq, status);
+    let f = AckStateRepFrame::new(
+        req_seq,
+        consumer_id,
+        generation,
+        cursor,
+        low_seq,
+        high_seq,
+        status,
+    );
     registry.send_bytes(conn_id, bytes::Bytes::copy_from_slice(f.as_bytes()));
 }
 

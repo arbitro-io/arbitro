@@ -279,7 +279,10 @@ mod tests {
 
     #[test]
     fn validate_empty_token_consecutive_dots() {
-        assert_eq!(validate_pattern(b"orders..created"), Err(PatternError::EmptyToken));
+        assert_eq!(
+            validate_pattern(b"orders..created"),
+            Err(PatternError::EmptyToken)
+        );
     }
 
     #[test]
@@ -294,7 +297,10 @@ mod tests {
 
     #[test]
     fn validate_tokens_after_gt() {
-        assert_eq!(validate_pattern(b"orders.>.eu"), Err(PatternError::TokensAfterGt));
+        assert_eq!(
+            validate_pattern(b"orders.>.eu"),
+            Err(PatternError::TokensAfterGt)
+        );
     }
 
     #[test]
