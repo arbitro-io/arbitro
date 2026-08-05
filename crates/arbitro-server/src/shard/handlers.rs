@@ -13,7 +13,9 @@ use arbitro_store::EntryRef;
 
 use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::command::*;
-use crate::shard::worker::{rewind_released, AccumCaller, ActiveBinding, CommandWorker, StreamAccum};
+use crate::shard::worker::{
+    rewind_released, AccumCaller, ActiveBinding, CommandWorker, StreamAccum,
+};
 
 impl CommandWorker {
     // ── Hot path — accumulator ──────────────────────────────────────────
@@ -106,8 +108,11 @@ impl CommandWorker {
                     if crate::shard::drain::chaos_debug() {
                         eprintln!(
                             "[APPEND-OK] stream={} first_seq={} last_seq={} count={} callers={}",
-                            stream_id.raw(), first_seq, first_seq + entry_count - 1,
-                            entry_count, callers.len()
+                            stream_id.raw(),
+                            first_seq,
+                            first_seq + entry_count - 1,
+                            entry_count,
+                            callers.len()
                         );
                     }
                     let mut seq_offset = 0u64;
@@ -115,8 +120,10 @@ impl CommandWorker {
                         if crate::shard::drain::chaos_debug() {
                             eprintln!(
                                 "[REPOK-SEND] conn={} env_seq={} assigned_seq={} count={}",
-                                caller.conn_id, caller.env_seq,
-                                first_seq + seq_offset, caller.entry_count
+                                caller.conn_id,
+                                caller.env_seq,
+                                first_seq + seq_offset,
+                                caller.entry_count
                             );
                         }
                         send_rep_ok_v2(
@@ -151,22 +158,19 @@ impl CommandWorker {
                                 for e in &store_entries {
                                     let subj_len = e.subject.len() as u16;
                                     let total_len = 2 + e.subject.len() + e.payload.len();
-                                    entries_bytes.extend_from_slice(
-                                        &(total_len as u32).to_le_bytes(),
-                                    );
                                     entries_bytes
-                                        .extend_from_slice(&subj_len.to_le_bytes());
+                                        .extend_from_slice(&(total_len as u32).to_le_bytes());
+                                    entries_bytes.extend_from_slice(&subj_len.to_le_bytes());
                                     entries_bytes.extend_from_slice(&e.subject);
                                     entries_bytes.extend_from_slice(&e.payload);
                                 }
-                                let batch =
-                                    crate::cluster::replication::ReplicationBatch {
-                                        stream_id: stream_id.raw(),
-                                        first_seq,
-                                        entry_count: store_entries.len() as u32,
-                                        timestamp_ms: now_ms,
-                                        entries_bytes,
-                                    };
+                                let batch = crate::cluster::replication::ReplicationBatch {
+                                    stream_id: stream_id.raw(),
+                                    first_seq,
+                                    entry_count: store_entries.len() as u32,
+                                    timestamp_ms: now_ms,
+                                    entries_bytes,
+                                };
                                 // Non-blocking: drop the batch if the channel
                                 // is full — async replication is best-effort
                                 // for v1. The ISR tracker will eject lagging
@@ -266,9 +270,7 @@ impl CommandWorker {
             for entry in &cmd.entries {
                 for &bid in catalog.bindings_for_consumer(cmd.consumer_id) {
                     if let Some(b) = catalog.binding(bid) {
-                        if b.stream_id == entry.stream_id
-                            && b.pending.contains_key(&entry.seq)
-                        {
+                        if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
                             floors.record_acked(cmd.consumer_id.0, entry.seq);
                             break;
                         }
@@ -394,7 +396,7 @@ impl CommandWorker {
                          redelivering instead of dropping (no data loss)"
                     );
                 }
-                keep.extend(dlq_seqs.drain(..));
+                keep.append(&mut dlq_seqs);
             }
 
             if keep.is_empty() {
@@ -738,7 +740,9 @@ impl CommandWorker {
         let events = self.engine.delete_stream(cmd.stream_id);
         self.apply_delta_and_sync(&events);
         self.stream_retention.remove(&cmd.stream_id);
-        self.idempotency_tracker.write().remove(&cmd.stream_id.raw());
+        self.idempotency_tracker
+            .write()
+            .remove(&cmd.stream_id.raw());
         // NOTE: tombstone_stream removed — created_at_seq filtering in the
         // drain is O(1) and replaces the O(N) tombstone walk. The Store
         // trait method is kept for future compaction use.

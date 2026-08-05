@@ -120,7 +120,11 @@ pub fn render(config: &Config, ctx: &BannerContext) -> String {
         format!("arbitro-server v{}", ctx.version),
         format!(
             "{} build  --  pid {}",
-            if ctx.release_build { "release" } else { "debug" },
+            if ctx.release_build {
+                "release"
+            } else {
+                "debug"
+            },
             ctx.pid
         ),
         format!("features: {features}"),
@@ -203,7 +207,12 @@ pub fn render(config: &Config, ctx: &BannerContext) -> String {
     body.push(String::new());
 
     // engine
-    field(&mut body, "engine", "shards", &config.shard_count.to_string());
+    field(
+        &mut body,
+        "engine",
+        "shards",
+        &config.shard_count.to_string(),
+    );
     field(
         &mut body,
         "",
@@ -235,7 +244,14 @@ pub fn render(config: &Config, ctx: &BannerContext) -> String {
             } else {
                 ""
             };
-            body.push(format!("  {:<g$}    - {}@{}{}", "", id, addr, tag, g = GUTTER));
+            body.push(format!(
+                "  {:<g$}    - {}@{}{}",
+                "",
+                id,
+                addr,
+                tag,
+                g = GUTTER
+            ));
         }
     } else {
         let mode = if ctx.cluster_compiled {
@@ -309,9 +325,9 @@ fn field(lines: &mut Vec<String>, gutter: &str, label: &str, value: &str) {
 fn human_bytes(n: usize) -> String {
     const MIB: usize = 1024 * 1024;
     const KIB: usize = 1024;
-    if n >= MIB && n % MIB == 0 {
+    if n >= MIB && n.is_multiple_of(MIB) {
         format!("{} MiB", n / MIB)
-    } else if n >= KIB && n % KIB == 0 {
+    } else if n >= KIB && n.is_multiple_of(KIB) {
         format!("{} KiB", n / KIB)
     } else {
         format!("{n} bytes")
@@ -422,7 +438,10 @@ mod tests {
         c.metrics_listen = Some("0.0.0.0:9091".to_string());
         let banner = render(&config, &c);
         let widths: Vec<usize> = banner.lines().map(|l| l.len()).collect();
-        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged box:\n{banner}");
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "ragged box:\n{banner}"
+        );
         assert!(banner.lines().all(|l| l.is_ascii()), "non-ASCII output");
     }
 
