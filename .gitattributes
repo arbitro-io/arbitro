@@ -1,0 +1,15 @@
+# Normalize line endings.
+#
+# This repo is worked on from both Windows (git-for-Windows ships
+# core.autocrlf=true system-wide) and WSL (autocrlf unset). Without this
+# file each git believes the other one dirtied every source file: a clean
+# checkout showed 17 files "modified" with ~10 000 changed lines that were
+# nothing but CR bytes. Pinning eol=lf makes both agree and keeps the CRLF
+# noise out of commits.
+* text=auto eol=lf
+
+# Binary — never touch these.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
