@@ -34,10 +34,34 @@ fn system_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// WAL configuration. Sensible defaults via [`WalConfig::new`].
+/// WAL configuration. Sensible defaults via [`WalConfig::new`] (explicit
+/// directory) or [`WalConfig::default`] (platform default directory).
+///
+/// # Storage location
+///
+/// `dir` is the one setting a deployment almost always needs to override, so
+/// it is reachable from the client's normal configuration surface:
+/// [`ClientConfig::ack_store`](crate::config::ClientConfig::ack_store) holds a
+/// `WalConfig`, and [`Client::connect`](crate::Client::connect) opens it.
+///
+/// `None` means "resolve at open": `ARBITRO_ACKSTORE_DIR`, else the platform
+/// state directory (`$XDG_STATE_HOME/arbitro/ackstore`,
+/// `~/Library/Application Support/arbitro/ackstore`,
+/// `%LOCALAPPDATA%\arbitro\ackstore`), else a hard error — never the cwd and
+/// never a temp dir. See [`super::dir`] for the full rationale.
+///
+/// # One writer per directory
+///
+/// [`Wal::open`] takes an OS advisory lock on the directory and fails with
+/// [`StoreError::Locked`] if another live process already holds it (see
+/// [`super::lock`]). Point two clients that must run concurrently at two
+/// directories. The lock is machine-local: a WAL on a network filesystem
+/// shared between hosts is not a supported configuration.
 #[derive(Clone)]
 pub struct WalConfig {
-    pub dir: PathBuf,
+    /// Directory holding `ackstore.log`. `None` → platform default, resolved
+    /// by [`super::dir::default_dir`] when the WAL is opened.
+    pub dir: Option<PathBuf>,
     /// Per-entry expiry; `None`/zero disables the TTL sweep.
     pub ttl: Option<Duration>,
     /// TTL sweep cadence; default 5s.
@@ -67,10 +91,12 @@ impl std::fmt::Debug for WalConfig {
     }
 }
 
-impl WalConfig {
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
+impl Default for WalConfig {
+    /// Defaults with **no** explicit directory — the WAL lands in the platform
+    /// state directory (or `ARBITRO_ACKSTORE_DIR`) when opened.
+    fn default() -> Self {
         Self {
-            dir: dir.into(),
+            dir: None,
             ttl: None,
             sweep_interval: Duration::from_secs(5),
             fsync: false,
@@ -78,6 +104,26 @@ impl WalConfig {
             snapshot_every_n: 0,
             compact_at_bytes: 0,
             now: Arc::new(system_now_ms),
+        }
+    }
+}
+
+impl WalConfig {
+    /// Defaults with an explicit store directory.
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: Some(dir.into()),
+            ..Self::default()
+        }
+    }
+
+    /// The directory this config will actually use: the explicit `dir` if set,
+    /// otherwise the platform default. Useful for logging the resolved path at
+    /// startup without opening the store.
+    pub fn resolve_dir(&self) -> Result<PathBuf, StoreError> {
+        match &self.dir {
+            Some(d) => Ok(d.clone()),
+            None => super::dir::default_dir(),
         }
     }
 }
@@ -106,6 +152,9 @@ pub(crate) struct Writer {
 /// slot references, so `Arc<WalCore>` never forms a cycle with the slots.
 pub(crate) struct WalCore {
     pub cfg: WalConfig,
+    /// The directory actually in use — `cfg.dir` when set, otherwise the
+    /// platform default resolved once at [`Wal::open`].
+    pub dir: PathBuf,
     pub writer: Mutex<Writer>,
     pub counters: Counters,
 }
@@ -121,6 +170,9 @@ pub struct Wal {
     pub(crate) sym: Arc<RwLock<SymTable>>,
     stop: Arc<AtomicBool>,
     sweep: Mutex<Option<JoinHandle<()>>>,
+    /// Single-writer lock on the store directory. Dropped by `close()` (and by
+    /// `Drop`) so the directory can be reopened by this or another process.
+    lock: Mutex<Option<super::lock::DirLock>>,
 }
 
 impl std::fmt::Debug for Wal {
@@ -153,19 +205,44 @@ pub(crate) fn slot_key(stream: &str, consumer: &str) -> String {
 }
 
 impl Wal {
-    /// Open (creating if needed) a WAL at `cfg.dir` and replay it.
-    pub fn open(cfg: WalConfig) -> Result<Arc<Self>, StoreError> {
-        std::fs::create_dir_all(&cfg.dir)?;
-        let path = cfg.dir.join("ackstore.log");
+    /// Open (creating if needed) a WAL at `cfg.dir` — or, when that is `None`,
+    /// at the platform default directory — and replay it.
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NoDefaultDir`] — no directory configured and the
+    ///   platform exposes no state directory to default to.
+    /// * [`StoreError::BadDir`] — the path is a regular file, sits under a
+    ///   file, or cannot be created / written by this process.
+    /// * [`StoreError::Locked`] — another live process already has this
+    ///   directory open.
+    pub fn open(mut cfg: WalConfig) -> Result<Arc<Self>, StoreError> {
+        let dir = cfg.resolve_dir()?;
+        // Pin the resolution: the stored config must report the directory
+        // actually in use, not `None`, so `Debug` output and any later
+        // `resolve_dir()` agree with what is on disk.
+        cfg.dir = Some(dir.clone());
+        super::dir::prepare_dir(&dir)?;
+        // Take the single-writer lock BEFORE touching the log, so a second
+        // process never gets far enough to append an interleaved frame. This
+        // also surfaces "directory not writable" with the path attached.
+        let lock = super::lock::acquire(&dir)?;
+
+        let path = dir.join("ackstore.log");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false) // WAL: preserve the existing log for replay
-            .open(&path)?;
+            .open(&path)
+            .map_err(|e| StoreError::BadDir {
+                path: dir.clone(),
+                reason: format!("cannot open ackstore.log: {e}"),
+            })?;
 
         let core = Arc::new(WalCore {
             cfg: cfg.clone(),
+            dir: dir.clone(),
             writer: Mutex::new(Writer {
                 file: BufWriter::new(file),
                 size: 0,
@@ -185,6 +262,7 @@ impl Wal {
             sym: sym.clone(),
             stop: Arc::new(AtomicBool::new(false)),
             sweep: Mutex::new(None),
+            lock: Mutex::new(Some(lock)),
         });
 
         wal.replay()?;
@@ -223,6 +301,13 @@ impl Wal {
 
     fn get_slot(&self, cid_name: &str) -> Option<Arc<WalSlot>> {
         self.sym.read().unwrap().by_name.get(cid_name).cloned()
+    }
+
+    /// The directory this WAL resolved to at open — the configured `dir`, or
+    /// the platform default. Log it at startup so an operator can see where
+    /// the dedup state actually landed.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.core.dir
     }
 }
 
@@ -412,15 +497,21 @@ impl Store for Wal {
         if let Some(h) = self.sweep.lock().unwrap().take() {
             let _ = h.join();
         }
-        let mut w = self.core.writer.lock().unwrap();
-        if w.closed {
-            return Ok(());
+        {
+            let mut w = self.core.writer.lock().unwrap();
+            if !w.closed {
+                w.file.flush()?;
+                if self.core.cfg.fsync {
+                    w.file.get_ref().sync_all()?;
+                }
+                w.closed = true;
+            }
         }
-        w.file.flush()?;
-        if self.core.cfg.fsync {
-            w.file.get_ref().sync_all()?;
-        }
-        w.closed = true;
+        // Release the single-writer lock only after the log is safely on disk,
+        // so the directory is never handed to another writer mid-flush. A
+        // failed flush above returns early and keeps the lock — the store is
+        // still open.
+        drop(self.lock.lock().unwrap().take());
         Ok(())
     }
 

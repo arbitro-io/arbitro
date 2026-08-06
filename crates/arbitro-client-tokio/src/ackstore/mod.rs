@@ -11,7 +11,9 @@
 //! compaction.
 
 mod compact;
+pub mod dir;
 mod format;
+pub(crate) mod lock;
 pub mod memory;
 pub mod store;
 pub mod wal;
@@ -19,5 +21,6 @@ pub mod wal;
 #[cfg(test)]
 mod tests;
 
+pub use dir::{default_dir, ENV_DIR};
 pub use store::{Metrics, SlotInfo, SlotRef, Store, StoreError};
 pub use wal::WalConfig;

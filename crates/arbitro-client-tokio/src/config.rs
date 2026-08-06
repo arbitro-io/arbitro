@@ -18,6 +18,31 @@ pub struct ClientConfig {
     pub write_queue_capacity: usize,
     /// TTL for hot-tier deferred acks before the sweep drops them unpersisted.
     pub ack_pending_ttl: Duration,
+    /// Durable redelivery-dedup store (WAL), including **where it lives**.
+    ///
+    /// `None` (the default) means no dedup store: a redelivered message runs
+    /// the handler again, which is the plain at-least-once contract.
+    ///
+    /// `Some(cfg)` makes [`Client::connect`](crate::Client::connect) open a
+    /// [`Wal`](crate::ackstore::wal::Wal) so a restarted process recognizes
+    /// messages it already processed. The storage path is
+    /// [`WalConfig::dir`](crate::ackstore::WalConfig::dir):
+    ///
+    /// ```ignore
+    /// // explicit path — what a packaged service should do
+    /// ClientConfig { ack_store: Some(WalConfig::new("/var/lib/myapp/ackstore")), ..d }
+    ///
+    /// // platform default path (ARBITRO_ACKSTORE_DIR, else the OS state dir)
+    /// ClientConfig { ack_store: Some(WalConfig::default()), ..d }
+    /// ```
+    ///
+    /// See [`WalConfig`](crate::ackstore::WalConfig) for the default-path rules
+    /// and the one-writer-per-directory requirement.
+    ///
+    /// [`Client::connect_with_ackstore`](crate::Client::connect_with_ackstore)
+    /// still takes precedence when a caller wants a fully custom
+    /// [`Store`](crate::ackstore::Store) implementation.
+    pub ack_store: Option<crate::ackstore::WalConfig>,
     /// TLS configuration. `None` → plain TCP. Requires the `tls` feature.
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
@@ -33,6 +58,7 @@ impl Default for ClientConfig {
             keep_alive: KeepAlive::default(),
             write_queue_capacity: 4096,
             ack_pending_ttl: Duration::from_secs(24 * 3600),
+            ack_store: None,
             #[cfg(feature = "tls")]
             tls: None,
         }

@@ -72,6 +72,9 @@ pub mod transport_internal {
 pub use arbitro_proto::v2::manager::SubjectLimit;
 pub use client::{BatchEntry, Client};
 pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
+// Re-exported at the root because `ClientConfig::ack_store` takes one — the
+// store's location is ordinary client configuration.
+pub use ackstore::WalConfig;
 pub use consume::message::{decode_reply_to, encode_reply_to, Message, REPLY_TO_MAGIC};
 pub use consume::SubscriptionHandle;
 pub use error::{ClientError, RequestResult};

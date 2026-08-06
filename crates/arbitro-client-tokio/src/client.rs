@@ -48,8 +48,11 @@ impl Client {
     /// Resolves once the initial TCP dial + HELLO handshake succeeds.
     /// All subsequent reconnects happen transparently in the background.
     ///
-    /// Redelivery dedup is disabled. To survive restarts without
-    /// reprocessing already-acked messages, use
+    /// Redelivery dedup follows
+    /// [`ClientConfig::ack_store`](crate::config::ClientConfig::ack_store):
+    /// `None` (the default) disables it; `Some(WalConfig)` opens a durable WAL
+    /// at the configured — or platform-default — directory. For a custom
+    /// [`Store`](crate::ackstore::Store) implementation use
     /// [`Client::connect_with_ackstore`].
     pub async fn connect(cfg: ClientConfig) -> Result<Self, ClientError> {
         Self::connect_with(cfg, None).await
@@ -83,6 +86,27 @@ impl Client {
         ack_store: Option<Arc<dyn crate::ackstore::Store>>,
     ) -> Result<Self, ClientError> {
         use arbitro_kit::route::MpscAsync;
+
+        // An explicitly supplied store wins; otherwise honour the WAL declared
+        // on the config (storage path included). Opening happens here, before
+        // any connection work, so a bad directory / already-locked directory
+        // fails fast instead of after a successful handshake.
+        let ack_store = match ack_store {
+            Some(s) => Some(s),
+            None => match &cfg.ack_store {
+                Some(wcfg) => {
+                    let wal = crate::ackstore::wal::Wal::open(wcfg.clone()).map_err(|e| {
+                        ClientError::InvalidConfig(format!("ackstore open: {e}"))
+                    })?;
+                    let store: Arc<dyn crate::ackstore::Store> = wal;
+                    store.restore().map_err(|e| {
+                        ClientError::InvalidConfig(format!("ackstore restore: {e}"))
+                    })?;
+                    Some(store)
+                }
+                None => None,
+            },
+        };
 
         // Allocate the shared write-producer pool (16 leasable slots).
         let (pool, consumer, _shutdown) =
@@ -142,7 +166,18 @@ impl Client {
         ));
 
         // Establish the first connection; background loop handles reconnects.
-        spawn_connection(consumer, Arc::clone(&inner), session_replay_lease).await?;
+        if let Err(e) = spawn_connection(consumer, Arc::clone(&inner), session_replay_lease).await {
+            // The caller never receives a Client and so can never `close()` it.
+            // Cancel the background tasks (each holds an `Arc<Inner>`, which
+            // owns the store) and release the store's directory lock — without
+            // this, one transient dial failure would turn every subsequent
+            // connect attempt on that directory into `StoreError::Locked`.
+            inner.cancel.cancel();
+            if let Some(store) = &inner.ack_store {
+                let _ = store.close();
+            }
+            return Err(e);
+        }
 
         Ok(Self { inner })
     }

@@ -43,6 +43,24 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("ackstore: corrupt record")]
     Corrupt,
+    /// The configured (or defaulted) store directory cannot be used: it is a
+    /// regular file, sits under a file, or is not writable by this process.
+    #[error("ackstore: store directory {path:?}: {reason}")]
+    BadDir { path: std::path::PathBuf, reason: String },
+    /// No platform default directory could be resolved. Configure one
+    /// explicitly or export `ARBITRO_ACKSTORE_DIR`.
+    #[error(
+        "ackstore: cannot resolve a default store directory ({0}); \
+         set ClientConfig.ack_store's dir explicitly or export ARBITRO_ACKSTORE_DIR"
+    )]
+    NoDefaultDir(String),
+    /// Another live process already holds the single-writer lock on this
+    /// directory. Give each client its own directory.
+    #[error(
+        "ackstore: store directory {0:?} is already open by another process \
+         (a WAL directory allows exactly one writer)"
+    )]
+    Locked(std::path::PathBuf),
 }
 
 /// The pluggable delivered-set store. Implementations MUST be `Send + Sync`.

@@ -27,6 +27,11 @@ tokio-rustls  = { version = "0.26", optional = true }
 rustls        = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots  = { version = "0.26", optional = true }
 
+# `flock` for the ackstore single-writer directory lock (src/ackstore/lock.rs).
+# Already in this crate's graph via tokio on unix, so it adds no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio          = { workspace = true }
 criterion      = { workspace = true }

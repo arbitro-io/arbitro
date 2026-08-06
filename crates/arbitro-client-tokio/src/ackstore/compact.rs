@@ -44,7 +44,7 @@ impl Wal {
         let (slots, names, _good) = scan_bytes(&data, ttl_cutoff)?;
 
         // Write compacted content to a temp file in the same dir.
-        let tmp_path = self.core.cfg.dir.join("ackstore.log.compact");
+        let tmp_path = self.core.dir.join("ackstore.log.compact");
         let new_size = {
             let tmp = OpenOptions::new()
                 .read(true)
@@ -90,7 +90,7 @@ impl Wal {
         };
 
         // Atomic swap: rename temp → log, reopen for appends.
-        let log_path = self.core.cfg.dir.join("ackstore.log");
+        let log_path = self.core.dir.join("ackstore.log");
         std::fs::rename(&tmp_path, &log_path)?;
         let file = OpenOptions::new().read(true).write(true).open(&log_path)?;
         let mut bw = BufWriter::new(file);

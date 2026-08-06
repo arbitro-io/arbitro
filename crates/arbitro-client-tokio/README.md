@@ -85,12 +85,15 @@ process restart — attach a durable dedup store keyed by
 `(stream_name, consumer_name, seq)`:
 
 ```rust
-use arbitro_client_tokio::ackstore::wal::Wal;
 use arbitro_client_tokio::ackstore::WalConfig;
 
-// Durable write-ahead log; survives restarts.
-let wal = Wal::open(WalConfig::new("/var/lib/app/ackstore"))?;
-let client = Client::connect_with_ackstore(cfg, wal).await?;
+// The store — and the directory it lives in — is ordinary client config.
+let cfg = ClientConfig {
+    addr: "127.0.0.1:9898".into(),
+    ack_store: Some(WalConfig::new("/var/lib/app/ackstore")),
+    ..ClientConfig::default()
+};
+let client = Client::connect(cfg).await?;
 
 // subscribe_dedup carries the names the store needs to resolve a slot.
 let mut sub = client
@@ -113,7 +116,50 @@ under the same name still recognizes already-completed work.
 The [`Store`] trait is pluggable: `Wal` is the durable backend,
 `MemoryStore` an in-process one; a future infra swap needs no hot-path
 changes. (This WAL replaced the old optional SQLite cold tier — there is no
-longer any `rusqlite` dependency.)
+longer any `rusqlite` dependency.) `Client::connect_with_ackstore(cfg, store)`
+remains available for a custom `Store` implementation and takes precedence over
+`cfg.ack_store`.
+
+### Where the WAL is stored
+
+`ClientConfig::ack_store` is `None` by default: no dedup store, plain
+at-least-once. When set, the directory comes from, in order:
+
+1. `WalConfig::new("/explicit/path")` — what a packaged service should do.
+2. `$ARBITRO_ACKSTORE_DIR` — operator override, no code change, honoured
+   identically by the Rust, Go and TS clients.
+3. The platform state directory, used by `WalConfig::default()`:
+
+   | platform    | default directory                                  |
+   |-------------|----------------------------------------------------|
+   | Linux / BSD | `$XDG_STATE_HOME/arbitro/ackstore`, else `~/.local/state/arbitro/ackstore` |
+   | macOS       | `~/Library/Application Support/arbitro/ackstore`    |
+   | Windows     | `%LOCALAPPDATA%\arbitro\ackstore`                   |
+
+4. Nothing resolvable (no `HOME`/`%LOCALAPPDATA%`, e.g. a bare systemd unit)
+   → `StoreError::NoDefaultDir`.
+
+There is deliberately **no** cwd-relative and **no** temp-dir fallback. A
+cwd-relative store moves whenever the service is started from a different
+directory, and a temp store is erased on reboot — both silently resurrect the
+duplicate processing the store exists to prevent, while looking healthy. An
+explicit error naming the two fixes is better than either.
+
+`Wal::dir()` reports the resolved path; log it at startup.
+
+### One writer per directory
+
+`Wal::open` takes an OS advisory lock (`flock` on unix, exclusive share mode on
+Windows) on `<dir>/ackstore.lock` and returns `StoreError::Locked` if another
+live process already holds it. This is enforced rather than documented because
+two writers do not merely corrupt bytes: each numbers slots from its own
+counter, so after a restart replay attributes one process's records to the
+other's `(stream, consumer)` — and a false `seen()` hit is a message whose
+handler never runs. The lock is released by the kernel when the process exits,
+so a crash never wedges the directory. It does not extend across a network
+filesystem; a WAL shared between hosts is not supported.
+
+Run two clients concurrently? Give each its own directory.
 
 ## Service (Request/Reply RPC)
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::memory::MemoryStore;
-use super::store::Store;
+use super::store::{Store, StoreError};
 use super::wal::{Wal, WalConfig};
 
 /// Injectable clock for deterministic TTL tests.
@@ -522,6 +522,185 @@ fn concurrent_stress_with_restart() {
         "no records lost across concurrent-write + restart"
     );
     w2.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- storage location: configuration, defaults, failure modes ---
+
+/// Serializes the tests that mutate `ARBITRO_ACKSTORE_DIR`; the test harness
+/// runs them on parallel threads and the environment is process-wide.
+static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs `f` with `ARBITRO_ACKSTORE_DIR` set to `val`, restoring the previous
+/// value (set or unset) afterwards.
+fn with_env_dir<R>(val: Option<&std::path::Path>, f: impl FnOnce() -> R) -> R {
+    let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    let prev = std::env::var_os(super::dir::ENV_DIR);
+    match val {
+        Some(p) => std::env::set_var(super::dir::ENV_DIR, p),
+        None => std::env::remove_var(super::dir::ENV_DIR),
+    }
+    let out = f();
+    match prev {
+        Some(v) => std::env::set_var(super::dir::ENV_DIR, v),
+        None => std::env::remove_var(super::dir::ENV_DIR),
+    }
+    out
+}
+
+#[test]
+fn explicit_dir_is_used_verbatim_and_beats_env() {
+    let dir = tmp_dir();
+    let other = tmp_dir();
+    let cfg = WalConfig::new(&dir);
+    assert_eq!(cfg.dir.as_deref(), Some(dir.as_path()));
+    let resolved = with_env_dir(Some(&other), || cfg.resolve_dir().unwrap());
+    assert_eq!(resolved, dir, "an explicit dir must outrank the env var");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&other).ok();
+}
+
+#[test]
+fn default_config_has_no_dir_and_resolves_to_env_override() {
+    let dir = tmp_dir();
+    let cfg = WalConfig::default();
+    assert!(cfg.dir.is_none(), "default config carries no explicit dir");
+    let resolved = with_env_dir(Some(&dir), || cfg.resolve_dir().unwrap());
+    assert_eq!(resolved, dir);
+    // `default_dir()` is the same resolution, exposed for callers that want to
+    // log the path before opening.
+    let d2 = with_env_dir(Some(&dir), || super::dir::default_dir().unwrap());
+    assert_eq!(d2, dir);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn platform_default_dir_is_absolute_and_namespaced() {
+    // With no override the default must be an absolute, arbitro-namespaced
+    // path — never the cwd, never bare temp.
+    let d = with_env_dir(None, super::dir::default_dir);
+    match d {
+        Ok(p) => {
+            assert!(p.is_absolute(), "default dir must be absolute, got {p:?}");
+            assert!(
+                p.ends_with(std::path::Path::new("arbitro/ackstore")),
+                "default dir must end with arbitro/ackstore, got {p:?}"
+            );
+            let cwd = std::env::current_dir().unwrap();
+            assert!(!p.starts_with(&cwd) || cwd == std::path::Path::new("/"));
+        }
+        // A sandbox with no HOME/LOCALAPPDATA: must be a loud error, never a
+        // silent cwd/temp fallback.
+        Err(e) => assert!(matches!(e, StoreError::NoDefaultDir(_)), "got {e:?}"),
+    }
+}
+
+#[test]
+fn open_with_default_dir_writes_to_the_resolved_path() {
+    let dir = tmp_dir();
+    let target = dir.join("nested").join("store"); // also proves mkdir -p
+    let w = with_env_dir(Some(&target), || Wal::open(WalConfig::default()).unwrap());
+    assert_eq!(w.dir(), target.as_path());
+    w.slot("s", "c").unwrap().check_record(1).unwrap();
+    w.sync().unwrap();
+    assert!(target.join("ackstore.log").is_file());
+    w.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_rejects_dir_that_is_a_regular_file() {
+    let dir = tmp_dir();
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let err = Wal::open(WalConfig::new(&file)).unwrap_err();
+    match &err {
+        StoreError::BadDir { path, reason } => {
+            assert_eq!(path, &file);
+            assert!(reason.contains("not a directory"), "got {reason}");
+        }
+        other => panic!("expected BadDir, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_rejects_dir_nested_under_a_regular_file() {
+    let dir = tmp_dir();
+    let file = dir.join("blocker");
+    std::fs::write(&file, b"x").unwrap();
+    let err = Wal::open(WalConfig::new(file.join("store"))).unwrap_err();
+    assert!(
+        matches!(err, StoreError::BadDir { .. }),
+        "expected BadDir, got {err:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn second_writer_on_one_dir_is_refused_then_allowed_after_close() {
+    let dir = tmp_dir();
+    let first = Wal::open(WalConfig::new(&dir)).unwrap();
+    assert!(
+        super::lock::lock_path(&dir).is_file(),
+        "open must create the lock file"
+    );
+
+    let err = Wal::open(WalConfig::new(&dir)).unwrap_err();
+    match &err {
+        StoreError::Locked(p) => assert_eq!(p, &dir),
+        // Platforms without flock/share-modes document this as caller
+        // responsibility; there the second open legitimately succeeds.
+        other if cfg!(not(any(unix, windows))) => {
+            panic!("unexpected error on lock-less platform: {other:?}")
+        }
+        other => panic!("expected Locked, got {other:?}"),
+    }
+
+    // Closing hands the directory over cleanly.
+    first.close().unwrap();
+    let second = Wal::open(WalConfig::new(&dir)).unwrap();
+    second.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dropped_wal_releases_the_dir_lock() {
+    // A crashed/forgotten store (no explicit close) must not wedge the
+    // directory — the OS drops the lock with the file handle.
+    let dir = tmp_dir();
+    {
+        let w = Wal::open(WalConfig::new(&dir)).unwrap();
+        w.slot("s", "c").unwrap().check_record(1).unwrap();
+        w.sync().unwrap();
+    }
+    let w2 = Wal::open(WalConfig::new(&dir)).unwrap();
+    w2.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn open_reports_unwritable_dir_with_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+    // root ignores the mode bits — nothing to assert there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tmp_dir();
+    let store = dir.join("ro");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let err = Wal::open(WalConfig::new(&store)).unwrap_err();
+    match &err {
+        StoreError::BadDir { path, reason } => {
+            assert_eq!(path, &store);
+            assert!(reason.contains("ackstore.lock"), "got {reason}");
+        }
+        other => panic!("expected BadDir, got {other:?}"),
+    }
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
 

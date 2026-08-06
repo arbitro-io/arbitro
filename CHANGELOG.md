@@ -5,6 +5,43 @@ All notable changes to `arbitro-server` (and the in-tree Rust reference client
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer with
 the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
+## [Unreleased]
+
+### Added — `arbitro-client-tokio`
+- **`ClientConfig::ack_store`** — the redelivery-dedup WAL, and the directory it
+  lives in, are now declared on the normal client configuration struct, and
+  plain `Client::connect` opens it. `WalConfig::new(dir)` pins an explicit path;
+  `WalConfig::default()` selects the platform default: `$ARBITRO_ACKSTORE_DIR`,
+  else `$XDG_STATE_HOME/arbitro/ackstore` (Linux/BSD),
+  `~/Library/Application Support/arbitro/ackstore` (macOS), or
+  `%LOCALAPPDATA%\arbitro\ackstore` (Windows). Never the cwd, never a temp dir
+  — both silently defeat restart survival, so an unresolvable default is a hard
+  error (`StoreError::NoDefaultDir`) instead.
+- **`ackstore::default_dir()` / `WalConfig::resolve_dir()` / `Wal::dir()`** —
+  report the resolved path (before or after opening) so it can be logged.
+- **Single-writer directory lock** — `Wal::open` takes an OS advisory lock
+  (`flock` on unix, exclusive share-mode open on Windows) on
+  `<dir>/ackstore.lock`. A second client on the same directory now fails with
+  `StoreError::Locked` instead of interleaving frames into one log, which after
+  a restart misattributed records between slots and could skip real work. The
+  kernel releases the lock on process exit, so a crash never wedges the store.
+- **`StoreError::BadDir` / `NoDefaultDir` / `Locked`** — an unusable store
+  directory now names the path and the specific problem instead of surfacing an
+  opaque `io::Error`.
+
+### Changed — `arbitro-client-tokio`
+- `WalConfig::dir` is now `Option<PathBuf>` (`None` = platform default).
+- A failed initial connect cancels the background tasks and closes the ack
+  store — previously they leaked for the process lifetime, and with the new
+  directory lock a retry loop would have hit `StoreError::Locked`.
+- New unix-only dependency `libc` (for `flock`); it was already in this crate's
+  graph via tokio, so no new crate is pulled in.
+
+### Unchanged
+- On-disk WAL format and store semantics. This is configuration only.
+- `Client::connect` still opens no store by default; `connect_with_ackstore`
+  still accepts a custom `Store` and takes precedence over `cfg.ack_store`.
+
 ## [0.6.2] - 2026-07-18
 
 Cluster-hardening release. The Raft control plane gains transport-level mutual
