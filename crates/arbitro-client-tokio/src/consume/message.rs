@@ -164,13 +164,21 @@ impl Message {
 
     /// Reply to the sender of this message.
     ///
-    /// The reply_to field must be encoded with stream_id (0xFF prefix format)
-    /// for this to work. Returns `ClientError::NoReplyAddress` if reply_to
-    /// is empty or not in the encoded format.
+    /// Crate-internal on purpose: this is the transport the service
+    /// dispatcher uses to deliver a handler's return value, not a method
+    /// callers are meant to reach for. A `reply_to` address is only ever
+    /// attached by `Service::request`, so on any other delivery this can
+    /// do nothing but fail — exposing it publicly only invites writing
+    /// request/reply by hand, outside the framework that manages the
+    /// matching ack/nack. Handlers answer by returning bytes; see
+    /// [`crate::service::HandlerResult`].
+    ///
+    /// Returns `ClientError::NoReplyAddress` if reply_to is empty or not
+    /// in the encoded (0xFF stream_id prefix) format.
     ///
     /// This is a fire-and-forget publish via a leased producer — it does
     /// not wait for broker confirmation.
-    pub fn reply(&self, payload: &[u8]) -> Result<(), ClientError> {
+    pub(crate) fn reply(&self, payload: &[u8]) -> Result<(), ClientError> {
         let (target_stream_id, subject) =
             decode_reply_to(&self.reply_to).ok_or(ClientError::NoReplyAddress)?;
 
