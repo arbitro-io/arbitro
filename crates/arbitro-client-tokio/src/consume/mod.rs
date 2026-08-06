@@ -15,7 +15,8 @@ use crate::consume::message::{AckCmd, Message, NackCmd};
 use crate::error::ClientError;
 use crate::state::Inner;
 use crate::transport::encode::{
-    encode_ack_batch_v2, encode_batch_ack_v2, encode_batch_nack_v2, encode_sub_v2, encode_unsub_v2,
+    encode_ack_batch_v2, encode_ack_state_req_v2, encode_batch_ack_v2, encode_batch_nack_v2,
+    encode_sub_v2, encode_unsub_v2,
 };
 use crate::transport::frame::{WriteFrame, WriteLease, INLINE_CAP};
 
@@ -107,6 +108,7 @@ pub(crate) fn subscribe_async(
     // 1. Register channel BEFORE enqueuing the SubFrame.
     //    Any Deliver frames that arrive while the round-trip is in flight
     //    are buffered in the channel (capacity = 4096).
+    let has_slot = slot.is_some();
     let rx = inner
         .subscriptions
         .register(consumer_id, stream_id, sub_body.clone(), slot);
@@ -128,11 +130,35 @@ pub(crate) fn subscribe_async(
                 .and_then(|r| r)
         };
         match wire_result {
-            Ok(_) => Ok(SubscriptionHandle {
-                rx,
-                consumer_id,
-                inner: inner2,
-            }),
+            Ok(_) => {
+                // On-connect ackstore purge: the WAL may hold entries recorded
+                // by a previous, dead session (its `AckBatchResp` never
+                // arrived, so nothing confirmed them). Ask the broker for its
+                // authoritative ack cursor ONCE, now that the subscribe is
+                // confirmed (the consumer provably exists server-side); the
+                // `AckStateRep` handler in `transport::reader` drops every WAL
+                // entry at or below that cursor. Cold path — one 24 B frame
+                // per subscribe, fire-and-forget, nothing on the delivery/ack
+                // hot path. Reconnects are covered separately by
+                // `conn::session::send_ack_state_reqs`.
+                if has_slot {
+                    let req_seq = inner2.seq_alloc.next();
+                    let generation = inner2.ackrel.generation_of(consumer_id);
+                    let _ = crate::publish::enqueue(
+                        &inner2.pool,
+                        WriteFrame::Mono(encode_ack_state_req_v2(
+                            req_seq,
+                            consumer_id,
+                            generation,
+                        )),
+                    );
+                }
+                Ok(SubscriptionHandle {
+                    rx,
+                    consumer_id,
+                    inner: inner2,
+                })
+            }
             Err(e) => {
                 inner2.subscriptions.remove(consumer_id);
                 Err(e)

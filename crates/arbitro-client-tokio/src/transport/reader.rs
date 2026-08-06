@@ -181,6 +181,8 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
 /// than try to reconcile entry-by-entry. Otherwise, trim the deferred set
 /// to the broker's confirmed/retained range and flush what survives.
 fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
+    use arbitro_proto::v2::ingress::ack_state::ACK_STATUS_OK;
+
     if frame.len() < AckStateRepFrame::WIRE_SIZE {
         return; // truncated frame — don't panic the reader on the slice
     }
@@ -192,6 +194,41 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
     let cursor = rep.body.cursor.get();
     let low_seq = rep.body.low_seq.get();
     let high_seq = rep.body.high_seq.get();
+    let status = rep.body.status.get();
+
+    // ── Durable dedup: on-connect WAL purge (cold path) ────────────────
+    //
+    // The broker's cursor is authoritative for the consumer currently
+    // registered under this id: it never (re)delivers seqs <= cursor to
+    // it, so dropping them from the WAL live set can never cause a
+    // duplicate execution. This runs BEFORE (and independent of) the
+    // ackrel generation check below: the WAL slot is keyed by durable
+    // `(stream, consumer)` names, and a fresh process (in-memory ackrel
+    // generation 0, broker generation possibly bumped by consumer-id
+    // recycling) must still purge entries recorded by a previous, dead
+    // session — that reconnect purge is the whole point of the
+    // on-(re)connect `AckStateReq`.
+    //
+    // Deliberate conservatism: the purge only runs when the broker
+    // vouches for the cursor (`status == OK`). On any other status —
+    // notably `ACK_STATUS_CONSUMER_UNKNOWN` (consumer deleted, or broker
+    // restarted without it) — we purge NOTHING, even though the entries
+    // are probably useless: a recreated same-name consumer will answer a
+    // later request with `OK` and its own cursor, and stale high-seq
+    // entries are left to the store TTL. A wrongly kept entry costs a
+    // little disk; a wrongly dropped one costs a duplicate execution of
+    // real work.
+    if status == ACK_STATUS_OK {
+        if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
+            if let Err(e) = slot.confirm_up_to(cursor) {
+                inner
+                    .metrics
+                    .ackstore_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
+            }
+        }
+    }
 
     if generation != inner.ackrel.generation_of(consumer_id) {
         // `ensure` on a new generation replaces the slot wholesale — the
@@ -205,19 +242,6 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
     inner
         .ackrel
         .purge_up_to(consumer_id, low_seq.saturating_sub(1));
-
-    // Durable dedup: the broker's cursor is a cumulative ack floor — it never
-    // redelivers at or below it, so drop those seqs from the WAL live set.
-    // Keeps the set tiny with no periodic job (see `SlotRef::confirm_up_to`).
-    if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
-        if let Err(e) = slot.confirm_up_to(cursor) {
-            inner
-                .metrics
-                .ackstore_errors
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(consumer_id, error = %e, "ackstore: confirm_up_to failed");
-        }
-    }
 
     let pending = inner.ackrel.drain_ascending(consumer_id, usize::MAX);
     if let Some(&max_seq) = pending.last() {
@@ -306,6 +330,13 @@ mod tests {
 
     /// Build a minimal `Inner` for use in unit tests (no real connection).
     fn make_inner(cancel: CancellationToken) -> Arc<Inner> {
+        make_inner_with_store(cancel, None)
+    }
+
+    fn make_inner_with_store(
+        cancel: CancellationToken,
+        ack_store: Option<Arc<dyn crate::ackstore::Store>>,
+    ) -> Arc<Inner> {
         let (pool, _consumer, _shutdown) =
             MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
@@ -324,7 +355,7 @@ mod tests {
             cron_state: crate::cron::CronState::new(),
             session_cancel: std::sync::Mutex::new(None),
             ackrel: Arc::new(crate::ackrel::AckRelay::new()),
-            ack_store: None,
+            ack_store,
         })
     }
 
@@ -384,5 +415,92 @@ mod tests {
 
         assert_eq!(result.len(), 8);
         cancel.cancel();
+    }
+
+    // ── AckStateRep → ackstore purge (reconnect-purge feature) ──────────
+
+    /// Set up an `Inner` with a memory ackstore, one slotted subscription
+    /// for `cid`, and the given pre-recorded seqs (simulating entries left
+    /// by a dead session that was never confirmed).
+    fn make_purge_fixture(
+        cid: u32,
+        seqs: &[u64],
+    ) -> (Arc<Inner>, Arc<dyn crate::ackstore::SlotRef>) {
+        let store: Arc<dyn crate::ackstore::Store> =
+            Arc::new(crate::ackstore::memory::MemoryStore::new(0));
+        let slot = store.slot("s", "c").unwrap();
+        for &s in seqs {
+            slot.record(s).unwrap();
+        }
+        let inner = make_inner_with_store(CancellationToken::new(), Some(store));
+        let _rx = inner
+            .subscriptions
+            .register(cid, 1, Bytes::new(), Some(slot.clone()));
+        (inner, slot)
+    }
+
+    fn ack_state_rep_bytes(
+        cid: u32,
+        generation: u32,
+        cursor: u64,
+        low_seq: u64,
+        high_seq: u64,
+        status: u32,
+    ) -> Bytes {
+        let f = AckStateRepFrame::new(1, cid, generation, cursor, low_seq, high_seq, status);
+        Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&f))
+    }
+
+    /// The on-connect purge must run even when the broker's generation does
+    /// not match the local (fresh-process) ackrel generation: the WAL slot is
+    /// keyed by durable names, so entries recorded by a dead session are
+    /// dropped up to the broker's cursor while entries above it survive.
+    #[test]
+    fn ack_state_rep_purges_ackstore_despite_generation_mismatch() {
+        let (inner, slot) = make_purge_fixture(3, &[5, 10, 15, 10_000]);
+
+        // Broker generation 7 vs local ackrel generation 0 → mismatch.
+        let frame = ack_state_rep_bytes(3, 7, 15, 1, 20, 0 /* ACK_STATUS_OK */);
+        dispatch_ack_state_rep(&inner, &frame);
+
+        let info = slot.info();
+        assert_eq!(info.live, 1, "entries <= cursor(15) must be dropped");
+        assert_eq!(info.min_seq, 10_000, "entries above the cursor must survive");
+        assert!(!slot.seen(5) && !slot.seen(10) && !slot.seen(15));
+        assert!(slot.seen(10_000));
+    }
+
+    /// When the broker does NOT vouch for the cursor (status != OK, e.g. the
+    /// consumer no longer exists), nothing may be purged — even if the frame
+    /// carries a non-zero cursor. Conservative by design: a wrongly kept
+    /// entry costs disk, a wrongly dropped one costs a duplicate execution.
+    #[test]
+    fn ack_state_rep_non_ok_status_purges_nothing() {
+        let (inner, slot) = make_purge_fixture(4, &[5, 10, 15, 10_000]);
+
+        // Adversarial frame: CONSUMER_UNKNOWN but cursor = 10_000.
+        let frame = ack_state_rep_bytes(
+            4, 0, 10_000, 0, 0, 3, /* ACK_STATUS_CONSUMER_UNKNOWN */
+        );
+        dispatch_ack_state_rep(&inner, &frame);
+
+        let info = slot.info();
+        assert_eq!(info.live, 4, "no entry may be dropped without an OK status");
+        assert!(slot.seen(5) && slot.seen(10) && slot.seen(15) && slot.seen(10_000));
+    }
+
+    /// Matching generation (steady-state reconnect) also purges — the
+    /// original primary-path behavior must be preserved.
+    #[test]
+    fn ack_state_rep_matching_generation_still_purges() {
+        let (inner, slot) = make_purge_fixture(5, &[1, 2, 3, 400]);
+
+        // ackrel generation for an untouched consumer is 0; broker also 0.
+        let frame = ack_state_rep_bytes(5, 0, 3, 1, 400, 0);
+        dispatch_ack_state_rep(&inner, &frame);
+
+        let info = slot.info();
+        assert_eq!(info.live, 1);
+        assert_eq!(info.min_seq, 400);
     }
 }

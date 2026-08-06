@@ -184,13 +184,37 @@ fn replay_subscriptions(inner: &Inner, lease: &mut WriteLease) {
 }
 
 /// Ack-reliability: request the broker's cursor/retention state for every
-/// consumer with outstanding deferred acks. Pipelined, fire-and-forget —
-/// the `AckStateRep` handler in `transport::reader` drives the follow-up
-/// `AckBatchFrame` flush.
+/// consumer with outstanding deferred acks, AND for every consumer that
+/// carries a durable ackstore slot. Pipelined, fire-and-forget — the
+/// `AckStateRep` handler in `transport::reader` drives the follow-up
+/// `AckBatchFrame` flush and the WAL `confirm_up_to` purge.
+///
+/// The slotted sweep exists for the reconnect-purge guarantee: WAL entries
+/// recorded by a session that died before its `AckBatchResp` arrived are
+/// never confirmed by the normal flow, so on every (re)connect each slotted
+/// consumer asks the broker for its authoritative cursor once and drops
+/// everything at or below it. Cold path — one 24 B frame per consumer per
+/// (re)connect, nothing added to the delivery/ack hot path.
 fn send_ack_state_reqs(inner: &Inner, lease: &mut WriteLease) {
     let consumers = inner.ackrel.active_consumers();
+    let mut sent: std::collections::HashSet<u32> =
+        consumers.iter().map(|&(cid, _)| cid).collect();
     for (consumer_id, generation) in consumers {
         let seq = inner.seq_alloc.next();
+        let _ = lease.try_send(WriteFrame::Mono(encode_ack_state_req_v2(
+            seq,
+            consumer_id,
+            generation,
+        )));
+    }
+    // Durable-dedup consumers with no outstanding deferred acks still need
+    // the cursor snapshot (idle consumers never see an AckBatchResp).
+    for consumer_id in inner.subscriptions.slotted_consumer_ids() {
+        if !sent.insert(consumer_id) {
+            continue; // already covered by the deferred-ack sweep above
+        }
+        let seq = inner.seq_alloc.next();
+        let generation = inner.ackrel.generation_of(consumer_id);
         let _ = lease.try_send(WriteFrame::Mono(encode_ack_state_req_v2(
             seq,
             consumer_id,
@@ -246,6 +270,74 @@ where
     let _ = w.shutdown().await;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClientConfig;
+    use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
+    use crate::transport::frame::{MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
+    use arbitro_kit::route::MpscAsync;
+    use arbitro_proto::action::Action;
+    use arbitro_proto::v2::header::HEADER_SIZE;
+    use std::sync::atomic::AtomicU64;
+
+    /// The (re)connect sweep must send one `AckStateReq` per consumer that
+    /// carries a durable ackstore slot, even when it has no outstanding
+    /// deferred acks — that request is what drives the reconnect WAL purge.
+    /// Consumers without a slot and without deferred acks get nothing.
+    #[test]
+    fn send_ack_state_reqs_covers_slotted_consumers() {
+        let (pool, mut consumer, _shutdown) =
+            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
+        let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(16);
+        let inner = Inner {
+            cfg: ClientConfig::default(),
+            pool: Arc::clone(&pool),
+            pending: Arc::new(Pending::new()),
+            seq_alloc: SeqAllocator::new(),
+            cancel: CancellationToken::new(),
+            subscriptions: Arc::new(Subscriptions::new()),
+            ack_tx,
+            nack_tx,
+            last_pong_ns: AtomicU64::new(0),
+            metrics: Arc::new(crate::metrics::ClientMetrics::new()),
+            cron_state: crate::cron::CronState::new(),
+            session_cancel: std::sync::Mutex::new(None),
+            ackrel: Arc::new(crate::ackrel::AckRelay::new()),
+            ack_store: None,
+        };
+
+        // Consumer 7: durable dedup slot, no deferred acks.
+        let store: Arc<dyn crate::ackstore::Store> =
+            Arc::new(crate::ackstore::memory::MemoryStore::new(0));
+        let slot = store.slot("s", "c").unwrap();
+        let _rx7 = inner
+            .subscriptions
+            .register(7, 1, bytes::Bytes::new(), Some(slot));
+        // Consumer 8: plain subscription, no slot, no deferred acks.
+        let _rx8 = inner.subscriptions.register(8, 1, bytes::Bytes::new(), None);
+
+        let mut lease = pool.acquire().expect("fresh pool has slots");
+        send_ack_state_reqs(&inner, &mut lease);
+
+        let mut reqs: Vec<u32> = Vec::new();
+        while let Some(frame) = consumer.try_recv() {
+            let bytes = match frame {
+                WriteFrame::Mono(b) => b,
+                other => panic!("unexpected frame variant: {other:?}"),
+            };
+            let action = u16::from_le_bytes([bytes[0], bytes[1]]);
+            assert_eq!(action, Action::AckStateReq.as_u16());
+            let cid = u32::from_le_bytes(
+                bytes[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap(),
+            );
+            reqs.push(cid);
+        }
+        assert_eq!(reqs, vec![7], "exactly the slotted consumer is queried");
+    }
 }
 
 // ── TLS: danger_accept_invalid_certs verifier ─────────────────────────

@@ -130,4 +130,19 @@ impl Subscriptions {
             .map(|r| r.sub_body.clone())
             .collect()
     }
+
+    /// Consumer ids that carry a durable dedup slot. Feeds the reconnect
+    /// `AckStateReq` sweep (`conn::session::send_ack_state_reqs`): every
+    /// slotted consumer asks the broker for its ack cursor once per
+    /// (re)connect so stale WAL entries left by a dead session get purged
+    /// even when no deferred acks are outstanding. Cold path.
+    pub fn slotted_consumer_ids(&self) -> Vec<u32> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.slot.is_some())
+            .map(|(&cid, _)| cid)
+            .collect()
+    }
 }
