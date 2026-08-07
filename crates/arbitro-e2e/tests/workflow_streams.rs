@@ -2656,3 +2656,97 @@ async fn workflow_distrib_suspend_cancel() {
     }
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// max_retries exhaustion: bounded attempts, then DLQ + compensation
+//
+// `max_retries` and the saga compensation it triggers had no coverage here at
+// all -- the only retry test above (`workflow_step_retry_on_nack`) proves a
+// nack redelivers, never that attempts are COUNTED toward a ceiling. That gap
+// is what this test closes.
+//
+// It matters because the two are not the same mechanism. `attempt` is encoded
+// in the task payload, every publish writes 0 into it, and a failing step
+// nacks -- so the broker redelivers the identical payload. If nothing rewrites
+// `attempt` on the retry path, it stays 0 forever: the ceiling is never
+// reached, the DLQ never receives anything, and compensation never runs, while
+// the step retries without bound.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Ignored because it FAILS: it is a regression test written ahead of the fix,
+// not a broken test. Measured on arbitro cbf8e85: 24401 attempts in 5s against
+// max_retries=2 -- a permanently-failing step does not retry a bounded number
+// of times, it spins against the broker as fast as the redelivery loop allows.
+// Run it with `cargo test -- --ignored workflow_max_retries` to watch the fix
+// land. Un-ignore once `attempt` is carried across the retry path.
+#[ignore = "known bug: retry ceiling unreachable, step spins unbounded (see body)"]
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_max_retries_stops_and_compensates() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    const MAX_RETRIES: u8 = 2;
+
+    let attempts = Arc::new(AtomicU32::new(0));
+    let compensated = Arc::new(AtomicBool::new(false));
+
+    let attempts_clone = attempts.clone();
+    let compensated_flag = compensated.clone();
+
+    let handle = client
+        .workflow(b"max-retries-test")
+        .trigger(b"maxretry.start")
+        .ack_wait_ms(500)
+        .max_retries(MAX_RETRIES)
+        // Step 0 succeeds, so it is the one compensation must roll back.
+        .step(b"ok-step", move |_ctx: StepContext| async move {
+            Ok(StepResult {
+                context: b"step0".to_vec(),
+            })
+        })
+        .compensate(b"ok-step", move |_ctx: StepContext| {
+            let flag = compensated_flag.clone();
+            async move {
+                flag.store(true, Ordering::Release);
+                Ok(StepResult { context: Vec::new() })
+            }
+        })
+        // Step 1 never succeeds: it must stop after MAX_RETRIES.
+        .step(b"always-fails", move |_ctx: StepContext| {
+            let att = attempts_clone.clone();
+            async move {
+                att.fetch_add(1, Ordering::SeqCst);
+                Err("permanent failure".to_string())
+            }
+        })
+        .start()
+        .await
+        .expect("workflow start");
+
+    handle
+        .trigger(&client, b"initial")
+        .await
+        .expect("trigger workflow");
+
+    // Long enough for MAX_RETRIES + 1 attempts at a 500ms ack_wait, and long
+    // enough for an unbounded loop to overshoot the ceiling visibly.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let seen = attempts.load(Ordering::SeqCst);
+    let ceiling = u32::from(MAX_RETRIES) + 1;
+
+    handle.stop();
+    server.shutdown().await;
+
+    assert!(
+        seen <= ceiling,
+        "step retried without bound: {seen} attempts with max_retries={MAX_RETRIES} \
+         (ceiling {ceiling}). `attempt` is never incremented on the retry path, so \
+         the payload always says 0 and the ceiling is unreachable."
+    );
+    assert!(
+        compensated.load(Ordering::Acquire),
+        "compensation for the completed step never ran after {seen} failed attempts; \
+         saga rollback is unreachable while the retry ceiling is"
+    );
+}
