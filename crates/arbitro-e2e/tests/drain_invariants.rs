@@ -1905,3 +1905,89 @@ async fn nack_during_active_drain_always_redelivers() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A ByStartSeq join must not skip a capacity-pinned sibling's owed messages
+//
+// The existing ByStartSeq coverage cannot catch this:
+// `deliver_policy_by_start_seq_skips_earlier` has a single consumer, and
+// `late_join_by_start_seq_does_not_redeliver_to_acked_sibling` has a sibling
+// that already acked everything. Neither has a sibling still OWED messages
+// below the new consumer's start offset.
+//
+// The concern (flagged by audit, unproven until this test): the forward-skip
+// branch does a bare `set_cursor(target)` on the SHARD-wide cursor. If a
+// sibling is pinned by max_inflight at a low seq, jumping the shared cursor
+// past its owed range would mean those entries are never walked again — loss,
+// not just late delivery.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn by_start_seq_join_does_not_skip_a_pinned_siblings_backlog() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"pin", b">").await;
+
+    // Sibling A: tiny inflight so it pins near the head of the stream.
+    let a_id = create_consumer(
+        &client, stream_id, b"pinned", b"pinned-group", b"", 4, 1, 0, 30_000, 0,
+    )
+    .await;
+    let mut a = client.subscribe(stream_id, a_id, b"").await.unwrap();
+
+    const N: usize = 30;
+    for i in 0..N {
+        client
+            .publish_wait(
+                stream_id,
+                b"pin.event",
+                Bytes::copy_from_slice(format!("m-{i}").as_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+
+    // A fills its inflight and holds it — deliberately no acks yet.
+    let held = drain_n(&mut a, 4, Duration::from_secs(5)).await;
+    assert_eq!(held.len(), 4, "A must fill its max_inflight of 4 first");
+    let mut a_payloads: Vec<String> = held
+        .iter()
+        .map(|m| String::from_utf8_lossy(&m.payload()).to_string())
+        .collect();
+
+    // B joins asking to start near the tail, while A is still pinned with
+    // 26 messages owed to it.
+    let b_id = create_consumer(
+        &client, stream_id, b"jumper", b"jumper-group", b"", 100, 1, 2, 30_000, 25,
+    )
+    .await;
+    let mut b = client.subscribe(stream_id, b_id, b"").await.unwrap();
+    let b_got = drain_n(&mut b, 6, Duration::from_secs(5)).await;
+    for m in b_got {
+        m.ack();
+    }
+
+    // A releases its inflight. Everything it was owed must still arrive.
+    for m in held {
+        m.ack();
+    }
+
+    let mut a_seen = 4usize;
+    while a_seen < N {
+        match recv_within(&mut a, Duration::from_secs(3)).await {
+            Some(m) => {
+                a_payloads.push(String::from_utf8_lossy(&m.payload()).to_string());
+                m.ack();
+                a_seen += 1;
+            }
+            None => break,
+        }
+    }
+    eprintln!("A RECEIVED ({}): {:?}", a_payloads.len(), a_payloads);
+    assert_eq!(
+        a_seen, N,
+        "A was owed all {N}; a ByStartSeq sibling joining at 25 must not \
+         move the shared cursor past what A had not yet been served"
+    );
+    server.shutdown().await;
+}
