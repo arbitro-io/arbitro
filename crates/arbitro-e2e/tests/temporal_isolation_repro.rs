@@ -213,3 +213,63 @@ async fn late_join_by_start_seq_does_not_redeliver_to_acked_sibling() {
     );
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DeliverPolicy::New over an UNDRAINED backlog.
+//
+// The existing New coverage (catalog_invariants.rs
+// `rejected_reconsumer_does_not_corrupt_registry`) has a sibling drain and ack
+// the history first, so the shard cursor is already past the backlog and
+// "leave the cursor where it is" happens to be correct. Nothing exercises New
+// when the backlog is still sitting there unread — which is the ordinary way
+// a monitoring or tail-follow consumer joins.
+//
+// Found from the other side: the C and Go suites both assert this and both see
+// the full history. Adding it here puts the case in the reference client's own
+// harness rather than leaving it as "the C client disagrees".
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deliver_new_skips_an_undrained_backlog() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let stream_id = create_stream(&client, b"new_undrained", b">").await;
+
+    // Publish history with NO consumer attached — nothing advances the cursor.
+    for i in 0..10u8 {
+        client
+            .publish_wait(stream_id, b"new_undrained.h", Bytes::from(vec![b'h', i]))
+            .await
+            .expect("history publish");
+    }
+
+    let late_id = create_consumer(&client, stream_id, b"late", b"late", 100u16, 1u8).await;
+    let mut late = client.subscribe(stream_id, late_id, b"").await.unwrap();
+
+    // Drain for a bounded window rather than asserting immediately: the claim
+    // is that nothing arrives, and checking too early would pass by not having
+    // waited.
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), late.recv()).await {
+            Ok(Some(msg)) => {
+                got.push(msg.payload().to_vec());
+                msg.ack();
+            }
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+
+    assert!(
+        got.is_empty(),
+        "DeliverPolicy::New replayed {} message(s) of an undrained backlog; \
+         a New consumer must start at the tail regardless of whether anyone \
+         consumed the history: {:?}",
+        got.len(),
+        got.iter().map(|p| String::from_utf8_lossy(p).to_string()).collect::<Vec<_>>()
+    );
+    server.shutdown().await;
+}
