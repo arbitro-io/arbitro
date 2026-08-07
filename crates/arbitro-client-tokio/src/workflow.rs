@@ -998,7 +998,36 @@ impl WorkflowBuilder {
                                         );
                                         msg.ack();
                                     } else {
-                                        msg.nack();
+                                        // Republish with attempt+1 rather than nack:
+                                        // `attempt` lives in the payload, so a nack
+                                        // redelivers the same bytes and the counter never
+                                        // moves. The msg_id's last field is the attempt,
+                                        // so bumping it dodges the idempotency window.
+                                        let next_attempt = attempt + 1;
+                                        let mid = format!(
+                                            "wf:{instance_id}:{step_index}:{next_attempt}"
+                                        );
+                                        let subj =
+                                            format!("_wf.{wf_name_str}.step.{step_index}");
+                                        let task = encode_task(
+                                            &instance_id, step_index, next_attempt, context,
+                                        );
+                                        match client.publish_with_id(
+                                            task_stream_id,
+                                            subj.as_bytes(),
+                                            mid.as_bytes(),
+                                            Bytes::from(task),
+                                        ) {
+                                            // Ack only once the retry is queued.
+                                            Ok(_) => {
+                                                msg.ack();
+                                            }
+                                            // Retry not queued — fall back to redelivery
+                                            // so the task is not lost.
+                                            Err(_) => {
+                                                msg.nack();
+                                            }
+                                        }
                                     }
                                 }
                             }
