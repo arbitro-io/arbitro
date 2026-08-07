@@ -1595,3 +1595,87 @@ async fn max_subject_inflight_multiple_patterns() {
     }
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tombstone: a deleted message is never delivered
+//
+// delete_message had no coverage in this crate. The invariant is the whole
+// promise of the call: once a seq is tombstoned, no consumer may see it --
+// including one that subscribes afterwards and reads the stream from the
+// start, which is the case that skips any per-consumer filtering and asks
+// the store directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tombstoned_message_is_never_delivered() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"tomb", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    // Distinct subjects on purpose: a shared subject would let a per-subject
+    // index carry the filtering, and the interesting case is the one where it
+    // cannot.
+    for (subject, body) in [
+        (&b"tomb.a"[..], &b"first"[..]),
+        (&b"tomb.b"[..], &b"second"[..]),
+        (&b"tomb.c"[..], &b"third"[..]),
+    ] {
+        client
+            .publish_wait(stream_id, subject, Bytes::copy_from_slice(body))
+            .await
+            .expect("publish");
+    }
+
+    // Delete the middle message BEFORE any consumer exists, so nothing can
+    // have filtered it on the way in.
+    client
+        .delete_message(b"tomb", 2)
+        .await
+        .expect("delete_message");
+
+    let resp = client
+        .create_consumer(
+            stream_id, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+        )
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    // Drain for a bounded window rather than expecting exactly two: the point
+    // is that the third delivery must never arrive, and asserting a count too
+    // early would pass simply by not having waited.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), handle.recv()).await {
+            Ok(Some(msg)) => {
+                got.push(msg.payload().to_vec());
+                msg.ack();
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if got.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
+
+    server.shutdown().await;
+
+    assert!(
+        !got.iter().any(|b| b == b"second"),
+        "tombstoned message was delivered: {got:?}"
+    );
+    assert_eq!(
+        got,
+        vec![b"first".to_vec(), b"third".to_vec()],
+        "surviving messages must arrive, in order"
+    );
+}
