@@ -51,6 +51,8 @@ dependencies = [
  "fastrand",
  "libc",
  "rustls",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

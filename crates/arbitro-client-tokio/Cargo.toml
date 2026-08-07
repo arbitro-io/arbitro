@@ -9,6 +9,10 @@ description = "Pure-tokio Arbitro client built on arbitro-kit primitives (Mpsc, 
 [features]
 default = []
 tls = ["tokio-rustls", "rustls", "webpki-roots"]
+# JSON helpers on StepContext (json_or_default / json_merge / json_replace).
+# Off by default: the workflow context is opaque bytes and JSON is only one
+# way to use it, so serde stays out of the graph unless asked for.
+json = ["serde", "serde_json"]
 
 [dependencies]
 arbitro-proto      = { path = "../arbitro-proto" }
@@ -26,6 +30,10 @@ thiserror     = "1"
 tokio-rustls  = { version = "0.26", optional = true }
 rustls        = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots  = { version = "0.26", optional = true }
+
+# JSON step helpers (optional — enable with `features = ["json"]`)
+serde         = { version = "1", optional = true }
+serde_json    = { version = "1", optional = true }
 
 # `flock` for the ackstore single-writer directory lock (src/ackstore/lock.rs).
 # Already in this crate's graph via tokio on unix, so it adds no new crate.

@@ -49,6 +49,79 @@ pub struct StepContext {
     pub context: Vec<u8>,
 }
 
+/// JSON helpers for the common case where the context holds a JSON document.
+///
+/// The context is opaque bytes and stays that way — these are sugar over
+/// serde, gated behind the `json` feature so the crate keeps its lean
+/// dependency graph for everyone who does not want them.
+#[cfg(feature = "json")]
+impl StepContext {
+    /// Decode the context as `T`, or `T::default()` when it is empty.
+    ///
+    /// The empty case is the first step of a workflow triggered without a
+    /// payload; without this it is a parse error every caller has to special
+    /// case. A non-empty context that does not parse is still an error.
+    pub fn json_or_default<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: serde::de::DeserializeOwned + Default,
+    {
+        if self.context.is_empty() {
+            return Ok(T::default());
+        }
+        serde_json::from_slice(&self.context)
+    }
+
+    /// Decode the context as `T`. Errors on an empty context — use
+    /// [`Self::json_or_default`] when empty is legitimate.
+    pub fn json<T>(&self) -> Result<T, serde_json::Error>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        serde_json::from_slice(&self.context)
+    }
+
+    /// Shallow-merge `patch` into the context and return it as the step's
+    /// result.
+    ///
+    /// Shallow on purpose: a deep merge has to guess whether arrays replace
+    /// or concatenate, and guessing wrong is silent. Nest explicitly when you
+    /// need it. A non-object context or patch is replaced outright, since
+    /// there is nothing to merge into.
+    pub fn json_merge(
+        &self,
+        patch: serde_json::Value,
+    ) -> Result<StepResult, serde_json::Error> {
+        let mut base: serde_json::Value = if self.context.is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_slice(&self.context)?
+        };
+
+        match (base.as_object_mut(), patch) {
+            (Some(obj), serde_json::Value::Object(p)) => {
+                obj.extend(p);
+            }
+            (_, other) => base = other,
+        }
+
+        Ok(StepResult {
+            context: serde_json::to_vec(&base)?,
+        })
+    }
+
+    /// Replace the context wholesale with `value`, as the step's result.
+    /// Without this, "replace" is spelled as a merge over an empty object,
+    /// which is not the same thing.
+    pub fn json_replace<T>(&self, value: &T) -> Result<StepResult, serde_json::Error>
+    where
+        T: serde::Serialize,
+    {
+        Ok(StepResult {
+            context: serde_json::to_vec(value)?,
+        })
+    }
+}
+
 /// Outcome returned by a step handler.
 #[derive(Debug, Clone)]
 pub enum StepOutcome {
@@ -1323,5 +1396,83 @@ async fn create_or_get_stream(
             Ok(u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32)
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(all(test, feature = "json"))]
+mod json_helper_tests {
+    use super::*;
+
+    fn ctx(bytes: &[u8]) -> StepContext {
+        StepContext {
+            name: b"wf".to_vec(),
+            instance_id: "i1".into(),
+            step_index: 0,
+            attempt: 0,
+            context: bytes.to_vec(),
+        }
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize, Default, PartialEq, Debug)]
+    struct Order {
+        id: u32,
+        paid: bool,
+    }
+
+    #[test]
+    fn json_or_default_returns_default_on_empty() {
+        let got: Order = ctx(b"").json_or_default().unwrap();
+        assert_eq!(got, Order::default());
+    }
+
+    #[test]
+    fn json_or_default_still_errors_on_garbage() {
+        // Empty is legitimate (a trigger with no payload); malformed is not.
+        assert!(ctx(b"not json").json_or_default::<Order>().is_err());
+    }
+
+    #[test]
+    fn json_decodes_a_populated_context() {
+        let got: Order = ctx(br#"{"id":7,"paid":true}"#).json().unwrap();
+        assert_eq!(got, Order { id: 7, paid: true });
+    }
+
+    #[test]
+    fn json_merge_keeps_untouched_keys() {
+        let out = ctx(br#"{"id":7,"paid":false}"#)
+            .json_merge(serde_json::json!({ "paid": true }))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.context).unwrap();
+        assert_eq!(v["id"], 7, "keys not in the patch must survive");
+        assert_eq!(v["paid"], true);
+    }
+
+    #[test]
+    fn json_merge_on_empty_context_starts_from_an_object() {
+        let out = ctx(b"")
+            .json_merge(serde_json::json!({ "id": 1 }))
+            .unwrap();
+        assert_eq!(out.context, br#"{"id":1}"#);
+    }
+
+    #[test]
+    fn json_merge_is_shallow() {
+        // Nested objects are replaced, not deep-merged. Asserted so the
+        // behaviour is a decision rather than an accident.
+        let out = ctx(br#"{"meta":{"a":1,"b":2}}"#)
+            .json_merge(serde_json::json!({ "meta": { "a": 9 } }))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.context).unwrap();
+        assert_eq!(v["meta"]["a"], 9);
+        assert!(v["meta"]["b"].is_null(), "shallow merge drops sibling keys");
+    }
+
+    #[test]
+    fn json_replace_discards_the_previous_context() {
+        let out = ctx(br#"{"id":7,"paid":true}"#)
+            .json_replace(&Order { id: 1, paid: false })
+            .unwrap();
+        let v: Order = serde_json::from_slice(&out.context).unwrap();
+        assert_eq!(v, Order { id: 1, paid: false });
     }
 }
