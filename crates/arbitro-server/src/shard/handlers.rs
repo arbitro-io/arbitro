@@ -562,6 +562,24 @@ impl CommandWorker {
                     .unwrap_or(false);
                 let ack_wait_ms = consumer.map(|c| c.ack_wait_ms).unwrap_or(0);
 
+                // Per-binding deliver floor: seqs at or below it were never
+                // owed to this consumer. New (1) carries the journal tail
+                // stamped at consumer CREATION in `start_seq` (see
+                // `v2_create_consumer`); ByStartSeq (2) skips everything
+                // below the requested start. Carried in the DrainSnapshot so
+                // the drain sees the binding and its floor atomically — the
+                // shared cursor is never moved FORWARD to express a start
+                // position (that would skip seqs owed to siblings).
+                let deliver_floor = deliver_floor_for(cmd.deliver_policy, cmd.start_seq);
+                // Seed the contiguous-acked floor to match: nothing at or
+                // below the deliver floor can ever become pending, so the
+                // invariant holds and the first real ack (floor + 1)
+                // advances it contiguously instead of stalling forever in
+                // the out-of-order set.
+                if deliver_floor > 0 {
+                    self.ack_floors.seed(consumer_id.0, deliver_floor);
+                }
+
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
                 if let Some(write_tx) = self.registry.get_write_tx(connection_id.0) {
@@ -580,6 +598,7 @@ impl CommandWorker {
                         max_inflight,
                         fire_and_forget,
                         ack_wait_ms,
+                        deliver_floor,
                         write_tx,
                         write_failed,
                     });
@@ -597,72 +616,42 @@ impl CommandWorker {
                 self.bindings.retain(|b| b.binding_id != bid);
             }
 
-            // Rewind cursor based on deliver_policy:
-            // 0 = All: rewind to 0 (replay entire store)
-            // 1 = New: no rewind (only future messages)
-            // 2 = ByStartSeq: rewind to start_seq - 1
+            // Position the shared cursor for this deliver_policy. All arms
+            // go through `rewind_released` (BUG3 protocol: backward
+            // set_cursor + durable min-composing signal_rewind) — the
+            // shared cursor only ever moves BACKWARD here. Moving it
+            // FORWARD to express a start position destroyed a
+            // capacity-pinned sibling's re-walk (its owed seqs were never
+            // scanned again — message loss); forward positioning is
+            // per-binding via `deliver_floor`, enforced by the drain.
             match cmd.deliver_policy {
                 0 => {
-                    // DeliverPolicy::All — if the consumer has a persisted
-                    // cursor (from a previous session), resume from
-                    // last_acked_seq + 1 instead of replaying from 0.
-                    //
-                    // BUG3: use the same protocol as handle_bind
-                    // (set_cursor + signal_rewind), NOT a bare set_cursor +
-                    // clear_rewind. If a drain cycle is mid-flight during a
-                    // resubscribe, its final set_cursor(new_cursor) would
-                    // clobber the resume point and clear_rewind would erase
-                    // the correction (and any pending retirement rewind from
-                    // BUG2), skipping seqs forever. signal_rewind is durable:
-                    // the drain honours it at the top of its next cycle.
+                    // DeliverPolicy::All — resume from the persisted cursor
+                    // (last acked seq) when present, else replay from 0.
                     let resume = self.names.consumer_cursor(consumer_id).unwrap_or(0);
-                    self.counters.set_cursor(resume);
-                    self.counters.signal_rewind(resume + 1);
+                    rewind_released(&self.counters, resume.saturating_add(1));
                 }
                 1 => {
-                    // DeliverPolicy::New — cursor stays at current position.
-                    // New consumer only sees messages published after subscribe.
+                    // DeliverPolicy::New — rewind to the creation floor so
+                    // messages published after the consumer was created but
+                    // already scanned past (a sibling advanced the cursor
+                    // while this consumer was not subscribed) are still
+                    // delivered. History at or below the floor is skipped
+                    // per-binding; siblings are shielded by their ack
+                    // floors / suppression sets.
+                    rewind_released(&self.counters, cmd.start_seq.saturating_add(1));
                 }
                 2 => {
-                    // DeliverPolicy::ByStartSeq — position the cursor at
-                    // `start_seq - 1` so the next delivery is the message
-                    // with sequence `start_seq`.
-                    //
-                    // This must work in BOTH directions:
-                    //   - rewind  (current > target): replay messages we
-                    //     have already delivered past
-                    //   - forward (current < target): a fresh consumer
-                    //     subscribing on a stream that already has a
-                    //     backlog and wants to skip the first N msgs
-                    //
-                    // The previous implementation only handled the rewind
-                    // case (`if target < current { signal_rewind }`),
-                    // silently dropping the forward case — so a brand-new
-                    // consumer with cursor=0 asking for start_seq=6 was
-                    // served from seq=1, not seq=6.
-                    let target = cmd.start_seq.saturating_sub(1);
-                    //
-                    // BUG3/M3: same protocol as handle_bind (set_cursor +
-                    // signal_rewind), NOT set_cursor + clear_rewind. The
-                    // old `clear_rewind()` wiped a co-pending rewind
-                    // (retirement/resubscribe) → those seqs were never
-                    // redelivered; and in the rewind direction a bare
-                    // set_cursor is clobbered by a mid-flight drain
-                    // cycle's end-of-cycle `set_cursor(new_cursor)`.
-                    // `signal_rewind` is durable and min-composes: a
-                    // smaller co-pending rewind still wins (redelivery is
-                    // safe, loss is not). The forward-skip case keeps its
-                    // bare set_cursor semantics — the signal is a no-op
-                    // there (drain only rewinds backward).
-                    self.counters.set_cursor(target);
-                    self.counters.signal_rewind(target.saturating_add(1));
+                    // DeliverPolicy::ByStartSeq — replay from `start_seq`
+                    // when the cursor is already past it; the forward-skip
+                    // direction is covered by `deliver_floor` alone.
+                    // start_seq 0 degenerates to a full replay (same as
+                    // the pre-floor behavior).
+                    rewind_released(&self.counters, cmd.start_seq.max(1));
                 }
                 _ => {
-                    // Unknown — default to All for safety. Same
-                    // set_cursor + signal_rewind protocol as handle_bind
-                    // (see BUG3 note above).
-                    self.counters.set_cursor(0);
-                    self.counters.signal_rewind(1);
+                    // Unknown — default to All-from-0 for safety.
+                    rewind_released(&self.counters, 1);
                 }
             }
 
@@ -760,6 +749,12 @@ impl CommandWorker {
 
     pub(in crate::shard) fn handle_create_consumer(&mut self, cmd: CreateConsumerCmd) {
         let stream_id = cmd.config.stream_id;
+        // Tail read BEFORE the engine create: a publish racing with the
+        // creation then lands ABOVE a DeliverPolicy::New consumer's floor
+        // and is still delivered — over-delivery to a brand-new consumer
+        // is benign, silently skipping a message published after creation
+        // would be loss.
+        let journal_tail = self.store.lock().info().last_seq;
         match self.engine.create_consumer(cmd.config) {
             Ok(true) => {
                 // Newly created — apply subject limits.
@@ -768,17 +763,24 @@ impl CommandWorker {
                         .engine
                         .set_max_subject_inflight(stream_id, pattern, *limit);
                 }
-                let _ = cmd.reply.send(1); // created
+                let _ = cmd.reply.send(CreateConsumerReply {
+                    code: 1,
+                    journal_tail,
+                });
             }
             Ok(false) => {
                 // Already existed, same config — idempotent.
-                let _ = cmd.reply.send(0);
+                let _ = cmd.reply.send(CreateConsumerReply {
+                    code: 0,
+                    journal_tail,
+                });
             }
-            Err(e) if e.code() == arbitro_engine_v2::error::ErrorCode::ConsumerConfigMismatch => {
-                let _ = cmd.reply.send(2); // config mismatch
-            }
+            // Config mismatch and any other error → rejection.
             Err(_) => {
-                let _ = cmd.reply.send(2); // other error → treat as rejection
+                let _ = cmd.reply.send(CreateConsumerReply {
+                    code: 2,
+                    journal_tail,
+                });
             }
         }
     }
@@ -883,6 +885,17 @@ impl CommandWorker {
                 .unwrap_or(false);
             let ack_wait_ms = consumer.map(|c| c.ack_wait_ms).unwrap_or(0);
 
+            // Same deliver-floor derivation as handle_subscribe — bind has
+            // no policy in its command, so recover it from the registry.
+            let (deliver_policy, start_seq) = self
+                .names
+                .consumer_deliver_policy(consumer_id)
+                .unwrap_or((0, 0));
+            let deliver_floor = deliver_floor_for(deliver_policy, start_seq);
+            if deliver_floor > 0 {
+                self.ack_floors.seed(consumer_id.0, deliver_floor);
+            }
+
             if let Some(write_tx) = self.registry.get_write_tx(cmd.connection_id.0) {
                 let write_failed = self
                     .registry
@@ -899,6 +912,7 @@ impl CommandWorker {
                     max_inflight,
                     fire_and_forget,
                     ack_wait_ms,
+                    deliver_floor,
                     write_tx,
                     write_failed,
                 });
@@ -963,24 +977,27 @@ impl CommandWorker {
     pub(in crate::shard) fn handle_purge_stream(&mut self, cmd: PurgeStreamCmd) {
         let new_last_seq = {
             let mut g = self.store.lock();
-            let deleted = g.purge();
+            // Scope the purge to the named stream. `Store::purge()` clears
+            // the WHOLE shard, and a shard holds every stream routed to it
+            // — so purging one stream destroyed its neighbours' messages
+            // and returned a shard-wide count. `tombstone_stream` is the
+            // stream-scoped primitive both stores already implement.
+            let deleted = g.tombstone_stream(cmd.stream_id.0);
             let info = g.info();
             (deleted, info.last_seq)
         };
-        let (deleted, last_seq) = new_last_seq;
-        // M4: snap the drain cursor forward to the store's last_seq so the
-        // drain doesn't try to deliver entries from a window that no
-        // longer exists (purge resets `first_seq` to `last_seq + 1`).
-        // Without this, the next drain cycle reads `for_each(prev_cursor+1
-        // .. last_seq+1)` and gets an empty walk forever, OR — worse on a
-        // store that re-issues seqs after purge — replays the brand new
-        // entries from the wrong cursor.
-        self.counters.set_cursor(last_seq);
-        // Drop any pending rewind that referenced the purged window;
-        // it would otherwise rewind into a non-existent range. M3-aware
-        // unconditional clear is fine here: purge is admin-cold-path and
-        // the drain is parked anyway.
-        self.counters.clear_rewind();
+        let (deleted, _last_seq) = new_last_seq;
+        // The cursor is deliberately NOT snapped forward any more.
+        //
+        // M4 snapped it to `last_seq` because `Store::purge()` dropped every
+        // entry and reset `first_seq` past the old window, leaving the drain
+        // walking a range that no longer existed. `tombstone_stream` does not
+        // do that: entries stay in place with the TOMBSTONE flag, every seq
+        // stays valid, and the shard's other streams still have live entries
+        // inside the window. Snapping the cursor here would skip those — the
+        // very neighbours this fix exists to protect. The drain already
+        // filters tombstoned entries, so leaving the cursor put is correct
+        // and costs one walk over entries that are now skipped.
         let _ = cmd.reply.send(deleted);
     }
 
@@ -1174,5 +1191,20 @@ impl CommandWorker {
             self.gate.release();
         }
         let _ = cmd.reply.send(ok);
+    }
+}
+
+/// Per-binding deliver floor for a `(deliver_policy, start_seq)` pair:
+/// entries with `seq <= floor` are never delivered on the binding.
+/// New (1) stores the journal tail at consumer creation in `start_seq`
+/// (stamped by `v2_create_consumer`); ByStartSeq (2) starts at
+/// `start_seq`, so everything below it is off-limits. All (0) and
+/// unknown policies have no floor.
+#[inline]
+fn deliver_floor_for(deliver_policy: u8, start_seq: u64) -> u64 {
+    match deliver_policy {
+        1 => start_seq,
+        2 => start_seq.saturating_sub(1),
+        _ => 0,
     }
 }

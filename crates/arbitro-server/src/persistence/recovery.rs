@@ -116,17 +116,17 @@ impl ReplayApplier {
                     let consumer_id = config.id;
                     let shard = self.server.shard_for(stream_id);
                     match shard.create_consumer(config, max_subject_inflights).await {
-                        Ok(1) => {
+                        Ok(r) if r.code == 1 => {
                             consumers_recovered += 1;
                             tracing::debug!(?consumer_id, "replayed CreateConsumer");
                         }
-                        Ok(0) => tracing::debug!(
+                        Ok(r) if r.code == 0 => tracing::debug!(
                             ?consumer_id,
                             "CreateConsumer already exists (idempotent)"
                         ),
-                        Ok(code) => tracing::warn!(
+                        Ok(r) => tracing::warn!(
                             ?consumer_id,
-                            code,
+                            code = r.code,
                             "replay CreateConsumer rejected (config mismatch?)"
                         ),
                         Err(e) => {

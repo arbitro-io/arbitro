@@ -1806,32 +1806,49 @@ async fn v2_create_consumer(
         )
         .await;
 
+    let create_code = create_res.as_ref().ok().map(|r| r.code);
+
     // Quota counts consumers this connection actually brought into being.
-    // An idempotent re-join (Ok(0)), a config-mismatch rejection (Ok(2)) and
-    // a dead shard all give the reserved unit back.
-    if !matches!(create_res, Ok(1)) {
+    // An idempotent re-join (code 0), a config-mismatch rejection (code 2)
+    // and a dead shard all give the reserved unit back.
+    if create_code != Some(1) {
         registry.release_quota(conn_id, QuotaKind::Consumer);
     }
 
+    // DeliverPolicy::New (1): the consumer's start position is the journal
+    // tail observed by the shard at creation — its deliver floor — stored
+    // in the registry's start_seq slot, NOT the client's start_seq. An
+    // idempotent re-join keeps the original stamp: re-stamping at re-join
+    // time would skip messages published since creation.
+    let effective_start_seq = if body.deliver_policy == 1 {
+        let prior = server.names().consumer_deliver_policy(seq_consumer);
+        match (create_code, prior) {
+            (Some(0), Some((1, floor))) => floor,
+            _ => create_res.as_ref().map(|r| r.journal_tail).unwrap_or(0),
+        }
+    } else {
+        body.start_seq
+    };
+
     // AUDIT-10 follow-up: mutate the NameRegistry ONLY after the engine
-    // accepts the create (Ok(1) = new, Ok(0) = idempotent same-config).
+    // accepts the create (code 1 = new, code 0 = idempotent same-config).
     // These writes used to happen BEFORE the engine's config-mismatch
-    // check, so a REJECTED re-create (Ok(2) → InvalidConsumerConfig)
+    // check, so a REJECTED re-create (code 2 → InvalidConsumerConfig)
     // silently overwrote deliver_policy/queue/stream for the existing
     // consumer — durable registry state diverged from the engine and a
     // later subscribe (or restart replay) used the rejected config.
-    if matches!(create_res, Ok(0) | Ok(1)) {
+    if matches!(create_code, Some(0) | Some(1)) {
         server.names().set_consumer_queue(seq_consumer, queue_id);
         server.names().set_consumer_stream(seq_consumer, seq_stream);
         server.names().set_consumer_deliver_policy(
             seq_consumer,
             body.deliver_policy,
-            body.start_seq,
+            effective_start_seq,
         );
     }
 
-    match create_res {
-        Ok(1) => {
+    match create_code {
+        Some(1) => {
             // F37: a new consumer must show up in list_consumers reply.
             server.invalidate_list_cache();
             // Metadata log keeps the legacy zerocopy
@@ -1855,6 +1872,10 @@ async fn v2_create_consumer(
                     tail_len,
                 );
                 let mut wire = vec![0u8; total];
+                // The record carries `effective_start_seq` (the stamped
+                // deliver floor for DeliverPolicy::New) so recovery
+                // (AUDIT-6b) restores the creation position, not the
+                // client's start_seq.
                 CreateConsumerFrame::encode_into(
                     &mut wire,
                     0,
@@ -1867,7 +1888,7 @@ async fn v2_create_consumer(
                     body.deliver_policy,
                     body.deliver_mode,
                     body.ack_wait_ms,
-                    body.start_seq,
+                    effective_start_seq,
                     &limit_refs,
                 );
                 let cmd = build_create_consumer(&wire[HEADER_SIZE..]);
@@ -1877,16 +1898,15 @@ async fn v2_create_consumer(
             }
             send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64)
         }
-        Ok(0) => {
+        Some(0) => {
             // Already existed with same config — idempotent, return id.
             send_rep_ok_v2(registry, conn_id, req_seq, seq_consumer.0 as u64)
         }
-        Ok(2) => {
+        Some(2) => {
             // GAP-3: consumer exists with different config.
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig)
         }
-        Ok(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
-        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        _ => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
 

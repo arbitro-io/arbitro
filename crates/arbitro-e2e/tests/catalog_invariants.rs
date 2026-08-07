@@ -893,3 +893,94 @@ async fn create_consumer_empty_group_rejected_by_broker() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PurgeStream and DrainSubject must be scoped to the named stream.
+//
+// `PurgeStreamCmd` and `DrainSubjectCmd` both carry a `stream_id`, but
+// `handle_purge_stream` / `handle_drain_subject` call `store.purge()` /
+// `store.drain()` on the SHARD store and never read that id. A shard holds
+// every stream routed to it, so purging one stream wipes its neighbours'
+// messages and returns a shard-wide count.
+//
+// `shard_count(1)` forces both streams onto the same shard so the collision
+// is deterministic rather than hash-dependent.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn purge_stream_does_not_touch_a_shard_neighbour() {
+    let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
+    let client = server.connect().await;
+
+    let victim = create_stream(&client, b"purge_victim").await;
+    let bystander = create_stream(&client, b"purge_bystander").await;
+
+    for i in 0..10u8 {
+        client
+            .publish_wait(victim, b"purge_victim.a", Bytes::from(vec![i]))
+            .await
+            .expect("publish to victim");
+    }
+    for i in 0..7u8 {
+        client
+            .publish_wait(bystander, b"purge_bystander.a", Bytes::from(vec![100 + i]))
+            .await
+            .expect("publish to bystander");
+    }
+
+    let resp = client
+        .purge_stream(b"purge_victim")
+        .await
+        .expect("purge must succeed");
+    let purged = u64::from_le_bytes(resp[..8].try_into().unwrap());
+    assert_eq!(
+        purged, 10,
+        "purge must count only the named stream's messages, not the whole shard"
+    );
+
+    // The bystander's 10..=16 payloads must still be deliverable.
+    let consumer = create_consumer(&client, bystander, b"survivor").await;
+    let mut sub = client
+        .subscribe(bystander, consumer, b"")
+        .await
+        .expect("subscribe to the bystander");
+
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while got.len() < 7 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, sub.recv()).await {
+            Ok(Some(msg)) => {
+                got.push(msg.payload().to_vec());
+                msg.ack();
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        got.len(),
+        7,
+        "purging a sibling stream must not destroy this stream's messages; \
+         got {} of 7",
+        got.len()
+    );
+
+    // …and the purge must actually purge. Counting 10 while still
+    // delivering them would satisfy every assertion above.
+    let victim_consumer = create_consumer(&client, victim, b"after_purge").await;
+    let mut victim_sub = client
+        .subscribe(victim, victim_consumer, b"")
+        .await
+        .expect("subscribe to the purged stream");
+    let leaked = tokio::time::timeout(Duration::from_millis(500), victim_sub.recv()).await;
+    assert!(
+        matches!(leaked, Err(_) | Ok(None)),
+        "a purged stream must deliver nothing; got {:?}",
+        leaked.ok().flatten().map(|m| m.payload().to_vec())
+    );
+
+    server.shutdown().await;
+}

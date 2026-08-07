@@ -273,3 +273,82 @@ async fn deliver_new_skips_an_undrained_backlog() {
     );
     server.shutdown().await;
 }
+
+/// The creation floor of a DeliverPolicy::New consumer survives a restart:
+/// the create record carries the stamped floor (not the client's
+/// start_seq) and recovery restores it (AUDIT-6b). The idempotent re-join
+/// after the restart must keep the recovered stamp, not re-stamp at
+/// re-join time. If the floor were lost, the subscribe-time rewind would
+/// replay the entire pre-creation history.
+#[tokio::test(flavor = "multi_thread")]
+async fn deliver_new_floor_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap();
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        let stream_id = create_stream(&client, b"new_restart", b">").await;
+        for i in 0..10u8 {
+            client
+                .publish_wait(stream_id, b"new_restart.h", Bytes::from(vec![b'h', i]))
+                .await
+                .expect("history publish");
+        }
+        // Created AFTER the history — floor = journal tail at creation.
+        create_consumer(&client, stream_id, b"late", b"late", 100u16, 1u8).await;
+        server.shutdown().await;
+    }
+
+    {
+        let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
+        let client = server.connect().await;
+        // Idempotent re-create/re-join to recover the ids.
+        let stream_id = create_stream(&client, b"new_restart", b">").await;
+        let late_id = create_consumer(&client, stream_id, b"late", b"late", 100u16, 1u8).await;
+
+        for i in 0..3u8 {
+            client
+                .publish_wait(stream_id, b"new_restart.l", Bytes::from(vec![b'n', i]))
+                .await
+                .expect("live publish");
+        }
+
+        let mut late = client.subscribe(stream_id, late_id, b"").await.unwrap();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while got.len() < 3 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), late.recv()).await {
+                Ok(Some(msg)) => {
+                    got.push(msg.payload().to_vec());
+                    msg.ack();
+                }
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        // Bounded quiet window: nothing further may arrive.
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(500), late.recv()).await
+        {
+            got.push(msg.payload().to_vec());
+            msg.ack();
+        }
+
+        let rendered: Vec<String> = got
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).to_string())
+            .collect();
+        assert_eq!(
+            got.len(),
+            3,
+            "New consumer after restart must see exactly the 3 post-restart \
+             messages, not the pre-creation history: {rendered:?}"
+        );
+        assert!(
+            got.iter().all(|p| p.first() == Some(&b'n')),
+            "only post-restart payloads expected: {rendered:?}"
+        );
+        server.shutdown().await;
+    }
+}

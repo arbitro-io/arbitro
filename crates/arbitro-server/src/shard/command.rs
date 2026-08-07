@@ -170,15 +170,25 @@ pub struct DeleteStreamCmd {
 
 // ── Consumer management ─────────────────────────────────────────────────────
 
-/// CreateConsumer reply codes:
-/// - `0` = consumer already existed (same config — idempotent)
-/// - `1` = newly created
-/// - `2` = consumer already exists with different config (GAP-3)
 pub struct CreateConsumerCmd {
     pub config: ConsumerConfig,
     /// Per-subject inflight limits: (pattern, limit). Applied after consumer creation.
     pub max_subject_inflights: Vec<(Vec<u8>, u32)>,
-    pub reply: oneshot::Sender<u8>,
+    pub reply: oneshot::Sender<CreateConsumerReply>,
+}
+
+/// CreateConsumer reply.
+pub struct CreateConsumerReply {
+    /// - `0` = consumer already existed (same config — idempotent)
+    /// - `1` = newly created
+    /// - `2` = consumer already exists with different config (GAP-3)
+    pub code: u8,
+    /// Shard journal `last_seq` read by the command thread alongside the
+    /// create. For a `DeliverPolicy::New` consumer this is its deliver
+    /// floor — the dispatch stamps it into the NameRegistry `start_seq`
+    /// slot so every subscribe (and the recovery record) carries the
+    /// consumer's creation position.
+    pub journal_tail: u64,
 }
 
 pub struct DeleteConsumerCmd {

@@ -278,15 +278,13 @@ impl ShardHandle {
 
     // ── Consumer management ─────────────────────────────────────────────
 
-    /// Create or ensure a consumer. Returns:
-    /// - `Ok(1)` = newly created
-    /// - `Ok(0)` = already existed with same config (idempotent)
-    /// - `Ok(2)` = consumer exists with different config (GAP-3)
+    /// Create or ensure a consumer. See [`CreateConsumerReply`] for the
+    /// reply codes and the journal tail carried alongside them.
     pub async fn create_consumer(
         &self,
         config: ConsumerConfig,
         max_subject_inflights: Vec<(Vec<u8>, u32)>,
-    ) -> Result<u8, SendError> {
+    ) -> Result<CreateConsumerReply, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::CreateConsumer(CreateConsumerCmd {
             config,

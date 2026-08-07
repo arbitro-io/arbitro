@@ -92,6 +92,33 @@ impl AckFloors {
             .record(seq);
     }
 
+    /// Seed the floor at a consumer's start position (DeliverPolicy::New
+    /// / ByStartSeq deliver floor). Seqs at or below the deliver floor
+    /// are never delivered to this consumer, so "nothing unacked at or
+    /// below the floor" holds by construction — without the seed, the
+    /// first real ack (floor + 1) would stall forever in the
+    /// out-of-order set because seqs 1..=floor never arrive. Monotonic
+    /// max: never lowers an existing floor. Absorbs any buffered run the
+    /// raised floor reaches.
+    pub fn seed(&mut self, consumer_id: u32, floor: u64) {
+        let idx = consumer_id as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx + 1, || None);
+        }
+        let slot = self.slots[idx].get_or_insert_with(FloorSlot::default);
+        if floor > slot.floor {
+            slot.floor = floor;
+            slot.ooo = slot.ooo.split_off(&(floor + 1));
+            while let Some(&next) = slot.ooo.first() {
+                if next != slot.floor + 1 {
+                    break;
+                }
+                slot.ooo.pop_first();
+                slot.floor = next;
+            }
+        }
+    }
+
     /// Current floor for `consumer_id`. 0 = nothing acked contiguously.
     #[inline]
     pub fn floor(&self, consumer_id: u32) -> u64 {
@@ -161,6 +188,33 @@ mod tests {
         assert_eq!(f.floor(1), 1);
         assert_eq!(f.floor(2), 2);
         assert_eq!(f.floor(3), 0);
+    }
+
+    /// A seeded floor (deliver floor of a New / ByStartSeq consumer)
+    /// makes the first real ack contiguous instead of out-of-order.
+    #[test]
+    fn seed_makes_first_ack_contiguous() {
+        let mut f = AckFloors::new();
+        f.seed(1, 10);
+        assert_eq!(f.floor(1), 10);
+        f.record_acked(1, 11);
+        assert_eq!(f.floor(1), 11, "ack at seed + 1 must advance the floor");
+    }
+
+    /// Seeding is monotonic and absorbs a buffered out-of-order run.
+    #[test]
+    fn seed_is_monotonic_and_absorbs_ooo_run() {
+        let mut f = AckFloors::new();
+        // Acks 12, 13 buffered out of order (floor still 0).
+        f.record_acked(1, 12);
+        f.record_acked(1, 13);
+        assert_eq!(f.floor(1), 0);
+        // Seed to 11 — the buffered run 12, 13 becomes contiguous.
+        f.seed(1, 11);
+        assert_eq!(f.floor(1), 13);
+        // A lower re-seed (resubscribe) never lowers the floor.
+        f.seed(1, 5);
+        assert_eq!(f.floor(1), 13);
     }
 
     /// Recycled consumer ids must start from a clean floor.

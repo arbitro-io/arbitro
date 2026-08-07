@@ -761,6 +761,7 @@ fn dispatch_recipients(
     let (mut dbg_conn0, mut dbg_qdedup, mut dbg_dead, mut dbg_unbound, mut dbg_wf) =
         (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut dbg_acked_floor = 0u32;
+    let mut dbg_deliver_floor = 0u32;
 
     for i in 0..n {
         let raw = start + i;
@@ -847,6 +848,17 @@ fn dispatch_recipients(
             continue;
         }
         let binding = &bindings[binding_idx];
+
+        // Deliver floor (DeliverPolicy::New / ByStartSeq): seqs at or
+        // below the binding's start position were never owed to this
+        // consumer. Same no-side-effect discipline as the suppression
+        // skip above — no `track_skipped`, no `served_queues` — so a
+        // below-floor entry neither pins the cursor nor starves a queue
+        // sibling. One u64 compare on the hot path.
+        if entry.seq <= binding.deliver_floor {
+            dbg_deliver_floor += 1;
+            continue;
+        }
 
         // BUG4: a binding whose writer has already failed is ineligible.
         // Skip it WITHOUT marking `served_queues` so a queue's live sibling
@@ -985,8 +997,8 @@ fn dispatch_recipients(
     // skip-track is the loss signature: the cursor will advance past it.
     if dbg_recipients == 0 && !dbg_tracked && chaos_debug() {
         eprintln!(
-            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={} acked_floor={}",
-            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf, dbg_acked_floor
+            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={} acked_floor={} deliver_floor={}",
+            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf, dbg_acked_floor, dbg_deliver_floor
         );
     }
 }

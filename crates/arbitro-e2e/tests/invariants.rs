@@ -1638,14 +1638,20 @@ async fn tombstoned_message_is_never_delivered() {
         .await
         .expect("delete_message");
 
+    // Subscribe through a subject FILTER, not the unfiltered path. Filtered
+    // and unfiltered delivery are different walks, and a tombstone honoured by
+    // one says nothing about the other.
     let resp = client
         .create_consumer(
-            stream_id, b"reader", b"reader", b"", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
+            stream_id, b"reader", b"reader", b"tomb.>", 100u16, 1u8, 0u8, 0u8, 0u32, 0u64,
         )
         .await
         .unwrap();
     let consumer_id = TestServer::parse_id(&resp);
-    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+    let mut handle = client
+        .subscribe(stream_id, consumer_id, b"tomb.>")
+        .await
+        .unwrap();
 
     let mut got: Vec<Vec<u8>> = Vec::new();
     // Drain for a bounded window rather than expecting exactly two: the point

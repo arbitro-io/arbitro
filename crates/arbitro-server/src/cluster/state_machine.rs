@@ -364,27 +364,45 @@ impl ArbitroStateMachine {
             )
             .await;
 
+        let create_code = create_res.as_ref().ok().map(|r| r.code);
+
+        // DeliverPolicy::New: same creation-tail stamping as
+        // `v2_create_consumer`. The apply order is identical on every
+        // replica, so the locally observed journal tail is deterministic
+        // across the cluster.
+        let effective_start_seq = if deliver_policy == 1 {
+            let prior = router.names().consumer_deliver_policy(seq_consumer);
+            match (create_code, prior) {
+                (Some(0), Some((1, floor))) => floor,
+                _ => create_res.as_ref().map(|r| r.journal_tail).unwrap_or(0),
+            }
+        } else {
+            start_seq
+        };
+
         // AUDIT-10 follow-up (same as v2_create_consumer): only mutate the
         // NameRegistry after the engine accepts the create. A rejected
         // re-create (config mismatch) must not overwrite the registry copy
         // of deliver_policy/queue/stream for the existing consumer.
-        if matches!(create_res, Ok(0) | Ok(1)) {
+        if matches!(create_code, Some(0) | Some(1)) {
             router.names().set_consumer_queue(seq_consumer, queue_id);
             router.names().set_consumer_stream(seq_consumer, seq_stream);
-            router
-                .names()
-                .set_consumer_deliver_policy(seq_consumer, deliver_policy, start_seq);
+            router.names().set_consumer_deliver_policy(
+                seq_consumer,
+                deliver_policy,
+                effective_start_seq,
+            );
         }
 
-        match create_res {
-            Ok(1) => {
+        match create_code {
+            Some(1) => {
                 router.invalidate_list_cache();
                 tracing::debug!(name, "state_machine: consumer created");
             }
-            Ok(0) => {
+            Some(0) => {
                 tracing::trace!(name, "state_machine: consumer already exists");
             }
-            Ok(_) | Err(_) => {
+            _ => {
                 tracing::warn!(name, "state_machine: create_consumer failed or mismatch");
             }
         }

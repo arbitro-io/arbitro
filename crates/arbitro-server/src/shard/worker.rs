@@ -70,6 +70,12 @@ pub struct ActiveBinding {
     pub(super) fire_and_forget: bool,
     /// Ack deadline in milliseconds. 0 = no timeout (no wheel entry).
     pub(super) ack_wait_ms: u32,
+    /// Deliver floor: entries with `seq <= deliver_floor` are never
+    /// delivered on this binding (DeliverPolicy::New = journal tail at
+    /// consumer creation; ByStartSeq = start_seq - 1; All = 0). Rides in
+    /// the DrainSnapshot so the drain sees the binding and its floor as
+    /// one atomic unit — no ring event, no ordering hazard.
+    pub(super) deliver_floor: u64,
     /// Sender to the per-connection async writer task. `try_send` is
     /// non-blocking — no `block_in_place`, no write lock, no runtime handle.
     pub(super) write_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
@@ -1320,6 +1326,7 @@ impl CommandWorker {
                 max_inflight: b.max_inflight,
                 fire_and_forget: b.fire_and_forget,
                 ack_wait_ms: b.ack_wait_ms,
+                deliver_floor: b.deliver_floor,
                 write_tx: b.write_tx.clone(),
                 write_failed: std::sync::Arc::clone(&b.write_failed),
             })
