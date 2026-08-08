@@ -17,12 +17,14 @@
 
 pub mod clock;
 pub mod gate;
+pub mod hierarchical_wheel;
 pub mod id_pool;
 pub mod name_registry;
 pub mod wheel;
 
 pub use clock::SharedClock;
 pub use gate::Gate;
+pub use hierarchical_wheel::{HierarchicalTimingWheel, Insert};
 pub use id_pool::{IdPool, PoolError, PoolSnapshot};
 pub use name_registry::NameRegistry;
 pub use wheel::{TimingWheel, WheelEntry, WheelEntryKind};
