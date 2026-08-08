@@ -73,10 +73,17 @@ async fn delayed_publish_arrives_after_delay() {
         .expect("channel should be open");
 
     let elapsed = publish_time.elapsed();
+    // The bound is the delay itself, not the delay minus slack. A tolerance
+    // here would hide exactly the defect this test exists to catch: a delay
+    // that matures early because it was rounded onto a coarse scheduling
+    // grid. Late is acceptable and unbounded above; early is not acceptable
+    // at all, because the caller asked for the delay in order to get it.
     assert!(
-        elapsed >= Duration::from_millis(1800),
-        "message arrived too early: {:?} (expected >= 2s)",
-        elapsed
+        elapsed >= Duration::from_millis(delay_ms),
+        "message arrived {:?} after a {}ms delay — a delay must never \
+         mature early",
+        elapsed,
+        delay_ms
     );
     assert_eq!(&msg.payload()[..], b"hello-delayed");
 
@@ -379,6 +386,106 @@ async fn delayed_publish_respects_discard_new_quota() {
         ),
         "expected StreamFull on the delay=0 path, got {err:?}"
     );
+
+    server.shutdown().await;
+}
+
+// ===================================================================
+// nack_delay — a DIFFERENT mechanism from publish_delayed.
+//
+// publish_delayed parks the entry with a deliver_at_ms timestamp and the
+// journal matures it. nack_delay schedules a cursor rewind through the
+// shard's timing wheel instead. Nothing in this suite covered the wheel
+// path, so a rounding defect there went unseen until a C client test
+// measured it.
+//
+// The wheel converts delay_ms into whole buckets and inserts at
+// `current + ceil(delay/tick)`. The current bucket is already partly
+// elapsed when the nack lands, so the entry matures before the requested
+// delay — and only ever early, never late.
+// ===================================================================
+
+/// Swept across several delays, not just one. A single value proves very
+/// little here: 1000ms is an exact multiple of the wheel's tick, so it is
+/// the one value where a rounding defect and correct behaviour can look
+/// alike. Values that are NOT tick multiples separate the two sharply —
+/// a wheel that rounds would push 1200ms out to ~2000ms and pull 300ms up
+/// to ~1000ms, while an exact scheduler returns each as asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn nack_delay_never_redelivers_early() {
+    for delay_ms in [300u64, 1000, 1200, 1800] {
+        nack_delay_case(delay_ms).await;
+    }
+}
+
+async fn nack_delay_case(delay_ms: u64) {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let resp = client
+        .create_stream(b"nackdelay", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .unwrap();
+    let stream_id = TestServer::parse_id(&resp);
+
+    // ack_wait of 30s so an ack timeout cannot be mistaken for the delay
+    // firing: anything arriving inside the window came from the wheel.
+    let resp = client
+        .create_consumer(
+            stream_id, b"nd_worker", b"nd_worker", b"", 100, 1, 0, 0, 30_000, 0,
+        )
+        .await
+        .unwrap();
+    let consumer_id = TestServer::parse_id(&resp);
+
+    let mut handle = client.subscribe(stream_id, consumer_id, b"").await.unwrap();
+
+    client
+        .publish_wait(stream_id, b"nackdelay.evt", Bytes::from_static(b"retry-me"))
+        .await
+        .expect("publish");
+
+    let first = tokio::time::timeout(Duration::from_secs(4), handle.recv())
+        .await
+        .expect("first delivery must arrive")
+        .expect("channel open");
+
+    // Taken immediately before the nack, so it can only under-report the
+    // elapsed time — never flatter the broker.
+    let nacked_at = Instant::now();
+    first.nack_delay(delay_ms as u32);
+
+    // Anything inside the delay window is an early redelivery.
+    let early = tokio::time::timeout(Duration::from_millis(delay_ms), handle.recv()).await;
+    if let Ok(Some(msg)) = early {
+        panic!(
+            "redelivered {:?} after a {}ms nack delay — the delay was not honoured \
+             (payload {:?})",
+            nacked_at.elapsed(),
+            delay_ms,
+            msg.payload().to_vec()
+        );
+    }
+
+    // …and it must still come back afterwards, or the delay ate the message.
+    let again = tokio::time::timeout(Duration::from_secs(8), handle.recv())
+        .await
+        .expect("the nacked message must be redelivered after the delay")
+        .expect("channel open");
+    let observed = nacked_at.elapsed();
+    // Printed, not just asserted: a bound alone cannot distinguish "the
+    // wheel honoured the delay" from "the client batched the nack so long
+    // that the window had already passed". The number has to be looked at.
+    eprintln!(
+        "[nack_delay] requested {}ms, redelivered after {:?}",
+        delay_ms, observed
+    );
+    assert_eq!(&again.payload()[..], b"retry-me");
+    assert!(
+        observed >= Duration::from_millis(delay_ms),
+        "redelivery at {observed:?} is inside the {delay_ms}ms delay"
+    );
+    again.ack();
 
     server.shutdown().await;
 }
