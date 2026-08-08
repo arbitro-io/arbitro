@@ -3,3 +3,5 @@
 *.log
 .claude/
 .private/
+# Runtime state written by a locally-run broker (data_dir default).
+data/

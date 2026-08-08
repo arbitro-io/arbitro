@@ -502,7 +502,27 @@ async fn conn_writer_task(
 ) {
     let mut err = false;
     while let Some(frame) = rx.recv().await {
+        // The last point the broker owns these bytes. `[FLUSH-OK]` says the
+        // drain handed a frame to this channel; this says it reached the
+        // socket. A delivery the client never sees, with both lines present,
+        // is on the client side of the wire.
+        if crate::shard::drain::chaos_debug() {
+            let action = if frame.len() >= 2 {
+                u16::from_le_bytes([frame[0], frame[1]])
+            } else {
+                0
+            };
+            eprintln!(
+                "[SOCKET-WRITE] conn={} action=0x{:04x} len={}",
+                conn_id,
+                action,
+                frame.len()
+            );
+        }
         if w.write_all(&frame).await.is_err() {
+            if crate::shard::drain::chaos_debug() {
+                eprintln!("[SOCKET-WRITE-FAILED] conn={conn_id}");
+            }
             // M8: signal the drain path that this connection is dead.
             write_failed.store(true, Relaxed);
             err = true;

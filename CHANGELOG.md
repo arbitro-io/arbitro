@@ -7,6 +7,48 @@ the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
 ## [Unreleased]
 
+### Fixed — `arbitro-server` (delay accuracy)
+
+Three ways a deadline could mature EARLY, all live before this. Early is the
+one direction a delay must never go: it hands back a message the consumer was
+promised it still owned.
+
+- **`ack_wait` truncated to whole seconds.** `(ack_wait_ms / 1000).max(1)` —
+  integer division. An `ack_wait` of 1500ms became one tick, so the broker
+  auto-nacked somewhere inside the first second and redelivered a message whose
+  `ack_wait` had not run out. Deadlines are absolute now; nothing rounds.
+- **`nack_delay` clamped at 119 seconds, silently.** The flat wheel's ring could
+  not express anything further out, so a request for ten minutes came back after
+  two and the caller was never told. No ceiling now.
+- **Delayed publish stamped its deadline from the cached clock.** A task
+  refreshes that clock on a timer, so it reads behind, and stamping from it
+  anchors the deadline in the past. A 5-second delay matured at 3.967s against a
+  container that had been up for hours — the cached clock and the maturity
+  check had drifted apart. Stamping now reads the clock directly and rounds up,
+  matching the source the maturity check uses.
+
+Measured `nack_delay`, before → after: 300ms 1.001s → 400ms; 1000ms 1.001s →
+1.098s; 1200ms 2.002s → 1.299s; 1800ms 2.002s → 1.898s.
+
+### Added — `arbitro-server` (hierarchical timing wheel)
+
+- **`HierarchicalTimingWheel`** in `arbitro-common` — Kafka-shaped, driven by
+  absolute time rather than a tick count. Levels stack by a factor of 64, so
+  100ms resolution reaches years in roughly 9 KB, where the flat wheel's memory
+  was span ÷ resolution. Two deliberate divergences from Kafka: level 0
+  releases a bucket at its END, so firing lands in
+  `[deadline, deadline + tick_ms]` and is never early (Kafka fires up to a tick
+  early, harmless at 1ms but not for an ack timeout); and a deadline past the
+  top level parks and is re-placed rather than being clamped.
+- **The shard timer sleeps to the wheel's next deadline instead of ticking.**
+  A shard with nothing scheduled now arms no timer at all — the old 1-second
+  tick woke every shard, every second, forever. Resolution went from 1s to
+  100ms while idle cost went to zero.
+- **Per-stream dedup windows take elapsed wall time**, not a count of worker
+  wakeups. The two wheels no longer share a cadence; dividing the wakeups would
+  desynchronise the first time the timer arm lost to command traffic, which is
+  routine.
+
 ### Added — `arbitro-client-tokio`
 - **`ClientConfig::ack_store`** — the redelivery-dedup WAL, and the directory it
   lives in, are now declared on the normal client configuration struct, and

@@ -1149,7 +1149,7 @@ fn track_skipped(lowest: &mut Option<u64>, seq: u64) {
 }
 
 // TEMP chaos-debug probe — remove after loss diagnosis.
-pub(in crate::shard) fn chaos_debug() -> bool {
+pub(crate) fn chaos_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ARBITRO_CHAOS_DEBUG").is_ok())
 }
