@@ -984,3 +984,89 @@ async fn purge_stream_does_not_touch_a_shard_neighbour() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DrainSubject is the same defect class as PurgeStream: the command carried
+// a stream_id that `handle_drain_subject` threw away, because `Store::drain`
+// only took a subject and swept the shard. Two streams sharing a shard and
+// using the same subject names — the common case, not a contrived one — meant
+// draining either destroyed the other's matching messages.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_subject_does_not_touch_a_shard_neighbour() {
+    let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
+    let client = server.connect().await;
+
+    let victim = create_stream(&client, b"drain_victim").await;
+    let bystander = create_stream(&client, b"drain_bystander").await;
+
+    // Identical subjects on both streams — that is the whole point.
+    for i in 0..6u8 {
+        client
+            .publish_wait(victim, b"shared.evt", Bytes::from(vec![i]))
+            .await
+            .expect("publish to victim");
+    }
+    for i in 0..4u8 {
+        client
+            .publish_wait(bystander, b"shared.evt", Bytes::from(vec![100 + i]))
+            .await
+            .expect("publish to bystander");
+    }
+
+    let resp = client
+        .drain_subject(b"drain_victim", b"shared.>")
+        .await
+        .expect("drain must succeed");
+    let drained = u64::from_le_bytes(resp[..8].try_into().unwrap());
+    assert_eq!(
+        drained, 6,
+        "drain must count only the named stream's matches, not the shard's"
+    );
+
+    // The bystander's 4 messages must still be deliverable.
+    let consumer = create_consumer(&client, bystander, b"drain_survivor").await;
+    let mut sub = client
+        .subscribe(bystander, consumer, b"")
+        .await
+        .expect("subscribe to the bystander");
+
+    let mut got = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while got.len() < 4 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, sub.recv()).await {
+            Ok(Some(msg)) => {
+                got.push(msg.payload().to_vec());
+                msg.ack();
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        got.len(),
+        4,
+        "draining a sibling stream must not destroy this stream's messages; \
+         got {} of 4",
+        got.len()
+    );
+
+    // …and the drain must actually drain.
+    let victim_consumer = create_consumer(&client, victim, b"after_drain").await;
+    let mut victim_sub = client
+        .subscribe(victim, victim_consumer, b"")
+        .await
+        .expect("subscribe to the drained stream");
+    let leaked = tokio::time::timeout(Duration::from_millis(500), victim_sub.recv()).await;
+    assert!(
+        matches!(leaked, Err(_) | Ok(None)),
+        "a drained stream must deliver nothing; got {:?}",
+        leaked.ok().flatten().map(|m| m.payload().to_vec())
+    );
+
+    server.shutdown().await;
+}

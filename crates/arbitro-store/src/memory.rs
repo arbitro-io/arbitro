@@ -509,16 +509,22 @@ impl Store for MemoryStore {
         count
     }
 
-    fn drain(&mut self, subject: &[u8]) -> u64 {
+    fn drain(&mut self, stream_id: u32, subject: &[u8]) -> u64 {
         // Cold path: rebuild all segments + index from scratch, skipping
-        // entries that match `subject`. This compacts gaps left by
-        // removed entries.
+        // entries that belong to `stream_id` AND match `subject`. This
+        // compacts gaps left by removed entries.
+        //
+        // The stream check comes FIRST and is not optional: without it a
+        // neighbour stream sharing this shard loses its matching subjects
+        // too. An empty `subject` drains the whole stream.
         let mut new_store = MemoryStore::with_segment_size(self.segment_size, self.index.len());
         let mut removed = 0u64;
 
         for i in 0..self.index.len() {
             let entry = self.get_entry_view(i);
-            if entry_matches(&entry, subject) {
+            let mine = entry.stream_id == stream_id;
+            let matches = subject.is_empty() || entry_matches(&entry, subject);
+            if mine && matches {
                 removed += 1;
             } else {
                 let meta = &self.index[i];
@@ -776,7 +782,7 @@ mod tests {
         )
         .unwrap();
 
-        let drained = s.drain(b"orders.created");
+        let drained = s.drain(0, b"orders.created");
         assert_eq!(drained, 2);
         assert_eq!(s.info().messages, 2);
 
@@ -823,12 +829,83 @@ mod tests {
         )
         .unwrap();
 
-        let drained = s.drain(b"orders.>");
+        let drained = s.drain(0, b"orders.>");
         assert_eq!(drained, 2);
         assert_eq!(s.info().messages, 1);
 
         let remaining = s.read(3).unwrap().unwrap();
         assert_eq!(remaining.subject, b"payments.done");
+    }
+
+    /// A shard holds several streams. Draining one must not touch the
+    /// others, however well their subjects match the pattern.
+    #[test]
+    fn drain_is_scoped_to_its_stream() {
+        let mut s = MemoryStore::new();
+        for (stream_id, subject) in [
+            (7u32, &b"orders.created"[..]),
+            (7, b"orders.paid"),
+            (9, b"orders.created"), // neighbour, identical subject
+            (9, b"orders.paid"),
+        ] {
+            s.append(
+                EntryRef {
+                    subject,
+                    payload: b"x",
+                    stream_id,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
+                0,
+            )
+            .unwrap();
+        }
+
+        let drained = s.drain(7, b"orders.>");
+        assert_eq!(drained, 2, "only stream 7's two entries may go");
+        assert_eq!(s.info().messages, 2, "stream 9 must be untouched");
+
+        let mut survivors = Vec::new();
+        s.for_each(0, u64::MAX, &mut |e| survivors.push(e.stream_id))
+            .unwrap();
+        assert_eq!(
+            survivors,
+            vec![9, 9],
+            "the survivors must all belong to the neighbour stream"
+        );
+    }
+
+    /// An empty pattern means "everything in this stream" — and still
+    /// nothing outside it.
+    #[test]
+    fn drain_with_empty_subject_takes_the_whole_stream_only() {
+        let mut s = MemoryStore::new();
+        for (stream_id, subject) in [
+            (1u32, &b"a.one"[..]),
+            (1, b"b.two"),
+            (2, b"a.one"),
+        ] {
+            s.append(
+                EntryRef {
+                    subject,
+                    payload: b"x",
+                    stream_id,
+                    flags: 0,
+                    deliver_at_ms: 0,
+                },
+                0,
+            )
+            .unwrap();
+        }
+
+        let drained = s.drain(1, b"");
+        assert_eq!(drained, 2, "both of stream 1's entries, whatever the subject");
+        assert_eq!(s.info().messages, 1);
+
+        let mut survivors = Vec::new();
+        s.for_each(0, u64::MAX, &mut |e| survivors.push(e.stream_id))
+            .unwrap();
+        assert_eq!(survivors, vec![2]);
     }
 
     #[test]

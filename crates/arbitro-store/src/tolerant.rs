@@ -1052,16 +1052,29 @@ impl Store for TolerantStore {
         }
         Ok(result)
     }
-    fn drain(&mut self, subject: &[u8]) -> u64 {
-        // ROB-18: find every live (non-tombstoned) entry whose subject
-        // matches, then tombstone each one. `tombstone_at` owns the
-        // CRC-fixup and `.tombstones` sidecar persistence (ROB-17), so
-        // this just collects the matching seqs first (read-only pass)
-        // and mutates in a second pass.
+    fn drain(&mut self, stream_id: u32, subject: &[u8]) -> u64 {
+        // ROB-18: find every live (non-tombstoned) entry that belongs to
+        // `stream_id` and whose subject matches, then tombstone each one.
+        // `tombstone_at` owns the CRC-fixup and `.tombstones` sidecar
+        // persistence (ROB-17), so this just collects the matching seqs
+        // first (read-only pass) and mutates in a second pass.
+        //
+        // The stream filter is checked before the subject and before any
+        // segment read: a shard holds several streams, so a subject-only
+        // sweep tombstoned a neighbour's messages. Skipping non-matching
+        // streams up front also avoids touching their mmap pages at all.
+        // An empty `subject` drains the whole stream.
         let active_seg_id = self.sealed_segments.len() as u32;
         let mut to_tombstone = Vec::new();
         for m in &self.index {
             if m.flags & crate::store::flags::TOMBSTONE != 0 {
+                continue;
+            }
+            if m.stream_id != stream_id {
+                continue;
+            }
+            if subject.is_empty() {
+                to_tombstone.push(m.seq);
                 continue;
             }
             let data: &[u8] = if m.segment_idx == active_seg_id {

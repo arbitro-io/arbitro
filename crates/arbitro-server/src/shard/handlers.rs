@@ -1002,7 +1002,13 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_drain_subject(&mut self, cmd: DrainSubjectCmd) {
-        let deleted = self.store.lock().drain(&cmd.subject);
+        // The stream_id has always arrived on this command; it just had
+        // nowhere to go, because `Store::drain` only took a subject and
+        // swept the whole shard. Same defect class as PurgeStream.
+        let deleted = self
+            .store
+            .lock()
+            .drain(cmd.stream_id.0, &cmd.subject);
         let _ = cmd.reply.send(deleted);
     }
 

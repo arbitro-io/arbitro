@@ -184,8 +184,19 @@ pub trait Store: Send + Sync {
     /// Returns number of deleted messages.
     fn truncate_front(&mut self, first_seq: u64) -> u64;
 
-    /// Delete all messages matching a subject pattern. Returns deleted count.
-    fn drain(&mut self, subject: &[u8]) -> u64;
+    /// Delete messages belonging to `stream_id` whose subject matches
+    /// `subject`. Returns the deleted count.
+    ///
+    /// An EMPTY `subject` means "every message in this stream" — the
+    /// pattern is not a filter then, so nothing is excluded.
+    ///
+    /// The `stream_id` is not optional and never was cosmetic: a shard
+    /// holds every stream routed to it, so a subject-only sweep deleted
+    /// a neighbour stream's messages whenever both landed on the same
+    /// shard. That is what this signature exists to prevent. If a
+    /// genuine shard-wide sweep is ever wanted, add it as its own
+    /// deliberately-named method rather than by widening this one.
+    fn drain(&mut self, stream_id: u32, subject: &[u8]) -> u64;
 
     /// Tombstone a single entry by sequence number. Returns `true` if the
     /// entry was found and tombstoned, `false` if not found or already
