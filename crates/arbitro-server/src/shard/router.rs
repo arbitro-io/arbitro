@@ -299,7 +299,9 @@ impl ShardRouter {
                 next_eviction: None,
                 wheel: None,
                 wheel_buf: Vec::new(),
-                next_wheel_tick: None,
+                next_timer_ms: None,
+                epoch: std::time::Instant::now(),
+                last_idempotency_ms: 0,
                 idempotency_tracker: Arc::clone(&shard_idempotency),
                 has_idempotency: Arc::clone(&shard_has_idempotency),
                 flush_stream_ids: Vec::new(),
@@ -307,7 +309,6 @@ impl ShardRouter {
                 pending_consumer_remove: Vec::new(),
                 pending_drain_acks: Vec::new(),
                 ack_floors: crate::shard::ack_floor::AckFloors::new(),
-                last_wheel_tick: None,
                 evict_resume_seq: 0,
                 stream_oldest_ts: HashMap::default(),
                 dlq_nack_counts: std::collections::HashMap::with_hasher(

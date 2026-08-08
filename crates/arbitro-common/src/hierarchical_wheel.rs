@@ -1,139 +1,73 @@
-//! Hierarchical Timing Wheel — Kafka-shaped, driven by absolute time.
+//! Hierarchical timing wheel, Kafka-shaped, driven by absolute time.
 //!
-//! The flat [`crate::wheel::TimingWheel`] counts ticks: one array of
-//! buckets, one bucket per tick, `advance()` moves the cursor by one. Its
-//! memory is proportional to `span / resolution`, so a finer resolution
-//! costs buckets, and a deadline past the end of the ring is silently
-//! clamped to the last bucket.
+//! Levels stack by a factor of `WHEEL_SIZE`: a timer too far out for one
+//! level is handed upward, and handed back down (cascaded) as its
+//! deadline approaches. Resolution stays at `tick_ms` while the span
+//! grows geometrically — ~9 KB reaches years.
 //!
-//! This wheel is the other shape. Levels stack: level 0 has `tick_ms`
-//! resolution, level 1 has `tick_ms × WHEEL_SIZE`, level 2 squares that,
-//! and so on. A timer that does not fit in a level is handed upward; when
-//! an upper bucket comes due its timers are handed back down (the
-//! *cascade*), landing at a finer level each pass until level 0 fires
-//! them. Resolution stays at `tick_ms` while the span grows
-//! geometrically, so the whole structure is ~9 KB and reaches years.
+//! Contrast [`crate::wheel::TimingWheel`], which counts ticks: its
+//! memory is `span / resolution`, and a deadline past the ring is
+//! silently clamped.
 //!
-//! # It has no clock
-//!
-//! Same contract as the flat wheel, for the same reason — deterministic
-//! tests, and a single owner deciding when time moves. The difference is
-//! *what* the caller passes: an **instant**, not a count of elapsed ticks.
+//! No clock inside. The caller passes an instant, not a tick count, so
+//! an oversleeping driver catches up in one call instead of drifting:
 //!
 //! ```text
-//! driver → wheel : "it is now T, give me what is due"   advance_to(T, &mut out)
-//! wheel  → driver: "the next thing is due at T2"        next_expiry_ms()
-//! driver         : sleep until T2, repeat
+//! advance_to(now, &mut out)  → what is due
+//! next_expiry_ms()           → when to come back, None if nothing is
 //! ```
 //!
-//! Passing an instant is what removes tick counting, and with it drift: a
-//! driver that oversleeps, or that gets preempted by other work in its
-//! `select!`, hands over the real time on the next pass and the wheel
-//! catches up in one call. Nothing accumulates.
+//! `None` means the driver arms no timer, which is what decouples
+//! resolution from wake rate: an idle wheel is free at any `tick_ms`.
 //!
-//! `next_expiry_ms()` returning `None` means nothing is scheduled, so the
-//! driver arms no timer at all. That decouples resolution from wake rate:
-//! an idle wheel costs zero wakeups whether `tick_ms` is 1000 or 1.
+//! Two deliberate divergences from Kafka:
 //!
-//! # Firing is never early
+//! - **Never early.** Kafka flushes a bucket at its start, so a timer can
+//!   fire up to a tick early — harmless at 1ms, not for an ack timeout,
+//!   where early means redelivering a message whose `ack_wait` had not
+//!   run out. Level 0 here flushes bucket `v` at `now ≥ (v+1)·tick_ms`,
+//!   so firing lands in `[deadline, deadline + tick_ms]`. Upper levels
+//!   keep Kafka's rule; they cascade rather than fire, and the bucket
+//!   start is what leaves a full lower level of room underneath.
+//! - **No clamping.** A deadline past the top level parks in its furthest
+//!   bucket and is re-placed when that bucket comes due.
 //!
-//! Kafka flushes a bucket when the clock reaches the bucket's *start*, so
-//! a timer can fire up to one tick before its deadline. At `tick_ms = 1`
-//! nobody notices. Arbitro uses this for ack timeouts, where firing early
-//! means redelivering a message whose `ack_wait` has not actually run
-//! out — a duplicate the consumer was promised it would not get.
+//! Cancellation is lazy, as in the flat wheel: buckets stay flat `Vec`s
+//! and the ack path never touches the wheel. Kafka cancels in O(1) with
+//! intrusive lists, but that costs an allocation per timer, and here
+//! nearly every timer is acked before it expires.
 //!
-//! So level 0 here flushes bucket `v` when `now ≥ (v + 1) · tick_ms`,
-//! one bucket behind Kafka. Every timer in that bucket has a deadline
-//! below `(v + 1) · tick_ms`, hence at or before `now`. A timer fires at
-//! an instant in `[deadline, deadline + tick_ms]` — **never early**, and
-//! late by at most one tick. Upper levels keep Kafka's rule —
-//! they do not fire, they cascade, and cascading at the bucket start is
-//! exactly what leaves a full lower-level span of room underneath.
+//! Memory: `WHEEL_SIZE × 24` bytes of `Vec` headers per level, levels
+//! created on demand. Bucket and scratch capacity is trimmed after a
+//! drain with hysteresis, so steady load keeps its buffers and a spike is
+//! walked back down; [`HierarchicalTimingWheel::shrink_to_fit`] releases
+//! the rest for a driver that knows it has gone idle. `T: Copy` means
+//! `T: !Drop` — nothing here can leak, and there is no `unsafe`.
 //!
-//! # Deadlines beyond the top level
-//!
-//! They are not clamped. A timer that outruns the top level parks in that
-//! level's furthest bucket; when the bucket comes due the timer is
-//! re-placed against the new time and either fits or parks again. Each
-//! pass advances by the top level's whole span, so with the default
-//! shape one pass covers more than any caller will ask for — and the
-//! answer stays correct rather than quietly wrong.
-//!
-//! # Cancellation
-//!
-//! There is none, deliberately — same **lazy cancel** as the flat wheel.
-//! Kafka can cancel in O(1) because its buckets are intrusive linked
-//! lists, which costs an allocation per timer and a pointer chase per
-//! fire. Arbitro's ack path is the hot path and the overwhelming majority
-//! of timers are acked before they expire, so the cheaper trade is to
-//! leave them: buckets stay flat `Vec`s, insert is a `push`, and the
-//! driver drops fired timers whose work already completed.
-//!
-//! # Memory
-//!
-//! - Structure: `WHEEL_SIZE × 24` bytes of `Vec` headers per level,
-//!   ≈ 1.5 KB, so ≈ 9 KB even with all [`MAX_LEVELS`] levels — and
-//!   levels exist only once a deadline has reached that far.
-//! - Timers: [`Timer<T>`] is `T` plus a `u64` deadline, heap-resident
-//!   only while scheduled, so this term tracks the number of timers in
-//!   flight rather than the shape of the wheel.
-//! - Buffers: bucket and scratch capacity is trimmed after a drain with
-//!   hysteresis — a steady load keeps its working buffers instead of
-//!   shrinking and regrowing every rotation, while a one-off spike is
-//!   walked back down over the rotations that follow. A wheel that goes
-//!   quiet has no rotations left to do that with; [`
-//!   HierarchicalTimingWheel::shrink_to_fit`] releases the remainder for
-//!   a driver that knows it has gone idle.
-//!
-//! `T: Copy` means `T: !Drop`: the wheel owns nothing that can leak, only
-//! its own `Vec`s. There is no `unsafe`, no interior mutability, and no
-//! reference cycle, so "no leaks" is a property of the types rather than
-//! a claim about the code.
-//!
-//! # Thread safety
-//!
-//! Not needed, same as the flat wheel. It lives inside the single-owner
-//! shard worker: the task that inserts is the task that advances. That is
-//! also why there is no `DelayQueue` and no signalling — Kafka needs to
-//! wake a sleeping timer thread when an earlier deadline arrives, while
-//! here the loop that inserted simply recomputes `next_expiry_ms()` on
-//! its next pass and re-arms.
+//! Not thread safe, and does not need to be: the task that inserts is the
+//! task that advances. That is also why there is no `DelayQueue` — Kafka
+//! signals a sleeping timer thread, whereas here the inserting loop just
+//! re-reads `next_expiry_ms()` on its next pass.
 
-/// Buckets per level.
-///
-/// Fixed at 64 so per-level occupancy fits one `u64`, which is what makes
-/// [`HierarchicalTimingWheel::next_expiry_ms`] a couple of bit
-/// instructions per level instead of a scan over buckets.
+/// Buckets per level. Fixed at 64 so occupancy fits one `u64`, which is
+/// what makes [`HierarchicalTimingWheel::next_expiry_ms`] a couple of bit
+/// instructions per level instead of a scan.
 pub const WHEEL_SIZE: usize = 64;
 
-/// Bit width of the occupancy mask; identical to [`WHEEL_SIZE`], named
-/// separately where the intent is "bits" rather than "buckets".
 const WHEEL_BITS: u64 = WHEEL_SIZE as u64;
 
-/// Hard cap on levels, so a nonsense deadline cannot grow the structure
-/// without bound. With `tick_ms = 1` the top level already spans
-/// `64⁶ ms` ≈ 2.2 years; with `tick_ms = 100` it spans centuries.
+/// Hard cap on levels. At `tick_ms = 1` the top already spans ~2.2 years.
 pub const MAX_LEVELS: usize = 6;
 
-/// Floor below which a drained bucket is never trimmed.
 const BUCKET_RETAIN_CAP: usize = 16;
-
-/// Floor below which the cascade scratch buffer is never trimmed. Sized
-/// so an ordinary wake, which touches at most a rotation's worth of
-/// buckets, never reallocates.
 const SCRATCH_RETAIN_CAP: usize = WHEEL_SIZE * 4;
 
 /// Give back capacity a spike left behind, with hysteresis.
 ///
-/// Trimming unconditionally back to a fixed floor would be worse than
-/// not trimming at all: a bucket holding a steady thousand timers would
-/// shrink to the floor on every drain and regrow through ~7 reallocs on
-/// every rotation, turning an allocation-free steady state into
-/// guaranteed allocator churn. Keeping twice the last drain, and only
-/// acting once capacity exceeds twice *that*, leaves a steady load alone
-/// and still walks a one-off spike back down over the following
-/// rotations.
+/// Trimming to a fixed floor after every drain would be worse than not
+/// trimming: a bucket holding a steady thousand timers would regrow from
+/// the floor through ~7 reallocs every rotation. Keeping twice the last
+/// drain, and acting only past twice that, leaves steady load alone.
 #[inline]
 fn trim<E>(buf: &mut Vec<E>, last_len: usize, floor: usize) {
     let keep = last_len.saturating_mul(2).max(floor);
@@ -142,16 +76,13 @@ fn trim<E>(buf: &mut Vec<E>, last_len: usize, floor: usize) {
     }
 }
 
-/// Level 0 lags one bucket behind the clock so it never fires early; see
-/// the module docs. Upper levels use Kafka's rule and cascade at the
-/// bucket start.
+/// Level 0 lags a bucket so it never fires early; upper levels cascade at
+/// the bucket start. See the module docs.
 const BOTTOM_LAG: u64 = 1;
 const UPPER_LAG: u64 = 0;
 
-/// What [`HierarchicalTimingWheel::insert`] did with a timer.
-///
-/// `#[must_use]`: an `Elapsed` timer was **not** stored, and silently
-/// dropping that return is how a deadline goes missing.
+/// What [`HierarchicalTimingWheel::insert`] did with a timer. `Elapsed`
+/// was not stored, and dropping that return is how a deadline vanishes.
 #[must_use = "an Elapsed timer was not scheduled — the caller must fire it"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insert {
@@ -162,12 +93,9 @@ pub enum Insert {
     Elapsed,
 }
 
-/// A scheduled value plus the instant it is due.
-///
-/// The absolute deadline rides with the timer because cascading needs
-/// it: a timer handed down from an upper level has to be re-placed
-/// against the *current* time, which a relative offset can no longer
-/// express.
+/// A scheduled value plus the instant it is due. The deadline is
+/// absolute because cascading re-places against the current time, which
+/// a relative offset can no longer express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Timer<T: Copy> {
     value: T,
@@ -185,11 +113,9 @@ struct Level<T: Copy> {
     /// buckets on every push and drain, and cross-checked against the
     /// buckets themselves by this file's `assert_consistent` helper.
     occupied: u64,
-    /// First virtual bucket id not yet drained — the cursor.
-    ///
-    /// Held as "next" rather than "last drained" so a wheel whose clock
-    /// starts at zero has a representable cursor: the bottom level lags a
-    /// bucket, and `last_drained` would have to be −1.
+    /// First virtual bucket id not yet drained. Held as "next" rather
+    /// than "last drained" so a clock starting at zero is representable:
+    /// the bottom level lags a bucket, so `last_drained` would be −1.
     next_vid: u64,
     len: usize,
 }
@@ -201,15 +127,10 @@ impl<T: Copy> Level<T> {
             tick_ms,
             buckets: Box::new(core::array::from_fn(|_| Vec::new())),
             occupied: 0,
-            // Nothing has been drained yet, and nothing may be treated as
-            // overdue at construction: the cursor starts exactly where
-            // the first legal insert slot begins.
-            //
-            // `+ (1 - lag)` rather than `+ 1 - lag`: the bottom level
-            // divides by a tick as small as 1ms, so `vid + 1` can
-            // overflow at the top of the u64 range even though the final
-            // value cannot. Folding the constants keeps the intermediate
-            // in range.
+            // Starts where the first legal insert slot begins, so
+            // nothing counts as overdue at construction. `+ (1 - lag)`
+            // and not `+ 1 - lag`: with a 1ms tick the intermediate can
+            // overflow u64 even though the result cannot.
             next_vid: now_ms / tick_ms + (1 - lag),
             len: 0,
         }
@@ -221,12 +142,9 @@ impl<T: Copy> Level<T> {
         at_ms / self.tick_ms
     }
 
-    /// Can a timer due at `vid` be stored here without aliasing a bucket
-    /// that is already spoken for?
-    ///
-    /// The live window is the 64 ids starting at the cursor. Below it the
-    /// bucket is already past; at or above `+ WHEEL_SIZE` the id wraps
-    /// onto a bucket belonging to a different rotation.
+    /// Live window: the 64 ids from the cursor. Below it the bucket is
+    /// past; at or above `+ WHEEL_SIZE` the id wraps onto another
+    /// rotation's bucket.
     #[inline]
     fn accepts(&self, vid: u64) -> bool {
         vid >= self.next_vid && vid < self.next_vid + WHEEL_BITS
@@ -241,10 +159,9 @@ impl<T: Copy> Level<T> {
         self.len += 1;
     }
 
-    /// Move the cursor to `now_ms` and hand every bucket it passes to
-    /// `out`. `lag` selects the flush rule: 1 for the bottom level (flush
-    /// at the bucket's end, never early), 0 for upper levels (flush at
-    /// the start, so the cascade lands with a full span of room).
+    /// Move the cursor to `now_ms`, handing every bucket it passes to
+    /// `out`. `lag` picks the flush rule: 1 at the bottom (bucket end,
+    /// never early), 0 above (bucket start, so the cascade has room).
     fn drain_due(&mut self, now_ms: u64, lag: u64, out: &mut Vec<Timer<T>>) {
         // See `Level::new` for why the constants are folded.
         let limit = self.vid(now_ms) + (1 - lag);
@@ -252,9 +169,8 @@ impl<T: Copy> Level<T> {
             return;
         }
         if self.occupied == 0 {
-            // Nothing to hand over — skip the bucket walk. Once a
-            // hierarchy has grown, most of its levels are idle most of
-            // the time, and this is the whole cost of them.
+            // Most levels of a grown hierarchy are idle most of the
+            // time, and this branch is their whole cost.
             self.next_vid = limit;
             return;
         }
@@ -272,18 +188,15 @@ impl<T: Copy> Level<T> {
             self.len -= drained;
             out.append(bucket);
             self.occupied &= !(1u64 << idx);
-            // `append` leaves the capacity behind; hand back what a
-            // spike grabbed, but not what the steady load is using.
+            // `append` leaves the capacity behind.
             trim(bucket, drained, BUCKET_RETAIN_CAP);
         }
         self.next_vid = limit;
     }
 
-    /// Instant at which this level next has something to hand over, or
-    /// `None` when it holds nothing.
-    ///
-    /// Rotating the occupancy mask so the cursor lands on bit 0 turns
-    /// "find the nearest non-empty bucket" into one `trailing_zeros`.
+    /// When this level next has something to hand over. Rotating the
+    /// mask so the cursor sits on bit 0 turns "nearest non-empty bucket"
+    /// into one `trailing_zeros`.
     #[inline]
     fn next_due_ms(&self, lag: u64) -> Option<u64> {
         if self.occupied == 0 {
@@ -291,8 +204,7 @@ impl<T: Copy> Level<T> {
         }
         let rot = (self.next_vid % WHEEL_BITS) as u32;
         let ahead = self.occupied.rotate_right(rot).trailing_zeros() as u64;
-        // Bucket `vid` is handed over once `now / tick + 1 - lag > vid`,
-        // that is once `now` reaches `(vid + lag) * tick`.
+        // Handed over once `now` reaches `(vid + lag) * tick`.
         Some((self.next_vid + ahead + lag) * self.tick_ms)
     }
 
@@ -308,10 +220,8 @@ impl<T: Copy> Level<T> {
     }
 }
 
-/// Hierarchical timing wheel over absolute milliseconds.
-///
-/// See the module docs for the shape, the firing guarantee and the
-/// reasoning behind lazy cancel.
+/// Hierarchical timing wheel over absolute milliseconds. See the module
+/// docs for the shape and the firing guarantee.
 ///
 /// ```
 /// use arbitro_common::hierarchical_wheel::{HierarchicalTimingWheel, Insert};
@@ -333,27 +243,21 @@ impl<T: Copy> Level<T> {
 /// ```
 pub struct HierarchicalTimingWheel<T: Copy> {
     levels: Vec<Level<T>>,
-    /// Base resolution, and the resolution of level 0.
     tick_ms: u64,
     now_ms: u64,
     len: usize,
-    /// Reused across `advance_to` calls so cascading allocates nothing in
-    /// steady state.
+    /// Reused so cascading allocates nothing in steady state.
     scratch: Vec<Timer<T>>,
 }
 
 impl<T: Copy> HierarchicalTimingWheel<T> {
-    /// Build a wheel with `tick_ms` resolution whose clock starts at
-    /// `start_ms`.
-    ///
-    /// `start_ms` should come from the same monotonic source later fed to
-    /// [`Self::advance_to`]; the wheel only ever compares instants, so
-    /// the origin is arbitrary as long as it is consistent.
+    /// Build a wheel with `tick_ms` resolution, clock starting at
+    /// `start_ms`. The wheel only compares instants, so the origin is
+    /// arbitrary as long as it matches what [`Self::advance_to`] gets.
     ///
     /// # Panics
     ///
-    /// If `tick_ms` is zero — a wheel with no resolution has no meaning,
-    /// and every bucket calculation divides by it.
+    /// If `tick_ms` is zero — every bucket calculation divides by it.
     pub fn new(tick_ms: u64, start_ms: u64) -> Self {
         assert!(tick_ms > 0, "tick_ms must be at least 1ms");
         Self {
@@ -365,15 +269,13 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         }
     }
 
-    /// Schedule `value` to come due at `expire_at_ms`.
+    /// Schedule `value` for `expire_at_ms`.
     ///
-    /// Returns [`Insert::Elapsed`] — and stores nothing — when the
-    /// deadline is at or before the wheel's current time. Otherwise the
-    /// timer is stored and will surface from an `advance_to` at or after
-    /// its deadline, never before, and by at most one `tick_ms` after.
+    /// [`Insert::Elapsed`] stores nothing — the deadline was already at
+    /// or before now. Otherwise it surfaces from a later `advance_to`,
+    /// never before its deadline and at most one `tick_ms` after.
     ///
-    /// O(levels) worst case, and O(1) for the common case of a deadline
-    /// inside level 0.
+    /// O(1) for a deadline inside level 0, O(levels) worst case.
     pub fn insert(&mut self, value: T, expire_at_ms: u64) -> Insert {
         if expire_at_ms <= self.now_ms {
             return Insert::Elapsed;
@@ -389,18 +291,13 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         Insert::Scheduled
     }
 
-    /// Move the clock to `now_ms` and collect everything due into `out`,
-    /// which is cleared first.
+    /// Move the clock to `now_ms` and collect what is due into `out`,
+    /// which is cleared first. Timers surface exactly once.
     ///
-    /// Time only moves forward: a `now_ms` at or below the current time
-    /// is ignored, so a non-monotonic clock cannot rewind the wheel or
-    /// double-fire a timer. Jumps of any size are fine — the wheel
-    /// catches up in this one call, which is what lets the driver sleep
-    /// to [`Self::next_expiry_ms`] instead of ticking.
-    ///
-    /// Timers surface exactly once. Cascading from upper levels happens
-    /// here, so a single call can both hand a timer down several levels
-    /// and fire it.
+    /// Time only moves forward; a `now_ms` at or below the current one is
+    /// ignored, so a non-monotonic clock cannot rewind or double-fire.
+    /// Jumps of any size catch up in this one call — which is what lets
+    /// the driver sleep to [`Self::next_expiry_ms`] instead of ticking.
     pub fn advance_to(&mut self, now_ms: u64, out: &mut Vec<T>) {
         out.clear();
         if now_ms <= self.now_ms {
@@ -408,21 +305,15 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         }
         self.now_ms = now_ms;
 
-        // Taken out so levels can be drained while others are written;
-        // put back before returning so the buffer is reused.
         let mut scratch = core::mem::take(&mut self.scratch);
         debug_assert!(scratch.is_empty(), "scratch is emptied before storing");
 
-        // Every cursor moves to `now` *before* anything is re-placed.
-        //
-        // This ordering is the whole correctness argument. A timer handed
-        // down from an upper level is measured against the receiving
-        // level's cursor; if that cursor were still at the previous
-        // instant it would read the timer as "too far ahead", reject it,
-        // and bounce it back up — after a long sleep, all the way to the
-        // top level's parking bucket, where it would sit for years.
-        // Kafka avoids the same trap by having `advanceClock` set the
-        // time on every level before flushing a single bucket.
+        // Every cursor moves to `now` BEFORE anything is re-placed, and
+        // that ordering is the correctness argument. A timer handed down
+        // is measured against the receiving level's cursor; a stale
+        // cursor reads it as too far ahead and bounces it back up — after
+        // a long sleep, into the top level's parking bucket. Kafka avoids
+        // the same trap by setting every level's clock before flushing.
         for li in 0..self.levels.len() {
             let lag = if li == 0 { BOTTOM_LAG } else { UPPER_LAG };
             self.levels[li].drain_due(now_ms, lag, &mut scratch);
@@ -434,33 +325,28 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
                 out.push(timer.value);
                 self.len -= 1;
             } else {
-                // Only reachable from an upper level: level 0 lags a full
-                // bucket precisely so everything it releases is due.
-                // With all cursors current this lands one pass down and
-                // needs no further cascade in this call.
+                // Only from an upper level — level 0 lags a bucket so
+                // everything it releases is due. With cursors current
+                // this lands one pass down, no further cascade needed.
                 self.place(timer, 0);
             }
         }
 
         scratch.clear();
-        // Without this the scratch buffer keeps the largest catch-up it
-        // ever performed, for the life of the process — the per-bucket
-        // trimming above would just be moving the burst in here.
+        // Without this, scratch keeps the largest catch-up it ever did
+        // for the life of the process, and the per-bucket trimming above
+        // would just be moving the burst in here.
         trim(&mut scratch, drained, SCRATCH_RETAIN_CAP);
         self.scratch = scratch;
     }
 
-    /// The instant the driver must call [`Self::advance_to`] again, or
-    /// `None` when nothing is scheduled.
+    /// When to call [`Self::advance_to`] next, or `None` if nothing is
+    /// scheduled — which is the point: an idle wheel arms no timer, so
+    /// its cost does not follow `tick_ms`.
     ///
-    /// `None` is the whole point of the design: with nothing pending the
-    /// driver arms no timer, so an idle wheel costs nothing no matter how
-    /// fine `tick_ms` is.
-    ///
-    /// The returned instant is the earliest at which *some* level has
-    /// work — for upper levels that work is a cascade, not a fire, so a
-    /// wake can legitimately produce an empty `out`. Firing still
-    /// happens no later than one `tick_ms` past the deadline.
+    /// This is the earliest instant *some* level has work; upstairs that
+    /// work is a cascade, not a fire, so a wake may produce an empty
+    /// `out`. Firing still lands within a tick of the deadline.
     ///
     /// O(levels), a couple of bit instructions each.
     pub fn next_expiry_ms(&self) -> Option<u64> {
@@ -477,11 +363,8 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         best
     }
 
-    /// How long the driver should sleep from `now_ms`, saturating at zero
-    /// when something is already due. `None` when nothing is scheduled.
-    ///
-    /// Convenience over [`Self::next_expiry_ms`] for drivers that hold a
-    /// duration rather than a deadline.
+    /// [`Self::next_expiry_ms`] as a duration from `now_ms`, saturating
+    /// at zero when something is already due.
     pub fn sleep_for_ms(&self, now_ms: u64) -> Option<u64> {
         self.next_expiry_ms().map(|due| due.saturating_sub(now_ms))
     }
@@ -509,16 +392,15 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         self.tick_ms
     }
 
-    /// Levels currently allocated. Grows only when a deadline reaches
-    /// past the existing top, never shrinks.
+    /// Levels allocated. Grows when a deadline reaches past the top,
+    /// never shrinks.
     #[inline]
     pub fn levels(&self) -> usize {
         self.levels.len()
     }
 
-    /// Span the current levels cover from `now`, in milliseconds. A
-    /// deadline past this parks and is re-placed later — it is not
-    /// clamped, and not lost.
+    /// Span the current levels cover, in ms. A deadline past this parks
+    /// and is re-placed later — not clamped, not lost.
     pub fn span_ms(&self) -> u64 {
         self.levels
             .last()
@@ -533,14 +415,11 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         self.len = 0;
     }
 
-    /// Hand back every byte the wheel is not currently using.
+    /// Hand back every byte the wheel is not using.
     ///
-    /// Draining trims with hysteresis, which keeps the working set of a
-    /// steady load and walks a spike back down over the rotations that
-    /// follow it. A wheel that goes quiet has no rotations left to do
-    /// that with, so a driver that knows its shard has gone idle can
-    /// call this to release the rest. Purely an optimisation — it
-    /// changes no behaviour, and skipping it costs only memory.
+    /// Draining trims with hysteresis, which needs rotations to work; a
+    /// wheel that has gone quiet has none left. Purely an optimisation —
+    /// skipping it costs only memory.
     pub fn shrink_to_fit(&mut self) {
         for level in self.levels.iter_mut() {
             for bucket in level.buckets.iter_mut() {
@@ -551,11 +430,8 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
     }
 
     /// Store `timer` at the finest level at or above `from_level` that
-    /// can hold it, growing the hierarchy when the deadline outruns the
-    /// current top.
-    ///
-    /// Callers guarantee `timer.expire_at_ms > self.now_ms`; `insert`
-    /// checks it and the cascade re-checks it per timer.
+    /// can hold it, growing the hierarchy if the deadline outruns the
+    /// top. Callers guarantee `expire_at_ms > now_ms`.
     fn place(&mut self, timer: Timer<T>, from_level: usize) {
         debug_assert!(timer.expire_at_ms > self.now_ms, "a due timer must fire");
         for li in from_level..self.levels.len() {
@@ -566,8 +442,7 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
             }
         }
 
-        // Past the top: add coarser levels until it fits, or until the
-        // cap says stop.
+        // Past the top: add coarser levels until it fits, or hit the cap.
         while self.levels.len() < MAX_LEVELS {
             let top_tick = self.levels[self.levels.len() - 1].tick_ms;
             let Some(next_tick) = top_tick.checked_mul(WHEEL_BITS) else {
@@ -583,11 +458,10 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
             }
         }
 
-        // Still too far even at the cap. Park in the top level's furthest
-        // bucket rather than clamp: when that bucket comes due the timer
-        // is re-placed against the advanced clock, and either fits or
-        // parks again. Late by construction, never early, never wrong —
-        // one pass here covers the top level's entire span.
+        // Still too far at the cap. Park in the top level's furthest
+        // bucket rather than clamp: when it comes due the timer is
+        // re-placed against the advanced clock and either fits or parks
+        // again. One pass covers the top level's whole span.
         let li = self.levels.len() - 1;
         let park = self.levels[li].next_vid + WHEEL_BITS - 1;
         self.levels[li].push(park, timer);

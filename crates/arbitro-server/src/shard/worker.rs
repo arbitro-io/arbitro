@@ -466,11 +466,20 @@ pub struct CommandWorker {
     /// Timing wheel for ack deadlines and nack-with-delay.
     /// Created lazily on first consumer with ack_wait_ms > 0.
     /// Resolution: 1 second per tick, 120 buckets = covers up to 120s.
-    pub(super) wheel: Option<arbitro_common::TimingWheel<arbitro_common::WheelEntry>>,
+    pub(super) wheel:
+        Option<arbitro_common::HierarchicalTimingWheel<arbitro_common::WheelEntry>>,
     /// Scratch buffer reused across wheel ticks to avoid allocation.
     pub(super) wheel_buf: Vec<arbitro_common::WheelEntry>,
-    /// Next time to advance the wheel (1 tick per second).
-    pub(super) next_wheel_tick: Option<Instant>,
+    /// When the timer arm next runs, `epoch`-relative. `None` disables
+    /// the arm: driven by deadlines rather than a tick, an idle shard
+    /// arms nothing.
+    pub(super) next_timer_ms: Option<u64>,
+    /// Origin for every millisecond the worker deals in.
+    pub(super) epoch: Instant,
+    /// When the idempotency trackers were last advanced. The difference
+    /// against now is what they get, so their windows follow wall time
+    /// rather than a count of wakeups.
+    pub(super) last_idempotency_ms: u64,
     /// Per-shard idempotency dedup, shared with `dispatch_v2` so the
     /// publish hot path can check membership and record new entries
     /// (publishes don't go through this worker — they hit the store
@@ -536,13 +545,6 @@ pub struct CommandWorker {
     /// already-populated store.
     pub(super) replay_mode: bool,
 
-    /// H12: timestamp of the last `wheel_tick + idempotency tick` pass.
-    /// The `tokio::select!` sleep arm can be starved when commands are
-    /// arriving continuously; this field lets `dispatch_command` force
-    /// a tick after every WHEEL_TICK_INTERVAL of wall time. The
-    /// `Option` stays `None` until the first command runs, so the
-    /// behaviour for a quiescent shard is unchanged.
-    pub(super) last_wheel_tick: Option<Instant>,
     /// F16 — incremental eviction resume cursor. evict_expired walks the
     /// store at most `EVICT_WALK_CAP` entries per call and stores the
     /// next-to-scan seq here so the following call picks up from where
@@ -570,11 +572,16 @@ pub struct CommandWorker {
 impl CommandWorker {
     /// Eviction interval — cold path, runs every 5 seconds.
     const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
-    /// Wheel tick interval — 1 second resolution.
-    pub(super) const WHEEL_TICK_INTERVAL: Duration = Duration::from_secs(1);
-    /// Number of wheel buckets (max delay in seconds). Exposed to handlers
-    /// so M6 can clamp nack delay_ms without wrapping the bucket index.
-    pub(super) const WHEEL_BUCKETS: usize = 120;
+    /// Base resolution of the ack-timeout / nack-delay wheel: how late a
+    /// deadline can fire, never how early. The hierarchical wheel arms no
+    /// wakeups while idle, so this is chosen for the precision a delay
+    /// deserves, not for what the shard can afford to wake for.
+    pub(super) const WHEEL_TICK_MS: u64 = 100;
+
+    /// How often dedup windows are retired. Coarser than the wheel on
+    /// purpose: a window is minutes long, the tracker buckets in seconds,
+    /// and there is one tracker per stream.
+    const IDEMPOTENCY_INTERVAL_MS: u64 = 1_000;
 
     /// Async command loop — runs as a `tokio::spawn` task.
     pub async fn run(mut self) {
@@ -657,11 +664,17 @@ impl CommandWorker {
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Self::EVICTION_INTERVAL);
 
-            // Wheel tick sleep — only active when wheel exists.
-            let wheel_sleep = self
-                .next_wheel_tick
-                .map(|t| t.saturating_duration_since(Instant::now()))
-                .unwrap_or(Self::EVICTION_INTERVAL); // dormant if no wheel
+            // Every pass, not just where timers are inserted: the
+            // idempotency trackers are allocated lazily by the publish
+            // path, which runs elsewhere and cannot re-arm anything.
+            // A few bit ops and one relaxed load.
+            self.rearm_timer();
+
+            // The wheel's own next deadline, not a tick.
+            let timer_sleep = self
+                .next_timer_ms
+                .map(|due| Duration::from_millis(due.saturating_sub(self.now_ms())))
+                .unwrap_or(Self::EVICTION_INTERVAL);
 
             if self.accum_total > 0 {
                 let timeout = self
@@ -690,24 +703,11 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed) => {
-                        // Both timers run at the same 1-second cadence;
-                        // one tokio::sleep drives both. Wheel tick is a
-                        // no-op when wheel is None. Idempotency tick
-                        // locks the shared Arc<Mutex<>>; the publish
-                        // path also locks it on idempotent publishes,
-                        // but contention is negligible (publish lock
-                        // hold time = HashMap lookup, sub-microsecond).
-                        self.wheel_tick();
-                        // F26: tick every per-stream tracker. Outer
-                        // read lock is uncontended in steady state;
-                        // each per-stream Mutex is taken only briefly.
-                        let guard = self.idempotency_tracker.read();
-                        for tracker_arc in guard.values() {
-                            tracker_arc.lock().tick();
-                        }
-                        drop(guard);
-                        self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
+                    _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
+                        // One sleep, two wheels, no shared cadence: the
+                        // deadline is whichever comes first and each gets
+                        // the wall time that actually elapsed.
+                        self.run_timers();
                     }
                 }
             } else {
@@ -729,24 +729,11 @@ impl CommandWorker {
                         self.evict_expired();
                         self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                     }
-                    _ = tokio::time::sleep(wheel_sleep), if self.wheel.is_some() || self.has_idempotency.load(std::sync::atomic::Ordering::Relaxed) => {
-                        // Both timers run at the same 1-second cadence;
-                        // one tokio::sleep drives both. Wheel tick is a
-                        // no-op when wheel is None. Idempotency tick
-                        // locks the shared Arc<Mutex<>>; the publish
-                        // path also locks it on idempotent publishes,
-                        // but contention is negligible (publish lock
-                        // hold time = HashMap lookup, sub-microsecond).
-                        self.wheel_tick();
-                        // F26: tick every per-stream tracker. Outer
-                        // read lock is uncontended in steady state;
-                        // each per-stream Mutex is taken only briefly.
-                        let guard = self.idempotency_tracker.read();
-                        for tracker_arc in guard.values() {
-                            tracker_arc.lock().tick();
-                        }
-                        drop(guard);
-                        self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
+                    _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
+                        // One sleep, two wheels, no shared cadence: the
+                        // deadline is whichever comes first and each gets
+                        // the wall time that actually elapsed.
+                        self.run_timers();
                     }
                 }
             }
@@ -916,12 +903,38 @@ impl CommandWorker {
 
     // ── Timing wheel ─────────────────────────────────────────────────────────
 
+    /// Milliseconds since this worker's epoch — the single source of
+    /// time for both wheels, monotonic because `Instant` is.
+    #[inline]
+    pub(super) fn now_ms(&self) -> u64 {
+        Instant::now().duration_since(self.epoch).as_millis() as u64
+    }
+
     /// Ensure the wheel is initialized. Called lazily on first need.
     pub(super) fn ensure_wheel(&mut self) {
         if self.wheel.is_none() {
-            self.wheel = Some(arbitro_common::TimingWheel::new(Self::WHEEL_BUCKETS));
-            self.next_wheel_tick = Some(Instant::now() + Self::WHEEL_TICK_INTERVAL);
+            let now_ms = self.now_ms();
+            self.wheel = Some(arbitro_common::HierarchicalTimingWheel::new(
+                Self::WHEEL_TICK_MS,
+                now_ms,
+            ));
         }
+    }
+
+    /// The earlier of the wheel's next deadline and the next idempotency
+    /// sweep. `None` disables the arm — which is the point of asking the
+    /// wheel instead of ticking: a shard with nothing scheduled sleeps
+    /// until real work arrives, however fine [`Self::WHEEL_TICK_MS`] is.
+    pub(super) fn rearm_timer(&mut self) {
+        let wheel_due = self.wheel.as_ref().and_then(|w| w.next_expiry_ms());
+        let idempotency_due = self
+            .has_idempotency
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.last_idempotency_ms + Self::IDEMPOTENCY_INTERVAL_MS);
+        self.next_timer_ms = match (wheel_due, idempotency_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (only, None) | (None, only) => only,
+        };
     }
 
     /// Insert delivered entries into the wheel for ack-timeout tracking.
@@ -942,31 +955,43 @@ impl CommandWorker {
         }
 
         self.ensure_wheel();
-        let delay_ticks = (ack_wait_ms / 1000).max(1); // at least 1 tick
+        // The instant ack_wait actually runs out. This was
+        // `ack_wait_ms / 1000` whole ticks, which truncated: 1500ms
+        // became one tick, so the broker auto-nacked inside the first
+        // second and redelivered a message whose ack_wait had not
+        // expired. Nothing left to round now.
+        let now_ms = self.now_ms();
+        let deadline_ms = now_ms + u64::from(ack_wait_ms);
 
         let wheel = self.wheel.as_mut().unwrap();
         for entry in entries {
             // M5: explicit kind tag — no more "subject_hash == 0" hack.
-            wheel.insert(
+            let outcome = wheel.insert(
                 arbitro_common::WheelEntry {
                     seq: entry.seq,
                     consumer_id: consumer_id.0,
                     subject_hash: entry.subject_hash,
                     kind: arbitro_common::WheelEntryKind::AckTimeout,
                 },
-                delay_ticks,
+                deadline_ms,
+            );
+            debug_assert_eq!(
+                outcome,
+                arbitro_common::Insert::Scheduled,
+                "ack_wait_ms > 0 was checked above"
             );
         }
+        self.rearm_timer();
     }
 
-    /// Advance the wheel by one tick. Process expired entries: verify
+    /// Move the wheel to `now_ms`. Process expired entries: verify
     /// still pending → auto-nack (cursor rewind + gate release).
-    fn wheel_tick(&mut self) {
+    fn wheel_advance(&mut self, now_ms: u64) {
         let wheel = match self.wheel.as_mut() {
             Some(w) => w,
             None => return,
         };
-        wheel.advance_into(&mut self.wheel_buf);
+        wheel.advance_to(now_ms, &mut self.wheel_buf);
         if self.wheel_buf.is_empty() {
             return;
         }
@@ -1075,36 +1100,44 @@ impl CommandWorker {
         }
     }
 
-    /// H12: run the wheel + idempotency tick if at least
-    /// `WHEEL_TICK_INTERVAL` has elapsed since the last pass. Called
-    /// after every dispatched command so a busy shard doesn't starve
-    /// the timer arm of the `tokio::select!`. Idle shards still fall
-    /// back to the sleep-driven branch in `run()`.
-    fn maybe_tick_periodic(&mut self) {
-        let now = Instant::now();
-        let due = match self.last_wheel_tick {
-            Some(last) => now.duration_since(last) >= Self::WHEEL_TICK_INTERVAL,
-            None => true,
-        };
-        if !due {
-            return;
-        }
-        if !(self.wheel.is_some()
-            || self
+    /// Move the wheel to `now`, retire whatever dedup windows ran out,
+    /// re-arm. Safe at any moment: both wheels take an instant, so an
+    /// early call moves nothing and a late one catches up in full.
+    fn run_timers(&mut self) {
+        let now_ms = self.now_ms();
+        self.wheel_advance(now_ms);
+
+        // F26: every per-stream tracker. Handing over elapsed wall time
+        // rather than a tick count keeps the windows honest even though
+        // this arm competes with command traffic and is regularly late.
+        let elapsed = now_ms.saturating_sub(self.last_idempotency_ms);
+        if elapsed >= Self::IDEMPOTENCY_INTERVAL_MS
+            && self
                 .has_idempotency
-                .load(std::sync::atomic::Ordering::Relaxed))
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
-            self.last_wheel_tick = Some(now);
+            let guard = self.idempotency_tracker.read();
+            for tracker_arc in guard.values() {
+                tracker_arc.lock().advance_by_ms(elapsed);
+            }
+            drop(guard);
+            self.last_idempotency_ms = now_ms;
+        }
+
+        self.rearm_timer();
+    }
+
+    /// H12: run a pass if its deadline has gone by. Called after every
+    /// dispatched command so a busy shard doesn't starve the `select!`
+    /// timer arm. Idle shards fall back to the sleep-driven branch.
+    fn maybe_tick_periodic(&mut self) {
+        let Some(due_ms) = self.next_timer_ms else {
+            return;
+        };
+        if self.now_ms() < due_ms {
             return;
         }
-        self.wheel_tick();
-        let guard = self.idempotency_tracker.read();
-        for tracker_arc in guard.values() {
-            tracker_arc.lock().tick();
-        }
-        drop(guard);
-        self.last_wheel_tick = Some(now);
-        self.next_wheel_tick = Some(now + Self::WHEEL_TICK_INTERVAL);
+        self.run_timers();
     }
 
     /// Returns `true` if shutdown was requested.
@@ -1536,7 +1569,9 @@ mod tests {
             next_eviction: None,
             wheel: None,
             wheel_buf: Vec::new(),
-            next_wheel_tick: None,
+            next_timer_ms: None,
+            epoch: Instant::now(),
+            last_idempotency_ms: 0,
             idempotency_tracker: crate::shard::idempotency::new_shared_idempotency(),
             has_idempotency: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flush_stream_ids: Vec::new(),
@@ -1544,7 +1579,6 @@ mod tests {
             pending_consumer_remove: Vec::new(),
             pending_drain_acks: Vec::new(),
             ack_floors: crate::shard::ack_floor::AckFloors::new(),
-            last_wheel_tick: None,
             evict_resume_seq: 0,
             stream_oldest_ts: HashMap::default(),
             dlq_nack_counts: HashMap::with_hasher(foldhash::fast::FixedState::default()),

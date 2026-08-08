@@ -450,26 +450,32 @@ impl CommandWorker {
 
             self.apply_delta_and_sync(&delta, false);
 
-            // Insert into wheel — delay_ms converted to ticks (1 tick = 1s).
-            // M6: clamp to `WHEEL_BUCKETS - 1` so a caller passing
-            // delay_ms > 120_000 doesn't wrap the bucket index back to the
-            // current bucket (which would fire the entry immediately
-            // instead of after the requested delay).
-            let max_ticks = (Self::WHEEL_BUCKETS as u32).saturating_sub(1);
-            let delay_ticks = ((cmd.delay_ms as u64).div_ceil(1000) as u32).min(max_ticks);
+            // The instant the caller asked for. This used to round up to
+            // whole seconds and clamp at `WHEEL_BUCKETS - 1`, because the
+            // flat ring could not express anything further out — a
+            // request for ten minutes came back after 119 seconds and
+            // nobody was told. No rounding beyond the wheel's own
+            // resolution now, and no ceiling.
             self.ensure_wheel();
+            let deadline_ms = self.now_ms() + u64::from(cmd.delay_ms);
             let wheel = self.wheel.as_mut().unwrap();
             for entry in &cmd.entries {
-                wheel.insert(
+                let outcome = wheel.insert(
                     arbitro_common::WheelEntry {
                         seq: entry.seq,
                         consumer_id: cmd.consumer_id.0,
                         subject_hash: 0, // not needed for nack-delay rewind
                         kind: arbitro_common::WheelEntryKind::NackDelay,
                     },
-                    delay_ticks,
+                    deadline_ms,
+                );
+                debug_assert_eq!(
+                    outcome,
+                    arbitro_common::Insert::Scheduled,
+                    "delay_ms > 0 guards this branch"
                 );
             }
+            self.rearm_timer();
 
             let _ = cmd.reply.send(NackReply {
                 requeued,

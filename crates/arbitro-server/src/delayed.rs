@@ -519,3 +519,19 @@ fn current_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// Same clock, rounded up — for stamping a deadline rather than testing
+/// one.
+///
+/// A delay may mature late, never early, and two things push it early:
+/// the server's cached clock is refreshed on a timer so it reads behind,
+/// and truncating to whole ms throws away time already passed. Reading
+/// directly and rounding up does neither, and this is the cold path.
+#[inline]
+pub fn stamp_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .div_ceil(1_000_000) as u64
+}

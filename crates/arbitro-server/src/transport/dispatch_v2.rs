@@ -840,7 +840,10 @@ fn v2_publish_delayed(
         }
     };
 
-    let now_ms = server.now_ms();
+    // Direct read, not the server's cached clock: the cache is refreshed
+    // on a timer, so a deadline stamped from it is anchored in the past
+    // and matures early. See `delayed::stamp_now_ms`.
+    let now_ms = crate::delayed::stamp_now_ms();
     let deliver_at_ms = now_ms + delay_ms;
 
     let mut j = journal.lock();

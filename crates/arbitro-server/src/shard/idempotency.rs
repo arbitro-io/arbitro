@@ -146,6 +146,8 @@ pub struct IdempotencyTracker {
     wheel: TimingWheel<IdempotencyEntry>,
     /// Scratch buffer reused on every `tick()` to avoid allocation.
     drain_buf: Vec<IdempotencyEntry>,
+    /// Wall time since the last whole tick was consumed, in ms.
+    pending_ms: u64,
 }
 
 impl IdempotencyTracker {
@@ -154,6 +156,7 @@ impl IdempotencyTracker {
             seen: HashMap::with_hasher(FixedState::default()),
             wheel: TimingWheel::new(WHEEL_BUCKETS),
             drain_buf: Vec::with_capacity(256),
+            pending_ms: 0,
         }
     }
 
@@ -261,6 +264,22 @@ impl IdempotencyTracker {
     /// 64-bit foldhash on bounded id-space (msg_ids per stream within
     /// a 5-minute window) is dominated by the birthday bound — even at
     /// 10M ids/window the expected collision count is ~3 × 10⁻⁶.
+    /// Retire whatever `elapsed_ms` of wall time has expired.
+    ///
+    /// The worker's timer now runs at the ack wheel's resolution, far
+    /// finer than this needs. Counting its wakeups and dividing would
+    /// desynchronise the moment one is late — and it competes in a
+    /// `select!` with command traffic, so late is normal. Elapsed time
+    /// plus a carried remainder keeps a five-minute window five minutes
+    /// long however irregular the caller is.
+    pub fn advance_by_ms(&mut self, elapsed_ms: u64) {
+        self.pending_ms += elapsed_ms;
+        while self.pending_ms >= TICK_MS {
+            self.pending_ms -= TICK_MS;
+            self.tick();
+        }
+    }
+
     pub fn tick(&mut self) {
         self.wheel.advance_into(&mut self.drain_buf);
         for e in self.drain_buf.drain(..) {
