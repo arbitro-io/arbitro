@@ -72,13 +72,19 @@
 //!
 //! # Memory
 //!
-//! - Buckets: `WHEEL_SIZE × 24` bytes per level (empty `Vec` headers),
-//!   ≈ 1.5 KB, so ≈ 9 KB with all [`MAX_LEVELS`] levels — and levels are
-//!   created only when a deadline reaches that far.
+//! - Structure: `WHEEL_SIZE × 24` bytes of `Vec` headers per level,
+//!   ≈ 1.5 KB, so ≈ 9 KB even with all [`MAX_LEVELS`] levels — and
+//!   levels exist only once a deadline has reached that far.
 //! - Timers: [`Timer<T>`] is `T` plus a `u64` deadline, heap-resident
-//!   only while scheduled.
-//! - Bucket capacity is trimmed back to [`BUCKET_RETAIN_CAP`] after a
-//!   drain, so a one-off burst does not pin its high-water mark forever.
+//!   only while scheduled, so this term tracks the number of timers in
+//!   flight rather than the shape of the wheel.
+//! - Buffers: bucket and scratch capacity is trimmed after a drain with
+//!   hysteresis — a steady load keeps its working buffers instead of
+//!   shrinking and regrowing every rotation, while a one-off spike is
+//!   walked back down over the rotations that follow. A wheel that goes
+//!   quiet has no rotations left to do that with; [`
+//!   HierarchicalTimingWheel::shrink_to_fit`] releases the remainder for
+//!   a driver that knows it has gone idle.
 //!
 //! `T: Copy` means `T: !Drop`: the wheel owns nothing that can leak, only
 //! its own `Vec`s. There is no `unsafe`, no interior mutability, and no
@@ -110,10 +116,31 @@ const WHEEL_BITS: u64 = WHEEL_SIZE as u64;
 /// `64⁶ ms` ≈ 2.2 years; with `tick_ms = 100` it spans centuries.
 pub const MAX_LEVELS: usize = 6;
 
-/// Capacity a bucket keeps after being drained. Bounds the memory a
-/// traffic burst leaves behind while still avoiding a realloc per insert
-/// in steady state.
+/// Floor below which a drained bucket is never trimmed.
 const BUCKET_RETAIN_CAP: usize = 16;
+
+/// Floor below which the cascade scratch buffer is never trimmed. Sized
+/// so an ordinary wake, which touches at most a rotation's worth of
+/// buckets, never reallocates.
+const SCRATCH_RETAIN_CAP: usize = WHEEL_SIZE * 4;
+
+/// Give back capacity a spike left behind, with hysteresis.
+///
+/// Trimming unconditionally back to a fixed floor would be worse than
+/// not trimming at all: a bucket holding a steady thousand timers would
+/// shrink to the floor on every drain and regrow through ~7 reallocs on
+/// every rotation, turning an allocation-free steady state into
+/// guaranteed allocator churn. Keeping twice the last drain, and only
+/// acting once capacity exceeds twice *that*, leaves a steady load alone
+/// and still walks a one-off spike back down over the following
+/// rotations.
+#[inline]
+fn trim<E>(buf: &mut Vec<E>, last_len: usize, floor: usize) {
+    let keep = last_len.saturating_mul(2).max(floor);
+    if buf.capacity() > keep.saturating_mul(2) {
+        buf.shrink_to(keep);
+    }
+}
 
 /// Level 0 lags one bucket behind the clock so it never fires early; see
 /// the module docs. Upper levels use Kafka's rule and cascade at the
@@ -151,9 +178,12 @@ struct Timer<T: Copy> {
 struct Level<T: Copy> {
     /// Milliseconds one bucket covers.
     tick_ms: u64,
-    buckets: Box<[Vec<Timer<T>>]>,
+    /// Fixed-size so the compiler can prove `vid % WHEEL_BITS` is in
+    /// bounds and drop the check on every push and drain.
+    buckets: Box<[Vec<Timer<T>>; WHEEL_SIZE]>,
     /// Bit `i` set ⇔ `buckets[i]` is non-empty. Kept in step with the
-    /// buckets on every push and drain; `debug_assert`ed in tests.
+    /// buckets on every push and drain, and cross-checked against the
+    /// buckets themselves by this file's `assert_consistent` helper.
     occupied: u64,
     /// First virtual bucket id not yet drained — the cursor.
     ///
@@ -167,15 +197,20 @@ struct Level<T: Copy> {
 impl<T: Copy> Level<T> {
     fn new(tick_ms: u64, now_ms: u64, lag: u64) -> Self {
         debug_assert!(tick_ms > 0);
-        let buckets: Vec<Vec<Timer<T>>> = (0..WHEEL_SIZE).map(|_| Vec::new()).collect();
         Self {
             tick_ms,
-            buckets: buckets.into_boxed_slice(),
+            buckets: Box::new(core::array::from_fn(|_| Vec::new())),
             occupied: 0,
             // Nothing has been drained yet, and nothing may be treated as
             // overdue at construction: the cursor starts exactly where
             // the first legal insert slot begins.
-            next_vid: now_ms / tick_ms + 1 - lag,
+            //
+            // `+ (1 - lag)` rather than `+ 1 - lag`: the bottom level
+            // divides by a tick as small as 1ms, so `vid + 1` can
+            // overflow at the top of the u64 range even though the final
+            // value cannot. Folding the constants keeps the intermediate
+            // in range.
+            next_vid: now_ms / tick_ms + (1 - lag),
             len: 0,
         }
     }
@@ -211,8 +246,16 @@ impl<T: Copy> Level<T> {
     /// at the bucket's end, never early), 0 for upper levels (flush at
     /// the start, so the cascade lands with a full span of room).
     fn drain_due(&mut self, now_ms: u64, lag: u64, out: &mut Vec<Timer<T>>) {
-        let limit = self.vid(now_ms) + 1 - lag;
+        // See `Level::new` for why the constants are folded.
+        let limit = self.vid(now_ms) + (1 - lag);
         if limit <= self.next_vid {
+            return;
+        }
+        if self.occupied == 0 {
+            // Nothing to hand over — skip the bucket walk. Once a
+            // hierarchy has grown, most of its levels are idle most of
+            // the time, and this is the whole cost of them.
+            self.next_vid = limit;
             return;
         }
         // A jump longer than one rotation would revisit buckets; every
@@ -225,14 +268,13 @@ impl<T: Copy> Level<T> {
                 continue;
             }
             let bucket = &mut self.buckets[idx];
-            self.len -= bucket.len();
+            let drained = bucket.len();
+            self.len -= drained;
             out.append(bucket);
             self.occupied &= !(1u64 << idx);
-            // `append` leaves the capacity behind; give back anything a
-            // burst grabbed so the high-water mark is not permanent.
-            if bucket.capacity() > BUCKET_RETAIN_CAP {
-                bucket.shrink_to(BUCKET_RETAIN_CAP);
-            }
+            // `append` leaves the capacity behind; hand back what a
+            // spike grabbed, but not what the steady load is using.
+            trim(bucket, drained, BUCKET_RETAIN_CAP);
         }
         self.next_vid = limit;
     }
@@ -369,7 +411,7 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         // Taken out so levels can be drained while others are written;
         // put back before returning so the buffer is reused.
         let mut scratch = core::mem::take(&mut self.scratch);
-        scratch.clear();
+        debug_assert!(scratch.is_empty(), "scratch is emptied before storing");
 
         // Every cursor moves to `now` *before* anything is re-placed.
         //
@@ -386,6 +428,7 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
             self.levels[li].drain_due(now_ms, lag, &mut scratch);
         }
 
+        let drained = scratch.len();
         for timer in scratch.iter().copied() {
             if timer.expire_at_ms <= now_ms {
                 out.push(timer.value);
@@ -400,6 +443,10 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
         }
 
         scratch.clear();
+        // Without this the scratch buffer keeps the largest catch-up it
+        // ever performed, for the life of the process — the per-bucket
+        // trimming above would just be moving the burst in here.
+        trim(&mut scratch, drained, SCRATCH_RETAIN_CAP);
         self.scratch = scratch;
     }
 
@@ -484,6 +531,23 @@ impl<T: Copy> HierarchicalTimingWheel<T> {
             level.clear();
         }
         self.len = 0;
+    }
+
+    /// Hand back every byte the wheel is not currently using.
+    ///
+    /// Draining trims with hysteresis, which keeps the working set of a
+    /// steady load and walks a spike back down over the rotations that
+    /// follow it. A wheel that goes quiet has no rotations left to do
+    /// that with, so a driver that knows its shard has gone idle can
+    /// call this to release the rest. Purely an optimisation — it
+    /// changes no behaviour, and skipping it costs only memory.
+    pub fn shrink_to_fit(&mut self) {
+        for level in self.levels.iter_mut() {
+            for bucket in level.buckets.iter_mut() {
+                bucket.shrink_to_fit();
+            }
+        }
+        self.scratch.shrink_to_fit();
     }
 
     /// Store `timer` at the finest level at or above `from_level` that
@@ -649,21 +713,25 @@ mod tests {
         let mut rng = Lcg::new(0xB0B);
         let mut deadlines = std::collections::HashMap::new();
 
-        for id in 0..1_000u64 {
-            // Reach past level 0 (6.4 s) so cascaded timers are covered
-            // by the bound too, not just the ones that never moved.
-            let deadline = rng.in_range(1, 400_000);
+        // Level spans at this tick: L0 6.4s, L1 409.6s, L2 26_214s.
+        // The range has to clear L1 or the bound is only ever checked on
+        // a single cascade, and a two-hop handover that lost a tick on
+        // the way down would go unnoticed.
+        const HORIZON: u64 = 5_000_000;
+        for id in 0..2_000u64 {
+            let deadline = rng.in_range(1, HORIZON);
             if wheel.insert(id, deadline) == Insert::Scheduled {
                 deadlines.insert(id, deadline);
             }
         }
+        assert!(wheel.levels() >= 3, "the range must reach level 2");
 
         // Driven one tick at a time, so "fired at" is the tightest
         // observation the resolution allows.
         let mut out = Vec::new();
         let mut seen = 0usize;
         let mut now = 0;
-        while now <= 500_000 {
+        while now <= HORIZON + TICK {
             now += TICK;
             wheel.advance_to(now, &mut out);
             for &id in out.iter() {
@@ -800,7 +868,9 @@ mod tests {
         // order, as one that wakes every tick — otherwise the CPU saving
         // would come at the cost of behaviour.
         const TICK: u64 = 100;
-        const HORIZON: u64 = 300_000;
+        // Past level 1 (409.6s), so the equivalence covers multi-level
+        // cascades and not just the timers that never left level 0.
+        const HORIZON: u64 = 5_000_000;
         let mut rng = Lcg::new(0xC0FFEE);
         let schedule: Vec<(u32, u64)> = (0..500u32)
             .map(|id| (id, rng.in_range(1, HORIZON)))
@@ -812,6 +882,7 @@ mod tests {
             assert_eq!(ticked.insert(id, deadline), Insert::Scheduled);
             assert_eq!(slept.insert(id, deadline), Insert::Scheduled);
         }
+        assert!(ticked.levels() >= 3, "the horizon must reach level 2");
 
         let mut by_tick: Vec<(u64, u32)> = Vec::new();
         let mut out = Vec::new();
@@ -955,7 +1026,28 @@ mod tests {
         assert_eq!(out.len(), 50_000);
         assert!(wheel.is_empty());
 
-        let retained: usize = wheel
+        // Hysteresis means the spike's own rotation keeps its capacity —
+        // at that moment a spike is indistinguishable from a load that
+        // is about to repeat. What must hold is that ordinary traffic
+        // afterwards walks it back down.
+        let retained_now: usize = wheel
+            .levels
+            .iter()
+            .flat_map(|lv| lv.buckets.iter())
+            .map(|b| b.capacity())
+            .sum();
+
+        // One light timer per level-0 bucket, so every bucket the burst
+        // touched gets drained again.
+        let start_vid = 100u64;
+        for k in 0..WHEEL_BITS {
+            let deadline = (start_vid + k) * 100 + 50;
+            assert_eq!(wheel.insert(1_000_000 + k, deadline), Insert::Scheduled);
+        }
+        wheel.advance_to((start_vid + WHEEL_BITS + 1) * 100, &mut out);
+        assert_eq!(out.len(), WHEEL_SIZE, "every level-0 bucket was drained");
+
+        let retained_after: usize = wheel
             .levels
             .iter()
             .flat_map(|lv| lv.buckets.iter())
@@ -963,8 +1055,12 @@ mod tests {
             .sum();
         let ceiling = wheel.levels() * WHEEL_SIZE * BUCKET_RETAIN_CAP;
         assert!(
-            retained <= ceiling,
-            "buckets kept {retained} slots, above the {ceiling} ceiling"
+            retained_after < retained_now,
+            "the burst's capacity was never given back: {retained_now} → {retained_after}"
+        );
+        assert!(
+            retained_after <= ceiling,
+            "buckets kept {retained_after} slots, above the {ceiling} ceiling"
         );
     }
 
@@ -1032,6 +1128,153 @@ mod tests {
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(a, b, "the clock origin changed what fired at +{step}");
+        }
+    }
+
+    #[test]
+    fn a_sleeping_driver_does_not_oversleep_a_parked_timer() {
+        // The parked path and the sleep path together: a wrong wake
+        // instant for the parking bucket would show up as lateness past
+        // the one-tick bound, which a fixed-step walk cannot detect.
+        const TICK: u64 = 100;
+        let mut wheel: HierarchicalTimingWheel<u32> = HierarchicalTimingWheel::new(TICK, 0);
+        let far = wheel.span_ms().saturating_mul(2) + 12_345;
+        assert_eq!(wheel.insert(4, far), Insert::Scheduled);
+
+        let mut out = Vec::new();
+        let mut now = 0u64;
+        let mut wakeups = 0usize;
+        let mut fired_at = None;
+        while let Some(due) = wheel.next_expiry_ms() {
+            assert!(due > now, "a wakeup must move the clock forward");
+            now = due;
+            wakeups += 1;
+            wheel.advance_to(now, &mut out);
+            for &value in out.iter() {
+                assert_eq!(value, 4);
+                fired_at = Some(now);
+            }
+        }
+
+        let fired_at = fired_at.expect("the timer never fired");
+        assert!(fired_at >= far, "fired early: {fired_at} < {far}");
+        assert!(
+            fired_at - far <= TICK,
+            "sleeping overslept: due {far}, fired {fired_at}"
+        );
+        // Re-parking costs one extra wake per top-level span; anything
+        // near the tick count would mean the sleep path degenerated.
+        assert!(wakeups < 16, "{wakeups} wakeups for a single timer");
+    }
+
+    #[test]
+    fn a_deadline_on_the_seam_between_two_levels_still_fires_once() {
+        // The exact instant level 0 stops accepting and level 1 starts.
+        // A one-off error at either window edge drops the timer through
+        // the gap, and only a boundary-exact input can catch it.
+        const TICK: u64 = 100;
+        let level0_span = TICK * WHEEL_BITS;
+        for offset in [-2i64, -1, 0, 1, 2] {
+            let mut wheel: HierarchicalTimingWheel<u32> = HierarchicalTimingWheel::new(TICK, 0);
+            let deadline = (level0_span as i64 + offset) as u64;
+            assert_eq!(wheel.insert(1, deadline), Insert::Scheduled);
+
+            let mut out = Vec::new();
+            let mut now = 0u64;
+            let mut fires = 0usize;
+            while now < level0_span * 3 {
+                now += TICK;
+                wheel.advance_to(now, &mut out);
+                for &value in out.iter() {
+                    assert_eq!(value, 1);
+                    assert!(now >= deadline, "seam timer fired early at offset {offset}");
+                    assert!(now - deadline <= TICK, "seam timer fired late");
+                    fires += 1;
+                }
+            }
+            assert_eq!(fires, 1, "seam offset {offset} did not fire exactly once");
+        }
+    }
+
+    #[test]
+    fn the_end_of_the_clock_does_not_overflow() {
+        // u64::MAX is the obvious "flush everything" sentinel, and the
+        // cursor arithmetic runs a division by a tick as small as 1ms —
+        // an intermediate `+ 1` there would panic in debug and wrap in
+        // release, which is worse than either.
+        let mut wheel: HierarchicalTimingWheel<u32> = HierarchicalTimingWheel::new(1, 0);
+        assert_eq!(wheel.insert(1, 5), Insert::Scheduled);
+        assert_eq!(wheel.insert(2, u64::MAX), Insert::Scheduled);
+
+        let mut out = Vec::new();
+        wheel.advance_to(u64::MAX, &mut out);
+        out.sort_unstable();
+        assert_eq!(out, vec![1, 2], "both timers are due at the end of time");
+        assert!(wheel.is_empty());
+        assert_consistent(&wheel);
+    }
+
+    #[test]
+    fn a_burst_does_not_pin_the_cascade_buffer_either() {
+        // Trimming the buckets alone would just move a burst's footprint
+        // into the scratch buffer, where it would stay for the life of
+        // the process.
+        let mut wheel: HierarchicalTimingWheel<u64> = HierarchicalTimingWheel::new(100, 0);
+        let mut out = Vec::new();
+        for id in 0..50_000u64 {
+            assert_eq!(wheel.insert(id, 1_000 + (id % 10) * 100), Insert::Scheduled);
+        }
+        wheel.advance_to(10_000, &mut out);
+        assert_eq!(out.len(), 50_000);
+
+        // Steady low traffic afterwards must walk the buffer back down.
+        for round in 0..8u64 {
+            let base = 20_000 + round * 1_000;
+            for id in 0..10u64 {
+                assert_eq!(wheel.insert(id, base + 100), Insert::Scheduled);
+            }
+            wheel.advance_to(base + 500, &mut out);
+        }
+        assert!(
+            wheel.scratch.capacity() <= SCRATCH_RETAIN_CAP * 2,
+            "scratch still holds {} slots after the burst drained",
+            wheel.scratch.capacity()
+        );
+
+        wheel.shrink_to_fit();
+        assert_eq!(wheel.scratch.capacity(), 0, "shrink_to_fit left capacity");
+    }
+
+    #[test]
+    fn a_steady_load_is_not_shrunk_and_regrown_every_rotation() {
+        // Hysteresis: trimming back to a fixed floor after each drain
+        // would make a steady thousand-per-bucket load realloc its way
+        // up from 16 on every single rotation.
+        let mut wheel: HierarchicalTimingWheel<u64> = HierarchicalTimingWheel::new(100, 0);
+        let mut out = Vec::new();
+        let mut now = 0u64;
+        let mut capacity_after = Vec::new();
+
+        for round in 0..6u64 {
+            let base = now + 200;
+            for id in 0..1_000u64 {
+                assert_eq!(wheel.insert(round * 1_000 + id, base), Insert::Scheduled);
+            }
+            now = base + 200;
+            wheel.advance_to(now, &mut out);
+            assert_eq!(out.len(), 1_000);
+            let idx = ((base / 100) % WHEEL_BITS) as usize;
+            capacity_after.push(wheel.levels[0].buckets[idx].capacity());
+        }
+
+        // After the first round the bucket has its working capacity and
+        // must keep it: a drop back toward the floor is the thrash.
+        for (round, cap) in capacity_after.iter().enumerate().skip(1) {
+            assert!(
+                *cap >= 1_000,
+                "round {round}: bucket shrank to {cap}, so the next \
+                 rotation reallocates its way back up"
+            );
         }
     }
 
