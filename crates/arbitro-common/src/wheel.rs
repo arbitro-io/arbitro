@@ -124,6 +124,55 @@ impl<T: Copy> TimingWheel<T> {
         self.len -= out.len();
     }
 
+    /// How many ticks until the next bucket that actually holds something.
+    ///
+    /// `Some(k)` means the k-th `advance()` from here is the first that can
+    /// return entries; every advance before it would drain an empty bucket.
+    /// `None` means the wheel is empty and no advance can produce anything
+    /// until something is inserted.
+    ///
+    /// This is what lets the driver sleep to the next real deadline instead
+    /// of waking on every tick to look at nothing. It also decouples the
+    /// wheel's resolution from the wake rate: a finer tick costs nothing
+    /// while the wheel is idle, because an idle wheel schedules no wakes at
+    /// all.
+    ///
+    /// O(num_buckets) worst case — a scan over a small fixed array, run once
+    /// per sleep, not per entry. With the bucket counts this wheel is used
+    /// at, that beats maintaining a heap of buckets.
+    pub fn ticks_until_next_nonempty(&self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        // k starts at 1: `advance` increments before draining, so bucket
+        // `current` is not next — it is a full rotation away.
+        for k in 1..=self.num_buckets {
+            let idx = (self.current + k) % self.num_buckets;
+            if !self.buckets[idx].is_empty() {
+                return Some(k);
+            }
+        }
+        // Unreachable while `len` is maintained correctly: a non-zero len
+        // means some bucket is non-empty, and the loop visits every bucket.
+        None
+    }
+
+    /// Advance `ticks` positions at once, accumulating everything that
+    /// expires along the way into `out`.
+    ///
+    /// A driver that slept for several ticks must move the wheel by that
+    /// many, or its position drifts behind wall time and every subsequent
+    /// deadline fires late by the accumulated gap. `out` is cleared first.
+    pub fn advance_by(&mut self, ticks: usize, out: &mut Vec<T>) {
+        out.clear();
+        for _ in 0..ticks {
+            self.current = (self.current + 1) % self.num_buckets;
+            let bucket = &mut self.buckets[self.current];
+            self.len -= bucket.len();
+            out.append(bucket);
+        }
+    }
+
     /// Number of entries currently in the wheel (across all buckets).
     #[inline]
     pub fn len(&self) -> usize {
@@ -294,5 +343,95 @@ mod tests {
         w.insert(e, 1);
         let expired = w.advance();
         assert_eq!(expired.len(), 1);
+    }
+
+    // ── ticks_until_next_nonempty / advance_by ──────────────────────
+
+    #[test]
+    fn empty_wheel_schedules_no_wake() {
+        let w: TimingWheel<u64> = TimingWheel::new(8);
+        assert_eq!(w.ticks_until_next_nonempty(), None);
+    }
+
+    #[test]
+    fn next_wake_is_the_tick_the_entry_actually_fires_on() {
+        // For every reachable delay, the reported wake must be exactly the
+        // advance count that drains the entry — not one early, not one late.
+        for delay in 1..8u32 {
+            let mut w: TimingWheel<u64> = TimingWheel::new(8);
+            w.insert(delay as u64, delay);
+            assert_eq!(
+                w.ticks_until_next_nonempty(),
+                Some(delay as usize),
+                "wake for delay {delay}"
+            );
+            for _ in 0..delay - 1 {
+                assert!(w.advance().is_empty(), "nothing may fire before {delay}");
+            }
+            assert_eq!(w.advance(), vec![delay as u64]);
+            assert_eq!(w.ticks_until_next_nonempty(), None, "wheel drained");
+        }
+    }
+
+    #[test]
+    fn next_wake_reports_the_nearest_of_several() {
+        let mut w: TimingWheel<u64> = TimingWheel::new(16);
+        w.insert(90, 9);
+        w.insert(30, 3);
+        w.insert(70, 7);
+        assert_eq!(w.ticks_until_next_nonempty(), Some(3));
+        let mut out = Vec::new();
+        w.advance_by(3, &mut out);
+        assert_eq!(out, vec![30]);
+        // From here the next is the 7, four ticks further on.
+        assert_eq!(w.ticks_until_next_nonempty(), Some(4));
+    }
+
+    #[test]
+    fn next_wake_wraps_around_the_ring() {
+        // An entry sitting in the bucket the wheel is parked on is a full
+        // rotation away, not zero ticks — advance() steps before draining.
+        let mut w: TimingWheel<u64> = TimingWheel::new(4);
+        w.insert(7, 0);
+        assert_eq!(w.ticks_until_next_nonempty(), Some(4));
+        let mut out = Vec::new();
+        w.advance_by(4, &mut out);
+        assert_eq!(out, vec![7]);
+    }
+
+    #[test]
+    fn advance_by_matches_advancing_one_at_a_time() {
+        let build = || {
+            let mut w: TimingWheel<u64> = TimingWheel::new(10);
+            for d in 1..=6u32 {
+                w.insert(d as u64 * 10, d);
+            }
+            w
+        };
+
+        let mut stepwise = build();
+        let mut collected = Vec::new();
+        for _ in 0..6 {
+            collected.extend(stepwise.advance());
+        }
+
+        let mut jumped = build();
+        let mut out = Vec::new();
+        jumped.advance_by(6, &mut out);
+
+        assert_eq!(out, collected, "a 6-tick jump must expire the same set");
+        assert_eq!(jumped.len(), stepwise.len());
+        assert!(jumped.is_empty());
+    }
+
+    #[test]
+    fn advance_by_zero_is_a_noop() {
+        let mut w: TimingWheel<u64> = TimingWheel::new(4);
+        w.insert(1, 1);
+        let mut out = vec![999];
+        w.advance_by(0, &mut out);
+        assert!(out.is_empty(), "out is cleared even when nothing expires");
+        assert_eq!(w.len(), 1, "the entry must still be pending");
+        assert_eq!(w.ticks_until_next_nonempty(), Some(1));
     }
 }
