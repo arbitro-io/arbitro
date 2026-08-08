@@ -5,7 +5,7 @@ All notable changes to `arbitro-server` (and the in-tree Rust reference client
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer with
 the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
-## [Unreleased]
+## [0.7.0] - 2026-08-08
 
 ### Fixed — `arbitro-server` (delay accuracy)
 
@@ -131,4 +131,5 @@ close the gaps found while soak-testing multi-node restarts under chaos.
   production `NotifyRing` hand-off (OS-thread drain → tokio task) is also ~1.8×
   faster as a result of removing the gate's hot-line read.
 
+[0.7.0]: https://github.com/arbitro-io/arbitro/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/arbitro-io/arbitro/compare/v0.6.1...v0.6.2
