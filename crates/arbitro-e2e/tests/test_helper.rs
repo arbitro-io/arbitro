@@ -16,6 +16,7 @@ pub struct TestServerBuilder {
     write_buffer_cap: Option<usize>,
     drain_stall_evict_ms: Option<u64>,
     max_feed_per_cycle: Option<usize>,
+    max_connections: Option<u32>,
     auth_token: Option<String>,
 }
 
@@ -38,6 +39,7 @@ impl TestServerBuilder {
             write_buffer_cap: None,
             drain_stall_evict_ms: None,
             max_feed_per_cycle: None,
+            max_connections: None,
             auth_token: None,
         }
     }
@@ -97,6 +99,13 @@ impl TestServerBuilder {
         self
     }
 
+    /// Accepted connection ceiling — part of matching the throughput bench's
+    /// server configuration exactly.
+    pub fn max_connections(mut self, max: u32) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
     pub async fn spawn(self) -> TestServer {
         // Bind `:0` and hand the LIVE listener to the server. Dropping the
         // listener and letting the server re-bind the port opened a TOCTOU
@@ -141,6 +150,9 @@ impl TestServerBuilder {
         }
         if let Some(cap) = self.max_feed_per_cycle {
             config = config.max_feed_per_cycle(cap);
+        }
+        if let Some(max) = self.max_connections {
+            config = config.max_connections(max);
         }
 
         if let Some(ref dir) = self.data_dir {

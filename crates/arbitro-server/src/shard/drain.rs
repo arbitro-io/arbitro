@@ -29,6 +29,7 @@ use arbitro_store::Store;
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
+use crate::shard::drain_probe::{DrainProbe, ReadVerdict};
 use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
@@ -188,7 +189,7 @@ fn local_delta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
 
 /// Result of Phase 1 (store read). Passed from `drain_read` to `drain_deliver`
 /// so the store lock can be released in between.
-#[allow(dead_code)] // `start` kept for diagnostics
+#[derive(Clone, Copy)]
 pub(in crate::shard) struct DrainReadResult {
     pub start: u64,
     pub end: u64,
@@ -201,7 +202,9 @@ pub(in crate::shard) struct DrainReadResult {
 ///
 /// Holds the store reference only for the `for_each` walk. After this
 /// returns, the store is no longer needed and its lock can be released.
-/// Returns `None` if there is no work (caller should `gate.lock()`).
+/// Non-`Fed` verdicts mean no work; the gate stays cleared by the
+/// worker's top-of-cycle `lock()`.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::shard) fn drain_read(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
@@ -210,17 +213,21 @@ pub(in crate::shard) fn drain_read(
     scratch: &mut DrainScratch,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     now_ms: u64,
-) -> Option<DrainReadResult> {
+    snap_changed: bool,
+) -> ReadVerdict {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
 
     if !counters.has_any_demand() {
-        return None;
+        return ReadVerdict::NoDemand;
     }
 
     let info = store.info();
     let cursor = counters.cursor();
     if info.last_seq <= cursor {
-        return None;
+        return ReadVerdict::UpToDate {
+            last_seq: info.last_seq,
+            cursor,
+        };
     }
 
     let start = cursor + 1;
@@ -233,13 +240,14 @@ pub(in crate::shard) fn drain_read(
     scratch.local_subject.clear();
     scratch.deliveries.clear();
     scratch.acc.clear();
-    // Pattern and subject-limit caches must be flushed every cycle —
-    // they hold entries resolved against the match_table snapshot, and
-    // the snapshot may have changed since the last cycle (subscribe /
-    // unsubscribe rebuilds it). Keeping stale entries silently drops
-    // late-binding fanout subscribers during replay.
-    scratch.resolve_cache.clear();
-    scratch.subject_limit_cache.clear();
+    // Pattern/subject-limit caches are pure functions of the snapshot's
+    // match tables — valid while the snapshot Arc is unchanged (ptr_eq
+    // in the worker, ABA-safe because it holds the previous Arc). Stale
+    // entries after a swap would drop late-binding fanout subscribers.
+    if snap_changed {
+        scratch.resolve_cache.clear();
+        scratch.subject_limit_cache.clear();
+    }
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
@@ -268,7 +276,7 @@ pub(in crate::shard) fn drain_read(
         })
         .ok();
 
-    Some(DrainReadResult {
+    ReadVerdict::Fed(DrainReadResult {
         start,
         end,
         more_pending,
@@ -286,7 +294,7 @@ pub(in crate::shard) fn drain_read(
 /// `stall_evict_ms` — ROB-23 slow-consumer eviction bound (0 = disabled),
 /// see `DrainConfig::stall_evict_ms`.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::shard) fn drain_deliver(
+pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     counters: &SharedCounters,
     snap: &DrainSnapshot,
     gate: &Gate,
@@ -297,6 +305,7 @@ pub(in crate::shard) fn drain_deliver(
     silent_drops: &crate::common::SilentDrops,
     stall_evict_ms: u64,
     mut result: DrainReadResult,
+    probe: &mut P,
 ) {
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
     // Results are captured into a small Vec so Phase 3 can do ack
@@ -332,12 +341,7 @@ pub(in crate::shard) fn drain_deliver(
                 last_writer
             };
             let Some(writer) = writer else {
-                if chaos_debug() {
-                    eprintln!(
-                        "[FLUSH-DEAD-WRITER-NOT-FOUND] conn={} first_seq={} count={}",
-                        frame.connection_id.0, frame.first_seq, frame.count
-                    );
-                }
+                probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, true);
                 flush_results.push((
                     frame.connection_id,
                     FlushOutcome::WriterGone(frame.first_seq),
@@ -348,12 +352,7 @@ pub(in crate::shard) fn drain_deliver(
                 .write_failed
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
-                if chaos_debug() {
-                    eprintln!(
-                        "[FLUSH-DEAD-WRITE-FAILED] conn={} first_seq={} count={}",
-                        frame.connection_id.0, frame.first_seq, frame.count
-                    );
-                }
+                probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, false);
                 flush_results.push((
                     frame.connection_id,
                     FlushOutcome::WriterGone(frame.first_seq),
@@ -378,24 +377,11 @@ pub(in crate::shard) fn drain_deliver(
             let ok = writer.write_tx.try_send(frame.bytes).is_ok();
 
             if ok {
-                if chaos_debug() {
-                    eprintln!(
-                        "[FLUSH-OK] conn={} first_seq={} last_seq={} count={}",
-                        conn.0,
-                        first_seq,
-                        first_seq + (count as u64).saturating_sub(1),
-                        count
-                    );
-                }
+                probe.flush_ok(conn, first_seq, count);
                 crate::lifecycle_trace!("30_send_bytes_done", conn.0, count as u64, "shard");
                 flush_results.push((conn, FlushOutcome::Ok));
             } else {
-                if chaos_debug() {
-                    eprintln!(
-                        "[FLUSH-BACKPRESSURE] conn={} first_seq={} count={}",
-                        conn.0, first_seq, count
-                    );
-                }
+                probe.flush_backpressured(conn, first_seq, count);
                 flush_results.push((conn, FlushOutcome::Backpressured(first_seq)));
             }
             ok
@@ -405,20 +391,6 @@ pub(in crate::shard) fn drain_deliver(
     // Phase 3 — post-flush bookkeeping (atomics + command-thread
     // notifications). Fire-and-forget entries never hit scratch.deliveries,
     // so this loop is a no-op in the pub/sub default path.
-    //
-    // F11: flush_results is typically 1–8 entries; a linear-scan helper
-    // beats HashMap on inserts and lookups at this size and removes the
-    // per-cycle HashMap allocation entirely.
-    #[inline]
-    fn frame_ok_for(results: &[(ConnectionId, FlushOutcome)], conn: ConnectionId) -> bool {
-        for &(c, o) in results.iter() {
-            if c == conn {
-                return matches!(o, FlushOutcome::Ok);
-            }
-        }
-        false
-    }
-
     for &(conn, outcome) in &flush_results {
         match outcome {
             FlushOutcome::Ok => {}
@@ -497,26 +469,10 @@ pub(in crate::shard) fn drain_deliver(
         });
     }
 
-    for d in &scratch.deliveries {
-        if frame_ok_for(&flush_results, d.conn) {
-            counters.inc_inflight(d.consumer_id, d.queue_id);
-            // Drain owns the per-(consumer, subject) inflight map; this
-            // is a local HashMap mutation, no atomics, no contention.
-            let cs = consumer_subjects_slot_mut(consumer_subjects, d.consumer_id);
-            cs.inc(d.subject_hash);
-            // Delivery memory: this seq is now in flight for this
-            // consumer — a re-walk (pinned cursor, rewind) must not
-            // re-send it unless the command thread explicitly releases
-            // it (ack absorbs it into the floor; nack/ack-timeout/
-            // retirement remove it so redelivery re-arms).
-            cs.suppress(d.seq);
-        }
-    }
+    record_deliveries(counters, consumer_subjects, &scratch.deliveries, &flush_results);
 
     // Group successful deliveries by binding_id and notify the command
-    // thread once per binding. Matches the old `notify_delivered_grouped`
-    // semantics so the engine's Command::Delivered handler sees the same
-    // shape it did before.
+    // thread once per binding (same shape Command::Delivered expects).
     if !scratch.deliveries.is_empty() {
         notify_delivered_grouped(
             notify_tx,
@@ -530,31 +486,75 @@ pub(in crate::shard) fn drain_deliver(
     // Return the persistent flush buffer for the next cycle.
     scratch.flush_results = flush_results;
 
-    // Cursor advances to last fully-processed entry.
+    advance_cursor(counters, &result, probe);
+    close_window(&mut result);
+    report_dead_connections(&mut scratch.dead_connections, notify_tx, silent_drops);
+    reopen_if_pending(gate, &result);
+}
+
+// ── Drain-deliver tail components ───────────────────────────────────────────
+
+/// Bookkeeping for frames that flushed `Ok`: shared inflight, drain-owned
+/// per-(consumer, subject) inflight, and delivery-memory suppression — a
+/// re-walk must not re-send an in-flight seq until the command thread
+/// releases it (ack absorbs into the floor; nack/timeout/retirement re-arm).
+#[inline]
+fn record_deliveries(
+    counters: &SharedCounters,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+    deliveries: &[PendingNotify],
+    flush_results: &[(ConnectionId, FlushOutcome)],
+) {
+    for d in deliveries {
+        if frame_ok_for(flush_results, d.conn) {
+            counters.inc_inflight(d.consumer_id, d.queue_id);
+            let cs = consumer_subjects_slot_mut(consumer_subjects, d.consumer_id);
+            cs.inc(d.subject_hash);
+            cs.suppress(d.seq);
+        }
+    }
+}
+
+/// Cursor advance — the only place the drain moves the cursor forward.
+/// `lowest_skipped` pins it strictly before the first unsent seq.
+#[inline]
+fn advance_cursor<P: DrainProbe>(
+    counters: &SharedCounters,
+    result: &DrainReadResult,
+    probe: &mut P,
+) -> u64 {
     let new_cursor = result
         .lowest_skipped
         .map_or(result.end - 1, |ls| ls.saturating_sub(1));
-    if chaos_debug() {
-        eprintln!(
-            "[chaos-debug] cursor {} -> {} (start={} end={} skipped={:?} more={})",
-            counters.cursor(),
-            new_cursor,
-            result.start,
-            result.end,
-            result.lowest_skipped,
-            result.more_pending
-        );
-    }
+    probe.cursor_advance(counters, new_cursor, result);
     counters.set_cursor(new_cursor);
+    new_cursor
+}
 
+/// Final `more_pending` verdict. `end <= last_seq` (window stopped short
+/// of the store tail) is the genuinely new fact; the `lowest_skipped`
+/// half is redundant with the `track_skipped` sites (asserted below) and
+/// kept as a belt while the tail-stall bug is open.
+#[inline]
+fn close_window(result: &mut DrainReadResult) {
+    debug_assert!(
+        result.lowest_skipped.is_none() || result.more_pending,
+        "a track_skipped call site failed to set more_pending"
+    );
     if result.end <= result.last_seq || result.lowest_skipped.is_some() {
         result.more_pending = true;
     }
+}
 
-    // Notify command thread of truly dead connections (writer gone from
-    // registry — permanent). Backpressured channels are NOT reported here;
-    // they're transient and retried on the next cycle.
-    for conn_id in scratch.dead_connections.drain(..) {
+/// Report permanently-dead connections (writer gone) to the command
+/// thread. Backpressured conns are transient and NOT reported here.
+#[inline]
+fn report_dead_connections(
+    dead: &mut Vec<ConnectionId>,
+    notify_tx: &mut crate::shard::shared::NotifyProducer,
+    silent_drops: &crate::common::SilentDrops,
+) {
+    for conn_id in dead.drain(..) {
         if notify_tx
             .try_send(DrainNotification::ConnectionDead(conn_id))
             .is_err()
@@ -562,58 +562,17 @@ pub(in crate::shard) fn drain_deliver(
             silent_drops.inc_notify_ring();
         }
     }
+}
 
-    // Only ever RE-OPEN the gate here. Clearing is owned exclusively by the
-    // drain worker loop, which clears BEFORE reading the store — so a
-    // concurrent publish's `release()` can never be clobbered by a stale
-    // end-of-cycle `lock()` (the tail-message lost-wakeup this avoids).
+/// INVARIANT: only ever RE-OPEN the gate here — clearing is owned by the
+/// drain worker's top-of-cycle `lock()`, so a concurrent publish's
+/// `release()` can never be wiped by a stale end-of-cycle clear (the
+/// tail-message lost-wakeup). No path here may call `gate.lock()`.
+#[inline]
+fn reopen_if_pending(gate: &Gate, result: &DrainReadResult) {
     if result.more_pending {
         gate.release();
         crate::lifecycle_trace!("33_drainer_exit_released", 0, 0, "shard");
-    }
-}
-
-/// Legacy single-call API — kept for callers that don't need the split.
-/// Holds `store` for Phase 1 only; Phases 2+3 run after the borrow ends.
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(in crate::shard) fn drain_cycle(
-    counters: &SharedCounters,
-    snap: &DrainSnapshot,
-    store: &dyn Store,
-    gate: &Gate,
-    names: &Arc<crate::common::NameRegistry>,
-    cfg: &DrainConfig,
-    scratch: &mut DrainScratch,
-    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-    notify_tx: &mut crate::shard::shared::NotifyProducer,
-    silent_drops: &crate::common::SilentDrops,
-    now_ms: u64,
-) {
-    match drain_read(
-        counters,
-        snap,
-        store,
-        cfg,
-        scratch,
-        consumer_subjects,
-        now_ms,
-    ) {
-        Some(result) => drain_deliver(
-            counters,
-            snap,
-            gate,
-            names,
-            scratch,
-            consumer_subjects,
-            notify_tx,
-            silent_drops,
-            cfg.stall_evict_ms,
-            result,
-        ),
-        None => {
-            gate.lock();
-            crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
-        }
     }
 }
 
@@ -677,6 +636,16 @@ fn process_drain_entry(
         mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
         scratch.resolve_cache.insert(cache_key, resolved);
     }
+    // Snapshot-pin purity guard: a retained entry must equal a fresh
+    // resolve against the same (ptr-identical) snapshot.
+    #[cfg(debug_assertions)]
+    if lookup.is_empty() {
+        if let Some(cached) = scratch.resolve_cache.get(&cache_key) {
+            let mut fresh = Vec::new();
+            mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut fresh);
+            debug_assert_eq!(*cached, fresh, "resolve_cache stale under unchanged snapshot");
+        }
+    }
 
     // Step 2: resolve + cache subject_limit (stream-wide value — same for
     // every consumer matching this subject). The counter check using this
@@ -691,6 +660,15 @@ fn process_drain_entry(
     } else {
         None
     };
+    // Same snapshot-pin purity guard for the subject-limit cache.
+    #[cfg(debug_assertions)]
+    if mt.has_subject_limits() {
+        debug_assert_eq!(
+            subject_limit,
+            mt.resolve_subject_limit_readonly(subject_hash, entry.subject),
+            "subject_limit_cache stale under unchanged snapshot"
+        );
+    }
 
     // Step 3: collect matches — reuse `lookup` computed above.
     scratch.matches.clear();
@@ -1148,6 +1126,19 @@ fn track_skipped(lowest: &mut Option<u64>, seq: u64) {
     *lowest = Some(lowest.map_or(seq, |s| s.min(seq)));
 }
 
+/// F11: flush_results is typically 1–8 entries; a linear-scan helper
+/// beats HashMap on inserts and lookups at this size and removes the
+/// per-cycle HashMap allocation entirely.
+#[inline]
+fn frame_ok_for(results: &[(ConnectionId, FlushOutcome)], conn: ConnectionId) -> bool {
+    for &(c, o) in results.iter() {
+        if c == conn {
+            return matches!(o, FlushOutcome::Ok);
+        }
+    }
+    false
+}
+
 // TEMP chaos-debug probe — remove after loss diagnosis.
 pub(crate) fn chaos_debug() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1160,6 +1151,7 @@ pub(crate) fn chaos_debug() -> bool {
 mod tests {
     use super::*;
     use crate::common::{NameRegistry, SilentDrops};
+    use crate::shard::drain_probe::ProbeOff;
     use crate::shard::shared::NotifyRing;
 
     /// BUG1 — when a frame flushes as `WriterGone`, the cursor must NOT
@@ -1215,6 +1207,7 @@ mod tests {
             &silent,
             0,
             result,
+            &mut ProbeOff,
         );
 
         // With the fix the cursor stops at 9 (batch first_seq - 1); the
@@ -1298,6 +1291,7 @@ mod tests {
                         lowest_skipped: None,
                         last_seq: 10,
                     },
+                    &mut ProbeOff,
                 );
             };
 
@@ -1387,6 +1381,7 @@ mod tests {
                         lowest_skipped: None,
                         last_seq: 10,
                     },
+                    &mut ProbeOff,
                 );
             };
 

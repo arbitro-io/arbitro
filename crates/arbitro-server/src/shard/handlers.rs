@@ -4,237 +4,13 @@
 //! After engine mutations, handlers update `SharedCounters` atomically
 //! and swap `DrainSnapshot` for structural changes.
 
-use std::time::Duration;
-
 use arbitro_engine_v2::command::Command;
 use arbitro_engine_v2::types::*;
-use arbitro_proto::error::ErrorCode;
-use arbitro_store::EntryRef;
 
-use crate::common::reply_v2::{send_error_v2, send_rep_ok_v2};
 use crate::shard::command::*;
-use crate::shard::worker::{
-    rewind_released, AccumCaller, ActiveBinding, CommandWorker, StreamAccum,
-};
+use crate::shard::worker::{rewind_released, ActiveBinding, CommandWorker};
 
 impl CommandWorker {
-    // ── Hot path — accumulator ──────────────────────────────────────────
-
-    pub(in crate::shard) fn handle_publish_accumulate(&mut self, cmd: PublishCmd) {
-        if !self.engine.ctx().catalog.stream_exists(cmd.stream_id) {
-            send_error_v2(
-                &self.registry,
-                cmd.conn_id,
-                cmd.env_seq as u64,
-                ErrorCode::StreamNotFound,
-            );
-            return;
-        }
-
-        let entry_count = cmd.entries.len() as u32;
-        let entry_bytes: usize = cmd
-            .entries
-            .iter()
-            .map(|e| e.subject.len() + e.payload.len())
-            .sum();
-
-        let accum = self
-            .accum_streams
-            .entry(cmd.stream_id)
-            .or_insert_with(|| StreamAccum {
-                store_entries: Vec::new(),
-                callers: Vec::new(),
-                bytes: 0,
-            });
-
-        accum.store_entries.extend(cmd.entries);
-        accum.callers.push(AccumCaller {
-            conn_id: cmd.conn_id,
-            env_seq: cmd.env_seq,
-            entry_count,
-        });
-        accum.bytes += entry_bytes;
-
-        self.accum_total += entry_count as usize;
-        self.accum_bytes += entry_bytes;
-
-        let interval = Duration::from_millis(self.flusher_config.interval_ms);
-        self.accum_deadline = Some(std::time::Instant::now() + interval);
-
-        self.check_accumulator_flush();
-    }
-
-    pub(in crate::shard) fn flush_accumulator(&mut self) {
-        if self.accum_total == 0 {
-            return;
-        }
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        // F27: reuse the persistent scratch vec on every flush.
-        self.flush_stream_ids.clear();
-        self.flush_stream_ids
-            .extend(self.accum_streams.keys().copied());
-        let stream_ids = std::mem::take(&mut self.flush_stream_ids);
-
-        for stream_id in &stream_ids {
-            let stream_id = *stream_id;
-            let accum = self.accum_streams.get_mut(&stream_id).unwrap();
-            if accum.store_entries.is_empty() {
-                continue;
-            }
-
-            let store_entries = std::mem::take(&mut accum.store_entries);
-            let callers = std::mem::take(&mut accum.callers);
-            accum.bytes = 0;
-
-            let refs: Vec<EntryRef<'_>> = store_entries
-                .iter()
-                .map(|e| EntryRef {
-                    stream_id: stream_id.raw(),
-                    subject: &e.subject,
-                    payload: &e.payload,
-                    flags: 0,
-                    deliver_at_ms: 0,
-                })
-                .collect();
-
-            match self.store.lock().append_batch(&refs, now_ms) {
-                Ok(first_seq) => {
-                    let entry_count = refs.len() as u64;
-                    if crate::shard::drain::chaos_debug() {
-                        eprintln!(
-                            "[APPEND-OK] stream={} first_seq={} last_seq={} count={} callers={}",
-                            stream_id.raw(),
-                            first_seq,
-                            first_seq + entry_count - 1,
-                            entry_count,
-                            callers.len()
-                        );
-                    }
-                    let mut seq_offset = 0u64;
-                    for caller in &callers {
-                        if crate::shard::drain::chaos_debug() {
-                            eprintln!(
-                                "[REPOK-SEND] conn={} env_seq={} assigned_seq={} count={}",
-                                caller.conn_id,
-                                caller.env_seq,
-                                first_seq + seq_offset,
-                                caller.entry_count
-                            );
-                        }
-                        send_rep_ok_v2(
-                            &self.registry,
-                            caller.conn_id,
-                            caller.env_seq as u64,
-                            first_seq + seq_offset,
-                        );
-                        seq_offset += caller.entry_count as u64;
-                    }
-                    self.gate.release();
-
-                    // ── Async replication: fire-and-forget to followers ───
-                    // LIMITATION (audit §2.5 / action #8): RepOk was already
-                    // sent above, BEFORE this replication attempt — the
-                    // publisher's ack does not imply the message reached any
-                    // follower. Dropped batches (channel-full below, or TCP
-                    // error in replication_loop) are never caught up, and
-                    // ISR/high-watermark are not enforced, so replicas > 1
-                    // is best-effort: a leader failover may lose
-                    // acknowledged data. Fixing this (catch-up wire + ISR
-                    // record_ack + HW visibility gate) is deferred to the
-                    // arbitro-raft / cluster workstream.
-                    #[cfg(feature = "cluster")]
-                    {
-                        let replicas = self.names.stream_replicas(stream_id);
-                        if replicas > 1 {
-                            if let Some(tx) = self.replication_tx.lock().as_ref() {
-                                // Serialize entries for replication:
-                                // each entry = [total_len:u32][subject_len:u16][subject][payload]
-                                let mut entries_bytes = Vec::new();
-                                for e in &store_entries {
-                                    let subj_len = e.subject.len() as u16;
-                                    let total_len = 2 + e.subject.len() + e.payload.len();
-                                    entries_bytes
-                                        .extend_from_slice(&(total_len as u32).to_le_bytes());
-                                    entries_bytes.extend_from_slice(&subj_len.to_le_bytes());
-                                    entries_bytes.extend_from_slice(&e.subject);
-                                    entries_bytes.extend_from_slice(&e.payload);
-                                }
-                                let batch = crate::cluster::replication::ReplicationBatch {
-                                    stream_id: stream_id.raw(),
-                                    first_seq,
-                                    entry_count: store_entries.len() as u32,
-                                    timestamp_ms: now_ms,
-                                    entries_bytes,
-                                };
-                                // Non-blocking: drop the batch if the channel
-                                // is full — async replication is best-effort
-                                // for v1. The ISR tracker will eject lagging
-                                // followers once quorum wait is added.
-                                let _ = tx.try_send(batch);
-                            }
-                        }
-                    }
-
-                    // Enforce max_msgs / max_bytes capacity limits (FIFO eviction).
-                    // Checked after append so callers always get a sequence number.
-                    if let Some(ret) = self.stream_retention.get(&stream_id) {
-                        let need_check = (ret.max_msgs > 0) || (ret.max_bytes > 0);
-                        if need_check {
-                            let mut store = self.store.lock();
-                            let info = store.info();
-                            let excess_msgs = if ret.max_msgs > 0 {
-                                info.messages.saturating_sub(ret.max_msgs)
-                            } else {
-                                0
-                            };
-                            let excess_bytes = if ret.max_bytes > 0 && info.bytes > ret.max_bytes {
-                                // Estimate how many leading messages to drop to bring bytes under limit.
-                                // Simple heuristic: drop proportionally using average message size.
-                                let avg = if info.messages > 0 {
-                                    info.bytes / info.messages
-                                } else {
-                                    1
-                                };
-                                let over = info.bytes - ret.max_bytes;
-                                over.div_ceil(avg) // ceiling division
-                            } else {
-                                0
-                            };
-                            let excess = excess_msgs.max(excess_bytes);
-                            if excess > 0 {
-                                let new_first_seq = info.first_seq + excess;
-                                store.truncate_front(new_first_seq);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    for caller in &callers {
-                        send_error_v2(
-                            &self.registry,
-                            caller.conn_id,
-                            caller.env_seq as u64,
-                            ErrorCode::StreamFull,
-                        );
-                    }
-                }
-            }
-        }
-
-        self.accum_deadline = None;
-        self.accum_total = 0;
-        self.accum_bytes = 0;
-        // Return the scratch vec so the next flush can reuse its
-        // allocation. Keep capacity, drop content.
-        self.flush_stream_ids = stream_ids;
-        self.flush_stream_ids.clear();
-    }
-
     // ── Hot path — ack / nack ───────────────────────────────────────────
 
     pub(in crate::shard) fn handle_ack(&mut self, cmd: AckCmd) {
@@ -322,7 +98,7 @@ impl CommandWorker {
 
         if matched > 0 {
             // Release gate so drain re-checks from current cursor.
-            // Cursor already stopped at lowest_skipped in drain_cycle,
+            // Cursor already stopped at lowest_skipped in the drain cycle,
             // so freed capacity will be used on the next cycle.
             crate::lifecycle_trace!("a12c_acker_gate_fire", 0, 0, "shard");
             self.gate.release();
@@ -710,8 +486,6 @@ impl CommandWorker {
             self.stream_retention.insert(
                 stream_id,
                 crate::shard::worker::StreamRetention {
-                    max_msgs: cmd.max_msgs,
-                    max_bytes: cmd.max_bytes,
                     max_age_ms: cmd.max_age_ms,
                     created_at_seq,
                 },

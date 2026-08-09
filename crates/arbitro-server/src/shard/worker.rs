@@ -4,7 +4,7 @@
 //! ```text
 //! loop {
 //!     gate.acquire();
-//!     while gate.is_open() { drain_cycle(); }
+//!     while gate.is_open() { drain_read(); drain_deliver(); }
 //! }
 //! ```
 //! Reads `SharedCounters` (atomics) + `SnapshotSwap<DrainSnapshot>` (Arc).
@@ -30,6 +30,7 @@ use crate::common::Gate;
 use crate::shard::command::*;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::drain_events::DrainEvent;
+use crate::shard::drain_probe::{DrainProbe, ParkVerdict, ReadVerdict, RewindApplied};
 use crate::shard::router::SharedStore;
 use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
@@ -40,11 +41,15 @@ use crate::transport::ConnectionRegistry;
 /// `DrainSnapshot` for zero-copy access by the drain thread.
 #[derive(Clone, Copy, Default)]
 pub(super) struct StreamRetention {
-    /// Max messages per stream (0 = unlimited).
-    pub max_msgs: u64,
-    /// Max bytes per stream (0 = unlimited).
-    pub max_bytes: u64,
     /// Age-based eviction threshold in milliseconds (0 = disabled).
+    ///
+    /// Size limits (`max_msgs` / `max_bytes`) are NOT here: they are
+    /// enforced as a pre-append quota rejection in `dispatch_v2`, against
+    /// the engine's own quota. This struct once carried them for a
+    /// FIFO-eviction path (`DiscardPolicy::Old` — drop oldest to make
+    /// room) that lived only in the removed publish accumulator and was
+    /// therefore never reachable. Re-adding them means implementing that
+    /// eviction, not just restoring the fields.
     pub max_age_ms: u64,
     /// Global journal seq at which this stream incarnation was created.
     /// Drain skips entries with seq < created_at_seq for this stream_id.
@@ -56,8 +61,8 @@ pub(super) struct StreamRetention {
 
 /// A bound consumer↔connection pair for delivery.
 ///
-/// Created by `handle_subscribe` / `handle_bind`, iterated by
-/// `drain::drain_cycle`, filtered on unsubscribe / delete.
+/// Created by `handle_subscribe` / `handle_bind`, iterated by the
+/// drain cycle (`drain::drain_read`), filtered on unsubscribe / delete.
 pub struct ActiveBinding {
     pub(super) binding_id: BindingId,
     pub(super) connection_id: ConnectionId,
@@ -84,42 +89,9 @@ pub struct ActiveBinding {
     pub(super) write_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-// ── Accumulator private types ────────────────────────────────────────────────
-
-/// Flusher configuration — controls when accumulated entries are flushed.
-pub(super) struct FlusherConfig {
-    pub(super) max_size: usize,
-    pub(super) max_bytes: usize,
-    pub(super) interval_ms: u64,
-}
-
-impl Default for FlusherConfig {
-    fn default() -> Self {
-        Self {
-            max_size: 1024,
-            max_bytes: 4 * 1024 * 1024,
-            interval_ms: 5,
-        }
-    }
-}
-
-/// Tracks who to reply to after an accumulated flush.
-pub(super) struct AccumCaller {
-    pub(super) conn_id: u64,
-    pub(super) env_seq: u32,
-    pub(super) entry_count: u32,
-}
-
-/// Per-stream accumulation buffer.
-pub(super) struct StreamAccum {
-    pub(super) store_entries: Vec<PublishEntryOwned>,
-    pub(super) callers: Vec<AccumCaller>,
-    pub(super) bytes: usize,
-}
-
 // ── Drain worker ────────────────────────────────────────────────────────────
 
-/// Pure drain thread — gate.acquire → drain_cycle → loop.
+/// Pure drain thread — gate.acquire → drain_read/drain_deliver → loop.
 /// Nothing else runs here. No commands, no engine, no Mutex.
 ///
 /// Reads atomics (`SharedCounters`) and snapshots (`SnapshotSwap`)
@@ -155,8 +127,9 @@ pub struct DrainWorker {
 impl DrainWorker {
     /// Pure drain loop — runs as a tokio task. `gate.acquire().await`
     /// suspends the task on `tokio::sync::Notify` (via kit's
-    /// `NotifyWaiter`). No `std::thread`, no `JoinHandle<()>` of OS threads.
-    pub async fn run(mut self) {
+    /// `NotifyWaiter`). Generic over the observability probe, chosen once
+    /// at spawn (router.rs); `ProbeOff` compiles every probe call away.
+    pub(in crate::shard) async fn run<P: DrainProbe>(mut self, mut probe: P) {
         // ── Store init ───────────────────────────────────────────────────
         {
             let mut store_guard = self.store.lock();
@@ -169,6 +142,10 @@ impl DrainWorker {
             }
         }
 
+        // Previous cycle's snapshot — held so the `Arc::ptr_eq` compare is
+        // ABA-safe; gates the scratch-cache clear in `drain_read`.
+        let mut prev_snap: Option<Arc<DrainSnapshot>> = None;
+
         loop {
             crate::lifecycle_trace!("19_1_gate_waiting", 0, 0, "shard");
             self.gate.acquire().await;
@@ -179,94 +156,36 @@ impl DrainWorker {
             }
 
             loop {
-                // Shutdown liveness: when any entry is capacity-blocked,
-                // `more_pending` re-opens the gate every cycle so this inner
-                // loop never parks on `acquire()` — making the outer loop's
-                // `running` check (above) unreachable. If the acks that would
-                // free that capacity never arrive (e.g. the command worker has
-                // already processed Shutdown), the drain would spin until the
-                // process dies and `ShardRouter::shutdown()`'s JoinHandle await
-                // would deadlock. One relaxed load per cycle guarantees the
-                // drain always terminates within a cycle on shutdown.
+                // Shutdown liveness: `more_pending` can re-open the gate
+                // every cycle (capacity-blocked entry), so `acquire()` may
+                // never park again — this load is the guaranteed exit.
                 if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
 
                 crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
 
-                // ── Clear the gate BEFORE reading the store ───────────────
-                //
-                // This closes a tail-message lost-wakeup. A publish/ack does
-                // `append_batch → send ack → gate.release()` (see
-                // dispatch_v2). The drain's OLD end-of-cycle `gate.lock()`
-                // could wipe a `release()` that raced in just before it,
-                // stranding the entry in the store. Normally the next publish
-                // re-wakes the drain, but the FINAL message of a burst (no
-                // later publish — e.g. the last message before a server kill,
-                // or the last message of the whole run) would sit undelivered
-                // forever → delivery loss.
-                //
-                // By clearing here, at the TOP of the cycle:
-                //   * a `release()` that arrives AFTER this clear re-opens the
-                //     gate → the `is_open()` check at the bottom loops again;
-                //   * a `release()` CLOBBERED by this clear necessarily
-                //     appended its entry BEFORE releasing (publish orders
-                //     append-under-store-lock strictly before release), and we
-                //     take the store lock AFTER this clear, so the store read
-                //     below is guaranteed to observe that entry and deliver it.
-                // `drain_deliver` now only ever RE-OPENS the gate (on
-                // `more_pending`); it never clears it. Clearing is owned here.
+                // INVARIANT: clear the gate at the TOP, before any store
+                // read. A `release()` wiped by this clear appended its entry
+                // first and the store is read after, so the walk sees it; a
+                // later `release()` re-opens. `drain_deliver` only re-opens.
                 self.gate.lock();
 
-                // Consume the rewind signal BEFORE draining the event ring.
-                // The command thread orders: (C1) push `Released` events
-                // into the ring inside `apply_delta_and_sync`, THEN (C2)
-                // `signal_rewind` (nack / ack-timeout / retirement). With
-                // the old order — ring first, rewind second — the
-                // interleaving T(drain ring) < C1 < C2 < T(take_rewind)
-                // consumed the rewind while the `Released` was still in the
-                // ring: the rewound walk saw the seq suppressed, skipped it
-                // WITHOUT `track_skipped`, the cursor re-advanced, and the
-                // event was applied on a later cycle with no rewind left —
-                // a nacked or timed-out message was never redelivered on a
-                // quiescent workload. Taking the rewind FIRST restores the
-                // implication "signal visible ⇒ its Released events are in
-                // the ring": `signal_rewind` is a Release store sequenced
-                // after the ring push (itself a Release store on the ring
-                // head), and `take_rewind` is an Acquire swap, so observing
-                // the signal happens-after C1's push and the ring drain
-                // below must see the event.
-                if let Some(rw) = self.counters.take_rewind() {
-                    let cur = self.counters.cursor();
-                    if rw > 0 && rw - 1 < cur {
-                        self.counters.set_cursor(rw - 1);
-                    }
-                }
-
-                // Drain the command→drain event ring before deciding any
-                // delivery. This applies acks (subject inflight decs) and
-                // consumer removals so the upcoming dispatch sees current
-                // per-consumer state. Must run AFTER `take_rewind` above —
-                // see the ordering-race comment there.
+                // INVARIANT: rewind BEFORE the event ring — see `apply_rewind`.
+                let rewind = apply_rewind(&self.counters);
                 drain_event_ring(&mut self.drain_evt_rx, &mut self.consumer_subjects);
+                probe.cycle_start(&self.counters, rewind);
 
-                let now_ms = if self.drain_config.max_age_ms > 0 {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64
-                } else {
-                    0
-                };
+                let now_ms = cycle_now_ms(&self.drain_config);
 
-                // Load snapshot — Arc clone (~3ns), no lock on engine.
+                // Snapshot load — Arc clone (~3ns), no lock on engine.
                 let snap = self.snapshot.load();
+                let snap_changed = prev_snap.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &snap));
                 let prev_cursor = self.counters.cursor();
 
-                // Split drain into two phases so the store lock is held
-                // ONLY during the for_each walk (Phase 1). TCP delivery
-                // and bookkeeping (Phase 2+3) run lock-free.
-                let read_result = {
+                // Phase split: store lock held for the walk only; delivery
+                // and bookkeeping run lock-free.
+                let verdict = {
                     let store_guard = self.store.lock();
                     super::drain::drain_read(
                         &self.counters,
@@ -276,13 +195,13 @@ impl DrainWorker {
                         &mut self.drain_scratch,
                         &mut self.consumer_subjects,
                         now_ms,
+                        snap_changed,
                     )
                 };
-                // Store lock released — publish can proceed concurrently.
-                // `drain_deliver` re-opens the gate iff there is more work
-                // (`more_pending`); the `None` branch (no work this cycle)
-                // leaves the gate cleared by the top-of-loop `lock()`.
-                if let Some(result) = read_result {
+                probe.read_verdict(verdict);
+                // `drain_deliver` re-opens the gate iff more work remains;
+                // non-`Fed` verdicts leave it cleared by the top-of-loop lock.
+                if let ReadVerdict::Fed(result) = verdict {
                     super::drain::drain_deliver(
                         &self.counters,
                         &snap,
@@ -294,23 +213,26 @@ impl DrainWorker {
                         &self.silent_drops,
                         self.drain_config.stall_evict_ms,
                         result,
+                        &mut probe,
                     );
                 }
+                prev_snap = Some(snap);
 
                 let stalled = self.counters.cursor() == prev_cursor;
 
-                // Backpressure: work remains (gate re-opened via `more_pending`)
-                // but the cursor didn't advance → downstream channel full.
-                // Yield briefly so the writer task can drain before we retry.
+                // Backpressure: work remains but the cursor didn't advance →
+                // downstream writer full. Yield so it can drain. (First gate
+                // read; the park decision below takes its own.)
                 if stalled && self.gate.is_open() {
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
 
-                // No pending signal → genuinely idle: go back to sleep on
-                // `acquire()`. Any concurrent `release()` (publish/ack/rewind)
-                // that landed after the top-of-loop clear keeps the gate open
-                // and makes us loop instead.
-                if !self.gate.is_open() {
+                // INVARIANT: `park_verdict` is a SECOND, separate gate load,
+                // after the possible sleep — a concurrent `release()` during
+                // it must be observed. Never merge with the read above.
+                let park = park_verdict(&self.gate);
+                probe.park(&self.counters, park, stalled);
+                if park == ParkVerdict::Park {
                     crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
                     break;
                 }
@@ -356,6 +278,52 @@ fn drain_event_ring(
                 }
             }
         }
+    }
+}
+
+/// Consume the rewind signal and move the cursor back. MUST run before
+/// draining the event ring: `signal_rewind` (Release) is sequenced after
+/// the ring push and `take_rewind` is Acquire, so a visible signal
+/// implies its `Released` events are already in the ring.
+#[inline]
+fn apply_rewind(counters: &SharedCounters) -> RewindApplied {
+    match counters.take_rewind() {
+        None => RewindApplied::None,
+        Some(rw) => {
+            let cur = counters.cursor();
+            if rw > 0 && rw - 1 < cur {
+                counters.set_cursor(rw - 1);
+                RewindApplied::Applied { to: rw - 1 }
+            } else {
+                RewindApplied::AlreadyBehind { signal: rw }
+            }
+        }
+    }
+}
+
+/// Wall clock for TTL filtering — taken only when max-age is armed
+/// (0 on the server path, router.rs).
+#[inline]
+fn cycle_now_ms(cfg: &super::drain::DrainConfig) -> u64 {
+    if cfg.max_age_ms > 0 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    } else {
+        0
+    }
+}
+
+/// The park decision — one dedicated gate load, SEPARATE from the
+/// pre-sleep backpressure read. Collapsing the two reads reintroduces a
+/// lost wake: a `release()` during the 50µs sleep must be observed here.
+#[inline]
+fn park_verdict(gate: &Gate) -> ParkVerdict {
+    if gate.is_open() {
+        ParkVerdict::Continue
+    } else {
+        ParkVerdict::Park
     }
 }
 
@@ -445,15 +413,6 @@ pub struct CommandWorker {
     /// cleanup events.
     pub(super) drain_evt_tx: crate::shard::drain_events::DrainEventProducer,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
-    // Accumulator
-    pub(super) flusher_config: FlusherConfig,
-    // StreamId is dense but admin-path (publish accumulation), so HashMap is
-    // acceptable here — but we opt into foldhash per the dense/sparse rule
-    // (performance.md): non-std hashers for any keyed lookup.
-    pub(super) accum_streams: HashMap<StreamId, StreamAccum, foldhash::fast::FixedState>,
-    pub(super) accum_deadline: Option<Instant>,
-    pub(super) accum_total: usize,
-    pub(super) accum_bytes: usize,
     pub(super) drain_config_batch_size: u16,
     /// Per-stream retention limits. Set at CreateStream, cleared at DeleteStream.
     /// Propagated into `DrainSnapshot` during snapshot rebuild.
@@ -501,10 +460,6 @@ pub struct CommandWorker {
     /// publish hot path allocates the tracker; never goes back to false
     /// in steady state (the tracker only drops when the shard shuts down).
     pub(super) has_idempotency: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// F27 — reusable buffer for accumulator flush. Avoids one Vec
-    /// allocation per `flush_accumulator()` call (200/s at the default
-    /// 5 ms interval per shard).
-    pub(super) flush_stream_ids: Vec<StreamId>,
     /// H10: shared silent-drop counters.
     pub(super) silent_drops: Arc<crate::common::SilentDrops>,
     /// H11: ConsumerRemoved events that lost a `try_send` to the drain
@@ -676,65 +631,29 @@ impl CommandWorker {
                 .map(|due| Duration::from_millis(due.saturating_sub(self.now_ms())))
                 .unwrap_or(Self::EVICTION_INTERVAL);
 
-            if self.accum_total > 0 {
-                let timeout = self
-                    .accum_deadline
-                    .map(|d| d.saturating_duration_since(Instant::now()))
-                    .unwrap_or(Duration::from_millis(self.flusher_config.interval_ms));
-
-                tokio::select! {
-                    cmd = self.rx.recv() => {
-                        match cmd {
-                            Some(cmd) => {
-                                if self.handle_or_shutdown(cmd) {
-                                    return;
-                                }
+            tokio::select! {
+                cmd = self.rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            if self.handle_or_shutdown(cmd) {
+                                return;
                             }
-                            None => return,
                         }
-                    }
-                    Ok(n) = self.notify_ring.recv_async_send() => {
-                        self.handle_notification(n);
-                    }
-                    _ = tokio::time::sleep(timeout) => {
-                        self.flush_accumulator();
-                    }
-                    _ = tokio::time::sleep(eviction_sleep) => {
-                        self.evict_expired();
-                        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
-                    }
-                    _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
-                        // One sleep, two wheels, no shared cadence: the
-                        // deadline is whichever comes first and each gets
-                        // the wall time that actually elapsed.
-                        self.run_timers();
+                        None => return,
                     }
                 }
-            } else {
-                tokio::select! {
-                    cmd = self.rx.recv() => {
-                        match cmd {
-                            Some(cmd) => {
-                                if self.handle_or_shutdown(cmd) {
-                                    return;
-                                }
-                            }
-                            None => return,
-                        }
-                    }
-                    Ok(n) = self.notify_ring.recv_async_send() => {
-                        self.handle_notification(n);
-                    }
-                    _ = tokio::time::sleep(eviction_sleep) => {
-                        self.evict_expired();
-                        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
-                    }
-                    _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
-                        // One sleep, two wheels, no shared cadence: the
-                        // deadline is whichever comes first and each gets
-                        // the wall time that actually elapsed.
-                        self.run_timers();
-                    }
+                Ok(n) = self.notify_ring.recv_async_send() => {
+                    self.handle_notification(n);
+                }
+                _ = tokio::time::sleep(eviction_sleep) => {
+                    self.evict_expired();
+                    self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+                }
+                _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
+                    // One sleep, two wheels, no shared cadence: the
+                    // deadline is whichever comes first and each gets
+                    // the wall time that actually elapsed.
+                    self.run_timers();
                 }
             }
         }
@@ -1146,11 +1065,10 @@ impl CommandWorker {
             if crate::shard::drain::chaos_debug() {
                 let info = self.store.lock().info();
                 eprintln!(
-                    "[SHUTDOWN-BEGIN] accum_total={} store_first={} store_last={} messages={}",
-                    self.accum_total, info.first_seq, info.last_seq, info.messages
+                    "[SHUTDOWN-BEGIN] store_first={} store_last={} messages={}",
+                    info.first_seq, info.last_seq, info.messages
                 );
             }
-            self.flush_accumulator();
             if let Err(e) = self.store.lock().shutdown() {
                 tracing::error!(error = ?e, "store shutdown failed");
             }
@@ -1172,22 +1090,9 @@ impl CommandWorker {
         false
     }
 
-    pub(super) fn check_accumulator_flush(&mut self) {
-        if self.accum_total == 0 {
-            return;
-        }
-        let force = self.accum_total >= self.flusher_config.max_size
-            || self.accum_bytes >= self.flusher_config.max_bytes;
-        let expired = self.accum_deadline.is_some_and(|d| Instant::now() >= d);
-        if force || expired {
-            self.flush_accumulator();
-        }
-    }
-
     /// Dispatch a single command to its handler.
     fn dispatch_command(&mut self, cmd: ShardCommand) {
         match cmd {
-            ShardCommand::PublishAccumulate(cmd) => self.handle_publish_accumulate(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
             ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),
@@ -1558,11 +1463,6 @@ mod tests {
             notify_ring: notify_rx,
             drain_evt_tx,
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            flusher_config: FlusherConfig::default(),
-            accum_streams: HashMap::with_hasher(foldhash::fast::FixedState::default()),
-            accum_deadline: None,
-            accum_total: 0,
-            accum_bytes: 0,
             drain_config_batch_size: 64,
             stream_retention: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             bindings: Vec::new(),
@@ -1574,7 +1474,6 @@ mod tests {
             last_idempotency_ms: 0,
             idempotency_tracker: crate::shard::idempotency::new_shared_idempotency(),
             has_idempotency: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            flush_stream_ids: Vec::new(),
             silent_drops: Arc::new(crate::common::SilentDrops::new()),
             pending_consumer_remove: Vec::new(),
             pending_drain_acks: Vec::new(),

@@ -95,23 +95,6 @@ impl ShardHandle {
         Ok(())
     }
 
-    /// Fire & forget — shard accumulates entries, flushes with append_batch.
-    pub async fn publish_accumulate(
-        &self,
-        stream_id: StreamId,
-        conn_id: u64,
-        env_seq: u32,
-        entries: Vec<PublishEntryOwned>,
-    ) -> Result<(), SendError> {
-        self.send(ShardCommand::PublishAccumulate(PublishCmd {
-            stream_id,
-            conn_id,
-            env_seq,
-            entries,
-        }))
-        .await
-    }
-
     pub async fn ack(
         &self,
         consumer_id: ConsumerId,

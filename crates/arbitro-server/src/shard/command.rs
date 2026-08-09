@@ -20,7 +20,6 @@ pub use arbitro_engine_v2::AckEntry;
 /// dispatch layer, bypassing the shard worker entirely.
 pub enum ShardCommand {
     // Hot path
-    PublishAccumulate(PublishCmd),
     Ack(AckCmd),
     Nack(NackCmd),
     /// Terminate — ack + tombstone (never redeliver to any consumer).
@@ -70,14 +69,6 @@ pub enum ShardCommand {
 }
 
 // ── Hot path commands ───────────────────────────────────────────────────────
-
-/// Publish entries to a stream. Fire & forget — shard replies directly.
-pub struct PublishCmd {
-    pub stream_id: StreamId,
-    pub conn_id: u64,
-    pub env_seq: u32,
-    pub entries: Vec<PublishEntryOwned>,
-}
 
 /// Owned publish entry — subject and payload cross the channel.
 pub struct PublishEntryOwned {

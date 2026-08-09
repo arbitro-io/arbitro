@@ -13,7 +13,6 @@
 //!
 //!   * `Nack`/`BatchNack` — now implemented (Action::Nack/BatchNack handlers).
 //!   * `AckSync`/`BatchAckSync` — collapsed into fire-and-forget Ack/BatchAck.
-//!   * `PublishAccumulate` — accumulator path is v1-only for now.
 //!   * `PublishWithReply` — now implemented (request/reply RPC).
 //!   * `PublishWithHeaders` / `PublishBatchWithHeaders` — deleted §5.1.
 //!
@@ -230,8 +229,8 @@ pub async fn dispatch_frame_v2(
             registry.touch(conn_id);
         }
 
-        // L1 / L2: AckSync / BatchAckSync, PublishAccumulate,
-        // FanoutBatch — have wire codes but no dispatcher. Reply
+        // L1 / L2: AckSync / BatchAckSync, FanoutBatch — have wire
+        // codes but no dispatcher. Reply
         // `Unimplemented` so the client gets a stable, distinct error
         // instead of UnknownAction.
         _ => {

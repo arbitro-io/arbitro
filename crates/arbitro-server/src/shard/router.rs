@@ -22,7 +22,8 @@ use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::drain_events::DrainEventRing;
 use crate::shard::handle::ShardHandle;
 use crate::shard::shared::{DrainSnapshot, NotifyRing, SharedCounters, SnapshotSwap};
-use crate::shard::worker::{CommandWorker, DrainWorker, FlusherConfig};
+use crate::shard::drain_probe::{ProbeOff, ProbeOn};
+use crate::shard::worker::{CommandWorker, DrainWorker};
 use crate::transport::ConnectionRegistry;
 use arbitro_common::SharedClock;
 
@@ -242,7 +243,7 @@ impl ShardRouter {
             // the producer, drain owns the consumer.
             let (drain_evt_tx, drain_evt_rx) = DrainEventRing::new();
 
-            // ── Drain thread — pure: gate.acquire → drain_cycle ──────
+            // ── Drain task — pure: gate.acquire → drain_read/deliver ──
             let drain_worker = DrainWorker {
                 counters: Arc::clone(&counters),
                 snapshot: Arc::clone(&snapshot),
@@ -267,7 +268,17 @@ impl ShardRouter {
             // to false, release the gate, and await. After migrating to
             // an async drain, this is a tokio task — no OS-thread join,
             // no `spawn_blocking`, no impedance mismatch with the runtime.
-            let join = tokio::spawn(drain_worker.run());
+            //
+            // Probe monomorph selected ONCE here: recording drains carry
+            // `ProbeOn` (also serves the legacy ARBITRO_CHAOS_DEBUG drain
+            // prints); default drains compile every probe call to nothing.
+            let probe_on = std::env::var("ARBITRO_DRAIN_PROBE").is_ok()
+                || std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
+            let join = if probe_on {
+                tokio::spawn(drain_worker.run(ProbeOn::new()))
+            } else {
+                tokio::spawn(drain_worker.run(ProbeOff))
+            };
             drain_joins.push(Some(join));
             drain_running.push(Arc::clone(&running));
 
@@ -284,13 +295,6 @@ impl ShardRouter {
                 notify_ring: notify_rx,
                 drain_evt_tx,
                 running: Arc::clone(&running),
-                flusher_config: FlusherConfig::default(),
-                accum_streams: std::collections::HashMap::with_hasher(
-                    foldhash::fast::FixedState::default(),
-                ),
-                accum_deadline: None,
-                accum_total: 0,
-                accum_bytes: 0,
                 drain_config_batch_size: config.drain_batch_size,
                 stream_retention: std::collections::HashMap::with_hasher(
                     foldhash::fast::FixedState::default(),
@@ -304,7 +308,6 @@ impl ShardRouter {
                 last_idempotency_ms: 0,
                 idempotency_tracker: Arc::clone(&shard_idempotency),
                 has_idempotency: Arc::clone(&shard_has_idempotency),
-                flush_stream_ids: Vec::new(),
                 silent_drops: Arc::clone(&silent_drops),
                 pending_consumer_remove: Vec::new(),
                 pending_drain_acks: Vec::new(),

@@ -2,6 +2,7 @@
 //!
 //! * `command` — owned command types crossing the mpsc boundary.
 //! * `drain` — reactive linear-walk drain cycle (atomics + snapshot).
+//! * `drain_probe` — zero-cost drain observability (monomorph at spawn).
 //! * `handle` — async `ShardHandle` (tx + unpark).
 //! * `handlers` — command handler implementations (ack, subscribe, admin).
 //! * `router` — `ShardRouter` spawns shard threads and routes by stream_id.
@@ -14,6 +15,7 @@ pub mod command;
 pub mod consumer_subjects;
 pub mod drain;
 pub mod drain_events;
+pub mod drain_probe;
 pub mod handle;
 pub mod handlers;
 pub mod idempotency;
