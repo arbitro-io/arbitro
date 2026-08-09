@@ -272,10 +272,14 @@ impl ShardRouter {
             // Probe monomorph selected ONCE here: recording drains carry
             // `ProbeOn` (also serves the legacy ARBITRO_CHAOS_DEBUG drain
             // prints); default drains compile every probe call to nothing.
-            let probe_on = std::env::var("ARBITRO_DRAIN_PROBE").is_ok()
-                || std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
+            // ARBITRO_DRAIN_PROBE keeps the cycle ring only — the quiet
+            // instrument for chasing a race. ARBITRO_CHAOS_DEBUG additionally
+            // restores the legacy per-frame prints, which cost a write(2)
+            // each and shift the timing they are meant to observe.
+            let verbose = std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
+            let probe_on = verbose || std::env::var("ARBITRO_DRAIN_PROBE").is_ok();
             let join = if probe_on {
-                tokio::spawn(drain_worker.run(ProbeOn::new()))
+                tokio::spawn(drain_worker.run(ProbeOn::new(verbose)))
             } else {
                 tokio::spawn(drain_worker.run(ProbeOff))
             };

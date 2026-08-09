@@ -124,13 +124,17 @@ impl Default for CycleRecord {
 
 const RING_LEN: usize = 512;
 
-/// Recording probe. Emits the same lines the removed `chaos_debug()`
-/// sites printed (formats preserved), keeps the last [`RING_LEN`] cycle
-/// records in a ring allocated once at spawn, and dumps the ring on the
-/// first park at each cursor position while demand exists — the
+/// Recording probe. Keeps the last [`RING_LEN`] cycle records in a ring
+/// allocated once at spawn and dumps them when the drain parks — the
 /// strongest drain-side proxy for "parked with a consumer still owed
 /// messages" (per-consumer starvation is not decidable from drain-side
 /// state alone).
+///
+/// `verbose` restores the per-frame lines the removed `chaos_debug()`
+/// sites printed. Leave it off when chasing a race: each of those lines
+/// is an unbuffered `write(2)`, ~30k of them over a 500k-message replay,
+/// which perturbs the very timing under investigation. The ring costs
+/// nothing and survives either way.
 pub(in crate::shard) struct ProbeOn {
     ring: Box<[CycleRecord; RING_LEN]>,
     /// Next slot to write.
@@ -141,17 +145,19 @@ pub(in crate::shard) struct ProbeOn {
     cur: CycleRecord,
     /// Cursor value at the last ring dump — dedups quiesce-point dumps.
     last_dump_cursor: Option<u64>,
+    /// Per-frame/per-cycle printing. The ring and its dumps ignore this.
+    verbose: bool,
 }
 
 impl ProbeOn {
-    #[allow(clippy::new_without_default)]
-    pub(in crate::shard) fn new() -> Self {
+    pub(in crate::shard) fn new(verbose: bool) -> Self {
         Self {
             ring: Box::new([CycleRecord::default(); RING_LEN]),
             idx: 0,
             len: 0,
             cur: CycleRecord::default(),
             last_dump_cursor: None,
+            verbose,
         }
     }
 
@@ -219,6 +225,9 @@ impl DrainProbe for ProbeOn {
 
     fn flush_ok(&mut self, conn: ConnectionId, first_seq: u64, count: u16) {
         self.cur.flushed_ok = self.cur.flushed_ok.saturating_add(1);
+        if !self.verbose {
+            return;
+        }
         eprintln!(
             "[FLUSH-OK] conn={} first_seq={} last_seq={} count={}",
             conn.0,
@@ -230,6 +239,9 @@ impl DrainProbe for ProbeOn {
 
     fn flush_backpressured(&mut self, conn: ConnectionId, first_seq: u64, count: u16) {
         self.cur.flushed_backpressured = self.cur.flushed_backpressured.saturating_add(1);
+        if !self.verbose {
+            return;
+        }
         eprintln!(
             "[FLUSH-BACKPRESSURE] conn={} first_seq={} count={}",
             conn.0, first_seq, count
@@ -238,6 +250,9 @@ impl DrainProbe for ProbeOn {
 
     fn flush_writer_gone(&mut self, conn: ConnectionId, first_seq: u64, count: u16, not_found: bool) {
         self.cur.flushed_gone = self.cur.flushed_gone.saturating_add(1);
+        if !self.verbose {
+            return;
+        }
         if not_found {
             eprintln!(
                 "[FLUSH-DEAD-WRITER-NOT-FOUND] conn={} first_seq={} count={}",
@@ -253,6 +268,9 @@ impl DrainProbe for ProbeOn {
 
     fn cursor_advance(&mut self, counters: &SharedCounters, new_cursor: u64, r: &DrainReadResult) {
         self.cur.cursor_after = new_cursor;
+        if !self.verbose {
+            return;
+        }
         eprintln!(
             "[chaos-debug] cursor {} -> {} (start={} end={} skipped={:?} more={})",
             counters.cursor(),

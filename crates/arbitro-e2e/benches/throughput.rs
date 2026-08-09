@@ -155,17 +155,26 @@ async fn start_server() -> String {
     tokio::spawn(async move {
         let _ = server.run().await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
 
+/// Retry rather than guess. `tokio::spawn` returns before the server has
+/// bound its listener, and the fixed 50ms wait this replaces turned any
+/// slower startup into a ConnectionRefused panic before a single message
+/// was measured.
 async fn connect(addr: &str) -> Client {
-    Client::connect(ClientConfig {
-        addr: addr.to_string(),
-        ..ClientConfig::default()
-    })
-    .await
-    .expect("client must connect")
+    for _ in 0..200 {
+        if let Ok(c) = Client::connect(ClientConfig {
+            addr: addr.to_string(),
+            ..ClientConfig::default()
+        })
+        .await
+        {
+            return c;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("client must connect to {addr} — still refused after 2s");
 }
 
 /// Delete (if present) and recreate every stream in `names`.
