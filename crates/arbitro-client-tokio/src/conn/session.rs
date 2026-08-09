@@ -15,7 +15,7 @@ use arbitro_proto::v2::ingress::hello::Role;
 use crate::conn::reconnect::Backoff;
 use crate::error::ClientError;
 use crate::state::Inner;
-use crate::transport::encode::{encode_ack_state_req_v2, encode_hello_v2};
+use crate::transport::encode::{encode_ack_state_req_v2, encode_auth_v2, encode_hello_v2};
 use crate::transport::frame::{WriteFrame, WriteLease, WRITE_QUEUE_CAP};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
@@ -83,7 +83,7 @@ pub(crate) async fn spawn_connection(
 ) -> Result<(), ClientError> {
     // Initial connection — fast failure path.
     let (r, mut w) = dial(&inner).await?;
-    write_handshake(&mut w).await?;
+    write_handshake(&mut w, inner.cfg.auth_token.as_deref()).await?;
     // Replay any subscriptions (none on first connect — future-proofs reconnect).
     replay_subscriptions(&inner, &mut session_replay_lease);
     send_ack_state_reqs(&inner, &mut session_replay_lease);
@@ -136,7 +136,9 @@ pub(crate) async fn spawn_connection(
                 }
                 match dial(&inner).await {
                     Ok((r, mut w)) => {
-                        if let Err(e) = write_handshake(&mut w).await {
+                        if let Err(e) =
+                            write_handshake(&mut w, inner.cfg.auth_token.as_deref()).await
+                        {
                             warn!(?e, "handshake write failed");
                             continue;
                         }
@@ -160,10 +162,36 @@ pub(crate) async fn spawn_connection(
     Ok(())
 }
 
-/// Write the v2 Hello handshake frame.
-async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(w: &mut W) -> Result<(), ClientError> {
+/// Write the v2 handshake: Hello, then the Auth frame when a token is set.
+///
+/// This is the **only** place either frame is written, and it runs on the
+/// first dial *and* on every redial — so a reconnect cannot silently drop
+/// authentication. That single choke point is the whole reason the token is
+/// not sent from `connect()`.
+///
+/// Both frames go out in one `write_all`. The broker's handshake deadline
+/// covers Hello + Auth together, and pipelining them means the client never
+/// waits in between.
+///
+/// Nothing is awaited here: the broker answers only on *failure* (an error
+/// frame, then close). Success is silent, so waiting for a reply would hang
+/// forever. The reader classifies `AuthRequired`/`AuthFailed` and shuts the
+/// session down.
+async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    auth_token: Option<&str>,
+) -> Result<(), ClientError> {
     let hello = encode_hello_v2(Role::Client);
-    w.write_all(&hello).await?;
+    match auth_token {
+        None => w.write_all(&hello).await?,
+        Some(token) => {
+            let auth = encode_auth_v2(token.as_bytes());
+            let mut buf = Vec::with_capacity(hello.len() + auth.len());
+            buf.extend_from_slice(&hello);
+            buf.extend_from_slice(&auth);
+            w.write_all(&buf).await?;
+        }
+    }
     Ok(())
 }
 

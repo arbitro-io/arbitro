@@ -36,6 +36,16 @@ pub struct Session {
     /// observability and back-pressure detection (compare with frames
     /// enqueued via `try_send`).
     pub frames_written: Arc<AtomicU64>,
+    /// Who this connection authenticated as. Written once, by the handshake,
+    /// immediately after credentials are accepted; never mutated afterwards
+    /// (there is no re-auth — credential rotation means reconnecting).
+    ///
+    /// This is the authorization seam. A per-action permission check is
+    /// `registry.identity(conn_id)` inside the `match action` in
+    /// `transport::dispatch_v2` — which already holds `conn_id` and the
+    /// registry, so no signature anywhere needs to change. `Arc` so readers
+    /// clone a pointer, not a `Vec<Permission>`, while holding the map lock.
+    pub identity: Arc<crate::auth::Identity>,
 }
 
 /// Atomic connection ID generator.

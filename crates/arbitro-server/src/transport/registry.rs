@@ -327,9 +327,31 @@ impl ConnectionRegistry {
             last_activity: std::sync::atomic::AtomicU64::new(now_ms(&clock)),
             write_failed,
             frames_written,
+            // Registration happens before the handshake runs, so the
+            // connection starts anonymous. `set_identity` overwrites it if
+            // credentials are accepted; a connection that never authenticates
+            // is closed before it can dispatch anything.
+            identity: Arc::new(crate::auth::Identity::default()),
         };
         self.inner.sessions.lock().insert(conn_id, session);
         conn_id
+    }
+
+    /// Bind the authenticated identity to a connection. Called once, from the
+    /// handshake, before any frame is dispatched.
+    pub fn set_identity(&self, conn_id: u64, identity: crate::auth::Identity) {
+        let mut sessions = self.inner.sessions.lock();
+        if let Some(s) = sessions.get_mut(&conn_id) {
+            s.identity = Arc::new(identity);
+        }
+    }
+
+    /// The identity bound to a connection, or `None` if the connection is gone.
+    ///
+    /// This is what a future per-action authorization check calls.
+    pub fn identity(&self, conn_id: u64) -> Option<Arc<crate::auth::Identity>> {
+        let sessions = self.inner.sessions.lock();
+        sessions.get(&conn_id).map(|s| Arc::clone(&s.identity))
     }
 
     /// Remove a session — drops the Sender, which closes the writer task.

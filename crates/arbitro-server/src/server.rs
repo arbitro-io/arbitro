@@ -30,106 +30,10 @@ use crate::transport::dispatch_v2;
 use crate::transport::registry::{ConnReader, ConnWriter};
 use crate::transport::ConnectionRegistry;
 
-/// FEAT-10: a permission grantable to an auth'd connection. Scaffold only —
-/// `check_permission` is wired into the auth path but no dispatch call site
-/// enforces per-action permissions yet (that requires plumbing an identity
-/// through `dispatch_v2`, outside this file).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Permission {
-    Publish,
-    Consume,
-    Admin,
-}
-
-/// One configured user: a bearer token mapped to an identity and the set
-/// of permissions that identity holds.
-#[derive(Debug, Clone)]
-pub struct AuthUser {
-    pub username: String,
-    pub token: String,
-    pub permissions: Vec<Permission>,
-}
-
-impl AuthUser {
-    pub fn has_permission(&self, perm: Permission) -> bool {
-        self.permissions.contains(&perm) || self.permissions.contains(&Permission::Admin)
-    }
-}
-
-/// FEAT-10: multi-user auth scaffold. Alongside (or instead of) the single
-/// shared `ARBITRO_AUTH_TOKEN`, `users` allows per-connection identity: each
-/// token maps to a username and a permission set. Populated today from
-/// `ARBITRO_AUTH_USERS` (format: `user1:token1:publish,consume;user2:token2:admin`),
-/// independent of `Config` so it can be added without touching config.rs.
-#[derive(Debug, Clone, Default)]
-pub struct AuthConfig {
-    pub users: Vec<AuthUser>,
-}
-
-impl AuthConfig {
-    /// Look up a user by bearer token. Linear scan — fine for the small
-    /// user counts this is meant for; swap for a HashMap if that changes.
-    pub fn find_by_token(&self, token: &[u8]) -> Option<&AuthUser> {
-        self.users.iter().find(|u| u.token.as_bytes() == token)
-    }
-
-    /// Load from `ARBITRO_AUTH_USERS`. Returns an empty config (no
-    /// multi-user auth configured) if the env var is unset or empty.
-    pub fn from_env() -> Self {
-        let raw = match std::env::var("ARBITRO_AUTH_USERS") {
-            Ok(v) if !v.is_empty() => v,
-            _ => return Self::default(),
-        };
-        let users = raw
-            .split(';')
-            .filter_map(|entry| {
-                let entry = entry.trim();
-                if entry.is_empty() {
-                    return None;
-                }
-                let mut parts = entry.splitn(3, ':');
-                let username = parts.next()?.to_string();
-                let token = parts.next()?.to_string();
-                let perms = parts
-                    .next()
-                    .unwrap_or("")
-                    .split(',')
-                    .filter_map(|p| match p.trim() {
-                        "publish" => Some(Permission::Publish),
-                        "consume" => Some(Permission::Consume),
-                        "admin" => Some(Permission::Admin),
-                        "" => None,
-                        other => {
-                            tracing::warn!(
-                                permission = other,
-                                "ARBITRO_AUTH_USERS: unknown permission, skipping"
-                            );
-                            None
-                        }
-                    })
-                    .collect();
-                Some(AuthUser {
-                    username,
-                    token,
-                    permissions: perms,
-                })
-            })
-            .collect();
-        Self { users }
-    }
-}
-
-/// FEAT-10: check whether an identity (resolved from `AuthConfig`) is
-/// allowed to perform an action gated by `perm`. Returns `true` when no
-/// multi-user auth is configured (single shared-token mode, or auth
-/// disabled) so this can be called unconditionally without changing
-/// behavior for brokers that don't opt into per-user permissions.
-pub fn check_permission(user: Option<&AuthUser>, perm: Permission) -> bool {
-    match user {
-        Some(u) => u.has_permission(perm),
-        None => true,
-    }
-}
+// Authentication lives in `crate::auth` — one enum, one call site (the
+// handshake below). Re-exported here because these names were public from
+// this module before the extraction.
+pub use crate::auth::{AuthUser, Authenticator, Credentials, Identity, Permission};
 
 /// The running server — owns the shard router, connection registry, and lifecycle services.
 pub struct ArbitroServer {
@@ -804,13 +708,15 @@ impl ArbitroServer {
         #[cfg(feature = "tls")]
         let tls_acceptor_shared = tls_acceptor.map(std::sync::Arc::new);
 
-        let auth_token_shared: Option<Arc<str>> = self.config.auth_token.as_deref().map(Arc::from);
-        // FEAT-10: multi-user auth scaffold, loaded independently of Config.
-        let auth_config_shared: Arc<AuthConfig> = Arc::new(AuthConfig::from_env());
-        if !auth_config_shared.users.is_empty() {
+        // How this broker authenticates: shared `ARBITRO_AUTH_TOKEN`, per-user
+        // `ARBITRO_AUTH_USERS`, or neither (Disabled). Resolved once here and
+        // shared by every connection task.
+        let authenticator_shared: Arc<Authenticator> =
+            Arc::new(Authenticator::from_config(self.config.auth_token.clone()));
+        if authenticator_shared.requires_credentials() {
             tracing::info!(
-                users = auth_config_shared.users.len(),
-                "FEAT-10: multi-user auth configured"
+                users = authenticator_shared.user_count(),
+                "authentication enabled"
             );
         }
         let max_frame_size = self.config.max_frame_size;
@@ -839,8 +745,7 @@ impl ArbitroServer {
                                 let reg = accept_registry.clone();
                                 let srv = accept_server.clone();
                                 let sd = accept_shutdown.clone();
-                                let auth = auth_token_shared.clone();
-                                let auth_users = Arc::clone(&auth_config_shared);
+                                let authenticator = Arc::clone(&authenticator_shared);
                                 let cron = cron_registry.clone();
                                 let delayed = delayed_journal.clone();
                                 #[cfg(feature = "cluster")]
@@ -892,7 +797,7 @@ impl ArbitroServer {
                                     tracing::debug!(conn_id, %addr, "accepted");
 
                                     read_loop(
-                                        conn_id, reader, srv, reg, sd, auth, auth_users,
+                                        conn_id, reader, srv, reg, sd, authenticator,
                                         max_frame_size, max_ops_per_sec, cron,
                                         delayed,
                                         #[cfg(feature = "cluster")]
@@ -1090,8 +995,7 @@ async fn read_loop(
     server: ShardRouter,
     registry: ConnectionRegistry,
     mut shutdown: watch::Receiver<bool>,
-    auth_token: Option<Arc<str>>,
-    auth_users: Arc<AuthConfig>,
+    authenticator: Arc<Authenticator>,
     max_frame_size: usize,
     max_ops_per_sec: u32,
     cron_registry: std::sync::Arc<crate::cron::CronRegistry>,
@@ -1112,10 +1016,7 @@ async fn read_loop(
     // Per-connection HELLO state. Connection is closed if the first 4
     // bytes are not the v2 magic.
     let mut hello_done: bool = false;
-    let mut auth_done: bool = auth_token.is_none() && auth_users.users.is_empty();
-    // FEAT-10: identity attached to this connection once a per-user token
-    // matches. `None` when running in shared-token (or no-auth) mode.
-    let mut identity: Option<AuthUser> = None;
+    let mut auth_done: bool = !authenticator.requires_credentials();
 
     // ROB-1: handshake deadline. A connection that doesn't complete HELLO +
     // auth within this window is closed — otherwise a client that opens
@@ -1168,6 +1069,18 @@ async fn read_loop(
         // ---- Auth check (first frame after Hello must be Auth) ------------
         if hello_done && !auth_done && acc.len() >= HEADER_SIZE_V2 {
             let msg_len = u32::from_le_bytes([acc[4], acc[5], acc[6], acc[7]]) as usize;
+            // Action first, size second. A client that skipped Auth and opened
+            // with a large publish is owed AuthRequired ("send a token", which
+            // its reconnect logic treats as terminal), not InvalidLength — a
+            // generic code it would redial against forever.
+            if u16::from_le_bytes([acc[0], acc[1]]) != Action::Auth.as_u16() {
+                tracing::warn!(
+                    conn_id,
+                    "auth required but first frame is not Auth, closing"
+                );
+                send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
+                break 'outer;
+            }
             // SEC-1: auth frames carry a token, never a bulk payload — cap
             // at 4096 bytes (and never above max_frame_size) before we
             // buffer up to `total` bytes. Without this a client can send a
@@ -1186,63 +1099,37 @@ async fn read_loop(
             }
             let total = HEADER_SIZE_V2 + msg_len;
             if acc.len() >= total {
-                let action_raw = u16::from_le_bytes([acc[0], acc[1]]);
-                if action_raw != Action::Auth.as_u16() {
-                    // H2: surface the real reason (AuthRequired) instead
-                    // of pretending the server is shutting down. The
-                    // client needs to distinguish "send a token" from
-                    // "stop trying, the broker is down".
-                    tracing::warn!(
-                        conn_id,
-                        "auth required but first frame is not Auth, closing"
-                    );
-                    send_error_frame(&registry, conn_id, ErrorCode::AuthRequired);
-                    break 'outer;
-                }
-                // Token is the body (after 16-byte header)
-                let token_bytes = &acc[HEADER_SIZE_V2..total];
-                // M14: constant-time comparison so a network observer
-                // can't recover the token byte-by-byte via timing of `!=`.
-                // We keep the early length-mismatch reject (constant
-                // against a known expected length is fine — the attacker
-                // already knows it from a single failed attempt).
-                let shared_token_ok = auth_token.as_ref().is_some_and(|expected| {
-                    let e = expected.as_bytes();
-                    if token_bytes.len() != e.len() {
-                        false
-                    } else {
-                        let mut diff: u8 = 0;
-                        for (a, b) in token_bytes.iter().zip(e.iter()) {
-                            diff |= a ^ b;
-                        }
-                        diff == 0
-                    }
-                });
-                // FEAT-10: fall back to per-user token lookup when the
-                // shared token doesn't match (or isn't configured).
-                let matched_user = if shared_token_ok {
-                    None
-                } else {
-                    auth_users.find_by_token(token_bytes).cloned()
+                // Token is the body (after the 16-byte header). The whole
+                // security decision — constant-time compare, shared vs
+                // per-user, which error code is owed — lives in
+                // `Authenticator::authenticate`. A future layer (mTLS CN,
+                // JWT) is a new variant there and changes nothing here.
+                let creds = Credentials {
+                    token: Some(&acc[HEADER_SIZE_V2..total]),
                 };
-
-                if !shared_token_ok && matched_user.is_none() {
-                    // H2: a wrong token is AuthFailed, not a server
-                    // shutdown signal. Mis-coding this confuses
-                    // bootstrap loops and credential-rotation logic.
-                    tracing::warn!(conn_id, "auth failed: invalid token");
-                    send_error_frame(&registry, conn_id, ErrorCode::AuthFailed);
-                    break 'outer;
-                }
-                if let Some(user) = matched_user {
-                    tracing::debug!(conn_id, username = %user.username, "auth accepted (per-user)");
-                    identity = Some(user);
-                } else {
-                    tracing::debug!(conn_id, "auth accepted");
+                match authenticator.authenticate(&creds) {
+                    crate::auth::AuthOutcome::Deny(code) => {
+                        // H2: a wrong token is AuthFailed, not a server
+                        // shutdown signal. Mis-coding this confuses
+                        // bootstrap loops and credential-rotation logic.
+                        tracing::warn!(conn_id, ?code, "auth denied");
+                        send_error_frame(&registry, conn_id, code);
+                        break 'outer;
+                    }
+                    crate::auth::AuthOutcome::Allow(id) => {
+                        match id.username.as_deref() {
+                            Some(u) => {
+                                tracing::debug!(conn_id, username = %u, "auth accepted (per-user)")
+                            }
+                            None => tracing::debug!(conn_id, "auth accepted"),
+                        }
+                        // Bind it to the connection. Authorization later reads
+                        // it back by `conn_id` — nothing needs re-plumbing.
+                        registry.set_identity(conn_id, id);
+                    }
                 }
                 let _ = acc.split_to(total);
                 auth_done = true;
-                let _ = &identity; // FEAT-10: identity is attached for future permission checks.
             }
         }
 

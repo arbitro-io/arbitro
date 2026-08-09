@@ -5,6 +5,52 @@ All notable changes to `arbitro-server` (and the in-tree Rust reference client
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer with
 the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
+## [0.7.1] - 2026-08-08
+
+### Added — connection authentication
+
+A connection authenticates **once**, in the handshake, and never again. The TCP
+stream is the security boundary: once the peer is established, every later
+frame on that socket is from the same peer, so nothing on the delivery path
+re-checks anything. The hot path is untouched.
+
+- **`auth` module** — `Authenticator` is an enum (`Disabled` | `Token`) with a
+  single call site. A future layer (mTLS common-name, JWT, an external auth
+  service) is a new variant plus a new match arm; nothing else moves. New
+  evidence is a field on `Credentials`, new identity a field on `Identity`.
+- **`Identity` carries no secret.** The token that proved it stays in the
+  authenticator instead of being cloned onto every connection, and a future
+  mTLS/JWT identity has no static token to store anyway.
+- **Authorization seam, no plumbing.** The resolved identity is stored in the
+  connection registry, so a per-action check is `registry.identity(conn_id)`
+  inside the existing `match action` — which already holds `conn_id` and the
+  registry. No signature anywhere has to change.
+
+### Fixed — connection authentication
+
+- **An `Auth` frame killed a connection when the broker had auth disabled.**
+  `Action::Auth` had no dispatch arm, so it fell through to `Unimplemented` +
+  `Err`, which the read loop treats as a malformed frame and drops the
+  connection. Every token-configured client died on frame one against a broker
+  that simply doesn't want a token. Now a no-op: authentication is consumed by
+  the handshake, and there is deliberately no re-auth.
+- **The per-user token lookup was not constant-time.** The shared-token path
+  compared without an early exit; the multi-user path used `==`, which stops at
+  the first differing byte and turns response latency into an oracle. Both are
+  constant-time now, and the user scan no longer breaks on match — returning
+  early would leak how far down the list a token sits.
+- **A malformed `ARBITRO_AUTH_USERS` silently disabled authentication.** An
+  entry missing its colons was dropped, and a fully unparseable value left the
+  broker booting with auth off and no warning. A set-but-unusable value now
+  logs an error.
+- **`ARBITRO_AUTH_TOKEN=` (set but empty) enabled auth with an empty token.**
+  No client sends an `Auth` frame for an empty token, so this locked everyone
+  out. Empty now means unset, matching every other credential read.
+- **A tokenless client's oversized first frame got `InvalidLength`, not
+  `AuthRequired`.** The size gate ran before the action check. Clients treat
+  `AuthRequired` as terminal and `InvalidLength` as retryable, so the wrong code
+  turned a clean stop into redial noise.
+
 ## [0.7.0] - 2026-08-08
 
 ### Fixed — `arbitro-server` (delay accuracy)
@@ -131,5 +177,6 @@ close the gaps found while soak-testing multi-node restarts under chaos.
   production `NotifyRing` hand-off (OS-thread drain → tokio task) is also ~1.8×
   faster as a result of removing the gate's hot-line read.
 
+[0.7.1]: https://github.com/arbitro-io/arbitro/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/arbitro-io/arbitro/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/arbitro-io/arbitro/compare/v0.6.1...v0.6.2

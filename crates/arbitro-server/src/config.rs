@@ -124,7 +124,12 @@ impl Config {
             data_dir: Some(std::env::var("ARBITRO_DATA_DIR").unwrap_or_else(|_| "./data".into())),
             tls_cert: std::env::var("ARBITRO_TLS_CERT").ok(),
             tls_key: std::env::var("ARBITRO_TLS_KEY").ok(),
-            auth_token: std::env::var("ARBITRO_AUTH_TOKEN").ok(),
+            // Empty means "unset", not "auth with an empty token". `FOO=` is a
+            // routine compose idiom; treating it as configured would demand an
+            // Auth frame no client ever sends, locking everyone out.
+            auth_token: std::env::var("ARBITRO_AUTH_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty()),
             max_frame_size: env_parse("ARBITRO_MAX_FRAME_SIZE", 64 * 1024 * 1024),
             max_ops_per_sec: env_parse("ARBITRO_MAX_OPS_PER_SEC", 0),
             // Durability is opt-IN, not opt-out: the default is no per-write

@@ -22,6 +22,7 @@
 //! * `config`, `server` — top-level configuration and the `ArbitroServer`
 //!   accept loop.
 
+pub mod auth;
 pub mod banner;
 #[cfg(feature = "cluster")]
 pub mod cluster;

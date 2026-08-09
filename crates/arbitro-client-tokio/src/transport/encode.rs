@@ -15,6 +15,8 @@ use arbitro_proto::v2::cold::{
     GetConsumer, GetStream, ListConsumers, ListStreams, PauseConsumer, PurgeStream, ResumeConsumer,
     SubjectLimit as ColdSubjectLimit, Unsubscribe,
 };
+use arbitro_proto::action::Action;
+use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
 use arbitro_proto::v2::ingress::ack_state::{AckBatchFrame, AckStateReqFrame};
 use arbitro_proto::v2::ingress::hello::{HelloFrame, Role};
@@ -314,6 +316,21 @@ pub(crate) fn encode_list_consumers_v2(seq: u64, stream_id: u32, offset: u32, li
 pub(crate) fn encode_hello_v2(role: Role) -> Bytes {
     let f = HelloFrame::new(role);
     Bytes::copy_from_slice(f.as_bytes())
+}
+
+/// Auth frame — the bearer token as a raw body, no envelope.
+///
+/// Sent once per connection, immediately after Hello, and again after every
+/// reconnect. `seq` is 0: the broker consumes this during the handshake,
+/// before the dispatcher (and therefore before any request/reply correlation)
+/// exists, and answers only on failure.
+#[inline]
+pub(crate) fn encode_auth_v2(token: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(HEADER_SIZE + token.len());
+    let header = Header::new(Action::Auth.as_u16(), token.len() as u32, 0);
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(token);
+    Bytes::from(buf)
 }
 
 #[inline]

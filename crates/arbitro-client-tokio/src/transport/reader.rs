@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use zerocopy::FromBytes;
 
+use arbitro_proto::error::ErrorCode;
+
 use arbitro_proto::action::Action;
 use arbitro_proto::v2::egress::ack_state::{AckBatchRespFrame, AckStateRepFrame};
 use arbitro_proto::v2::egress::rep_frame::RepErrFrame;
@@ -120,9 +122,30 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
         }
         if let Ok(rep) = RepErrFrame::ref_from_bytes(&frame[..core::mem::size_of::<RepErrFrame>()])
         {
-            inner
-                .pending
-                .complete_err(req_seq, rep.body.error_code.get());
+            let code = rep.body.error_code.get();
+            // Auth rejections are terminal and must be classified by CODE,
+            // not by correlation: the broker sends them from the handshake
+            // with `seq = 0`, which matches no pending request, so routing
+            // them normally drops them silently. The connection then looks
+            // like an ordinary drop and the supervisor redials forever with
+            // a credential that will never work — hammering the broker once
+            // per backoff, with nothing in the logs explaining why.
+            if code == ErrorCode::AuthFailed as u16 || code == ErrorCode::AuthRequired as u16 {
+                tracing::error!(
+                    error_code = format_args!("0x{code:04x}"),
+                    "broker rejected authentication — not reconnecting; \
+                     check `auth_token` / ARBITRO_TOKEN against the broker's \
+                     ARBITRO_AUTH_TOKEN or ARBITRO_AUTH_USERS"
+                );
+                // Cancels the whole client, not just this session: the
+                // reconnect loop checks this token and returns instead of
+                // backing off. Retrying is pointless — only a config change
+                // can fix a wrong token.
+                inner.cancel.cancel();
+                inner.pending.drain_disconnected();
+                return;
+            }
+            inner.pending.complete_err(req_seq, code);
         } else {
             inner.pending.complete_err(req_seq, 0);
         }

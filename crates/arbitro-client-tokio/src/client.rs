@@ -87,6 +87,20 @@ impl Client {
     ) -> Result<Self, ClientError> {
         use arbitro_kit::route::MpscAsync;
 
+        // Reject an oversized token here, before any socket work. The broker
+        // closes with InvalidLength — a generic code the reader does NOT treat
+        // as terminal — so with the default unbounded reconnect policy this
+        // would redial forever. A local error names the actual problem.
+        if let Some(t) = &cfg.auth_token {
+            if t.len() > crate::config::MAX_AUTH_TOKEN_LEN {
+                return Err(ClientError::InvalidConfig(format!(
+                    "auth_token is {} bytes, the broker accepts at most {}",
+                    t.len(),
+                    crate::config::MAX_AUTH_TOKEN_LEN
+                )));
+            }
+        }
+
         // An explicitly supplied store wins; otherwise honour the WAL declared
         // on the config (storage path included). Opening happens here, before
         // any connection work, so a bad directory / already-locked directory

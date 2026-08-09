@@ -16,6 +16,7 @@ pub struct TestServerBuilder {
     write_buffer_cap: Option<usize>,
     drain_stall_evict_ms: Option<u64>,
     max_feed_per_cycle: Option<usize>,
+    auth_token: Option<String>,
 }
 
 impl Default for TestServerBuilder {
@@ -37,7 +38,14 @@ impl TestServerBuilder {
             write_buffer_cap: None,
             drain_stall_evict_ms: None,
             max_feed_per_cycle: None,
+            auth_token: None,
         }
+    }
+
+    /// Require this shared bearer token from every connection.
+    pub fn auth_token(mut self, token: &str) -> Self {
+        self.auth_token = Some(token.to_string());
+        self
     }
 
     pub fn data_dir(mut self, dir: &str) -> Self {
@@ -137,6 +145,9 @@ impl TestServerBuilder {
 
         if let Some(ref dir) = self.data_dir {
             config = config.data_dir(dir);
+        }
+        if let Some(ref token) = self.auth_token {
+            config.auth_token = Some(token.clone());
         }
 
         let mut server = ArbitroServer::new(config);

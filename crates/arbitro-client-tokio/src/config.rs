@@ -43,10 +43,33 @@ pub struct ClientConfig {
     /// still takes precedence when a caller wants a fully custom
     /// [`Store`](crate::ackstore::Store) implementation.
     pub ack_store: Option<crate::ackstore::WalConfig>,
+    /// Bearer token sent once per connection, right after the Hello frame.
+    ///
+    /// `None` (the default, or `ARBITRO_TOKEN` unset) sends no `Auth` frame at
+    /// all, which is what a broker with authentication disabled expects.
+    ///
+    /// The token is re-sent on every reconnect — it travels in the handshake,
+    /// so a reconnect cannot silently drop it. Authentication happens once per
+    /// connection and is never re-checked per message; rotating a credential
+    /// means reconnecting, not sending a second `Auth`.
+    ///
+    /// A wrong token is terminal: the broker replies `AuthFailed` and closes,
+    /// and the client stops reconnecting instead of hammering the broker with
+    /// a credential that will never work.
+    ///
+    /// Capped at 4096 bytes — the broker rejects anything larger (it expects a
+    /// token, never a payload).
+    pub auth_token: Option<String>,
     /// TLS configuration. `None` → plain TCP. Requires the `tls` feature.
     #[cfg(feature = "tls")]
     pub tls: Option<TlsConfig>,
 }
+
+/// Maximum accepted `auth_token` length. Mirrors the broker's `Auth` frame cap
+/// (`MAX_AUTH_FRAME_BODY` in `arbitro-server`): a longer token is rejected at
+/// the socket, so catching it locally turns a confusing disconnect into a
+/// clear configuration error.
+pub const MAX_AUTH_TOKEN_LEN: usize = 4096;
 
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -59,6 +82,10 @@ impl Default for ClientConfig {
             write_queue_capacity: 4096,
             ack_pending_ttl: Duration::from_secs(24 * 3600),
             ack_store: None,
+            // Env fallback so a deployment can turn auth on without a code
+            // change. An explicit field set by the caller overrides this,
+            // because `Default` runs first and the caller assigns after.
+            auth_token: std::env::var("ARBITRO_TOKEN").ok().filter(|t| !t.is_empty()),
             #[cfg(feature = "tls")]
             tls: None,
         }

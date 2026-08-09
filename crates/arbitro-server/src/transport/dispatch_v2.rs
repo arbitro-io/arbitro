@@ -212,6 +212,16 @@ pub async fn dispatch_frame_v2(
             v2_disconnect(conn_id, server, registry, cron_registry).await;
         }
         Action::Ping => v2_ping(conn_id, registry),
+        // Auth is consumed by the handshake, before dispatch ever runs. One
+        // still reaching here means the broker has auth disabled and the
+        // client sent its token anyway — the normal shape of a client
+        // configured with a token talking to a broker that doesn't want one.
+        // Ignore it: without this arm it falls to `_ => Unimplemented` and
+        // `return Err(())`, which the read loop treats as a malformed frame
+        // and drops the connection. Authentication is once, at handshake;
+        // there is deliberately no re-auth, so a late Auth frame is a no-op
+        // rather than a credential change.
+        Action::Auth => {}
         // M17: count Pongs so the keepalive path is observable. The
         // counter lives on the connection registry — it's stable across
         // the lifetime of the conn and the read loop already touches
