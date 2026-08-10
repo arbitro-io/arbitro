@@ -176,9 +176,18 @@ impl ArbitroEngine {
             for sid in sub_ids {
                 let _ = self.ctx.catalog.remove_subscription_entity(sid);
             }
+            // Read the queue while the entity is still here — it is gone on
+            // the next line, and the server needs it to release the queue's
+            // share of this consumer's inflight.
+            let queue_id = self
+                .ctx
+                .catalog
+                .consumer(*cid)
+                .map(|c| c.queue_id)
+                .unwrap_or(QueueId(0));
             let _ = self.ctx.catalog.remove_consumer_entity(*cid);
+            events.consumers_removed.push((*cid, queue_id));
         }
-        events.consumers_removed.extend(consumer_ids);
 
         // Retire any remaining stream-level bindings (defensive — most
         // bindings should already be retired through the per-consumer
@@ -219,9 +228,17 @@ impl ArbitroEngine {
             let _ = self.ctx.catalog.remove_subscription_entity(sid);
         }
 
-        // Remove consumer entity.
+        // Remove consumer entity. Same as the cascade above: the queue rides
+        // along on the event because it is unrecoverable once the entity is
+        // dropped.
+        let queue_id = self
+            .ctx
+            .catalog
+            .consumer(id)
+            .map(|c| c.queue_id)
+            .unwrap_or(QueueId(0));
         if self.ctx.catalog.remove_consumer_entity(id).is_ok() {
-            events.consumers_removed.push(id);
+            events.consumers_removed.push((id, queue_id));
         }
 
         events

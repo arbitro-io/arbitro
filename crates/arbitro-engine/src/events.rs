@@ -6,7 +6,7 @@
 //! inspects each return: `demand_became_available` → `gate.release()`,
 //! `bindings_retired` → cleanup cached tx handles.
 
-use crate::types::{BindingId, ConsumerId, StreamId};
+use crate::types::{BindingId, ConsumerId, QueueId, StreamId};
 
 /// Events produced by `execute(Command)` and admin mutations.
 ///
@@ -39,7 +39,13 @@ pub struct DeltaEvents {
     /// wire-name → id mapping (and reverse indexes) are cleared. Without
     /// it, a same-named recreate on a fresh stream silently aliases to
     /// the old (now-defunct) ConsumerId.
-    pub consumers_removed: Vec<ConsumerId>,
+    /// Carries the queue alongside the id: a consumer's inflight is also
+    /// counted against its queue, and the server has to release both. The
+    /// queue is a field of the consumer entity, so the engine reads it for
+    /// free right before removing it — while the only other way to recover
+    /// it afterwards is scanning the shard's bindings, which is a linear
+    /// walk per removed consumer and quadratic on a `delete_stream` cascade.
+    pub consumers_removed: Vec<(ConsumerId, QueueId)>,
     /// Seqs of pending entries released by binding retirement (disconnect).
     /// The shard worker rewinds the drain cursor to min(seqs) so these
     /// entries get redelivered to other group members.
