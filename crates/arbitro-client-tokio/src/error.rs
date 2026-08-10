@@ -11,7 +11,14 @@ use std::io;
 use arbitro_proto::error::{ErrorCode, ProtoError};
 
 /// All errors a client operation can surface.
+///
+/// `#[non_exhaustive]`: new variants (transport-side conditions the proto
+/// layer can't express, like `QueueFull` was) must be addable without that
+/// being a semver-major break for every downstream `match`. Callers outside
+/// this crate must include a wildcard arm; matches inside this crate are
+/// unaffected and may stay exhaustive.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     /// Underlying TCP / IO failure.
     #[error("io: {0}")]
@@ -51,7 +58,9 @@ pub enum ClientError {
     #[error("outgoing queue full")]
     QueueFull,
 
-    /// Every slot in the write-producer pool is currently leased.
+    /// Every slot in the write-producer pool is currently leased. Transient
+    /// and retryable, same as [`QueueFull`](Self::QueueFull) — the pool
+    /// frees up as in-flight publishes complete.
     #[error("write producer pool exhausted")]
     PoolExhausted,
 
