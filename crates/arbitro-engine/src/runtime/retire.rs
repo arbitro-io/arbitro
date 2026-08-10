@@ -24,12 +24,21 @@ pub fn retire_binding(ctx: &mut EngineContext, binding_id: BindingId, events: &m
     // Release inflight for every pending entry on this binding.
     let consumer_raw = binding.consumer_id.raw();
     let queue_raw = binding.queue_id.raw();
+    let released = binding.pending.len() as u32;
     for pending in binding.pending.values() {
         events
             .subject_hashes_acked
             .push((consumer_raw, pending.subject_hash, pending.seq));
         events.pending_seqs_released.push(pending.seq);
         ctx.inflight.dec_pending(consumer_raw, queue_raw);
+    }
+    // Report the release so the server can mirror it into its atomic
+    // counters. The engine's own count is now correct; the server's is
+    // not until it applies this. See `DeltaEvents::inflight_released`.
+    if released > 0 {
+        events
+            .inflight_released
+            .push((consumer_raw, queue_raw, released));
     }
 }
 

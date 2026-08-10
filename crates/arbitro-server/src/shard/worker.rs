@@ -1214,6 +1214,29 @@ impl CommandWorker {
                 self.gate.release();
             }
         }
+        // Mirror the inflight credit the engine released via binding
+        // retirement. The ack, nack and ack-timeout handlers decrement
+        // `counters` themselves; the four retirement handlers
+        // (delete_stream, delete_consumer, unsubscribe, drain_connection)
+        // did not, so the engine's count dropped to zero while the
+        // mirror kept the credit. Consumer ids are pool-recycled, so the
+        // next consumer to claim the id inherited the residue and
+        // `consumer_has_capacity` refused it delivery forever.
+        //
+        // Only `runtime::retire::retire_binding` populates this vec, and
+        // the ack/nack paths never reach it — applying unconditionally
+        // here cannot double-decrement.
+        //
+        // Exact subtraction, never a reset: the drain runs in parallel
+        // off a snapshot that still lists this consumer until the next
+        // `publish_snapshot`, so it can land a legitimate `inc_inflight`
+        // mid-cleanup. That delivery is real and is released by its own
+        // path (`Delivered` with a vanished binding reverses it); a blind
+        // zero here would erase it and re-create the residue one step later.
+        for &(consumer_raw, queue_raw, count) in &delta.inflight_released {
+            self.counters
+                .dec_inflight_bulk(consumer_raw, queue_raw, count);
+        }
         // Consumer entities removed (explicit DeleteConsumer or a
         // delete_stream cascade): drop the command-side ack-floor slot
         // AND the drain-side `ConsumerSubjects` slot. Consumer ids are

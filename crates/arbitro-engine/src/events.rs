@@ -30,6 +30,27 @@ pub struct DeltaEvents {
     /// a nack/timeout/retirement release removes it so the seq becomes
     /// deliverable again (the server distinguishes by call-site).
     pub subject_hashes_acked: Vec<(u32, u32, u64)>,
+    /// Inflight credit released by binding retirement, one row per
+    /// retired binding: `(consumer_raw, queue_raw, count)`.
+    ///
+    /// Populated ONLY by `runtime::retire::retire_binding`, which the
+    /// ack/nack paths never reach — so the server may apply it
+    /// unconditionally with no risk of double-decrementing.
+    ///
+    /// Why it exists: the server mirrors these counts in its atomic
+    /// `SharedCounters`, decremented per handler. The ack, nack and
+    /// ack-timeout handlers do it; the four retirement handlers
+    /// (`delete_stream`, `delete_consumer`, `unsubscribe`,
+    /// `drain_connection`) did not. The engine released the pendings
+    /// while the mirror kept the credit, and since consumer ids are
+    /// pool-recycled the next consumer to claim the id inherited the
+    /// residue and `consumer_has_capacity` refused it delivery forever.
+    ///
+    /// Carries a count rather than one row per entry so the server
+    /// subtracts an exact amount. A blind reset would erase a
+    /// concurrent drain delivery landing mid-cleanup — that delivery is
+    /// real, is on the wire, and is released by its own path later.
+    pub inflight_released: Vec<(u32, u32, u32)>,
     /// Consumer ids whose entities were removed as part of this
     /// mutation. Populated by `delete_consumer` (single id) and by
     /// `delete_stream` (every consumer attached to the stream).
@@ -55,6 +76,7 @@ impl DeltaEvents {
         self.demand_became_idle.extend(other.demand_became_idle);
         self.bindings_retired.extend(other.bindings_retired);
         self.subject_hashes_acked.extend(other.subject_hashes_acked);
+        self.inflight_released.extend(other.inflight_released);
         self.consumers_removed.extend(other.consumers_removed);
         self.pending_seqs_released
             .extend(other.pending_seqs_released);
@@ -67,6 +89,7 @@ impl DeltaEvents {
             && self.demand_became_idle.is_empty()
             && self.bindings_retired.is_empty()
             && self.subject_hashes_acked.is_empty()
+            && self.inflight_released.is_empty()
             && self.consumers_removed.is_empty()
             && self.pending_seqs_released.is_empty()
     }
