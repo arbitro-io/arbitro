@@ -165,10 +165,24 @@ async fn measure_vip_latency(
                 Err(e) => panic!("vip publish: {e:?}"),
             }
         }
-        let vip_msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("VIP delivery timeout")
-            .expect("subscription closed");
+        // Stop the clock on the message we just published, not on whatever
+        // arrives first. Stage 2 runs this with 100 basic subjects deliberately
+        // pinned unacked, and any one of them still sitting in the channel is
+        // handed back in nanoseconds -- a sample that measures a buffer read,
+        // not a round trip. Those samples dragged the isolated average below
+        // the baseline it exists to be compared against, which read as
+        // "isolation is faster than no load at all".
+        let vip_msg = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("VIP delivery timeout")
+                .expect("subscription closed");
+            if msg.subject() == subj.as_bytes() {
+                break msg;
+            }
+            // Dropped, never acked: the pinned subjects have to stay pinned for
+            // the whole measurement window.
+        };
         latencies.push(start.elapsed());
         vip_msg.ack();
     }
