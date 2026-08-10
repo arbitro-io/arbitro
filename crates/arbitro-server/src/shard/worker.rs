@@ -98,6 +98,12 @@ pub struct ActiveBinding {
 /// for all decisions. After delivery, increments atomic inflight and
 /// pushes notifications to the command thread via lock-free channel.
 pub struct DrainWorker {
+    /// Diagnostics only: every drain logs under the same `"shard"` thread
+    /// label, so without this the interleaved trace cannot be split per shard.
+    /// Read solely by `lifecycle_trace!`, which compiles to nothing when its
+    /// feature is off — hence unread in default builds.
+    #[cfg_attr(not(feature = "lifecycle_trace"), allow(dead_code))]
+    pub(super) shard_id: u32,
     pub(super) counters: Arc<SharedCounters>,
     pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
     pub(super) store: SharedStore,
@@ -147,9 +153,9 @@ impl DrainWorker {
         let mut prev_snap: Option<Arc<DrainSnapshot>> = None;
 
         loop {
-            crate::lifecycle_trace!("19_1_gate_waiting", 0, 0, "shard");
+            crate::lifecycle_trace!("19_1_gate_waiting", self.shard_id as u64, 0, "shard");
             self.gate.acquire().await;
-            crate::lifecycle_trace!("19_2_gate_acquired", 0, 0, "shard");
+            crate::lifecycle_trace!("19_2_gate_acquired", self.shard_id as u64, 0, "shard");
 
             if !self.running.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
@@ -163,7 +169,7 @@ impl DrainWorker {
                     return;
                 }
 
-                crate::lifecycle_trace!("20_gate_open_detected", 0, 0, "shard");
+                crate::lifecycle_trace!("20_gate_open_detected", self.shard_id as u64, 0, "shard");
 
                 // INVARIANT: clear the gate at the TOP, before any store
                 // read. A `release()` wiped by this clear appended its entry
@@ -233,7 +239,12 @@ impl DrainWorker {
                 let park = park_verdict(&self.gate);
                 probe.park(&self.counters, park, stalled);
                 if park == ParkVerdict::Park {
-                    crate::lifecycle_trace!("33_drainer_exit_locked", 0, 0, "shard");
+                    crate::lifecycle_trace!(
+                        "33_drainer_exit_locked",
+                        self.shard_id as u64,
+                        0,
+                        "shard"
+                    );
                     break;
                 }
             }

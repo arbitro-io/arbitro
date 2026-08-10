@@ -221,7 +221,11 @@ async fn run_single(
             }
         });
     }
-    while js.join_next().await.is_some() {}
+    // `is_some()` would swallow a JoinError: a panicking task then reads as
+    // success and the phase after it runs on incomplete state.
+    while let Some(joined) = js.join_next().await {
+        joined.expect("bench task panicked");
+    }
     start.elapsed()
 }
 
@@ -265,7 +269,11 @@ async fn run_batch(
             }
         });
     }
-    while js.join_next().await.is_some() {}
+    // `is_some()` would swallow a JoinError: a panicking task then reads as
+    // success and the phase after it runs on incomplete state.
+    while let Some(joined) = js.join_next().await {
+        joined.expect("bench task panicked");
+    }
     start.elapsed()
 }
 
@@ -303,7 +311,11 @@ async fn run_batch_sync(
             }
         });
     }
-    while js.join_next().await.is_some() {}
+    // `is_some()` would swallow a JoinError: a panicking task then reads as
+    // success and the phase after it runs on incomplete state.
+    while let Some(joined) = js.join_next().await {
+        joined.expect("bench task panicked");
+    }
     start.elapsed()
 }
 
@@ -341,10 +353,13 @@ async fn prefill_streams(
                         .await
                         .expect("prefill publish_batch_wait");
                 } else {
+                    // Backpressure (`QueueFull`) is transient — yield and
+                    // retry. `ChannelClosed` is terminal and must not be
+                    // retried; conflating them hid a lost tail batch.
                     loop {
                         match c.publish_batch(stream_id, slice) {
                             Ok(()) => break,
-                            Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                            Err(arbitro_client_tokio::ClientError::QueueFull) => {
                                 tokio::task::yield_now().await;
                             }
                             Err(e) => panic!("prefill publish_batch: {e:?}"),
@@ -354,7 +369,11 @@ async fn prefill_streams(
             }
         });
     }
-    while js.join_next().await.is_some() {}
+    // `is_some()` would swallow a JoinError: a panicking task then reads as
+    // success and the phase after it runs on incomplete state.
+    while let Some(joined) = js.join_next().await {
+        joined.expect("bench task panicked");
+    }
 }
 
 /// One replay iteration: for each stream, create a consumer and drain all msgs.
@@ -366,6 +385,7 @@ async fn run_replay(
     n: usize,
     msgs_per_stream: u32,
     iter: u32,
+    progress: &Arc<Vec<std::sync::atomic::AtomicU32>>,
 ) -> (Duration, Vec<(u32, u32)>) {
     assert_eq!(reader_clients.len(), n, "one reader client per consumer");
     let mut consumer_pairs = Vec::with_capacity(n);
@@ -397,6 +417,7 @@ async fn run_replay(
     for (idx, (stream_id, consumer_id)) in consumer_pairs.clone().into_iter().enumerate() {
         let client = reader_clients[idx].clone();
         let expected = msgs_per_stream;
+        let progress = Arc::clone(progress);
         js.spawn(async move {
             let t_sub = Instant::now();
             let mut handle = client
@@ -420,6 +441,7 @@ async fn run_replay(
                     break;
                 }
                 count += 1;
+                progress[idx].store(count, std::sync::atomic::Ordering::Relaxed);
                 let log_interval = if expected <= 1_000 { 100 } else { 50_000 };
                 if count.is_multiple_of(log_interval) {
                     let dt = last_log.elapsed().as_millis();
@@ -832,6 +854,10 @@ fn main() {
                 let cpu_before = cpu_time_ns();
                 let mut total_time = Duration::ZERO;
 
+                let progress: Arc<Vec<std::sync::atomic::AtomicU32>> =
+                    Arc::new((0..n).map(|_| std::sync::atomic::AtomicU32::new(0)).collect());
+
+                arbitro_server::lifecycle_trace::enable();
                 for iter in 0..replay_iterations {
                     match tokio::time::timeout(
                         REPLAY_TIMEOUT,
@@ -842,6 +868,7 @@ fn main() {
                             n,
                             replay_msgs,
                             iter,
+                            &progress,
                         ),
                     )
                     .await
@@ -854,6 +881,24 @@ fn main() {
                         }
                         Err(_) => {
                             println!("  {label:30} | TIMEOUT ({REPLAY_TIMEOUT:?})");
+                            for i in 0..n {
+                                let got = progress[i].load(std::sync::atomic::Ordering::Relaxed);
+                                println!(
+                                    "  [stall] idx={i} stream_id={} got={got}/{replay_msgs} missing={}",
+                                    rp_ids[i % rp_ids.len()],
+                                    replay_msgs.saturating_sub(got)
+                                );
+                            }
+                            // Bounded ring: these are the last events before
+                            // everything went quiet, i.e. where it stopped.
+                            let events = arbitro_server::lifecycle_trace::take();
+                            println!("  --- lifecycle: last {} events ---", events.len());
+                            for e in &events {
+                                println!(
+                                    "  [{}] {} conn={} seq={}",
+                                    e.thread, e.label, e.conn_id, e.seq
+                                );
+                            }
                             return;
                         }
                     }

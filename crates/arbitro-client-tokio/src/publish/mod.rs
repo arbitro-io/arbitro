@@ -18,15 +18,49 @@ use crate::transport::frame::{WriteFrame, WritePool, INLINE_CAP};
 /// Batches larger than this are automatically chunked by the client.
 pub const PUBLISH_BATCH_MAX: usize = 256;
 
+/// How long [`enqueue_wait`] parks on a full ring before giving up.
+/// Same role as Kafka's `max.block.ms`: bounded so a genuinely dead peer
+/// surfaces as an error instead of an unbounded hang.
+pub(crate) const MAX_BLOCK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Lease a producer slot from `pool` and `try_send` a single frame.
 /// Synchronous — no await — so the borrow never crosses an await point and
 /// futures that call this remain `Send`.
+///
+/// A full ring is [`ClientError::QueueFull`]: transient, and the caller may
+/// retry or park. Reporting it as `ChannelClosed` is what silently dropped
+/// tail batches — callers cannot tell "wait a moment" from "give up".
 #[inline]
 pub(crate) fn enqueue(pool: &Arc<WritePool>, frame: WriteFrame) -> Result<(), ClientError> {
     let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
-    lease
-        .try_send(frame)
-        .map_err(|_| ClientError::ChannelClosed)
+    match lease.try_send(frame) {
+        Ok(()) => Ok(()),
+        // `try_send` hands the frame back for BOTH causes. Ask the channel
+        // directly: inferring from `available()` races the consumer freeing
+        // a slot in between, and would report a live channel as closed.
+        Err(_) if lease.is_closed() => Err(ClientError::ChannelClosed),
+        Err(_) => Err(ClientError::QueueFull),
+    }
+}
+
+/// Enqueue, parking on the producer's backpressure waiter while the ring is
+/// full (0% CPU — no polling). For callers that already await a broker
+/// reply, so blocking here costs nothing they had not already accepted.
+pub(crate) async fn enqueue_wait(
+    pool: &Arc<WritePool>,
+    frame: WriteFrame,
+) -> Result<(), ClientError> {
+    let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
+    let frame = match lease.try_send(frame) {
+        Ok(()) => return Ok(()),
+        Err(f) => f,
+    };
+    if lease.is_closed() {
+        return Err(ClientError::ChannelClosed);
+    }
+    tokio::time::timeout(MAX_BLOCK, lease.send_async(frame))
+        .await
+        .map_err(|_| ClientError::QueueFull)
 }
 
 /// Encode a single PubFrame into a `WriteFrame`.
@@ -112,7 +146,7 @@ pub(crate) fn publish_batch_async(
 /// lives inside the returned future.
 pub(crate) fn publish_wait_async(
     pool: &Arc<WritePool>,
-    pending: &Pending,
+    pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
@@ -122,12 +156,13 @@ pub(crate) fn publish_wait_async(
     let seq = seq_alloc.next();
     let frame = encode_pub_frame(seq, stream_id, subject, msg_id, &payload);
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(pool, frame);
-    if enqueue_result.is_err() {
-        pending.cancel(seq); // leak-guard: see F3
-    }
+    let pool = Arc::clone(pool);
+    let pending = Arc::clone(pending);
     async move {
-        enqueue_result?;
+        if let Err(e) = enqueue_wait(&pool, frame).await {
+            pending.cancel(seq); // leak-guard: see F3
+            return Err(e);
+        }
         rx.recv_async()
             .await
             .map_err(|_| ClientError::ChannelClosed)
@@ -140,7 +175,7 @@ pub(crate) fn publish_wait_async(
 /// Returns a future that resolves once the broker confirms receipt.
 pub(crate) fn publish_delayed_async(
     pool: &Arc<WritePool>,
-    pending: &Pending,
+    pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
@@ -152,12 +187,13 @@ pub(crate) fn publish_delayed_async(
         seq, stream_id, subject, &payload, delay_ms,
     ));
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(pool, frame);
-    if enqueue_result.is_err() {
-        pending.cancel(seq); // leak-guard: see F3
-    }
+    let pool = Arc::clone(pool);
+    let pending = Arc::clone(pending);
     async move {
-        enqueue_result?;
+        if let Err(e) = enqueue_wait(&pool, frame).await {
+            pending.cancel(seq); // leak-guard: see F3
+            return Err(e);
+        }
         rx.recv_async()
             .await
             .map_err(|_| ClientError::ChannelClosed)
@@ -173,7 +209,7 @@ pub(crate) fn publish_delayed_async(
 /// reply_to subject (typically an `_INBOX.<token>` pattern) before calling.
 pub(crate) fn publish_with_reply_async(
     pool: &Arc<WritePool>,
-    pending: &Pending,
+    pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     subject: &[u8],
@@ -186,12 +222,13 @@ pub(crate) fn publish_with_reply_async(
         seq, stream_id, subject, reply_to, msg_id, &payload,
     ));
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(pool, frame);
-    if enqueue_result.is_err() {
-        pending.cancel(seq); // leak-guard: see F3
-    }
+    let pool = Arc::clone(pool);
+    let pending = Arc::clone(pending);
     async move {
-        enqueue_result?;
+        if let Err(e) = enqueue_wait(&pool, frame).await {
+            pending.cancel(seq); // leak-guard: see F3
+            return Err(e);
+        }
         rx.recv_async()
             .await
             .map_err(|_| ClientError::ChannelClosed)
@@ -207,42 +244,42 @@ pub(crate) fn publish_with_reply_async(
 /// because only the first seq is meaningful to the caller.
 pub(crate) fn publish_batch_wait_async(
     pool: &Arc<WritePool>,
-    pending: &Pending,
+    pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
     stream_id: u32,
     entries: &[BatchEntry<'_>],
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
+    // Encode every chunk up front: `entries` borrows caller data that must
+    // not outlive this call, while the enqueue below now awaits.
     let mut chunks = entries.chunks(PUBLISH_BATCH_MAX);
-
-    // First chunk — register a pending slot so we can await the reply.
     let first_chunk = chunks.next().unwrap_or(&[]);
     let seq = seq_alloc.next();
+    let mut frames = vec![WriteFrame::PubBatch(encode_pub_batch_v2(
+        seq,
+        stream_id,
+        0,
+        first_chunk,
+    ))];
+    for chunk in chunks {
+        let chunk_seq = seq_alloc.next();
+        frames.push(WriteFrame::PubBatch(encode_pub_batch_v2(
+            chunk_seq, stream_id, 0, chunk,
+        )));
+    }
+
     let rx = pending.register(seq);
-    let mut enqueue_result = enqueue(
-        pool,
-        WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, first_chunk)),
-    );
-
-    // Remaining chunks — fire-and-forget (each gets its own seq).
-    if enqueue_result.is_ok() {
-        for chunk in chunks {
-            let seq = seq_alloc.next();
-            if let Err(e) = enqueue(
-                pool,
-                WriteFrame::PubBatch(encode_pub_batch_v2(seq, stream_id, 0, chunk)),
-            ) {
-                enqueue_result = Err(e);
-                break;
-            }
-        }
-    }
-
-    if enqueue_result.is_err() {
-        pending.cancel(seq); // leak-guard: see F3
-    }
+    let pool = Arc::clone(pool);
+    let pending = Arc::clone(pending);
 
     async move {
-        enqueue_result?;
+        // The caller already agreed to await a reply, so parking on a full
+        // ring is cheaper than failing: backpressure is transient.
+        for frame in frames {
+            if let Err(e) = enqueue_wait(&pool, frame).await {
+                pending.cancel(seq); // leak-guard: see F3
+                return Err(e);
+            }
+        }
         rx.recv_async()
             .await
             .map_err(|_| ClientError::ChannelClosed)

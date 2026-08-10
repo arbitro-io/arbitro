@@ -245,6 +245,7 @@ impl ShardRouter {
 
             // ── Drain task — pure: gate.acquire → drain_read/deliver ──
             let drain_worker = DrainWorker {
+                shard_id: id as u32,
                 counters: Arc::clone(&counters),
                 snapshot: Arc::clone(&snapshot),
                 store: Arc::clone(&shared_store),

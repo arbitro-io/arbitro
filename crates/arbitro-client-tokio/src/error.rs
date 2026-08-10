@@ -44,6 +44,13 @@ pub enum ClientError {
     #[error("channel closed")]
     ChannelClosed,
 
+    /// The connection's outgoing ring is full — the writer task has not
+    /// drained to the socket fast enough. Transient and retryable, unlike
+    /// [`ChannelClosed`](Self::ChannelClosed) which is terminal. Publishing
+    /// faster than the link can carry is the normal cause.
+    #[error("outgoing queue full")]
+    QueueFull,
+
     /// Every slot in the write-producer pool is currently leased.
     #[error("write producer pool exhausted")]
     PoolExhausted,

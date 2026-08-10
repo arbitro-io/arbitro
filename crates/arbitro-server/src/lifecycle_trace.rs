@@ -30,15 +30,43 @@
 #[cfg(feature = "lifecycle_trace")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "lifecycle_trace")]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "lifecycle_trace")]
 use std::time::Instant;
 
 #[cfg(feature = "lifecycle_trace")]
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Events kept PER THREAD. One shared ring does not work: a stalled thread
+/// stops recording while every other thread keeps going, and the busy ones
+/// overwrite the stalled one's tail — which is exactly the evidence a hang
+/// investigation needs. Per-thread rings keep each thread's last moments.
 #[cfg(feature = "lifecycle_trace")]
-static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+const RING_CAP: usize = 256;
+
+#[cfg(feature = "lifecycle_trace")]
+struct Ring {
+    buf: Vec<Event>,
+    /// Oldest slot once the ring is full.
+    next: usize,
+}
+
+/// Every thread's ring, so `take` can collect across threads. Touched once
+/// per thread at first record; the hot path only locks its own ring, which
+/// is uncontended by construction.
+#[cfg(feature = "lifecycle_trace")]
+static RINGS: Mutex<Vec<Arc<Mutex<Ring>>>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "lifecycle_trace")]
+thread_local! {
+    static LOCAL: Arc<Mutex<Ring>> = {
+        let ring = Arc::new(Mutex::new(Ring { buf: Vec::new(), next: 0 }));
+        if let Ok(mut rings) = RINGS.lock() {
+            rings.push(Arc::clone(&ring));
+        }
+        ring
+    };
+}
 
 #[cfg(feature = "lifecycle_trace")]
 #[derive(Clone, Debug)]
@@ -54,7 +82,14 @@ pub struct Event {
 /// event until `disable()` is called.
 #[cfg(feature = "lifecycle_trace")]
 pub fn enable() {
-    EVENTS.lock().unwrap().clear();
+    if let Ok(rings) = RINGS.lock() {
+        for ring in rings.iter() {
+            if let Ok(mut r) = ring.lock() {
+                r.buf.clear();
+                r.next = 0;
+            }
+        }
+    }
     ENABLED.store(true, Ordering::Release);
 }
 
@@ -69,9 +104,42 @@ pub fn disable() {
 /// Drain all recorded events. Returns them sorted by timestamp.
 #[cfg(feature = "lifecycle_trace")]
 pub fn take() -> Vec<Event> {
-    let mut events = std::mem::take(&mut *EVENTS.lock().unwrap());
+    let mut events = Vec::new();
+    if let Ok(rings) = RINGS.lock() {
+        for ring in rings.iter() {
+            if let Ok(mut r) = ring.lock() {
+                let n = r.next;
+                let mut owned = std::mem::take(&mut r.buf);
+                r.next = 0;
+                if owned.len() == RING_CAP && n > 0 {
+                    owned.rotate_left(n);
+                }
+                events.append(&mut owned);
+            }
+        }
+    }
     events.sort_by_key(|e| e.at);
     events
+}
+
+/// Label prefixes to drop, from `ARBITRO_LIFECYCLE_SKIP` (comma separated).
+/// Per-message call sites drown everything else out of a bounded ring; naming
+/// them here keeps the rare events that a hang investigation actually needs.
+#[cfg(feature = "lifecycle_trace")]
+fn skipped(label: &str) -> bool {
+    static SKIP: OnceLock<Vec<String>> = OnceLock::new();
+    SKIP.get_or_init(|| {
+        std::env::var("ARBITRO_LIFECYCLE_SKIP")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .iter()
+    .any(|p| label.starts_with(p.as_str()))
 }
 
 /// Internal call target used by the `lifecycle_trace!` macro. Not meant to
@@ -81,7 +149,7 @@ pub fn take() -> Vec<Event> {
 #[doc(hidden)]
 #[inline]
 pub fn __record(label: &'static str, conn_id: u64, seq: u64, thread: &'static str) {
-    if !ENABLED.load(Ordering::Relaxed) {
+    if !ENABLED.load(Ordering::Relaxed) || skipped(label) {
         return;
     }
     let event = Event {
@@ -91,9 +159,18 @@ pub fn __record(label: &'static str, conn_id: u64, seq: u64, thread: &'static st
         thread,
         at: Instant::now(),
     };
-    if let Ok(mut events) = EVENTS.lock() {
-        events.push(event);
-    }
+    // try_with: a thread recording during its own TLS teardown must not panic.
+    let _ = LOCAL.try_with(|ring| {
+        if let Ok(mut r) = ring.lock() {
+            if r.buf.len() < RING_CAP {
+                r.buf.push(event);
+            } else {
+                let i = r.next;
+                r.buf[i] = event;
+                r.next = (i + 1) % RING_CAP;
+            }
+        }
+    });
 }
 
 // ── Feature ON: macro forwards to __record ─────────────────────────────────
