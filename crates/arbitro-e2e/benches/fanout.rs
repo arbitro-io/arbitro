@@ -236,7 +236,7 @@ async fn publish_single(client: &Client, stream_id: u32, n: u64) {
         loop {
             match client.publish(stream_id, SUBJECT, Bytes::copy_from_slice(PAYLOAD)) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("publish: {e:?}"),
@@ -255,7 +255,7 @@ async fn publish_batched(client: &Client, stream_id: u32, n: u64) {
         loop {
             match client.publish_batch(stream_id, &entries) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("publish_batch: {e:?}"),
@@ -438,7 +438,7 @@ async fn run_distribution() {
             loop {
                 match setup.publish_batch(stream_id, &entries) {
                     Ok(()) => break,
-                    Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                    Err(arbitro_client_tokio::ClientError::QueueFull) => {
                         tokio::task::yield_now().await;
                     }
                     Err(e) => panic!("publish_batch dist: {e:?}"),
@@ -578,7 +578,7 @@ async fn run_single_conn_multi_sub() {
         loop {
             match setup.publish_batch(stream_id, &entries) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("publish_batch scms: {e:?}"),

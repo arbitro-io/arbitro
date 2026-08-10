@@ -161,7 +161,7 @@ async fn run_iteration(
                 Bytes::copy_from_slice(&payload[..]),
             ) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("publish: {e:?}"),

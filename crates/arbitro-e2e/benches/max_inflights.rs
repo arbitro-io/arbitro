@@ -159,7 +159,7 @@ async fn measure_vip_latency(
         loop {
             match client.publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&payload)) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("vip publish: {e:?}"),
@@ -708,7 +708,7 @@ async fn shared_consumer_latency(iters: u64, n_conns: u64) -> Vec<Duration> {
         loop {
             match admin.publish(stream_id, subj.as_bytes(), Bytes::copy_from_slice(&payload)) {
                 Ok(()) => break,
-                Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                Err(arbitro_client_tokio::ClientError::QueueFull) => {
                     tokio::task::yield_now().await;
                 }
                 Err(e) => panic!("vip publish: {e:?}"),

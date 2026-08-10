@@ -314,7 +314,7 @@ async fn run_single_ff(
                 loop {
                     match c.publish(stream_id, b"bench.msg", Bytes::copy_from_slice(&payload)) {
                         Ok(()) => break,
-                        Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                        Err(arbitro_client_tokio::ClientError::QueueFull) => {
                             tokio::task::yield_now().await;
                         }
                         Err(e) => panic!("publish: {e:?}"),
@@ -389,7 +389,7 @@ async fn run_batch_ff(
                 loop {
                     match c.publish_batch(stream_id, &entries[..size]) {
                         Ok(()) => break,
-                        Err(arbitro_client_tokio::ClientError::ChannelClosed) => {
+                        Err(arbitro_client_tokio::ClientError::QueueFull) => {
                             tokio::task::yield_now().await;
                         }
                         Err(e) => panic!("publish_batch: {e:?}"),
