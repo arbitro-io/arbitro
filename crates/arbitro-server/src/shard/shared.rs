@@ -133,30 +133,6 @@ impl SharedCounters {
         Self::saturating_dec(&self.queue[queue_id as usize], count);
     }
 
-    /// Release everything a destroyed consumer was still holding.
-    ///
-    /// `inc_inflight` / `dec_inflight` assume a message finishes its own
-    /// lifecycle: the drain adds on delivery, the ack subtracts. A consumer
-    /// that dies holding messages never closes that loop — no ack is ever
-    /// coming — so the count stays behind, and consumer ids are pool-recycled.
-    /// The next consumer handed this id is then refused capacity it never
-    /// used, permanently, for as long as the process lives.
-    ///
-    /// This is the third per-consumer structure keyed by the raw id. The
-    /// engine's own counters and the drain's `ConsumerSubjects` are both
-    /// cleared on removal; this mirror lives outside the engine, so the
-    /// engine's release cannot reach it, and until now there was no operation
-    /// that could express "this consumer is gone, drop what it held".
-    ///
-    /// The queue slot is shared with sibling consumers, so it is decremented
-    /// by exactly what this consumer held rather than zeroed.
-    pub fn release_consumer(&self, consumer_id: u32, queue_id: u32) {
-        let held = self.consumer[consumer_id as usize].swap(0, Ordering::Relaxed);
-        if held > 0 {
-            Self::saturating_dec(&self.queue[queue_id as usize], held);
-        }
-    }
-
     /// Current consumer inflight count.
     #[inline]
     pub fn consumer_inflight(&self, consumer_id: u32) -> u32 {

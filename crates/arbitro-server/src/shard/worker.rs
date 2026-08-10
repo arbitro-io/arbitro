@@ -1222,13 +1222,7 @@ impl CommandWorker {
         // (message loss), so this cleanup is correctness-critical on
         // every removal path (handle_delete_consumer only covers the
         // explicit one). H11 retry on ring-full, same as the handler.
-        for &(cid, qid) in &delta.consumers_removed {
-            // The inflight mirror the drain tests capacity against lives in
-            // the server, not the engine, so the engine's release cannot
-            // reach it — and only an ack decrements it. Whatever this
-            // consumer still held is owed to nobody now.
-            self.counters.release_consumer(cid.raw(), qid.0);
-
+        for &cid in &delta.consumers_removed {
             self.ack_floors.remove(cid.raw());
             // A removed consumer's queued Ack retries are moot — and must
             // never be applied AFTER its ConsumerRemoved lands: consumer
