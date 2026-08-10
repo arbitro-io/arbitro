@@ -1991,3 +1991,95 @@ async fn by_start_seq_join_does_not_skip_a_pinned_siblings_backlog() {
     );
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deleting a stream must give back the inflight credit its consumers held.
+//
+// Every piece of this is already covered on its own. `max_inflight` pausing
+// and resuming lives in `max_inflight_pauses_then_resumes_on_ack`, but only
+// within one consumer's lifetime. `delete_stream_cascades_consumers` proves
+// the catalog entries go away. `create_delete_cycles_no_leak` runs 50 cycles
+// without ever publishing, so it can only see registry rows, not credit.
+//
+// The combination is what nothing tested: a SMALL cap, messages delivered and
+// deliberately NOT acked, and then the stream deleted out from under them. If
+// the charge for those unacked deliveries outlives the stream, the next
+// consumer to ask for the same small cap starts with nothing.
+//
+// Nothing here is exotic. It is what a worker that dies holding messages does,
+// or an operator dropping a stream that still has work in flight.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_stream_releases_inflight_credit() {
+    const CAP: u16 = 3;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    // ── First lifecycle: fill the cap and walk away without acking.
+    let stream_a = create_stream(&client, b"credit_a", b"credit_a.>").await;
+    let consumer_a = create_consumer(
+        &client, stream_a, b"holder_a", b"holder_a", b"", CAP, 1, /* Explicit */
+        0, /* All */
+        30_000, 0,
+    )
+    .await;
+    let mut sub_a = client.subscribe(stream_a, consumer_a, b"").await.unwrap();
+
+    for i in 0u32..10 {
+        client
+            .publish_wait(
+                stream_a,
+                b"credit_a.msg",
+                Bytes::from(format!("a-{i}").into_bytes()),
+            )
+            .await
+            .expect("publish to A");
+    }
+
+    let held = drain_n(&mut sub_a, CAP as usize, Duration::from_secs(5)).await;
+    assert_eq!(
+        held.len(),
+        CAP as usize,
+        "first consumer must receive exactly its cap before pausing"
+    );
+
+    // Held, never acked — this is the state the cap exists to produce.
+    drop(sub_a);
+    client.delete_stream(b"credit_a").await.expect("delete A");
+    drop(held);
+
+    // ── Second lifecycle: a different stream, a different consumer name, the
+    // same cap. Nothing it can see is shared with the first.
+    let stream_b = create_stream(&client, b"credit_b", b"credit_b.>").await;
+    let consumer_b = create_consumer(
+        &client, stream_b, b"holder_b", b"holder_b", b"", CAP, 1, /* Explicit */
+        0, /* All */
+        30_000, 0,
+    )
+    .await;
+    let mut sub_b = client.subscribe(stream_b, consumer_b, b"").await.unwrap();
+
+    for i in 0u32..10 {
+        client
+            .publish_wait(
+                stream_b,
+                b"credit_b.msg",
+                Bytes::from(format!("b-{i}").into_bytes()),
+            )
+            .await
+            .expect("publish to B");
+    }
+
+    let got = drain_n(&mut sub_b, CAP as usize, Duration::from_secs(5)).await;
+    assert_eq!(
+        got.len(),
+        CAP as usize,
+        "a fresh consumer on a fresh stream must get its full cap of {CAP}; \
+         got {} — the credit held by the deleted stream's unacked deliveries \
+         was never returned, so the cap is permanently spent",
+        got.len()
+    );
+
+    server.shutdown().await;
+}
