@@ -344,8 +344,7 @@ mod tests {
     use super::*;
     use crate::config::ClientConfig;
     use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions, Inner};
-    use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
-    use arbitro_kit::route::MpscAsync;
+    use crate::transport::frame::{WritePool, WRITE_QUEUE_CAP};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
@@ -360,8 +359,7 @@ mod tests {
         cancel: CancellationToken,
         ack_store: Option<Arc<dyn crate::ackstore::Store>>,
     ) -> Arc<Inner> {
-        let (pool, _consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        let (pool, _consumer) = WritePool::new(8, WRITE_QUEUE_CAP);
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(16);
         Arc::new(Inner {

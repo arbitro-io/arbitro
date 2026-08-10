@@ -19,7 +19,7 @@ use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::state::subscriptions::Subscriptions;
 use crate::state::Inner;
-use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
+use crate::transport::frame::{WritePool, MAX_WRITE_PRODUCERS};
 
 /// One entry of a batch publish: `{ subject: &[u8], payload: Bytes }`.
 pub use crate::transport::encode::BatchEntry;
@@ -85,8 +85,6 @@ impl Client {
         cfg: ClientConfig,
         ack_store: Option<Arc<dyn crate::ackstore::Store>>,
     ) -> Result<Self, ClientError> {
-        use arbitro_kit::route::MpscAsync;
-
         // Reject an oversized token here, before any socket work. The broker
         // closes with InvalidLength — a generic code the reader does NOT treat
         // as terminal — so with the default unbounded reconnect policy this
@@ -122,13 +120,37 @@ impl Client {
             },
         };
 
-        // Allocate the shared write-producer pool (16 leasable slots).
-        let (pool, consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        // Ring depth is a runtime value now; the ring indexes with a mask, so
+        // it has to be a non-zero power of two.
+        if cfg.write_queue_capacity == 0 || !cfg.write_queue_capacity.is_power_of_two() {
+            return Err(ClientError::InvalidConfig(format!(
+                "write_queue_capacity must be a non-zero power of two, got {}",
+                cfg.write_queue_capacity
+            )));
+        }
+        // heartbeat, ack, nack and session-replay each hold a lease for the
+        // client's lifetime, so publish/manage needs at least one slot beyond
+        // them or the first `acquire()` below fails.
+        const RESERVED_LEASES: usize = 4;
+        if cfg.max_write_producers <= RESERVED_LEASES
+            || cfg.max_write_producers > MAX_WRITE_PRODUCERS
+        {
+            return Err(ClientError::InvalidConfig(format!(
+                "max_write_producers must be {}..={MAX_WRITE_PRODUCERS} ({RESERVED_LEASES} are \
+                 reserved for background tasks), got {}",
+                RESERVED_LEASES + 1,
+                cfg.max_write_producers
+            )));
+        }
+
+        // One leasable ring per producer slot. Slots are allocated on first
+        // claim, so an unused producer costs its skeleton, not its ring.
+        let (pool, consumer) =
+            WritePool::new(cfg.max_write_producers, cfg.write_queue_capacity);
 
         // Ack-batcher and nack-batcher channels (tokio mpsc — Sender is Clone + Sync).
-        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(4096);
-        let (nack_tx, nack_rx) = tokio::sync::mpsc::channel(4096);
+        let (ack_tx, ack_rx) = tokio::sync::mpsc::channel(cfg.ack_queue_capacity);
+        let (nack_tx, nack_rx) = tokio::sync::mpsc::channel(cfg.ack_queue_capacity);
 
         let cancel = CancellationToken::new();
 
@@ -151,10 +173,18 @@ impl Client {
 
         // Dedicated leases for the long-lived background tasks — carved out
         // up front so they never contend with ad-hoc publish/manage leases.
-        let heartbeat_lease = pool.acquire().expect("fresh pool has 16 slots");
-        let ack_lease = pool.acquire().expect("fresh pool has 16 slots");
-        let nack_lease = pool.acquire().expect("fresh pool has 16 slots");
-        let session_replay_lease = pool.acquire().expect("fresh pool has 16 slots");
+        let heartbeat_lease = pool
+            .acquire_control()
+            .expect("validated: max_write_producers > RESERVED_LEASES");
+        let ack_lease = pool
+            .acquire_control()
+            .expect("validated: max_write_producers > RESERVED_LEASES");
+        let nack_lease = pool
+            .acquire_control()
+            .expect("validated: max_write_producers > RESERVED_LEASES");
+        let session_replay_lease = pool
+            .acquire_control()
+            .expect("validated: max_write_producers > RESERVED_LEASES");
 
         // Heartbeat runs for the Client lifetime (not per-session) so it can
         // hold a single dedicated lease across reconnects.
@@ -296,6 +326,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             subject,
             msg_id,
@@ -335,6 +366,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             entries,
         )
@@ -397,6 +429,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             subject,
             payload,
@@ -423,6 +456,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             subject,
             reply_to,
@@ -447,6 +481,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             subject,
             reply_to,
@@ -474,6 +509,7 @@ impl Client {
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
+            self.inner.cfg.max_block,
             stream_id,
             subject,
             headers,

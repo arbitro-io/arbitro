@@ -96,11 +96,9 @@ mod tests {
         // We use a real pool so try_send/acquire don't panic.
         use crate::config::ClientConfig;
         use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
-        use crate::transport::frame::{WriteFrame, MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
-        use arbitro_kit::route::MpscAsync;
+        use crate::transport::frame::{WritePool, WRITE_QUEUE_CAP};
 
-        let (pool, _consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        let (pool, _consumer) = WritePool::new(8, WRITE_QUEUE_CAP);
         let lease = pool.acquire().unwrap();
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(4);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(4);

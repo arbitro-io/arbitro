@@ -62,7 +62,9 @@ pub mod bench_helpers {
 /// Not part of the public API — may change without notice.
 #[doc(hidden)]
 pub mod transport_internal {
-    pub use crate::transport::frame::{WriteFrame, INLINE_CAP, WRITE_QUEUE_CAP};
+    pub use crate::transport::frame::{
+        WriteFrame, CONTROL_QUEUE_CAP, INLINE_CAP, WRITE_QUEUE_CAP,
+    };
 }
 
 // Public re-exports — keep the surface symmetric with `arbitro-client`

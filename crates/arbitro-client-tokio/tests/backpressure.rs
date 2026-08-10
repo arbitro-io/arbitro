@@ -78,7 +78,10 @@ async fn publish_after_close_returns_channel_closed_no_panic() {
             match client.publish(stream_id, b"bp.subj", Bytes::from(i.to_le_bytes().to_vec())) {
                 Ok(()) => {}                               // Ring still had space; keep going.
                 Err(ClientError::ChannelClosed) => return, // Expected — exit cleanly.
-                Err(e) => panic!("unexpected error: {e}"),
+                // A closed channel must never surface as a transient error:
+                // `QueueFull` and `PoolExhausted` both mean "retry", and a
+                // caller that retries against a dead client spins forever.
+                Err(e) => panic!("close must report ChannelClosed, got: {e}"),
             }
         }
         // If we exhausted the loop without a ChannelClosed, the ring must have
@@ -133,19 +136,27 @@ async fn publish_ring_saturation_no_panic_no_deadlock() {
     let client = Client::connect(cfg).await.expect("connect to null server");
 
     // Flood the ring without awaiting — fill it faster than the writer drains.
+    //
+    // A saturated ring on a LIVE channel is `QueueFull`, not `ChannelClosed`.
+    // Collapsing the two is what silently dropped tail batches: the caller
+    // could not tell "wait a moment" from "give up", so it gave up and the
+    // frames were never sent. `ChannelClosed` here would be a bug.
     let result = tokio::time::timeout(Duration::from_secs(3), async {
-        let mut channel_closed = false;
+        let mut saturated = false;
         for i in 0u32..(WRITE_QUEUE_CAP as u32 * 3) {
             match client.publish(1, b"sat.subj", Bytes::from(i.to_le_bytes().to_vec())) {
                 Ok(()) => {}
-                Err(ClientError::ChannelClosed) => {
-                    channel_closed = true;
+                Err(ClientError::QueueFull) => {
+                    saturated = true;
                     break;
+                }
+                Err(ClientError::ChannelClosed) => {
+                    panic!("a full ring on a live channel must be QueueFull, not ChannelClosed")
                 }
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
-        channel_closed // true if ring filled, false if writer was fast enough
+        saturated // true if the ring filled, false if the writer kept up
     })
     .await;
 

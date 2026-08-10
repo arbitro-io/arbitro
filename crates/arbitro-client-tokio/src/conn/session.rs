@@ -4,7 +4,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use arbitro_kit::route::MpscAsyncConsumer;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +15,7 @@ use crate::conn::reconnect::Backoff;
 use crate::error::ClientError;
 use crate::state::Inner;
 use crate::transport::encode::{encode_ack_state_req_v2, encode_auth_v2, encode_hello_v2};
-use crate::transport::frame::{WriteFrame, WriteLease, WRITE_QUEUE_CAP};
+use crate::transport::frame::{WriteConsumer, WriteFrame, WriteLease};
 use crate::transport::reader::reader_task;
 use crate::transport::writer::writer_task;
 
@@ -77,7 +76,7 @@ async fn dial(
 /// callers get a fast failure on bad addresses.  All subsequent reconnects
 /// happen silently in the background task.
 pub(crate) async fn spawn_connection(
-    consumer: MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
+    consumer: WriteConsumer,
     inner: Arc<Inner>,
     mut session_replay_lease: WriteLease,
 ) -> Result<(), ClientError> {
@@ -259,7 +258,7 @@ fn send_ack_state_reqs(inner: &Inner, lease: &mut WriteLease) {
 /// bindings immediately (the select may drop the writer future before
 /// it could flush the frame, so we do it here where `w` is still owned).
 async fn run_session<W, R>(
-    consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
+    consumer: &mut WriteConsumer,
     mut w: W,
     r: R,
     inner: Arc<Inner>,
@@ -305,8 +304,7 @@ mod tests {
     use super::*;
     use crate::config::ClientConfig;
     use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
-    use crate::transport::frame::{MAX_WRITE_PRODUCERS, WRITE_QUEUE_CAP};
-    use arbitro_kit::route::MpscAsync;
+    use crate::transport::frame::{WritePool, WRITE_QUEUE_CAP};
     use arbitro_proto::action::Action;
     use arbitro_proto::v2::header::HEADER_SIZE;
     use std::sync::atomic::AtomicU64;
@@ -317,8 +315,7 @@ mod tests {
     /// Consumers without a slot and without deferred acks get nothing.
     #[test]
     fn send_ack_state_reqs_covers_slotted_consumers() {
-        let (pool, mut consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::producer_pool(MAX_WRITE_PRODUCERS);
+        let (pool, mut consumer) = WritePool::new(8, WRITE_QUEUE_CAP);
         let (ack_tx, _ack_rx) = tokio::sync::mpsc::channel(16);
         let (nack_tx, _nack_rx) = tokio::sync::mpsc::channel(16);
         let inner = Inner {

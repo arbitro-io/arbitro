@@ -1,20 +1,18 @@
 //! Single-writer transport task — generic over `AsyncWrite`, drains the
 //! kit Mpsc consumer with `recv_async` + `try_recv`.
 
-use arbitro_kit::route::MpscAsyncConsumer;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ClientError;
-use crate::transport::frame::{WriteFrame, WRITE_QUEUE_CAP};
+use crate::transport::frame::WriteConsumer;
 
 /// Writer unit tests.
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::transport::frame::{WriteFrame, INLINE_CAP, MAX_WRITE_PRODUCERS};
-    use arbitro_kit::route::MpscAsync;
+    use crate::transport::frame::{WriteFrame, WritePool, INLINE_CAP, WRITE_QUEUE_CAP};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
@@ -24,9 +22,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let (mut producers, mut consumer, _shutdown) =
-            MpscAsync::<WriteFrame, WRITE_QUEUE_CAP>::new(MAX_WRITE_PRODUCERS);
-        let mut producer = producers.remove(0);
+        let (pool, mut consumer) = WritePool::new(4, WRITE_QUEUE_CAP);
+        let mut producer = pool.acquire().unwrap();
 
         // Enqueue 3 fixed payloads (pad inline arrays with zeros after content).
         let chunks: &[&[u8]] = &[b"aaa", b"bbbbb", b"cc"];
@@ -64,7 +61,7 @@ mod tests {
 }
 
 pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
-    consumer: &mut MpscAsyncConsumer<WriteFrame, WRITE_QUEUE_CAP>,
+    consumer: &mut WriteConsumer,
     w: &mut W,
     cancel: CancellationToken,
 ) -> Result<(), ClientError> {
@@ -73,7 +70,7 @@ pub(crate) async fn writer_task<W: AsyncWrite + Unpin>(
             biased;
             _ = cancel.cancelled() => return Ok(()),
             result = consumer.recv_async() => {
-                let Ok(frame) = result else {
+                let Some(frame) = result else {
                     return Ok(());
                 };
                 w.write_all(frame.as_slice()).await?;

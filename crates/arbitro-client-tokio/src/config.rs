@@ -14,8 +14,43 @@ pub struct ClientConfig {
     pub reconnect: ReconnectPolicy,
     /// Heartbeat / dead-connection detection.
     pub keep_alive: KeepAlive,
-    /// Bound for the writer mpsc (back-pressure threshold).
+    /// Depth of each publish producer's ring, in frames.
+    ///
+    /// Must be a non-zero power of two — the ring indexes with a mask.
+    /// [`Client::connect`](crate::Client::connect) rejects anything else.
+    ///
+    /// The four long-lived control tasks (heartbeat, the ack and nack
+    /// batchers, session replay) do not use this depth; they take
+    /// [`CONTROL_QUEUE_CAP`](crate::transport::frame::CONTROL_QUEUE_CAP)
+    /// instead, so raising this does not multiply their memory too.
     pub write_queue_capacity: usize,
+
+    /// How many producers may hold a lease at once — one ring each.
+    ///
+    /// Four are reserved for the control tasks; the rest serve publish and
+    /// manage calls, and an exhausted pool surfaces as
+    /// [`ClientError::PoolExhausted`](crate::ClientError::PoolExhausted).
+    ///
+    /// Rings are allocated on first claim rather than at connect, so an
+    /// unclaimed producer slot costs a five-cache-line skeleton instead of
+    /// `depth * ≈144 B`. Raising this is cheap; the memory that matters is
+    /// what actually gets claimed.
+    pub max_write_producers: usize,
+
+    /// How long a publish that awaits a broker reply parks on a full ring
+    /// before giving up with [`ClientError::QueueFull`](crate::ClientError::QueueFull).
+    ///
+    /// Same role as Kafka's `max.block.ms`: bounded, so a peer that has
+    /// stopped draining surfaces as an error instead of an unbounded hang.
+    /// Fire-and-forget publishes never park — they return `QueueFull` at once
+    /// and the caller decides.
+    pub max_block: Duration,
+
+    /// Depth of the ack and nack batcher channels, in commands.
+    ///
+    /// When full, an ack falls back to the deferred hot tier (`ackrel`) and a
+    /// sweep retries it, so a small value costs latency, not correctness.
+    pub ack_queue_capacity: usize,
     /// TTL for hot-tier deferred acks before the sweep drops them unpersisted.
     pub ack_pending_ttl: Duration,
     /// Durable redelivery-dedup store (WAL), including **where it lives**.
@@ -79,7 +114,10 @@ impl Default for ClientConfig {
             addr: "127.0.0.1:9898".to_string(),
             reconnect: ReconnectPolicy::default(),
             keep_alive: KeepAlive::default(),
-            write_queue_capacity: 4096,
+            write_queue_capacity: crate::transport::frame::WRITE_QUEUE_CAP,
+            max_write_producers: 16,
+            max_block: crate::publish::DEFAULT_MAX_BLOCK,
+            ack_queue_capacity: 4096,
             ack_pending_ttl: Duration::from_secs(24 * 3600),
             ack_store: None,
             // Env fallback so a deployment can turn auth on without a code

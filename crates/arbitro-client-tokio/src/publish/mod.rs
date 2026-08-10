@@ -13,15 +13,17 @@ use crate::state::pending::Pending;
 use crate::state::seq::SeqAllocator;
 use crate::transport::encode::{encode_pub_batch_v2, encode_pub_with_reply_v2, BatchEntry};
 use crate::transport::frame::{WriteFrame, WritePool, INLINE_CAP};
+use arbitro_kit::route::AcquireError;
+use arbitro_kit::stream::TrySendError;
 
 /// Maximum number of entries in a single publish-batch frame.
 /// Batches larger than this are automatically chunked by the client.
 pub const PUBLISH_BATCH_MAX: usize = 256;
 
-/// How long [`enqueue_wait`] parks on a full ring before giving up.
+/// Default for [`ClientConfig::max_block`](crate::ClientConfig::max_block).
 /// Same role as Kafka's `max.block.ms`: bounded so a genuinely dead peer
 /// surfaces as an error instead of an unbounded hang.
-pub(crate) const MAX_BLOCK: std::time::Duration = std::time::Duration::from_secs(5);
+pub const DEFAULT_MAX_BLOCK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Lease a producer slot from `pool` and `try_send` a single frame.
 /// Synchronous — no await — so the borrow never crosses an await point and
@@ -32,14 +34,16 @@ pub(crate) const MAX_BLOCK: std::time::Duration = std::time::Duration::from_secs
 /// tail batches — callers cannot tell "wait a moment" from "give up".
 #[inline]
 pub(crate) fn enqueue(pool: &Arc<WritePool>, frame: WriteFrame) -> Result<(), ClientError> {
-    let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
+    let mut lease = pool.acquire().map_err(|e| match e {
+        // Terminal: the channel is shut down and no lease will ever work.
+        AcquireError::Closed => ClientError::ChannelClosed,
+        // Transient: every ring is leased right now. Retryable.
+        AcquireError::Exhausted => ClientError::PoolExhausted,
+    })?;
     match lease.try_send(frame) {
         Ok(()) => Ok(()),
-        // `try_send` hands the frame back for BOTH causes. Ask the channel
-        // directly: inferring from `available()` races the consumer freeing
-        // a slot in between, and would report a live channel as closed.
-        Err(_) if lease.is_closed() => Err(ClientError::ChannelClosed),
-        Err(_) => Err(ClientError::QueueFull),
+        Err(TrySendError::Full(_)) => Err(ClientError::QueueFull),
+        Err(TrySendError::Closed(_)) => Err(ClientError::ChannelClosed),
     }
 }
 
@@ -49,18 +53,25 @@ pub(crate) fn enqueue(pool: &Arc<WritePool>, frame: WriteFrame) -> Result<(), Cl
 pub(crate) async fn enqueue_wait(
     pool: &Arc<WritePool>,
     frame: WriteFrame,
+    max_block: std::time::Duration,
 ) -> Result<(), ClientError> {
-    let mut lease = pool.acquire().ok_or(ClientError::PoolExhausted)?;
+    let mut lease = pool.acquire().map_err(|e| match e {
+        // Terminal: the channel is shut down and no lease will ever work.
+        AcquireError::Closed => ClientError::ChannelClosed,
+        // Transient: every ring is leased right now. Retryable.
+        AcquireError::Exhausted => ClientError::PoolExhausted,
+    })?;
     let frame = match lease.try_send(frame) {
         Ok(()) => return Ok(()),
-        Err(f) => f,
+        Err(TrySendError::Closed(_)) => return Err(ClientError::ChannelClosed),
+        Err(TrySendError::Full(f)) => f,
     };
-    if lease.is_closed() {
-        return Err(ClientError::ChannelClosed);
+    match tokio::time::timeout(max_block, lease.send_async(frame)).await {
+        Ok(Ok(())) => Ok(()),
+        // The value comes back only when the channel closed under us.
+        Ok(Err(_)) => Err(ClientError::ChannelClosed),
+        Err(_) => Err(ClientError::QueueFull),
     }
-    tokio::time::timeout(MAX_BLOCK, lease.send_async(frame))
-        .await
-        .map_err(|_| ClientError::QueueFull)
 }
 
 /// Encode a single PubFrame into a `WriteFrame`.
@@ -148,6 +159,7 @@ pub(crate) fn publish_wait_async(
     pool: &Arc<WritePool>,
     pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
+    max_block: std::time::Duration,
     stream_id: u32,
     subject: &[u8],
     msg_id: &[u8],
@@ -159,7 +171,7 @@ pub(crate) fn publish_wait_async(
     let pool = Arc::clone(pool);
     let pending = Arc::clone(pending);
     async move {
-        if let Err(e) = enqueue_wait(&pool, frame).await {
+        if let Err(e) = enqueue_wait(&pool, frame, max_block).await {
             pending.cancel(seq); // leak-guard: see F3
             return Err(e);
         }
@@ -177,6 +189,7 @@ pub(crate) fn publish_delayed_async(
     pool: &Arc<WritePool>,
     pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
+    max_block: std::time::Duration,
     stream_id: u32,
     subject: &[u8],
     payload: Bytes,
@@ -190,7 +203,7 @@ pub(crate) fn publish_delayed_async(
     let pool = Arc::clone(pool);
     let pending = Arc::clone(pending);
     async move {
-        if let Err(e) = enqueue_wait(&pool, frame).await {
+        if let Err(e) = enqueue_wait(&pool, frame, max_block).await {
             pending.cancel(seq); // leak-guard: see F3
             return Err(e);
         }
@@ -211,6 +224,7 @@ pub(crate) fn publish_with_reply_async(
     pool: &Arc<WritePool>,
     pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
+    max_block: std::time::Duration,
     stream_id: u32,
     subject: &[u8],
     reply_to: &[u8],
@@ -225,7 +239,7 @@ pub(crate) fn publish_with_reply_async(
     let pool = Arc::clone(pool);
     let pending = Arc::clone(pending);
     async move {
-        if let Err(e) = enqueue_wait(&pool, frame).await {
+        if let Err(e) = enqueue_wait(&pool, frame, max_block).await {
             pending.cancel(seq); // leak-guard: see F3
             return Err(e);
         }
@@ -246,6 +260,7 @@ pub(crate) fn publish_batch_wait_async(
     pool: &Arc<WritePool>,
     pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
+    max_block: std::time::Duration,
     stream_id: u32,
     entries: &[BatchEntry<'_>],
 ) -> impl Future<Output = Result<Bytes, ClientError>> + Send {
@@ -275,7 +290,7 @@ pub(crate) fn publish_batch_wait_async(
         // The caller already agreed to await a reply, so parking on a full
         // ring is cheaper than failing: backpressure is transient.
         for frame in frames {
-            if let Err(e) = enqueue_wait(&pool, frame).await {
+            if let Err(e) = enqueue_wait(&pool, frame, max_block).await {
                 pending.cancel(seq); // leak-guard: see F3
                 return Err(e);
             }
@@ -344,8 +359,9 @@ fn encode_pub_frame_with_headers(
 /// Sync publish with arbitrary headers. Awaits broker confirmation.
 pub(crate) fn publish_with_headers_sync_async(
     pool: &Arc<WritePool>,
-    pending: &Pending,
+    pending: &Arc<Pending>,
     seq_alloc: &SeqAllocator,
+    max_block: std::time::Duration,
     stream_id: u32,
     subject: &[u8],
     headers: &[(&[u8], &[u8])],
@@ -354,12 +370,13 @@ pub(crate) fn publish_with_headers_sync_async(
     let seq = seq_alloc.next();
     let frame = encode_pub_frame_with_headers(seq, stream_id, subject, headers, &payload);
     let rx = pending.register(seq);
-    let enqueue_result = enqueue(pool, frame);
-    if enqueue_result.is_err() {
-        pending.cancel(seq); // leak-guard: see F3
-    }
+    let pool = Arc::clone(pool);
+    let pending = Arc::clone(pending);
     async move {
-        enqueue_result?;
+        if let Err(e) = enqueue_wait(&pool, frame, max_block).await {
+            pending.cancel(seq); // leak-guard: see F3
+            return Err(e);
+        }
         rx.recv_async()
             .await
             .map_err(|_| ClientError::ChannelClosed)
