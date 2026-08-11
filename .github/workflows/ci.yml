@@ -43,10 +43,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -70,10 +72,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -99,10 +103,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -123,10 +129,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -158,10 +166,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -184,10 +194,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -208,10 +220,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -232,10 +246,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
+          ref: v0.4.1
           path: arbitro-raft
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit & cargo-deny
@@ -269,12 +285,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-kit
-          ref: v0.1.0
+          ref: v0.1.1
           path: arbitro-kit
       - uses: actions/checkout@v4
         with:
           repository: arbitro-io/arbitro-raft
-          ref: v0.4.0
+          ref: v0.4.1
           path: arbitro-raft
       - uses: docker/setup-buildx-action@v3
 
