@@ -151,16 +151,13 @@ async fn capped_low_seq_does_not_livelock_redelivery() {
     let mut got_capped = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(500), sub.recv()).await {
-            Ok(Some(msg)) => {
-                let is_capped = msg.data() == b"hot-capped".as_slice();
-                msg.ack();
-                if is_capped {
-                    got_capped = true;
-                    break;
-                }
+        if let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), sub.recv()).await {
+            let is_capped = msg.data() == b"hot-capped".as_slice();
+            msg.ack();
+            if is_capped {
+                got_capped = true;
+                break;
             }
-            _ => {}
         }
     }
     assert!(

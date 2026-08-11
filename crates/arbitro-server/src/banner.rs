@@ -387,12 +387,14 @@ mod tests {
 
     #[test]
     fn clustered_banner_lists_peers_and_marks_self() {
-        let mut config = Config::default();
-        config.cluster_peers = vec![
-            (1, "10.0.0.1:9900".to_string()),
-            (2, "10.0.0.2:9900".to_string()),
-        ];
-        config.cluster_node_id = 2;
+        let config = Config {
+            cluster_peers: vec![
+                (1, "10.0.0.1:9900".to_string()),
+                (2, "10.0.0.2:9900".to_string()),
+            ],
+            cluster_node_id: 2,
+            ..Default::default()
+        };
         let mut c = ctx();
         c.cluster_compiled = true;
         let banner = render(&config, &c);
@@ -404,10 +406,12 @@ mod tests {
 
     #[test]
     fn secrets_never_printed() {
-        let mut config = Config::default();
-        config.auth_token = Some("s3cret-token".to_string());
-        config.tls_cert = Some("/etc/arbitro/cert.pem".to_string());
-        config.tls_key = Some("/etc/arbitro/key.pem".to_string());
+        let config = Config {
+            auth_token: Some("s3cret-token".to_string()),
+            tls_cert: Some("/etc/arbitro/cert.pem".to_string()),
+            tls_key: Some("/etc/arbitro/key.pem".to_string()),
+            ..Default::default()
+        };
         let banner = render(&config, &ctx());
         assert!(!banner.contains("s3cret-token"));
         assert!(banner.contains("token required"));
@@ -418,9 +422,11 @@ mod tests {
 
     #[test]
     fn tls_misconfiguration_is_flagged_when_feature_missing() {
-        let mut config = Config::default();
-        config.tls_cert = Some("cert.pem".to_string());
-        config.tls_key = Some("key.pem".to_string());
+        let config = Config {
+            tls_cert: Some("cert.pem".to_string()),
+            tls_key: Some("key.pem".to_string()),
+            ..Default::default()
+        };
         let mut c = ctx();
         c.tls_compiled = false;
         let banner = render(&config, &c);
