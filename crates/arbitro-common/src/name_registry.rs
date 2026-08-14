@@ -174,6 +174,9 @@ struct Inner {
     /// the only structure that sees every stream, so it is the only place
     /// the no-overlap rule can be decided. Never read by any hot path.
     stream_filters: Vec<Vec<u8>>,
+    /// Per-consumer subject filter, indexed by `ConsumerId.0`. Needed to
+    /// compare a new consumer against its siblings on the same stream.
+    consumer_filters: Vec<Vec<u8>>,
     /// Slot allocator backing `StreamId.0`. Recycles freed slots (ROB-29)
     /// instead of growing monotonically; bumps a generation on reuse so
     /// stale `(slot, gen)` pairs can be detected via `is_stream_current`.
@@ -238,6 +241,7 @@ impl Inner {
             ),
             streams_seq_to_wire: Vec::with_capacity(PREALLOC),
             stream_filters: Vec::with_capacity(PREALLOC),
+            consumer_filters: Vec::with_capacity(PREALLOC),
             streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
             streams_replicas: Vec::with_capacity(PREALLOC),
             streams_name_by_wire: HashMap::with_capacity_and_hasher(
@@ -505,6 +509,28 @@ impl NameRegistry {
             }
             g.stream_filters[seq.0 as usize] = filter.to_vec();
         })
+    }
+
+    /// Record a consumer's resolved filter.
+    pub fn set_consumer_filter(&self, id: ConsumerId, filter: &[u8]) {
+        self.with_inner_swap(|g| {
+            if (id.0 as usize) >= g.consumer_filters.len() {
+                g.consumer_filters.resize((id.0 as usize) + 1, Vec::new());
+            }
+            g.consumer_filters[id.0 as usize] = filter.to_vec();
+        })
+    }
+
+    /// Filters held by every consumer on `stream` other than `except`.
+    pub fn sibling_consumer_filters(&self, stream: StreamId, except: ConsumerId) -> Vec<Vec<u8>> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumers_by_name
+            .values()
+            .filter(|c| c.0 != except.0)
+            .filter(|c| g.consumer_stream.get(c.0 as usize).copied() == Some(stream.0))
+            .filter_map(|c| g.consumer_filters.get(c.0 as usize).cloned())
+            .filter(|f| !f.is_empty())
+            .collect()
     }
 
     /// The subject slice this stream owns. Empty = none declared.

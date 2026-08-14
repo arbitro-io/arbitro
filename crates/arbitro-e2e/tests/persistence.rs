@@ -126,7 +126,7 @@ async fn no_data_dir_works_without_persistence() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     client
-        .create_stream(b"ephemeral", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"ephemeral", b"ephemeral.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -750,7 +750,7 @@ async fn deleted_consumer_stays_deleted_after_restart() {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
         let resp = client
-            .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);
@@ -792,7 +792,7 @@ async fn post_restart_create_does_not_collide_with_recovered_ids() {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
         let resp = client
-            .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);

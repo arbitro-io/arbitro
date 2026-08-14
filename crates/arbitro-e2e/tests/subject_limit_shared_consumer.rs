@@ -42,7 +42,7 @@ const SUBJECT: &[u8] = b"orders.premium.singleton";
 
 async fn create_stream(client: &Client) -> u32 {
     let resp = client
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(STREAM, b"orders.premium.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     TestServer::parse_id(&resp)

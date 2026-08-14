@@ -84,7 +84,7 @@ async fn drain_acking(
 async fn distinct_names_each_get_own_copy() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"events", b">").await;
+    let stream_id = create_stream(&client, b"events", b"events_tick").await;
 
     let cid_a = create_consumer(&client, stream_id, b"svc_a", b"group_a", 100, 1).await;
     let cid_b = create_consumer(&client, stream_id, b"svc_b", b"group_b", 100, 1).await;
@@ -121,7 +121,7 @@ async fn distinct_names_each_get_own_copy() {
 async fn late_join_all_does_not_redeliver_to_acked_sibling() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"events", b">").await;
+    let stream_id = create_stream(&client, b"events", b"events_tick").await;
 
     // A: DeliverPolicy::New, subscribe, consume + ack all 5.
     let cid_a = create_consumer(&client, stream_id, b"svc_a", b"group_a", 100, 1).await;
@@ -170,7 +170,7 @@ async fn late_join_all_does_not_redeliver_to_acked_sibling() {
 async fn late_join_by_start_seq_does_not_redeliver_to_acked_sibling() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"events", b">").await;
+    let stream_id = create_stream(&client, b"events", b"events_tick").await;
 
     // A: DeliverPolicy::New, consume + ack all 5.
     let cid_a = create_consumer(&client, stream_id, b"svc_a", b"group_a", 100, 1).await;
@@ -234,7 +234,7 @@ async fn deliver_new_skips_an_undrained_backlog() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"new_undrained", b">").await;
+    let stream_id = create_stream(&client, b"new_undrained", b"new_undrained.h").await;
 
     // Publish history with NO consumer attached — nothing advances the cursor.
     for i in 0..10u8 {

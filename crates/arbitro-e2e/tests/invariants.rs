@@ -16,7 +16,7 @@ async fn stream_create_then_list() {
     let client = server.connect().await;
 
     client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 
@@ -34,12 +34,12 @@ async fn stream_create_idempotent() {
     let client = server.connect().await;
 
     client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     // Second create should not fail
     client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 
@@ -55,7 +55,7 @@ async fn create_and_list_streams() {
     let client = server.connect().await;
 
     client
-        .create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"events", b"events.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 
@@ -96,7 +96,7 @@ async fn create_consumer_and_delete() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -127,7 +127,7 @@ async fn publish_single_delivers_correctly() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"chat", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"chat", b"chat_hello", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -164,7 +164,7 @@ async fn publish_batch_delivers_all() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"logs", b"logs.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -208,7 +208,7 @@ async fn publish_sequences_monotonic() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"counter", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"counter", b"counter_inc", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -244,7 +244,7 @@ async fn replay_deliver_all_historical() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"history", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"history", b"history.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -304,7 +304,7 @@ async fn ack_prevents_redelivery() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"acktest", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"acktest", b"acktest_msg", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -342,7 +342,7 @@ async fn nack_causes_redelivery() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"nacktest", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"nacktest", b"nacktest_msg", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -391,7 +391,7 @@ async fn delivery_preserves_order() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"ordered", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"ordered", b"ordered_seq", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -442,7 +442,7 @@ async fn fanout_two_consumers_each_receive_all() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"events", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"events", b"events_tick", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -503,7 +503,7 @@ async fn queue_group_distributes_messages() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"tasks", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"tasks", b"tasks_job", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -581,7 +581,7 @@ async fn fanout_with_subject_filters() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"filt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"filt", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -719,7 +719,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"qfilt", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qfilt", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -818,7 +818,7 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"qovlp", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qovlp", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -927,12 +927,12 @@ async fn consumers_on_different_streams_isolated() {
     let client = server.connect().await;
 
     let resp1 = client
-        .create_stream(b"logs", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"logs", b"logs_line", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id1 = TestServer::parse_id(&resp1);
     let resp2 = client
-        .create_stream(b"metrics", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"metrics", b"metrics.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id2 = TestServer::parse_id(&resp2);
@@ -1006,7 +1006,7 @@ async fn queue_group_multi_client() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"qtasks", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qtasks", b"qtasks_job", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1115,7 +1115,7 @@ async fn fanout_multi_client() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"fevents", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"fevents", b"fevents_tick", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1188,7 +1188,7 @@ async fn queue_group_three_clients_100_msgs() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"q3", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"q3", b"q3.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1325,12 +1325,12 @@ async fn streams_are_isolated() {
     let client = server.connect().await;
 
     let resp_a = client
-        .create_stream(b"alpha", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"alpha", b"alpha_event", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id_a = TestServer::parse_id(&resp_a);
     let resp_b = client
-        .create_stream(b"beta", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"beta", b"beta_event", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id_b = TestServer::parse_id(&resp_b);
@@ -1376,7 +1376,7 @@ async fn ack_sync_returns_ok() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"acksync", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"acksync", b"acksync_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1425,7 +1425,7 @@ async fn max_inflight_caps_delivery() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"inf_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"inf_stream", b"inf_subj", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1501,7 +1501,7 @@ async fn max_subject_inflight_multiple_patterns() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"msi", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"msi", b"msi.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1612,7 +1612,7 @@ async fn tombstoned_message_is_never_delivered() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"tomb", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"tomb", b"tomb.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

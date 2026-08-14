@@ -7,9 +7,9 @@ use std::time::Duration;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async fn create_stream(client: &Client, name: &[u8]) -> u32 {
+async fn create_stream(client: &Client, name: &[u8], filter: &[u8]) -> u32 {
     let resp = client
-        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(name, filter, 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream must succeed");
     TestServer::parse_id(&resp)
@@ -43,7 +43,7 @@ async fn delete_consumer_then_get_returns_not_found() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
 
     // Sanity: it exists before delete.
@@ -76,7 +76,7 @@ async fn delete_consumer_excluded_from_list() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
 
     let resp = client.list_consumers(stream_id, 0, 1000).await.unwrap();
@@ -112,7 +112,7 @@ async fn delete_then_recreate_same_name_is_functional() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
 
     let id_a = create_consumer(&client, stream_id, b"worker").await;
     client.delete_consumer(id_a).await.unwrap();
@@ -161,7 +161,7 @@ async fn delete_stream_resets_consumer_namespace() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id_a = create_stream(&client, b"events").await;
+    let stream_id_a = create_stream(&client, b"events", b"events.x").await;
     let consumer_id_a = create_consumer(&client, stream_id_a, b"worker").await;
 
     // Sanity: both exist.
@@ -171,7 +171,7 @@ async fn delete_stream_resets_consumer_namespace() {
     client.delete_stream(b"events").await.unwrap();
 
     // Recreate the stream + consumer with SAME names.
-    let stream_id_b = create_stream(&client, b"events").await;
+    let stream_id_b = create_stream(&client, b"events", b"events.x").await;
     let consumer_id_b = create_consumer(&client, stream_id_b, b"worker").await;
 
     // The streams may collapse to the same wire-id hash (deterministic
@@ -213,7 +213,7 @@ async fn delete_stream_cascades_consumers() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"events").await;
+    let stream_id = create_stream(&client, b"events", b"evt.>").await;
     for name in [&b"worker-a"[..], b"worker-b", b"worker-c"] {
         create_consumer(&client, stream_id, name).await;
     }
@@ -226,7 +226,7 @@ async fn delete_stream_cascades_consumers() {
     // Recreate the stream with the same name. The cascade must have
     // cleared its three consumers, so the list under the new stream id
     // must be empty.
-    let stream_id_2 = create_stream(&client, b"events").await;
+    let stream_id_2 = create_stream(&client, b"events", b"evt.>").await;
     let resp = client.list_consumers(stream_id_2, 0, 1000).await.unwrap();
     assert_eq!(
         TestServer::consumer_count(&resp),
@@ -253,7 +253,7 @@ async fn create_delete_cycles_no_leak() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
 
     const CYCLES: usize = 50;
     let mut ids = Vec::with_capacity(CYCLES);
@@ -302,7 +302,7 @@ async fn delete_consumer_is_idempotent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
     let consumer_id = create_consumer(&client, stream_id, b"worker").await;
 
     client.delete_consumer(consumer_id).await.unwrap();
@@ -337,7 +337,7 @@ async fn distinct_names_have_distinct_ids() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
     let mut ids = Vec::new();
     for n in 0..20u32 {
         let name = format!("worker-{n}");
@@ -376,7 +376,7 @@ async fn distinct_names_have_distinct_ids() {
 async fn create_4097_consumers_does_not_panic() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"capacity-stream").await;
+    let stream_id = create_stream(&client, b"capacity-stream", b"evt.>").await;
 
     // First 4096 should succeed.
     let mut ok = 0u32;
@@ -433,7 +433,7 @@ async fn delete_recreate_subscription_delivers() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"orders.>").await;
 
     // First lifecycle.
     let id_a = create_consumer(&client, stream_id, b"worker").await;
@@ -483,7 +483,7 @@ async fn malformed_create_consumer_does_not_leak_slot() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"orders").await;
+    let stream_id = create_stream(&client, b"orders", b"evt.>").await;
 
     // Attempt several invalid consumer names. Each should fail without
     // allocating a slot in the internal registry.
@@ -546,7 +546,7 @@ async fn create_consumer_config_mismatch_rejected() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"f1_cfg").await;
+    let stream_id = create_stream(&client, b"f1_cfg", b"f1_cfg.k").await;
 
     // Original: max_inflight = 10, AckPolicy::Explicit.
     let consumer_id = TestServer::parse_id(
@@ -657,7 +657,7 @@ async fn rejected_reconsumer_does_not_corrupt_registry() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"reg_guard").await;
+    let stream_id = create_stream(&client, b"reg_guard", b"reg_guard.>").await;
 
     // A sibling consumer drains 5 history messages first, so the stream
     // has advanced past the backlog before the victim joins (same
@@ -824,7 +824,7 @@ async fn create_consumer_empty_group_rejected_by_broker() {
 
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"group_guard").await;
+    let stream_id = create_stream(&client, b"group_guard", b"evt.>").await;
 
     // Queue mode (deliver_mode = 1) — the case that used to land every
     // group-less consumer in the shared anonymous `(stream, "")` queue.
@@ -912,8 +912,8 @@ async fn purge_stream_does_not_touch_a_shard_neighbour() {
     let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
     let client = server.connect().await;
 
-    let victim = create_stream(&client, b"purge_victim").await;
-    let bystander = create_stream(&client, b"purge_bystander").await;
+    let victim = create_stream(&client, b"purge_victim", b"evt.>").await;
+    let bystander = create_stream(&client, b"purge_bystander", b"evt.>").await;
 
     for i in 0..10u8 {
         client
@@ -998,8 +998,8 @@ async fn drain_subject_does_not_touch_a_shard_neighbour() {
     let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
     let client = server.connect().await;
 
-    let victim = create_stream(&client, b"drain_victim").await;
-    let bystander = create_stream(&client, b"drain_bystander").await;
+    let victim = create_stream(&client, b"drain_victim", b"shared.evt").await;
+    let bystander = create_stream(&client, b"drain_bystander", b"shared.evt").await;
 
     // Identical subjects on both streams — that is the whole point.
     for i in 0..6u8 {
@@ -1115,7 +1115,7 @@ async fn create_filtered_consumer(
 async fn nested_consumer_filters_are_independent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"nested_filters").await;
+    let stream_id = create_stream(&client, b"nested_filters", b"evt.>").await;
 
     let wide = create_filtered_consumer(&client, stream_id, b"all_orders", b"orders.>").await;
     let nested =
@@ -1214,7 +1214,7 @@ async fn drain_subjects(sub: &mut arbitro_client_tokio::SubscriptionHandle) -> V
 async fn nested_filters_applied_at_subscribe_do_cut() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"nested_at_sub").await;
+    let stream_id = create_stream(&client, b"nested_at_sub", b"evt.>").await;
 
     let wide = create_filtered_consumer(&client, stream_id, b"all_orders_s", b"orders.>").await;
     let nested =

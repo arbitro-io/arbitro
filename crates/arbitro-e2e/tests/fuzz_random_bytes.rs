@@ -29,7 +29,7 @@ async fn t20_random_bytes_after_hello_never_abort_broker() {
     // after the fuzzer is done.
     let sibling = server.connect().await;
     let resp = sibling
-        .create_stream(b"alive_check", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"alive_check", b"alive_check.ping", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("sibling create_stream pre-fuzz");
     let alive_stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

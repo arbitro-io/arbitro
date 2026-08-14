@@ -24,7 +24,7 @@ async fn programmatic_shutdown_stops_accept() {
 
     // Server is alive — basic ops work.
     client
-        .create_stream(b"sd_accept", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"sd_accept", b"sd_accept.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 
@@ -68,7 +68,7 @@ async fn shutdown_wakes_inflight_publish_wait() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"sd_wake", b"sd_wake.ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -112,7 +112,7 @@ async fn acked_messages_survive_shutdown() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_durable", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
+        .create_stream(b"sd_durable", b"sd_durable.ev", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -170,7 +170,7 @@ async fn sigterm_triggers_graceful_shutdown() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_sigterm", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
+        .create_stream(b"sd_sigterm", b"sd_sigterm.ev", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -218,7 +218,7 @@ async fn sigterm_raw_signal_isolated() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_raw_sig", b">", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
+        .create_stream(b"sd_raw_sig", b"sd_raw_sig.ev", 0, 0, 0, 1, 1 /* Disk */, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -256,7 +256,7 @@ async fn sigterm_wakes_inflight_publish_wait() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_sig_wake", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"sd_sig_wake", b"sd_sig_wake.ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -297,7 +297,7 @@ async fn double_shutdown_is_idempotent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     client
-        .create_stream(b"sd_double", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"sd_double", b"sd_double.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 
@@ -324,7 +324,7 @@ async fn shutdown_mid_publish_metadata_survives() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_mid", b">", 0, 0, 0, 1, 1, 0, 0, 0)
+        .create_stream(b"sd_mid", b"sd_mid.>", 0, 0, 0, 1, 1, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -370,7 +370,7 @@ async fn shutdown_under_concurrent_publish_load() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"sd_load", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"sd_load", b"sd_load.ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);

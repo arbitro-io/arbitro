@@ -55,17 +55,15 @@ pub fn not_nested_under_a_sibling(filter: &[u8], siblings: &[&[u8]]) -> Result<(
 /// Returns the filter to store: the consumer's own, or the stream's when it
 /// declared none.
 ///
-/// `not_nested_under_a_sibling` is written and tested but NOT called here:
-/// while a stream may still hold `>`, inheritance gives every filterless
-/// consumer that same `>`, which makes any consumer that does declare a
-/// filter nested under it and bans all specialisation. It joins this chain
-/// once `stream_rules::filter_is_not_global` is enforced.
 pub fn on_create<'a>(
     filter: &'a [u8],
     stream_filter: &'a [u8],
+    siblings: &[&[u8]],
 ) -> Result<&'a [u8], Violation> {
     stays_inside_its_stream(filter, stream_filter)?;
-    Ok(inherits_the_stream_filter(filter, stream_filter))
+    let resolved = inherits_the_stream_filter(filter, stream_filter);
+    not_nested_under_a_sibling(resolved, siblings)?;
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -74,13 +72,13 @@ mod tests {
 
     #[test]
     fn a_consumer_without_a_filter_inherits_the_stream() {
-        assert_eq!(on_create(b"", b"orders.>"), Ok(b"orders.>".as_slice()));
+        assert_eq!(on_create(b"", b"orders.>", &[]), Ok(b"orders.>".as_slice()));
     }
 
     #[test]
     fn a_consumer_may_narrow_within_its_stream() {
         assert_eq!(
-            on_create(b"orders.premium.>", b"orders.>"),
+            on_create(b"orders.premium.>", b"orders.>", &[]),
             Ok(b"orders.premium.>".as_slice())
         );
     }
@@ -88,14 +86,14 @@ mod tests {
     #[test]
     fn a_consumer_may_not_reach_outside_its_stream() {
         assert_eq!(
-            on_create(b"payments.>", b"orders.>"),
+            on_create(b"payments.>", b"orders.>", &[]),
             Err(Violation::ConsumerOutsideStream)
         );
     }
 
     #[test]
     fn a_consumer_on_a_global_stream_keeps_its_own_filter() {
-        assert_eq!(on_create(b"orders.>", b">"), Ok(b"orders.>".as_slice()));
+        assert_eq!(on_create(b"orders.>", b">", &[]), Ok(b"orders.>".as_slice()));
     }
 
     #[test]

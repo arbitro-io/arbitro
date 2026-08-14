@@ -30,7 +30,7 @@ async fn stream_without_window_allows_duplicates() {
 
     let resp = client
         .create_stream(
-            b"plain", b">", 0, 0, 0, 1, 0, 0, 0, /*idempotency_window_ms*/ 0,
+            b"plain", b"k.a", 0, 0, 0, 1, 0, 0, 0, /*idempotency_window_ms*/ 0,
         )
         .await
         .unwrap();
@@ -57,7 +57,7 @@ async fn stream_with_window_rejects_duplicate_msg_id() {
 
     let resp = client
         .create_stream(
-            b"dedup", b">", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000,
+            b"dedup", b"k.a", 0, 0, 0, 1, 0, 0, 0, /*window_ms*/ 60_000,
         )
         .await
         .unwrap();
@@ -87,7 +87,7 @@ async fn empty_msg_id_is_never_deduped() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"dedup2", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"dedup2", b"k.x", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -109,7 +109,7 @@ async fn different_msg_ids_are_independent() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"dedup3", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"dedup3", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -188,7 +188,7 @@ async fn delete_and_recreate_clears_dedup_state() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"recycle", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let first_id = TestServer::parse_id(&resp);
@@ -201,7 +201,7 @@ async fn delete_and_recreate_clears_dedup_state() {
     client.delete_stream(b"recycle").await.expect("delete");
 
     let resp = client
-        .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"recycle", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let second_id = TestServer::parse_id(&resp);
@@ -226,7 +226,7 @@ async fn batch_with_all_unique_ids_succeeds() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"batch_uniq", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"batch_uniq", b"batch_uniq.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap(),
     );
@@ -252,7 +252,7 @@ async fn batch_with_duplicate_from_prior_publish_is_rejected() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"batch_dup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"batch_dup", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap(),
     );
@@ -299,7 +299,7 @@ async fn batch_with_internal_duplicate_is_rejected() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"batch_internal", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"batch_internal", b"batch_internal.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap(),
     );
@@ -338,7 +338,7 @@ async fn cross_restart_dedup_survives() {
         let client = server.connect().await;
 
         let resp = client
-            .create_stream(b"persistent", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"persistent", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);
@@ -410,7 +410,7 @@ async fn batch_mixed_id_and_no_id_entries() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"batch_mixed", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"batch_mixed", b"batch_mixed.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap(),
     );
@@ -471,7 +471,7 @@ async fn delivery_with_headers_strips_metadata() {
     let resp = client
         .create_stream(
             b"strip_hdr",
-            b">",
+            b"k.a",
             0,
             0,
             0,
@@ -541,7 +541,7 @@ async fn cross_restart_idempotency_with_consumer() {
         let resp = client
             .create_stream(
                 b"restart_c",
-                b">",
+                b"k.ev",
                 0,
                 0,
                 0,
@@ -700,7 +700,7 @@ async fn publish_with_headers_roundtrip() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"hdrs", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"hdrs", b"orders.created", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -766,7 +766,7 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
 
         let stream_id = TestServer::parse_id(
             &client
-                .create_stream(b"batch_hdrs", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+                .create_stream(b"batch_hdrs", b"k.a", 0, 0, 0, 1, 0, 0, 0, 60_000)
                 .await
                 .unwrap(),
         );
@@ -895,7 +895,7 @@ async fn publish_with_headers_dedup() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"hdrs_dedup", b">", 0, 0, 0, 1, 0, 0, 0, 60_000)
+        .create_stream(b"hdrs_dedup", b"orders.new", 0, 0, 0, 1, 0, 0, 0, 60_000)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

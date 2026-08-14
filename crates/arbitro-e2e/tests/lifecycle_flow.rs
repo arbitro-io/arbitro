@@ -12,7 +12,7 @@ async fn trace_publish_subscribe_ack_flow() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"trace_stream", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"trace_stream", b"trace_stream.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -96,7 +96,7 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
 
     // Create stream + consumer; publish 5, drain+ack 3, leave 2 unacked.
     let resp = client
-        .create_stream(b"t12", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"t12", b"t12.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let old_stream_id = TestServer::parse_id(&resp);
@@ -156,7 +156,7 @@ async fn t12_stream_recreation_does_not_cross_contaminate() {
 
     // Recreate with the same name → fresh stream_id.
     let resp = client
-        .create_stream(b"t12", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"t12", b"t12.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let new_stream_id = TestServer::parse_id(&resp);

@@ -475,7 +475,7 @@ async fn workflow_survives_broker_restart() {
 
         // Create a user-facing stream (to prove metadata survives).
         client
-            .create_stream(b"user_data", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"user_data", b"user_data.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .expect("create user_data stream");
 

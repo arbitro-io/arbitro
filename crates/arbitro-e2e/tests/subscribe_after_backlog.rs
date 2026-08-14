@@ -39,7 +39,7 @@ async fn run_rounds(server: &TestServer, teardown: bool) -> Tally {
         let subject = format!("{stream}.a");
 
         let resp = client
-            .create_stream(stream.as_bytes(), b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(stream.as_bytes(), format!("{stream}.>").as_bytes(), 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);

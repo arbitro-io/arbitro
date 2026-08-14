@@ -27,7 +27,7 @@ async fn concurrent_publish_wait_correlation() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"corr", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"corr", b"corr_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -87,7 +87,7 @@ async fn many_inflight_publish_wait_wake_on_disconnect() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"orphan", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orphan", b"orphan_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -152,7 +152,7 @@ async fn publish_wait_recycles_env_seq() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"recycle", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"recycle", b"recycle_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -201,7 +201,7 @@ async fn ack_sync_and_publish_wait_share_registry_without_crosstalk() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"mix", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"mix", b"mix_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -226,7 +226,7 @@ async fn ack_sync_and_publish_wait_share_registry_without_crosstalk() {
 
     // Side-channel: another stream, fire publish_waits in parallel.
     let resp = client
-        .create_stream(b"mix_side", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"mix_side", b"side_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let side_stream_id = TestServer::parse_id(&resp);
@@ -300,7 +300,7 @@ async fn stale_message_ack_after_disconnect_is_silent() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"stale", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"stale", b"stale_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -377,7 +377,7 @@ async fn publish_wait_on_dead_server_returns_error() {
     let client = server.connect_with_config(cfg).await;
 
     let resp = client
-        .create_stream(b"dead", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"dead", b"dead_ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -427,7 +427,7 @@ async fn t11_reconnect_resumes_unacked_tail() {
         // Client A
         let client_a = server.connect().await;
         let resp = client_a
-            .create_stream(stream_name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(stream_name, filter, 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);
@@ -538,7 +538,7 @@ async fn t7_cross_tenant_ack_injection_does_not_affect_owner() {
     // Owner sets up stream + consumer, publishes 5, subscribes, and
     // intentionally does NOT ack — leaving 5 in flight.
     let resp = owner
-        .create_stream(b"t7", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"t7", b"t7.ev", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

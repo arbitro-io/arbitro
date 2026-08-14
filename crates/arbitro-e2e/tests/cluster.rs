@@ -51,7 +51,7 @@ async fn cluster_server_boots_and_serves() {
 
     // Create a stream — Standalone mode, goes through local shard path.
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let _stream_id = TestServer::parse_id(&resp);
@@ -164,7 +164,7 @@ async fn three_node_cluster_replicates_stream() {
         let create_client = TestServer::connect_to(&client_addrs[0]).await;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            create_client.create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0),
+            create_client.create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0),
         )
         .await;
 
@@ -629,7 +629,7 @@ async fn message_replication_survives_leader_kill() {
             Duration::from_secs(5),
             create_client.create_stream(
                 b"repl_test",
-                b">",
+                b"test.repl",
                 0, // max_msgs
                 0, // max_bytes
                 0, // max_age_secs
@@ -827,7 +827,7 @@ async fn partition_minority_then_rejoin_preserves_consistency() {
         let create_client = TestServer::connect_to(&client_addrs[0]).await;
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            create_client.create_stream(b"pre_partition", b">", 0, 0, 0, 1, 0, 0, 0, 0),
+            create_client.create_stream(b"pre_partition", b"pre_partition.>", 0, 0, 0, 1, 0, 0, 0, 0),
         )
         .await;
         if let Ok(Ok(_)) = result {
@@ -859,7 +859,7 @@ async fn partition_minority_then_rejoin_preserves_consistency() {
         let result = tokio::time::timeout(Duration::from_secs(5), async {
             let client = TestServer::connect_to(addr).await;
             client
-                .create_stream(b"during_partition", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+                .create_stream(b"during_partition", b"during_partition.>", 0, 0, 0, 1, 0, 0, 0, 0)
                 .await
         })
         .await;
@@ -1031,7 +1031,7 @@ async fn quorum_loss_blocks_writes_on_minority_node() {
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let client = TestServer::connect_to(&client_addrs[0]).await;
         client
-            .create_stream(b"should_not_commit", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"should_not_commit", b"should_not_commit.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
     })
     .await;

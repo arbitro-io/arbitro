@@ -21,7 +21,7 @@ async fn delayed_publish_arrives_after_delay() {
 
     // Create stream + consumer.
     let resp = client
-        .create_stream(b"delayed_test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"delayed_test", b"delayed_test.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -112,7 +112,7 @@ async fn delayed_publish_survives_broker_restart() {
 
         // Create stream.
         let resp = client
-            .create_stream(b"delayed_restart", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"delayed_restart", b"delayed_restart.evt", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);
@@ -215,7 +215,7 @@ async fn delayed_publish_duplicate_msg_id_is_deduped() {
         &client
             .create_stream(
                 b"delay_dedup",
-                b">",
+                b"immediate-dup",
                 0,
                 0,
                 0,
@@ -325,7 +325,7 @@ async fn delayed_publish_respects_discard_new_quota() {
         &client
             .create_stream(
                 b"delay_quota",
-                b">",
+                b"delay_quota.k",
                 /*max_msgs*/ 2,
                 0,
                 0,
@@ -423,7 +423,7 @@ async fn nack_delay_case(delay_ms: u64) {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"nackdelay", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"nackdelay", b"nackdelay.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

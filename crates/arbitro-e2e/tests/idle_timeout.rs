@@ -96,7 +96,7 @@ async fn active_client_survives_past_idle_timeout_with_steady_traffic() {
         .await;
 
     client
-        .create_stream(b"steady", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"steady", b"steady.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
 

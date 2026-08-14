@@ -33,7 +33,7 @@ async fn double_ack_does_not_wedge_consumer() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"dack", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"dack", b"dack_m", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -102,7 +102,7 @@ async fn redelivery_does_not_leak_inflight_capacity() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"phantom", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"phantom", b"phantom_m", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

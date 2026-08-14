@@ -120,7 +120,7 @@ async fn drain_n(
 async fn ack_wait_timeout_redelivers() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"acktimeout", b">").await;
+    let stream_id = create_stream(&client, b"acktimeout", b"acktimeout.event").await;
 
     // 500 ms wait window — short enough to keep the test fast.
     let consumer_id = create_consumer(
@@ -172,7 +172,7 @@ async fn ack_wait_timeout_redelivers() {
 async fn max_inflight_pauses_then_resumes_on_ack() {
     let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"flow", b">").await;
+    let stream_id = create_stream(&client, b"flow", b"flow.event").await;
 
     const K: u16 = 4;
     let consumer_id = create_consumer(
@@ -251,7 +251,7 @@ async fn max_inflight_pauses_then_resumes_on_ack() {
 async fn wildcard_single_token_filter_matches_correctly() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"wcsingle", b">").await;
+    let stream_id = create_stream(&client, b"wcsingle", b"wcsingle.>").await;
 
     let consumer_id = create_consumer(
         &client,
@@ -387,7 +387,7 @@ async fn wildcard_multi_token_filter_matches_everything_below() {
 async fn delete_consumer_mid_drain_stops_delivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"mid", b">").await;
+    let stream_id = create_stream(&client, b"mid", b"mid.event").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"worker", b"worker", b"", 100, 1, 0, 30_000, 0,
     )
@@ -442,7 +442,7 @@ async fn delete_consumer_mid_drain_stops_delivery() {
 async fn delete_stream_mid_drain_stops_all_subscriptions() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"midstream", b">").await;
+    let stream_id = create_stream(&client, b"midstream", b"midstream.event").await;
 
     let consumer_id_a = create_consumer(
         &client,
@@ -525,7 +525,7 @@ async fn delete_stream_mid_drain_stops_all_subscriptions() {
 async fn ack_policy_none_drains_without_acks() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"fire", b">").await;
+    let stream_id = create_stream(&client, b"fire", b"fire.event").await;
     let consumer_id = create_consumer(
         &client,
         stream_id,
@@ -610,7 +610,7 @@ async fn ack_policy_none_drains_without_acks() {
 async fn ack_policy_none_ignores_max_inflight() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"fire-cap", b">").await;
+    let stream_id = create_stream(&client, b"fire-cap", b"fire-cap.event").await;
     let consumer_id = create_consumer(
         &client,
         stream_id,
@@ -667,7 +667,7 @@ async fn ack_policy_none_ignores_max_inflight() {
 async fn ack_policy_explicit_does_enforce_max_inflight() {
     let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"explicit-cap", b">").await;
+    let stream_id = create_stream(&client, b"explicit-cap", b"explicit-cap.event").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"worker", b"worker", b"", 2, /* max_inflight = tiny */
         1, /* AckPolicy::Explicit */
@@ -724,7 +724,7 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
     use arbitro_client_tokio::SubjectLimit;
     let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"fire-subj", b">").await;
+    let stream_id = create_stream(&client, b"fire-subj", b"fire-subj.event").await;
 
     // Cannot reuse the helper — need create_consumer_with_limits.
     let resp = client
@@ -783,7 +783,7 @@ async fn ack_policy_none_ignores_max_subject_inflight() {
 async fn deliver_policy_by_start_seq_skips_earlier() {
     let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"seq", b">").await;
+    let stream_id = create_stream(&client, b"seq", b"seq.event").await;
 
     // Publish 10 BEFORE subscribing.
     for i in 0u32..10 {
@@ -835,7 +835,7 @@ async fn deliver_policy_by_start_seq_skips_earlier() {
 async fn empty_stream_subscribe_produces_no_deliveries() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"empty", b">").await;
+    let stream_id = create_stream(&client, b"empty", b"empty.>").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"reader", b"reader", b"", 100, 1, 0, 30_000, 0,
     )
@@ -863,7 +863,7 @@ async fn empty_stream_subscribe_produces_no_deliveries() {
 async fn slow_consumer_fast_publisher_is_lossless() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"pace", b">").await;
+    let stream_id = create_stream(&client, b"pace", b"pace.event").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"slow", b"slow", b"", 16, /* tight inflight */
         1, 0, 30_000, 0,
@@ -917,7 +917,7 @@ async fn slow_consumer_fast_publisher_is_lossless() {
 async fn recycle_subject_after_ack_drains_fresh_batch() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"recycle", b">").await;
+    let stream_id = create_stream(&client, b"recycle", b"recycle.event").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"worker", b"worker", b"", 10, 1, 0, 30_000, 0,
     )
@@ -979,7 +979,7 @@ async fn recycle_subject_after_ack_drains_fresh_batch() {
 async fn slow_consumer_does_not_starve_fast_consumer() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"fair", b">").await;
+    let stream_id = create_stream(&client, b"fair", b"fair.event").await;
 
     let slow_id = create_consumer(
         &client,
@@ -1067,7 +1067,7 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
 
     // Subscriber side.
     let sub_client = server.connect().await;
-    let stream_id = create_stream(&sub_client, b"concur", b">").await;
+    let stream_id = create_stream(&sub_client, b"concur", b"concur.event").await;
     let consumer_id = create_consumer(
         &sub_client,
         stream_id,
@@ -1163,7 +1163,7 @@ async fn concurrent_publishers_one_consumer_exactly_n() {
 async fn resubscribe_continues_from_cursor() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"cursor", b">").await;
+    let stream_id = create_stream(&client, b"cursor", b"cursor.event").await;
     let consumer_id = create_consumer(
         &client, stream_id, b"reader", b"reader", b"", 100, 1, 0, 30_000, 0,
     )
@@ -1239,7 +1239,7 @@ async fn t13_single_shard_saturation_no_silent_drops() {
     // notify ring (the silent-drop site H10 wired counters to).
     let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"sat1", b">").await;
+    let stream_id = create_stream(&client, b"sat1", b"sat1.event").await;
 
     // Explicit ack + small inflight cap forces the broker to alternate
     // between delivering and blocking, exercising the drain pause /
@@ -1315,7 +1315,7 @@ async fn evict_expired_does_not_stall_publish() {
     let resp = client
         .create_stream(
             b"evict_test",
-            b">",
+            b"evict_test.fresh",
             0,
             0,
             /*max_age_secs*/ 1,
@@ -1378,7 +1378,7 @@ async fn partial_write_recovery_redelivers_unacked() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
 
-    let stream_id = create_stream(&client, b"pw_recover", b">").await;
+    let stream_id = create_stream(&client, b"pw_recover", b"pw_recover.ev").await;
 
     // ack_wait_ms = 500ms — short enough for the test to be fast.
     let consumer_id = create_consumer(
@@ -1446,7 +1446,7 @@ async fn partial_write_recovery_redelivers_unacked() {
 async fn triple_fanout_two_explicit_one_none_all_receive() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"triple", b">").await;
+    let stream_id = create_stream(&client, b"triple", b"triple.ev").await;
 
     // Consumer A: Explicit, group "workers"
     let a_id = create_consumer(
@@ -1531,7 +1531,7 @@ async fn triple_fanout_two_explicit_one_none_all_receive() {
 async fn mixed_ack_explicit_and_none_both_receive_all() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"mixed", b">").await;
+    let stream_id = create_stream(&client, b"mixed", b"mixed.event").await;
 
     // Consumer A: Explicit ack (processing)
     let explicit_id = create_consumer(
@@ -1639,7 +1639,7 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     let client = server.connect().await;
     let client_b = server.connect().await;
 
-    let stream_id = create_stream(&client, b"starve", b">").await;
+    let stream_id = create_stream(&client, b"starve", b"tail").await;
 
     // A — fire-and-forget fanout consumer (no inflight cap, so frames keep
     // flowing until its writer channel is full).
@@ -1926,7 +1926,7 @@ async fn nack_during_active_drain_always_redelivers() {
 async fn by_start_seq_join_does_not_skip_a_pinned_siblings_backlog() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"pin", b">").await;
+    let stream_id = create_stream(&client, b"pin", b"pin.event").await;
 
     // Sibling A: tiny inflight so it pins near the head of the stream.
     let a_id = create_consumer(

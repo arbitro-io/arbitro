@@ -43,7 +43,7 @@ async fn correct_token_connects_and_works() {
     // a connection that authenticated but wasn't marked done would accept
     // the socket and then drop the first real frame.
     let resp = client
-        .create_stream(b"auth_ok", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"auth_ok", b"auth_ok.a", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("stream create must succeed on an authenticated connection");
     let stream_id = TestServer::parse_id(&resp);
@@ -74,7 +74,7 @@ async fn wrong_token_is_rejected_and_does_not_hang() {
             // itself may return before the rejection lands. What must NOT
             // happen is the connection working.
             let used = client
-                .create_stream(b"auth_bad", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+                .create_stream(b"auth_bad", b"auth_bad.>", 0, 0, 0, 1, 0, 0, 0, 0)
                 .await;
             assert!(
                 used.is_err(),
@@ -101,7 +101,7 @@ async fn missing_token_against_auth_broker_is_rejected() {
 
     if let Ok(client) = result {
         let used = client
-            .create_stream(b"auth_none", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"auth_none", b"auth_none.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await;
         assert!(
             used.is_err(),
@@ -125,7 +125,7 @@ async fn token_against_broker_without_auth_still_works() {
         .expect("a token must be harmless against a broker with auth disabled");
 
     let resp = client
-        .create_stream(b"auth_off", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"auth_off", b"auth_off.a", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("unsolicited Auth frame must not kill the connection");
     let stream_id = TestServer::parse_id(&resp);
@@ -146,7 +146,7 @@ async fn no_auth_configured_needs_no_token() {
         .expect("a broker without auth must accept a plain connection");
 
     let resp = client
-        .create_stream(b"auth_plain", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"auth_plain", b"auth_plain.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("plain connection must work");
     assert!(TestServer::parse_id(&resp) > 0);
@@ -180,7 +180,7 @@ async fn token_is_resent_after_reconnect() {
         .await;
 
     client
-        .create_stream(b"auth_rc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"auth_rc", b"auth_rc.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("pre-restart stream create");
 
@@ -200,7 +200,7 @@ async fn token_is_resent_after_reconnect() {
     let mut reconnected = false;
     while tokio::time::Instant::now() < deadline {
         if client
-            .create_stream(b"auth_rc2", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"auth_rc2", b"auth_rc2.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .is_ok()
         {

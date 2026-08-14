@@ -65,11 +65,9 @@ pub fn recreate_keeps_its_filter(filter: &[u8], existing: &[u8]) -> Result<(), V
 ///
 /// `claimed` is every filter already held by another stream.
 ///
-/// `filter_is_declared` and `filter_is_not_global` are written and tested
-/// but NOT called here: enforcing them rejects every stream created with
-/// `>` or no filter, which the existing test corpus does throughout. They
-/// go into this chain in the same commit that migrates those tests.
 pub fn on_create(filter: &[u8], claimed: &[&[u8]]) -> Result<(), Violation> {
+    filter_is_declared(filter)?;
+    filter_is_not_global(filter)?;
     filter_is_not_duplicate(filter, claimed)?;
     filter_does_not_overlap(filter, claimed)?;
     Ok(())
@@ -132,9 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn a_global_stream_never_collides() {
-        assert_eq!(on_create(b">", &[b"orders.>".as_slice()]), Ok(()));
-        assert_eq!(on_create(b"orders.>", &[b">".as_slice()]), Ok(()));
+    fn a_global_stream_is_rejected_outright() {
+        assert_eq!(
+            on_create(b">", &[b"orders.>".as_slice()]),
+            Err(Violation::StreamFilterGlobal)
+        );
+        assert_eq!(
+            on_create(b"", &[b"orders.>".as_slice()]),
+            Err(Violation::StreamFilterMissing)
+        );
     }
 
     #[test]

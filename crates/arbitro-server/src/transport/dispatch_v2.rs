@@ -1785,18 +1785,6 @@ async fn v2_create_consumer(
     // dedup in the drain worker.
     let is_fanout = body.deliver_mode == 0;
 
-    // C3/C4 — the consumer must live inside its stream's slice, and inherits
-    // it when it declares none. The registry holds the stream filter because
-    // it is the only structure that sees every stream. See `transport::rules`.
-    let owner_filter = server.names().stream_filter(seq_stream);
-    let resolved_filter: Vec<u8> =
-        match crate::transport::rules::consumer_rules::on_create(subject_filter, &owner_filter) {
-            Ok(f) => f.to_vec(),
-            Err(_) => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
-                return;
-            }
-        };
 
     // B6: subject limits are only honored under Explicit ack. The wire
     // body always carries the Vec, but we silently drop it for None-ack
@@ -1820,6 +1808,28 @@ async fn v2_create_consumer(
     }
 
     let (seq_consumer, _created) = server.names().get_or_create_consumer(seq_stream, name);
+    // C3/C4 — the consumer must live inside its stream's slice, and inherits
+    // it when it declares none. The registry holds the stream filter because
+    // it is the only structure that sees every stream. See `transport::rules`.
+    let owner_filter = server.names().stream_filter(seq_stream);
+    let sibling_owned = server
+        .names()
+        .sibling_consumer_filters(seq_stream, seq_consumer);
+    let siblings: Vec<&[u8]> = sibling_owned.iter().map(|f| f.as_slice()).collect();
+    let resolved_filter: Vec<u8> = match crate::transport::rules::consumer_rules::on_create(
+        subject_filter,
+        &owner_filter,
+        &siblings,
+    ) {
+        Ok(f) => f.to_vec(),
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+            return;
+        }
+    };
+    server
+        .names()
+        .set_consumer_filter(seq_consumer, &resolved_filter);
     // B1: registry refused — consumer slot pool exhausted.
     if seq_consumer.raw() == u32::MAX {
         registry.release_quota(conn_id, QuotaKind::Consumer);

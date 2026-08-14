@@ -12,7 +12,7 @@ async fn test_create_stream() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     server.shutdown().await;
@@ -23,7 +23,7 @@ async fn test_create_consumer() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -40,7 +40,7 @@ async fn test_list_streams() {
     let client = server.connect().await;
     for name in [b"orders".as_slice(), b"payments", b"events"] {
         client
-            .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(name, &[name, b".>"].concat(), 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
     }
@@ -64,7 +64,7 @@ async fn test_publish_ack_cycle() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -95,7 +95,7 @@ async fn test_publish_batch() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"batch", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"batch", b"batch.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -114,7 +114,7 @@ async fn test_fanout_delivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"fanout", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"fanout", b"fanout.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -170,7 +170,7 @@ async fn test_nack_redelivery() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"nack_test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"nack_test", b"nack.msg", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -199,7 +199,7 @@ async fn test_replay_publish_then_subscribe() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"replay", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"replay", b"replay.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -238,7 +238,7 @@ async fn test_gate_auto_delivery_smoke() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"gate_smoke", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"gate_smoke", b"gate.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -270,7 +270,7 @@ async fn test_fanout_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"fsc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"fsc", b"fsc.evt", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -329,7 +329,7 @@ async fn test_queue_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"qsc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qsc", b"qsc.job", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -385,7 +385,7 @@ async fn test_fanout_filtered_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"ffsc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"ffsc", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -457,7 +457,7 @@ async fn test_publish_with_reply_delivers_reply_to() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"rpc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"rpc", b"rpc.request", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -498,7 +498,7 @@ async fn test_publish_without_reply_has_empty_reply_to() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"norpc", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"norpc", b"norpc.msg", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -543,7 +543,7 @@ async fn test_graceful_shutdown() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     client
-        .create_stream(b"shutdown_test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"shutdown_test", b"shutdown_test.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let resp = client.list_streams(0, 1000).await.unwrap();

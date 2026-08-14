@@ -38,7 +38,7 @@ async fn publish_at_exact_max_frame_size_succeeds() {
 
     let stream_id = {
         let resp = client
-            .create_stream(b"exact_limit", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"exact_limit", b"exact_limit.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         TestServer::parse_id(&resp)
@@ -84,7 +84,7 @@ async fn publish_one_byte_over_max_frame_size_disconnects() {
 
     let stream_id = {
         let resp = client
-            .create_stream(b"over_limit", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(b"over_limit", b"over_limit.>", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         TestServer::parse_id(&resp)
@@ -124,7 +124,7 @@ async fn multi_mb_payload_round_trips() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"big_payload", b">", 0, 0, 0, 1, 1, 0, 0, 0)
+        .create_stream(b"big_payload", b"big.data", 0, 0, 0, 1, 1, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

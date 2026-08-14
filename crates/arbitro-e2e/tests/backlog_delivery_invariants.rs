@@ -165,7 +165,7 @@ async fn fixture(tag: &str, cfg: Setup) -> Fixture {
     for i in 0..STREAMS {
         let name = format!("{tag}_s{i}");
         let resp = setup
-            .create_stream(name.as_bytes(), b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(name.as_bytes(), format!("{name}.>").as_bytes(), 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .expect("create stream");
         stream_ids.push(TestServer::parse_id(&resp));

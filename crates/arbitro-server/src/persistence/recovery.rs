@@ -342,7 +342,7 @@ impl MetadataApplier for ReplayApplier {
 
                 let owner_filter = self.server.names().stream_filter(stream_id);
                 let replay_filter: Vec<u8> =
-                    match crate::transport::rules::consumer_rules::on_create(cv.subject(), &owner_filter) {
+                    match crate::transport::rules::consumer_rules::on_create(cv.subject(), &owner_filter, &[]) {
                         Ok(f) => f.to_vec(),
                         Err(_) => cv.subject().to_vec(),
                     };

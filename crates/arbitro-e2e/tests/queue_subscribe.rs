@@ -21,9 +21,9 @@ use arbitro_client_tokio::Client;
 use bytes::Bytes;
 use std::time::Duration;
 
-async fn create_stream(client: &Client, name: &[u8]) -> u32 {
+async fn create_stream(client: &Client, name: &[u8], filter: &[u8]) -> u32 {
     let resp = client
-        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(name, filter, 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     TestServer::parse_id(&resp)
@@ -63,7 +63,7 @@ async fn queue_subscribe_load_balances_across_workers() {
     let mut server = TestServerBuilder::new().spawn().await;
 
     let setup = server.connect().await;
-    let stream_id = create_stream(&setup, b"qs_lb").await;
+    let stream_id = create_stream(&setup, b"qs_lb", b"qs_lb.job").await;
 
     // Three workers, three separate connections, SAME queue name. The first
     // call creates the durable consumer; the other two join it idempotently.
@@ -144,7 +144,7 @@ async fn one_consumer_per_queue_name_not_per_subscription() {
     let mut server = TestServerBuilder::new().spawn().await;
 
     let setup = server.connect().await;
-    let stream_id = create_stream(&setup, b"qs_count").await;
+    let stream_id = create_stream(&setup, b"qs_count", b"evt.>").await;
 
     let n0 = TestServer::consumer_count(&setup.list_consumers(stream_id, 0, 1000).await.unwrap());
     assert_eq!(n0, 0, "no consumers before any queue_subscribe");
@@ -211,7 +211,7 @@ async fn unacked_message_is_redelivered() {
     let mut server = TestServerBuilder::new().spawn().await;
 
     let setup = server.connect().await;
-    let stream_id = create_stream(&setup, b"qs_redeliver").await;
+    let stream_id = create_stream(&setup, b"qs_redeliver", b"qs_redeliver.job").await;
 
     let worker = server.connect().await;
     let mut sub = worker
@@ -264,7 +264,7 @@ async fn ack_wait_redelivers_a_silently_dropped_job() {
     let mut server = TestServerBuilder::new().spawn().await;
 
     let setup = server.connect().await;
-    let stream_id = create_stream(&setup, b"qs_ackwait").await;
+    let stream_id = create_stream(&setup, b"qs_ackwait", b"qs_ackwait.job").await;
 
     let worker = server.connect().await;
     let mut sub = worker
@@ -314,7 +314,7 @@ async fn distinct_queue_names_are_independent_queues() {
     let mut server = TestServerBuilder::new().spawn().await;
 
     let setup = server.connect().await;
-    let stream_id = create_stream(&setup, b"qs_indep").await;
+    let stream_id = create_stream(&setup, b"qs_indep", b"qs_indep.evt").await;
 
     let a = server.connect().await;
     let b = server.connect().await;
@@ -376,7 +376,7 @@ async fn queue_survives_broker_restart() {
     {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
-        let stream_id = create_stream(&client, b"qs_durable").await;
+        let stream_id = create_stream(&client, b"qs_durable", b"qs_durable.job").await;
 
         let mut sub = client
             .queue_subscribe(stream_id, b"workers", b"")
@@ -404,7 +404,7 @@ async fn queue_survives_broker_restart() {
         let client = server.connect().await;
 
         // The stream survived the restart, so this resolves the existing one.
-        let stream_id = create_stream(&client, b"qs_durable").await;
+        let stream_id = create_stream(&client, b"qs_durable", b"qs_durable.job").await;
 
         // Re-join the SAME queue: the durable consumer was persisted, so this
         // is an idempotent re-create, not a fresh queue.
