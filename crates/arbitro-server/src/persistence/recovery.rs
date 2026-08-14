@@ -350,6 +350,12 @@ impl MetadataApplier for ReplayApplier {
                         },
                         ack_wait_ms: cv.ack_wait_ms(),
                         max_nack: 0,
+                        // The subject filter has always been IN this record
+                        // (`CreateConsumerFrame` reserves `subj_len` + the
+                        // subject in its tail) — replay just never read it
+                        // back, so a restart silently dropped the filter of
+                        // every consumer. Restores it now.
+                        filter: Box::from(cv.subject()),
                     },
                     max_subject_inflights,
                 });

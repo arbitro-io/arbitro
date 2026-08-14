@@ -47,6 +47,18 @@ pub struct ConsumerConfig {
     /// times are published to `{stream_name}.dlq` and acked from the
     /// original stream.
     pub max_nack: u32,
+    /// Subject filter declared at consumer-creation time. Empty = no
+    /// filter (the consumer accepts whatever its subscriptions accept).
+    ///
+    /// `Box<[u8]>` and not `Vec<u8>`: it is written once at creation and
+    /// never grows, so the capacity word would be dead weight.
+    ///
+    /// Consumed on the **management path only** — folded into the stream's
+    /// match table when a subscription is created. It is never read
+    /// per-message: `code-anti-patterns.md` bans runtime subject filter
+    /// evaluation on the hot path, and `Binding` deliberately does not
+    /// carry it.
+    pub filter: Box<[u8]>,
 }
 
 /// Configuration for creating a subscription.
@@ -80,6 +92,10 @@ pub struct ConsumerInfo {
     pub ack_wait_ms: u32,
     /// Maximum nack count before DLQ. 0 = DLQ disabled.
     pub max_nack: u32,
+    /// Subject filter declared at creation. Empty = no filter. See
+    /// [`ConsumerConfig::filter`] for why it lives here and not on
+    /// [`Binding`].
+    pub filter: Box<[u8]>,
 }
 
 /// Subscription metadata.
@@ -313,6 +329,11 @@ impl Catalog {
                 && existing.ack_wait_ms == config.ack_wait_ms
                 && existing.stream_id == config.stream_id
                 && existing.queue_id == config.queue_id
+                // The filter is routing configuration: re-creating a
+                // consumer under a different one must NOT be treated as
+                // idempotent, or the second caller would silently inherit
+                // the first one's routing.
+                && existing.filter == config.filter
             {
                 return Ok(false); // already existed, same config
             }
@@ -327,6 +348,7 @@ impl Catalog {
             durable: config.durable,
             ack_wait_ms: config.ack_wait_ms,
             max_nack: config.max_nack,
+            filter: config.filter,
         });
         Ok(true) // newly created
     }
@@ -829,8 +851,98 @@ mod tests {
             max_inflight: 1000,
             ack_wait_ms: 0,
             max_nack: 0,
+            filter: Box::default(),
         });
         assert!(result.is_err());
+    }
+
+    // ── Consumer subject filter ─────────────────────────────────────────
+    //
+    // The filter travelled from the client and was persisted to the
+    // metadata log, but was dropped before reaching the engine: it existed
+    // on disk and in no live structure. These pin that it is now stored,
+    // and that it participates in the same-config contract.
+
+    /// Builds a consumer on stream 1 that differs only in `filter`.
+    fn consumer_with_filter(id: u32, filter: &[u8]) -> ConsumerConfig {
+        ConsumerConfig {
+            id: ConsumerId(id),
+            queue_id: QueueId(10),
+            stream_id: StreamId(1),
+            durable: true,
+            ack_policy: AckPolicy::Explicit,
+            max_inflight: 100,
+            ack_wait_ms: 0,
+            max_nack: 0,
+            filter: Box::from(filter),
+        }
+    }
+
+    fn catalog_with_stream() -> Catalog {
+        let mut cat = Catalog::new();
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"orders".to_vec(),
+        })
+        .expect("stream");
+        cat
+    }
+
+    #[test]
+    fn consumer_filter_is_stored_verbatim() {
+        let mut cat = catalog_with_stream();
+        assert!(cat
+            .ensure_consumer(consumer_with_filter(1, b"orders.premium.>"))
+            .expect("create"));
+
+        assert_eq!(
+            &*cat.consumer(ConsumerId(1)).expect("consumer exists").filter,
+            b"orders.premium.>",
+            "the filter must survive into live catalog state"
+        );
+    }
+
+    #[test]
+    fn absent_filter_is_stored_empty_not_wildcard() {
+        // Empty means "no filter declared" — it must NOT be normalised to
+        // b">" here. Whether an absent filter widens or narrows is a
+        // decision for the fold into the match table, not for storage.
+        let mut cat = catalog_with_stream();
+        cat.ensure_consumer(consumer_with_filter(1, b""))
+            .expect("create");
+        assert!(cat.consumer(ConsumerId(1)).expect("exists").filter.is_empty());
+    }
+
+    #[test]
+    fn recreating_with_the_same_filter_is_idempotent() {
+        let mut cat = catalog_with_stream();
+        assert!(cat
+            .ensure_consumer(consumer_with_filter(1, b"orders.premium.>"))
+            .expect("first create"));
+        assert!(
+            !cat.ensure_consumer(consumer_with_filter(1, b"orders.premium.>"))
+                .expect("same config must be idempotent"),
+            "second create must report `already existed`, not `created`"
+        );
+    }
+
+    #[test]
+    fn recreating_with_a_different_filter_is_a_config_mismatch() {
+        let mut cat = catalog_with_stream();
+        cat.ensure_consumer(consumer_with_filter(1, b"orders.premium.>"))
+            .expect("first create");
+
+        let err = cat
+            .ensure_consumer(consumer_with_filter(1, b"orders.basic.>"))
+            .expect_err("a different filter is a different config");
+        assert_eq!(err.code(), crate::error::ErrorCode::ConsumerConfigMismatch);
+
+        // The rejected create must not have overwritten the stored filter.
+        assert_eq!(
+            &*cat.consumer(ConsumerId(1)).expect("exists").filter,
+            b"orders.premium.>",
+            "a rejected re-create must leave the original routing intact"
+        );
     }
 
     #[test]
@@ -852,6 +964,7 @@ mod tests {
             max_inflight: 10_000,
             ack_wait_ms: 0,
             max_nack: 0,
+            filter: Box::default(),
         })
         .unwrap();
 
@@ -885,6 +998,7 @@ mod tests {
             max_inflight: 100,
             ack_wait_ms: 0,
             max_nack: 0,
+            filter: Box::default(),
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
@@ -920,6 +1034,7 @@ mod tests {
             max_inflight: 100,
             ack_wait_ms: 0,
             max_nack: 0,
+            filter: Box::default(),
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
@@ -960,6 +1075,7 @@ mod tests {
             max_inflight: 100,
             ack_wait_ms: 0,
             max_nack: 0,
+            filter: Box::default(),
         })
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {

@@ -269,7 +269,7 @@ impl ArbitroStateMachine {
         stream_name: &str,
         name: &str,
         group: &str,
-        _filter: &str,
+        filter: &str,
         max_inflight: u16,
         ack_policy: u8,
         deliver_policy: u8,
@@ -359,6 +359,12 @@ impl ArbitroStateMachine {
                     },
                     ack_wait_ms,
                     max_nack: 0,
+                    // `ClusterCommand::CreateConsumer` has always carried
+                    // `filter`; the apply side took it as `_filter` and threw
+                    // it away, so a follower materialised the consumer with
+                    // different routing config than the leader. Same value,
+                    // same config, on every replica now.
+                    filter: Box::from(filter.as_bytes()),
                 },
                 Vec::new(), // no subject limits on replicated path
             )

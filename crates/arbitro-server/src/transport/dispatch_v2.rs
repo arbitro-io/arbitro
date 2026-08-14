@@ -1194,6 +1194,16 @@ async fn v2_subscribe(
                 max_inflight: u32::MAX,
                 ack_wait_ms: 0,
                 max_nack: 0,
+                // The SubFrame carries no consumer filter — that field only
+                // exists on CreateConsumer. Empty here is safe and cannot
+                // clobber a stored filter: `Catalog::ensure_consumer` only
+                // writes the slot when it is vacant, so for an already
+                // created consumer this whole config is inert (the resulting
+                // ConsumerConfigMismatch is deliberately swallowed in
+                // `shard::handlers::handle_subscribe`). When the consumer
+                // does NOT exist yet, subscribe creates it filterless, which
+                // is exactly right — no filter was ever declared.
+                filter: Box::default(),
             },
             SubscriptionConfig {
                 // body.subscription_id == 0 means "legacy default": use
@@ -1813,6 +1823,11 @@ async fn v2_create_consumer(
                 // default would silently drop poison messages. Keep it opt-in
                 // (0 = redeliver forever) until the DLQ is fully implemented.
                 max_nack: body.max_nack.unwrap_or(0),
+                // The subject filter finally reaches the engine. It was
+                // decoded and validated above, and written to the metadata
+                // command log below, but until now it was dropped here —
+                // stored on disk and nowhere in live state.
+                filter: Box::from(subject_filter),
             },
             subject_limits,
         )

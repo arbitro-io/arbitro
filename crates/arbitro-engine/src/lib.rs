@@ -392,6 +392,7 @@ mod engine_tests {
                 max_inflight: 1000,
                 ack_wait_ms: 0,
                 max_nack: 0,
+                filter: Box::default(),
             })
             .unwrap();
 
@@ -471,6 +472,7 @@ mod engine_tests {
                 max_inflight: 100,
                 ack_wait_ms: 0,
                 max_nack: 0,
+                filter: Box::default(),
             })
             .unwrap();
         engine
@@ -513,6 +515,7 @@ mod engine_tests {
                 max_inflight: 100,
                 ack_wait_ms: 0,
                 max_nack: 0,
+                filter: Box::default(),
             })
             .unwrap();
         engine
