@@ -1070,3 +1070,206 @@ async fn drain_subject_does_not_touch_a_shard_neighbour() {
 
     server.shutdown().await;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Nested consumer filters: `orders.premium.>` alongside `orders.>`.
+//
+// Streams may not have overlapping filters — `StreamConfig` says so and the
+// broker enforces it. Consumers have no such documented rule, and the natural
+// reading is that they are independent readers of one log: a wide consumer
+// and a narrow one nested inside it should both work, each seeing its own
+// slice. That is what hierarchical routing needs.
+//
+// Two things are being pinned, and they are separable:
+//
+//   1. Creation is allowed. If the broker refused, hierarchical routing would
+//      be impossible by construction — worth knowing loudly.
+//   2. The narrow consumer only receives what its filter matches. This is the
+//      part that fails today: the consumer-side filter is stored and even
+//      compared when detecting a config conflict, but `Binding` carries no
+//      filter field and the drain never consults one. `one_consumer_many_
+//      filters.rs` proves the strong form (a consumer on `telemetry.cpu.>`
+//      receives `orders.*`); this pins the subtler nested case, where the
+//      wrong behaviour is easy to mistake for correct.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a consumer with an explicit subject filter. The module's own
+/// `create_consumer` helper hardcodes `b""` — as do all 157 `create_consumer`
+/// calls across the e2e suite, which is why nothing ever exercised this.
+async fn create_filtered_consumer(
+    client: &Client,
+    stream_id: u32,
+    name: &[u8],
+    filter: &[u8],
+) -> u32 {
+    let resp = client
+        .create_consumer(
+            stream_id, name, name, filter, 100u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+        )
+        .await
+        .expect("create_consumer with a subject filter must succeed");
+    TestServer::parse_id(&resp)
+}
+
+#[tokio::test]
+async fn nested_consumer_filters_are_independent() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"nested_filters").await;
+
+    let wide = create_filtered_consumer(&client, stream_id, b"all_orders", b"orders.>").await;
+    let nested =
+        create_filtered_consumer(&client, stream_id, b"premium_only", b"orders.premium.>").await;
+    assert_ne!(
+        wide, nested,
+        "a nested filter collapsed onto the wide consumer's id"
+    );
+
+    let cw = server.connect().await;
+    let mut sub_wide = cw
+        .subscribe(stream_id, wide, b"")
+        .await
+        .expect("subscribe wide");
+    let cn = server.connect().await;
+    let mut sub_nested = cn
+        .subscribe(stream_id, nested, b"")
+        .await
+        .expect("subscribe nested");
+
+    // One outside the nested filter, two inside it.
+    for subj in [
+        &b"orders.basic.1"[..],
+        &b"orders.premium.1"[..],
+        &b"orders.premium.2"[..],
+    ] {
+        client
+            .publish_wait(stream_id, subj, Bytes::from("o"))
+            .await
+            .expect("publish");
+    }
+
+    let got_wide = drain_subjects(&mut sub_wide).await;
+    let got_nested = drain_subjects(&mut sub_nested).await;
+
+    client
+        .delete_stream(b"nested_filters")
+        .await
+        .expect("delete stream");
+    server.shutdown().await;
+
+    // WHAT arrived, before HOW MUCH — a count mismatch reads as "someone stole
+    // from me" when the defect is "I was handed traffic I never asked for".
+    let foreign: Vec<String> = got_nested
+        .iter()
+        .filter(|s| !s.starts_with(b"orders.premium."))
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "the consumer filtered on `orders.premium.>` was delivered {} subject(s) \
+         outside its filter: {foreign:?} — the consumer-side filter is not \
+         consulted at delivery time",
+        foreign.len()
+    );
+
+    assert_eq!(
+        got_nested.len(),
+        2,
+        "the nested consumer must see exactly the 2 premium messages, saw {}: \
+         {got_nested:?}",
+        got_nested.len()
+    );
+
+    // Nesting must not starve the parent: both are independent readers.
+    assert_eq!(
+        got_wide.len(),
+        3,
+        "the wide consumer on `orders.>` must see all 3, saw {}: {got_wide:?}",
+        got_wide.len()
+    );
+}
+
+/// Collect every subject a subscription hands over before it goes quiet.
+async fn drain_subjects(sub: &mut arbitro_client_tokio::SubscriptionHandle) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(400), sub.recv()).await {
+        out.push(msg.subject().to_vec());
+        msg.ack();
+    }
+    out
+}
+
+/// Control for [`nested_consumer_filters_are_independent`].
+///
+/// That test passes `b""` to `subscribe`, which is the pattern the rest of the
+/// suite uses (`subject_limit_shared_consumer` and 157 other call sites). It
+/// fails — but "I removed the filter that works and then complained nothing
+/// filtered" is a fair objection, so this runs the identical flow with the
+/// SAME pattern handed to `subscribe` instead.
+///
+/// If this passes and the other fails, the split is exact: filtering happens
+/// subscription-side, the consumer-side `filter` field is inert, and the bug
+/// is a promised-but-unimplemented API rather than broken delivery.
+#[tokio::test]
+async fn nested_filters_applied_at_subscribe_do_cut() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"nested_at_sub").await;
+
+    let wide = create_filtered_consumer(&client, stream_id, b"all_orders_s", b"orders.>").await;
+    let nested =
+        create_filtered_consumer(&client, stream_id, b"premium_only_s", b"orders.premium.>").await;
+
+    // The only difference from the sibling test: the pattern goes here too.
+    let cw = server.connect().await;
+    let mut sub_wide = cw
+        .subscribe(stream_id, wide, b"orders.>")
+        .await
+        .expect("subscribe wide");
+    let cn = server.connect().await;
+    let mut sub_nested = cn
+        .subscribe(stream_id, nested, b"orders.premium.>")
+        .await
+        .expect("subscribe nested");
+
+    for subj in [
+        &b"orders.basic.1"[..],
+        &b"orders.premium.1"[..],
+        &b"orders.premium.2"[..],
+    ] {
+        client
+            .publish_wait(stream_id, subj, Bytes::from("o"))
+            .await
+            .expect("publish");
+    }
+
+    let got_wide = drain_subjects(&mut sub_wide).await;
+    let got_nested = drain_subjects(&mut sub_nested).await;
+    println!(
+        "[at-subscribe] wide={:?} nested={:?}",
+        got_wide
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>(),
+        got_nested
+            .iter()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    client
+        .delete_stream(b"nested_at_sub")
+        .await
+        .expect("delete stream");
+    server.shutdown().await;
+
+    let foreign: Vec<String> = got_nested
+        .iter()
+        .filter(|s| !s.starts_with(b"orders.premium."))
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "even with the pattern at subscribe, the nested subscription got {foreign:?}"
+    );
+}
