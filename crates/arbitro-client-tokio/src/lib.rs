@@ -37,6 +37,7 @@ pub mod client;
 pub mod config;
 pub mod consumer_builder;
 pub mod cron;
+pub mod stream_builder;
 pub mod error;
 pub mod metrics;
 pub mod queue;
@@ -90,6 +91,17 @@ pub use publish::PUBLISH_BATCH_MAX;
 /// validation fails, and the API stays readable as the config grows.
 pub use consumer_builder::ConsumerBuilder;
 pub use cron::{CronBuilder, CronContext, CronHandle};
+
+/// Fluent builder for `CreateStream`. [`Client::create_stream`] takes ten
+/// positional arguments — three of them `u8` enums flattened to numbers —
+/// so a call site reads `(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)`
+/// and nobody can review it. This names every field, takes the enums as
+/// enums, and enforces the invariants `StreamConfig` only documents.
+pub use stream_builder::StreamBuilder;
+
+/// Stream policy enums, re-exported so callers never pass a raw `u8` to
+/// [`StreamBuilder`].
+pub use arbitro_proto::config::{DiscardPolicy, JournalKind, RetentionPolicy};
 
 /// Optional settings for [`Client::queue_subscribe_with`] — redelivery
 /// deadline, in-flight cap, where a brand-new queue starts reading. A plain
