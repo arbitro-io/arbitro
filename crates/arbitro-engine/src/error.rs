@@ -174,6 +174,14 @@ impl EngineError {
         }
     }
 
+    /// A subscription declared a filter that reaches outside its consumer's.
+    pub fn subscription_filter_not_nested() -> Self {
+        EngineError::Config {
+            code: ErrorCode::SubscriptionConfigMismatch,
+            detail: "subscription filter is not nested under the consumer filter".to_string(),
+        }
+    }
+
     pub fn entity_id_too_large() -> Self {
         EngineError::LimitExceeded {
             code: ErrorCode::EntityIdTooLarge,

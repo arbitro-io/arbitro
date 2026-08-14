@@ -40,6 +40,31 @@ pub fn subject_matches(pattern: &[u8], subject: &[u8]) -> bool {
     }
 }
 
+/// Does `wide` match every subject `narrow` matches? Zero-allocation.
+#[inline]
+pub fn subject_covers(wide: &[u8], narrow: &[u8]) -> bool {
+    let mut w = wide;
+    let mut n = narrow;
+
+    loop {
+        let (wtok, wrest) = next_token(w);
+        let (ntok, nrest) = next_token(n);
+
+        match (wtok, ntok) {
+            (b">", t) if !t.is_empty() => return true,
+            // `*` spans one token, `>` spans one or more — never covered.
+            (_, b">") => return false,
+            (b"*", t) if !t.is_empty() => {}
+            (a, b) if a == b && !a.is_empty() => {}
+            (a, b) if a.is_empty() && b.is_empty() => return wrest.is_empty() && nrest.is_empty(),
+            _ => return false,
+        }
+
+        w = wrest;
+        n = nrest;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +115,84 @@ mod tests {
     fn bare_gt() {
         assert!(subject_matches(b">", b"anything"));
         assert!(subject_matches(b">", b"a.b.c.d"));
+    }
+
+    // ── subject_covers ───────────────────────────────────────────────
+
+    #[test]
+    fn covers_nested_under_gt() {
+        assert!(subject_covers(b"orders.>", b"orders.premium.>"));
+        assert!(subject_covers(b"orders.>", b"orders.basic.1"));
+        assert!(subject_covers(b">", b"anything.at.all"));
+    }
+
+    #[test]
+    fn covers_itself() {
+        assert!(subject_covers(b"orders.premium.>", b"orders.premium.>"));
+        assert!(subject_covers(b"orders.created", b"orders.created"));
+        assert!(subject_covers(b"orders.*", b"orders.*"));
+    }
+
+    #[test]
+    fn narrower_does_not_cover_wider() {
+        assert!(!subject_covers(b"orders.premium.>", b"orders.>"));
+        assert!(!subject_covers(b"orders.*", b"orders.>"));
+        assert!(!subject_covers(b"orders.created", b"orders.*"));
+    }
+
+    #[test]
+    fn disjoint_never_covers() {
+        assert!(!subject_covers(b"orders.premium.>", b"orders.basic.>"));
+        assert!(!subject_covers(b"orders.>", b"payments.>"));
+    }
+
+    #[test]
+    fn star_spans_exactly_one_token() {
+        assert!(subject_covers(b"orders.*", b"orders.created"));
+        assert!(!subject_covers(b"orders.*", b"orders.a.b"));
+        assert!(subject_covers(b"*.orders.>", b"eu.orders.new"));
+    }
+
+    /// The contract, stated as a property: whatever `narrow` accepts,
+    /// `wide` must accept too.
+    #[test]
+    fn covers_agrees_with_subject_matches() {
+        let subjects: &[&[u8]] = &[
+            b"orders",
+            b"orders.basic.1",
+            b"orders.premium.1",
+            b"orders.premium.eu.2",
+            b"payments.new",
+            b"eu.orders.new",
+        ];
+        let pats: &[&[u8]] = &[
+            b">",
+            b"orders.>",
+            b"orders.*",
+            b"orders.premium.>",
+            b"orders.basic.>",
+            b"orders.created",
+            b"*.orders.>",
+        ];
+
+        for wide in pats {
+            for narrow in pats {
+                if !subject_covers(wide, narrow) {
+                    continue;
+                }
+                for s in subjects {
+                    if subject_matches(narrow, s) {
+                        assert!(
+                            subject_matches(wide, s),
+                            "{:?} claims to cover {:?} but rejects {:?}",
+                            String::from_utf8_lossy(wide),
+                            String::from_utf8_lossy(narrow),
+                            String::from_utf8_lossy(s),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

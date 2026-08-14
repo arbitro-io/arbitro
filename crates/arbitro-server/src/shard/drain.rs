@@ -630,8 +630,11 @@ fn process_drain_entry(
     let cache_key = (stream_raw, subject_hash);
     let lookup = mt.lookup(subject_hash);
 
-    // Step 1: pre-resolve patterns into local cache when lookup is empty.
-    if lookup.is_empty() && !scratch.resolve_cache.contains_key(&cache_key) {
+    // Step 1: resolve patterns whenever the stream HAS any. Gating on
+    // `lookup.is_empty()` starved every pattern subscriber as soon as one
+    // catch-all existed — `catch_all` ignores the subject, so the set was
+    // never empty and this branch never ran.
+    if mt.pattern_count() > 0 && !scratch.resolve_cache.contains_key(&cache_key) {
         let mut resolved = Vec::new();
         mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
         scratch.resolve_cache.insert(cache_key, resolved);
@@ -639,7 +642,7 @@ fn process_drain_entry(
     // Snapshot-pin purity guard: a retained entry must equal a fresh
     // resolve against the same (ptr-identical) snapshot.
     #[cfg(debug_assertions)]
-    if lookup.is_empty() {
+    if mt.pattern_count() > 0 {
         if let Some(cached) = scratch.resolve_cache.get(&cache_key) {
             let mut fresh = Vec::new();
             mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut fresh);
@@ -674,7 +677,15 @@ fn process_drain_entry(
     scratch.matches.clear();
     scratch.matches.extend(lookup.iter());
     if let Some(resolved) = scratch.resolve_cache.get(&cache_key) {
-        scratch.matches.extend(resolved.iter());
+        // Dedup across the merge: one subscription can sit in both buckets
+        // (literal + pattern). A duplicate delivers twice AND increments
+        // inflight twice against a single ack, permanently starving the
+        // consumer. `MatchEntry` equality excludes `binding_idx` by design.
+        for e in resolved.iter() {
+            if !scratch.matches.contains(e) {
+                scratch.matches.push(*e);
+            }
+        }
     }
 
     if scratch.matches.is_empty() {

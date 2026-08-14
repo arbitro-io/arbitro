@@ -10,7 +10,7 @@ pub mod match_table;
 
 use std::collections::HashMap;
 
-use crate::common::wire_hash_32;
+use crate::common::{subject_covers, wire_hash_32};
 use crate::error::{EngineError, EngineResult};
 use crate::events::DeltaEvents;
 use crate::types::*;
@@ -420,17 +420,34 @@ impl Catalog {
             .and_then(|s| s.as_ref())
             .ok_or_else(EngineError::consumer_not_found)?;
         let queue_id = consumer.queue_id;
+        // Copied out before the mutable borrows of `self` below.
+        let consumer_filter: Box<[u8]> = consumer.filter.clone();
 
         if self.subscriptions.contains_key(&config.id) {
             return Ok(());
         }
+
+        // Effective filter: inherit the consumer's when the subscription
+        // declares none, and stay under it when it declares its own.
+        let filters: Vec<Vec<u8>> = if consumer_filter.is_empty() {
+            config.filters.clone()
+        } else if config.filters.is_empty() {
+            vec![consumer_filter.to_vec()]
+        } else {
+            for f in &config.filters {
+                if !subject_covers(&consumer_filter, f) {
+                    return Err(EngineError::subscription_filter_not_nested());
+                }
+            }
+            config.filters.clone()
+        };
 
         self.subscriptions.insert(
             config.id,
             SubscriptionInfo {
                 stream_id: config.stream_id,
                 consumer_id: config.consumer_id,
-                filters: config.filters.clone(),
+                filters: filters.clone(),
             },
         );
 
@@ -449,10 +466,10 @@ impl Catalog {
 
         self.ensure_match_table_slot(config.stream_id);
         let mt = self.match_tables[config.stream_id.0 as usize].get_or_insert_with(MatchTable::new);
-        if config.filters.is_empty() {
+        if filters.is_empty() {
             mt.add_catch_all(match_entry);
         } else {
-            for filter in &config.filters {
+            for filter in &filters {
                 if filter.contains(&b'*') || filter.contains(&b'>') {
                     mt.add_pattern(filter.clone(), match_entry);
                 } else {
