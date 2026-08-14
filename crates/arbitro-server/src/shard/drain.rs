@@ -628,7 +628,8 @@ fn process_drain_entry(
         return;
     };
     let cache_key = (stream_raw, subject_hash);
-    let lookup = mt.lookup(subject_hash);
+    // SEC-5: verify the literal bytes — a 32-bit hash collision misdelivers.
+    let lookup = mt.lookup_verified(subject_hash, entry.subject);
 
     // Step 1: resolve patterns whenever the stream HAS any. Gating on
     // `lookup.is_empty()` starved every pattern subscriber as soon as one
