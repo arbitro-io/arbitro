@@ -217,6 +217,11 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_stream_replicas(stream_id, sv.replicas());
+                // Restore the claimed subject slice, or the admission rules
+                // see an unfiltered stream after every restart.
+                self.server
+                    .names()
+                    .set_stream_filter(stream_id, sv.filter());
                 // AUDIT-6a: restore the stream quota — same call
                 // `v2_create_stream` makes on the live path. Without
                 // this, the publish pre-check sees no quota after a
@@ -335,6 +340,12 @@ impl MetadataApplier for ReplayApplier {
                     .map(|e| (e.pattern.to_vec(), e.limit))
                     .collect();
 
+                let owner_filter = self.server.names().stream_filter(stream_id);
+                let replay_filter: Vec<u8> =
+                    match crate::transport::rules::consumer_rules::on_create(cv.subject(), &owner_filter) {
+                        Ok(f) => f.to_vec(),
+                        Err(_) => cv.subject().to_vec(),
+                    };
                 self.commands.push(ReplayCommand::CreateConsumer {
                     stream_id,
                     config: ConsumerConfig {
@@ -355,7 +366,12 @@ impl MetadataApplier for ReplayApplier {
                         // subject in its tail) — replay just never read it
                         // back, so a restart silently dropped the filter of
                         // every consumer. Restores it now.
-                        filter: Box::from(cv.subject()),
+                        // C4 — a consumer that declared no filter inherits its
+                        // stream's. Replay must resolve it exactly as
+                        // `v2_create_consumer` does, or the re-created consumer
+                        // carries a different filter than the replayed one and
+                        // the engine reads that as a config mismatch.
+                        filter: Box::from(replay_filter.as_slice()),
                     },
                     max_subject_inflights,
                 });

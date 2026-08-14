@@ -65,6 +65,36 @@ pub fn subject_covers(wide: &[u8], narrow: &[u8]) -> bool {
     }
 }
 
+/// Does some subject match both patterns? Zero-allocation.
+#[inline]
+pub fn subjects_overlap(a: &[u8], b: &[u8]) -> bool {
+    let mut x = a;
+    let mut y = b;
+
+    loop {
+        let (xt, xr) = next_token(x);
+        let (yt, yr) = next_token(y);
+
+        match (xt, yt) {
+            (b">", t) | (t, b">") if !t.is_empty() => return true,
+            (b"*", t) | (t, b"*") if !t.is_empty() => {}
+            (p, q) if p == q && !p.is_empty() => {}
+            (p, q) if p.is_empty() && q.is_empty() => return xr.is_empty() && yr.is_empty(),
+            _ => return false,
+        }
+
+        x = xr;
+        y = yr;
+    }
+}
+
+/// Is `narrow` strictly inside `wide` — covered, but not the same set?
+/// Equal patterns are siblings, not a hierarchy.
+#[inline]
+pub fn strictly_nested(narrow: &[u8], wide: &[u8]) -> bool {
+    subject_covers(wide, narrow) && !subject_covers(narrow, wide)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +223,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── subjects_overlap / strictly_nested ───────────────────────────
+
+    #[test]
+    fn overlap_detects_shared_subjects() {
+        assert!(subjects_overlap(b"orders.>", b"orders.new.>"));
+        assert!(subjects_overlap(b"orders.>", b"orders.>"));
+        assert!(subjects_overlap(b"orders.*", b"orders.created"));
+        assert!(subjects_overlap(b"*", b">"));
+        assert!(subjects_overlap(b">", b">"));
+    }
+
+    #[test]
+    fn overlap_rejects_disjoint() {
+        assert!(!subjects_overlap(b"orders.>", b"payments.>"));
+        assert!(!subjects_overlap(b"orders.*", b"orders.new.x"));
+        assert!(!subjects_overlap(b"a.b", b"a.b.c"));
+        assert!(!subjects_overlap(b"orders.premium.>", b"orders.basic.>"));
+    }
+
+    #[test]
+    fn strict_nesting_excludes_equals() {
+        assert!(strictly_nested(b"orders.premium.>", b"orders.>"));
+        assert!(strictly_nested(b"orders.created", b"orders.*"));
+        // Equal filters are siblings — fanout, not a hierarchy.
+        assert!(!strictly_nested(b"orders.>", b"orders.>"));
+        assert!(!strictly_nested(b"orders.>", b"orders.premium.>"));
+        assert!(!strictly_nested(b"orders.>", b"payments.>"));
     }
 
     #[test]

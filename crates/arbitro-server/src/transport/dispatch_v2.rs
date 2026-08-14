@@ -1319,7 +1319,23 @@ async fn v2_create_stream(
     // M7: collision-detecting variant. Two distinct names hashing to the
     // same u32 are rejected with StreamAlreadyExists rather than silently
     // merged. See `name_registry::STREAM_COLLISION_SENTINEL`.
-    let (seq_stream, _created) = server.names().get_or_create_stream_named(wire_stream, name);
+    // S3 — the registry is the only structure that sees every stream, so
+    // the no-overlap rule is decided here, under its lock, before any id
+    // is handed out. Rules live in `transport::rules`.
+    let checked = server.names().get_or_create_stream_checked(
+        wire_stream,
+        name,
+        filter,
+        crate::transport::rules::stream_rules::on_create,
+        crate::transport::rules::stream_rules::on_recreate,
+    );
+    let (seq_stream, _created) = match checked {
+        Ok(v) => v,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists);
+            return;
+        }
+    };
     if seq_stream.raw() == arbitro_common::name_registry::NameRegistry::STREAM_SLOT_FULL_SENTINEL {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
         return;
@@ -1769,6 +1785,19 @@ async fn v2_create_consumer(
     // dedup in the drain worker.
     let is_fanout = body.deliver_mode == 0;
 
+    // C3/C4 — the consumer must live inside its stream's slice, and inherits
+    // it when it declares none. The registry holds the stream filter because
+    // it is the only structure that sees every stream. See `transport::rules`.
+    let owner_filter = server.names().stream_filter(seq_stream);
+    let resolved_filter: Vec<u8> =
+        match crate::transport::rules::consumer_rules::on_create(subject_filter, &owner_filter) {
+            Ok(f) => f.to_vec(),
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+                return;
+            }
+        };
+
     // B6: subject limits are only honored under Explicit ack. The wire
     // body always carries the Vec, but we silently drop it for None-ack
     // consumers (legacy contract — predates serde migration).
@@ -1827,7 +1856,7 @@ async fn v2_create_consumer(
                 // decoded and validated above, and written to the metadata
                 // command log below, but until now it was dropped here —
                 // stored on disk and nowhere in live state.
-                filter: Box::from(subject_filter),
+                filter: Box::from(resolved_filter.as_slice()),
             },
             subject_limits,
         )

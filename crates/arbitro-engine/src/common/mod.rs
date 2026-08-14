@@ -5,7 +5,7 @@
 mod subject;
 mod trie;
 
-pub use subject::{next_token, subject_covers, subject_matches};
+pub use subject::{next_token, strictly_nested, subject_covers, subject_matches, subjects_overlap};
 pub use trie::{validate_pattern, PatternError, SubjectTrie, TrieNode};
 
 /// 32-bit wire hash. Foldhash with fixed seed → deterministic across

@@ -170,6 +170,10 @@ struct Inner {
     /// Per-stream quota limits. Indexed by `StreamId.0`. Authoritative copy;
     /// mirrored to `HotSnapshot.stream_quotas`.
     stream_quotas: Vec<StreamQuota>,
+    /// Per-stream subject filter. Indexed by `StreamId.0`. The registry is
+    /// the only structure that sees every stream, so it is the only place
+    /// the no-overlap rule can be decided. Never read by any hot path.
+    stream_filters: Vec<Vec<u8>>,
     /// Slot allocator backing `StreamId.0`. Recycles freed slots (ROB-29)
     /// instead of growing monotonically; bumps a generation on reuse so
     /// stale `(slot, gen)` pairs can be detected via `is_stream_current`.
@@ -233,6 +237,7 @@ impl Inner {
                 foldhash::fast::FixedState::default(),
             ),
             streams_seq_to_wire: Vec::with_capacity(PREALLOC),
+            stream_filters: Vec::with_capacity(PREALLOC),
             streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
             streams_replicas: Vec::with_capacity(PREALLOC),
             streams_name_by_wire: HashMap::with_capacity_and_hasher(
@@ -421,6 +426,96 @@ impl NameRegistry {
         })
     }
 
+    /// Like [`get_or_create_stream_named`], but `check` first vets the
+    /// filter against every slice already claimed by another stream.
+    ///
+    /// The check runs inside the registry lock, so two concurrent creates
+    /// cannot both pass it and leave the broker with overlapping streams.
+    /// Re-creating an existing stream skips the check and returns its id —
+    /// idempotent, exactly as the unchecked variant.
+    pub fn get_or_create_stream_checked<E>(
+        &self,
+        wire_id: u32,
+        expected_name: &[u8],
+        filter: &[u8],
+        check: impl FnOnce(&[u8], &[&[u8]]) -> Result<(), E>,
+        recheck: impl FnOnce(&[u8], &[u8]) -> Result<(), E>,
+    ) -> Result<(StreamId, bool), E> {
+        self.with_inner_swap(|g| {
+            if let Some(&id) = g.streams_by_wire.get(&wire_id) {
+                if let Some(prev) = g.streams_name_by_wire.get(&wire_id) {
+                    if prev.as_slice() != expected_name {
+                        return Ok((StreamId(u32::MAX - 1), false));
+                    }
+                }
+                // S1 — the stream exists; its slice must not move.
+                let held = g
+                    .stream_filters
+                    .get(id.0 as usize)
+                    .map(|f| f.as_slice())
+                    .unwrap_or(b"");
+                recheck(filter, held)?;
+                return Ok((id, false));
+            }
+            let claimed: Vec<&[u8]> = g
+                .streams_by_wire
+                .values()
+                .filter_map(|id| g.stream_filters.get(id.0 as usize))
+                .filter(|f| !f.is_empty())
+                .map(|f| f.as_slice())
+                .collect();
+            check(filter, &claimed)?;
+
+            let Ok((slot, _gen)) = g.stream_pool.alloc() else {
+                return Ok((StreamId(u32::MAX), false));
+            };
+            let id = StreamId(slot);
+            g.streams_by_wire.insert(wire_id, id);
+            g.streams_name_by_wire
+                .insert(wire_id, expected_name.to_vec());
+            if (id.0 as usize) >= g.streams_seq_to_wire.len() {
+                g.streams_seq_to_wire.resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_seq_to_wire[id.0 as usize] = wire_id;
+            if (id.0 as usize) >= g.streams_idempotency_window_ms.len() {
+                g.streams_idempotency_window_ms
+                    .resize((id.0 as usize) + 1, 0);
+            }
+            g.streams_idempotency_window_ms[id.0 as usize] = 0;
+            if (id.0 as usize) >= g.streams_replicas.len() {
+                g.streams_replicas.resize((id.0 as usize) + 1, 1);
+            }
+            g.streams_replicas[id.0 as usize] = 1;
+            if (id.0 as usize) >= g.stream_filters.len() {
+                g.stream_filters.resize((id.0 as usize) + 1, Vec::new());
+            }
+            g.stream_filters[id.0 as usize] = filter.to_vec();
+            Ok((id, true))
+        })
+    }
+
+    /// Restore a stream's claimed slice. Used by log replay, which
+    /// re-registers streams through the unchecked constructor — without
+    /// this the slice is lost across restart and the admission rules see
+    /// an unfiltered stream.
+    pub fn set_stream_filter(&self, seq: StreamId, filter: &[u8]) {
+        self.with_inner_swap(|g| {
+            if (seq.0 as usize) >= g.stream_filters.len() {
+                g.stream_filters.resize((seq.0 as usize) + 1, Vec::new());
+            }
+            g.stream_filters[seq.0 as usize] = filter.to_vec();
+        })
+    }
+
+    /// The subject slice this stream owns. Empty = none declared.
+    pub fn stream_filter(&self, seq: StreamId) -> Vec<u8> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.stream_filters
+            .get(seq.0 as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Sentinels returned by `get_or_create_stream_named`. Public so the
     /// dispatcher can distinguish slot-full vs collision without inventing
     /// a wire error code.
@@ -488,6 +583,11 @@ impl NameRegistry {
             }
             if let Some(slot) = g.streams_replicas.get_mut(removed.0 as usize) {
                 *slot = 0;
+            }
+            // Release the claimed slice, or the filter blocks every future
+            // create for as long as the process lives.
+            if let Some(slot) = g.stream_filters.get_mut(removed.0 as usize) {
+                slot.clear();
             }
             let _ = g.stream_pool.free(removed.0);
             Some(removed)

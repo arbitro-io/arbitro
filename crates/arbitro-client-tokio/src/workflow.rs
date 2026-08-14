@@ -502,7 +502,7 @@ impl WorkflowBuilder {
 
         // Create DLQ stream (idempotent).
         let dlq_stream_name = format!("_wf_{name_str}_dlq");
-        let dlq_subject = format!("_wf.{name_str}.dlq.>");
+        let dlq_subject = format!("_wfdlq.{name_str}.>");
         let dlq_stream_id = create_or_get_stream(
             &self.client,
             dlq_stream_name.as_bytes(),
@@ -515,7 +515,7 @@ impl WorkflowBuilder {
         // Park and remove events are replayed by each worker to build a
         // complete local map of all suspended instances across all workers.
         let state_stream_name = format!("_wf_{name_str}_state");
-        let state_subject = format!("_wf.{name_str}.__state.>");
+        let state_subject = format!("_wfstate.{name_str}.>");
         let state_stream_id = create_or_get_stream(
             &self.client,
             state_stream_name.as_bytes(),
@@ -608,8 +608,8 @@ impl WorkflowBuilder {
             let suspended = Arc::clone(&suspended);
             let cancel_state = cancel.clone();
             let wf_name_str: Arc<str> = String::from_utf8_lossy(&self.name).into();
-            let park_prefix: Vec<u8> = format!("_wf.{wf_name_str}.__state.park.").into_bytes();
-            let remove_prefix: Vec<u8> = format!("_wf.{wf_name_str}.__state.remove.").into_bytes();
+            let park_prefix: Vec<u8> = format!("_wfstate.{wf_name_str}.park.").into_bytes();
+            let remove_prefix: Vec<u8> = format!("_wfstate.{wf_name_str}.remove.").into_bytes();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -707,7 +707,7 @@ impl WorkflowBuilder {
                                                     }
                                                     // Publish remove to state stream.
                                                     let rm_subj = format!(
-                                                        "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                        "_wfstate.{wf_name_str}.remove.{iid}"
                                                     );
                                                     let rm_mid = format!("wf:{iid}:remove");
                                                     let _ = client.publish_with_id(
@@ -771,7 +771,7 @@ impl WorkflowBuilder {
                                                         }
                                                         // Publish remove to state stream.
                                                         let rm_subj = format!(
-                                                            "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                            "_wfstate.{wf_name_str}.remove.{iid}"
                                                         );
                                                         let rm_mid = format!("wf:{iid}:remove");
                                                         let _ = client.publish_with_id(
@@ -788,7 +788,7 @@ impl WorkflowBuilder {
                                                 // No timeout handler — discard and remove
                                                 // from state stream.
                                                 let rm_subj = format!(
-                                                    "_wf.{wf_name_str}.__state.remove.{iid}"
+                                                    "_wfstate.{wf_name_str}.remove.{iid}"
                                                 );
                                                 let rm_mid = format!("wf:{iid}:remove");
                                                 let _ = client.publish_with_id(
@@ -826,7 +826,7 @@ impl WorkflowBuilder {
                                 // state stream so ALL workers drop the entry.
                                 let _ = suspended.lock().await.remove(&iid);
                                 let rm_subj = format!(
-                                    "_wf.{wf_name_str}.__state.remove.{iid}"
+                                    "_wfstate.{wf_name_str}.remove.{iid}"
                                 );
                                 let rm_mid = format!("wf:{iid}:remove");
                                 let _ = client.publish_with_id(
@@ -961,7 +961,7 @@ impl WorkflowBuilder {
                                     // Publish park event to state stream for
                                     // cross-worker visibility via fanout.
                                     let park_subj = format!(
-                                        "_wf.{wf_name_str}.__state.park.{instance_id}"
+                                        "_wfstate.{wf_name_str}.park.{instance_id}"
                                     );
                                     let park_mid = format!(
                                         "wf:{instance_id}:park:{step_index}"
@@ -1018,7 +1018,7 @@ impl WorkflowBuilder {
                                     if attempt >= max_retries {
                                         // Publish to DLQ.
                                         let dlq_subject = format!(
-                                            "_wf.{wf_name_str}.dlq.{step_index}",
+                                            "_wfdlq.{wf_name_str}.{step_index}",
                                         );
                                         let mut dlq_payload = Vec::new();
                                         let id_bytes = instance_id.as_bytes();
