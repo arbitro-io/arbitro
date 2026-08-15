@@ -265,6 +265,9 @@ async fn stream_builder_puts_every_field_in_its_own_slot() {
 // ═══════════════════════════════════════════════════════════════════════
 // 3. Two consumers, two different filters — the server holds BOTH.
 //
+// The two filters are siblings, not nested: the nesting was incidental to
+// what this proves, and consumers may not nest under one another.
+//
 // This is the transport half of the open delivery question. Two consumers
 // on one stream, each built with its own filter, produce two records that
 // differ in exactly that field. So by the time the broker is deciding what
@@ -283,14 +286,14 @@ async fn distinct_consumer_filters_arrive_distinct_at_the_server() {
     let client = server.connect().await;
 
     let stream_id = StreamBuilder::new(b"fidelity_two")
-        .filter(b"orders.>")
+        .filter(b"*.>")
         .create(&client)
         .await
         .expect("create_stream must succeed");
 
     for (name, filter) in [
-        (&b"wide_reader"[..], &b"orders.>"[..]),
-        (&b"nested_reader"[..], &b"orders.premium.>"[..]),
+        (&b"orders_reader"[..], &b"orders.>"[..]),
+        (&b"payments_reader"[..], &b"payments.>"[..]),
     ] {
         ConsumerBuilder::new(name)
             .filter(filter)
@@ -304,14 +307,14 @@ async fn distinct_consumer_filters_arrive_distinct_at_the_server() {
     server.shutdown().await;
 
     let records = read_metadata_log(dir.path());
-    let wide = CreateConsumerView::new(consumer_record(&records, b"wide_reader"));
-    let nested = CreateConsumerView::new(consumer_record(&records, b"nested_reader"));
+    let orders = CreateConsumerView::new(consumer_record(&records, b"orders_reader"));
+    let payments = CreateConsumerView::new(consumer_record(&records, b"payments_reader"));
 
-    assert_eq!(wide.subject(), b"orders.>");
-    assert_eq!(nested.subject(), b"orders.premium.>");
+    assert_eq!(orders.subject(), b"orders.>");
+    assert_eq!(payments.subject(), b"payments.>");
     assert_ne!(
-        wide.subject(),
-        nested.subject(),
+        orders.subject(),
+        payments.subject(),
         "the two consumers must reach the server carrying DIFFERENT filters — \
          identical delivery is therefore a delivery-side defect, not a \
          transport one"
