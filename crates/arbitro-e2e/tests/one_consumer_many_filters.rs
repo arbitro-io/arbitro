@@ -21,7 +21,9 @@
 mod test_helper;
 use test_helper::TestServerBuilder;
 
-use arbitro_client_tokio::{AckPolicy, Client, ConsumerBuilder, StreamBuilder, SubscriptionHandle};
+use arbitro_client_tokio::{
+    AckPolicy, Client, ConsumerBuilder, DeliverMode, StreamBuilder, SubscriptionHandle,
+};
 use bytes::Bytes;
 use std::time::Duration;
 
@@ -303,8 +305,11 @@ async fn setup(admin: &Client, stream: &[u8], consumer: &[u8]) -> (u32, u32) {
         .expect("stream");
 
     // ONE consumer, wide open. Every narrowing below is subscription-side.
+    // Fanout: each subscription sees everything its own filter accepts,
+    // instead of the three splitting one copy between them.
     let consumer_id = ConsumerBuilder::new(consumer)
         .ack_policy(AckPolicy::Explicit)
+        .deliver_mode(DeliverMode::Fanout)
         .max_inflight(1_000)
         .ack_wait_ms(30_000)
         .create(admin, stream_id)
@@ -376,30 +381,25 @@ fn assert_outcome(case: &str, orders: &[Vec<u8>], pay: &[Vec<u8>], all: &[Vec<u8
         "[{case}] payments subscription got foreign subjects: {pay:?}"
     );
 
-    // 2. Queue mode: each seq goes to exactly one member, so the three
-    //    subscriptions must partition the fixture — nothing lost, nothing
-    //    duplicated.
-    let total = orders.len() + pay.len() + all.len();
+    // 2. Fanout: every subscription sees each message its own filter
+    //    accepts. Nothing is split, so each count is exact and independent.
     assert_eq!(
-        total,
-        TOTAL,
-        "[{case}] expected {TOTAL} messages across the three subscriptions, \
-         got {total} (orders={}, pay={}, all={})",
         orders.len(),
-        pay.len(),
-        all.len()
+        ORDERS,
+        "[{case}] orders.* saw {} of {ORDERS} — fanout gives each \
+         subscription its own copy, so a short count is a lost message",
+        orders.len()
     );
-
-    // 3. THE discovery. Assertion 2 alone still passes under a binding
-    //    takeover: the last subscription (`>`) would hold the only binding,
-    //    take all 6, and the total would balance. This one separates "the
-    //    three share the stream" from "the last subscribe won".
-    assert!(
-        !orders.is_empty() && !pay.is_empty(),
-        "[{case}] a narrow subscription received nothing — the later subscribe \
-         took over the binding (consume/mod.rs:86 sends sub_id=0, so all three \
-         collapse onto the same key). orders={}, pay={}",
-        orders.len(),
+    assert_eq!(
+        pay.len(),
+        PAYMENTS,
+        "[{case}] payments.* saw {} of {PAYMENTS}",
         pay.len()
+    );
+    assert_eq!(
+        all.len(),
+        TOTAL,
+        "[{case}] the catch-all saw {} of {TOTAL}",
+        all.len()
     );
 }
