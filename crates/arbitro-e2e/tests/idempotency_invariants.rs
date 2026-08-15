@@ -410,7 +410,7 @@ async fn batch_mixed_id_and_no_id_entries() {
 
     let stream_id = TestServer::parse_id(
         &client
-            .create_stream(b"batch_mixed", b"batch_mixed.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
+            .create_stream(b"batch_mixed", b"k", 0, 0, 0, 1, 0, 0, 0, 60_000)
             .await
             .unwrap(),
     );

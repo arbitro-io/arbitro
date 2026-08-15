@@ -288,7 +288,7 @@ async fn deliver_new_floor_survives_restart() {
     {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
-        let stream_id = create_stream(&client, b"new_restart", b">").await;
+        let stream_id = create_stream(&client, b"new_restart", b"new_restart.>").await;
         for i in 0..10u8 {
             client
                 .publish_wait(stream_id, b"new_restart.h", Bytes::from(vec![b'h', i]))
@@ -304,7 +304,7 @@ async fn deliver_new_floor_survives_restart() {
         let mut server = TestServerBuilder::new().data_dir(dir_str).spawn().await;
         let client = server.connect().await;
         // Idempotent re-create/re-join to recover the ids.
-        let stream_id = create_stream(&client, b"new_restart", b">").await;
+        let stream_id = create_stream(&client, b"new_restart", b"new_restart.>").await;
         let late_id = create_consumer(&client, stream_id, b"late", b"late", 100u16, 1u8).await;
 
         for i in 0..3u8 {

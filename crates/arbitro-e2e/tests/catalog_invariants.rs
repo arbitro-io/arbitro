@@ -912,8 +912,8 @@ async fn purge_stream_does_not_touch_a_shard_neighbour() {
     let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
     let client = server.connect().await;
 
-    let victim = create_stream(&client, b"purge_victim", b"evt.>").await;
-    let bystander = create_stream(&client, b"purge_bystander", b"evt.>").await;
+    let victim = create_stream(&client, b"purge_victim", b"purge_victim.>").await;
+    let bystander = create_stream(&client, b"purge_bystander", b"purge_bystander.>").await;
 
     for i in 0..10u8 {
         client
@@ -1214,7 +1214,7 @@ async fn drain_subjects(sub: &mut arbitro_client_tokio::SubscriptionHandle) -> V
 async fn nested_filters_applied_at_subscribe_do_cut() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"nested_at_sub", b"evt.>").await;
+    let stream_id = create_stream(&client, b"nested_at_sub", b"orders.>").await;
 
     let wide = create_filtered_consumer(&client, stream_id, b"all_orders_s", b"orders.>").await;
     let nested =

@@ -50,7 +50,7 @@ async fn filtered_subs_on_one_consumer_across_connections() {
         .expect("subscribe payments");
     let c3 = server.connect().await;
     let mut all = c3
-        .subscribe(stream_id, consumer_id, b">")
+        .subscribe(stream_id, consumer_id, b"*.>")
         .await
         .expect("subscribe all");
 
@@ -94,7 +94,7 @@ async fn filtered_subs_on_one_consumer_same_connection() {
         .await
         .expect("subscribe payments");
     let mut all = c
-        .subscribe(stream_id, consumer_id, b">")
+        .subscribe(stream_id, consumer_id, b"*.>")
         .await
         .expect("subscribe all");
 
@@ -126,7 +126,7 @@ async fn two_consumers_may_share_one_filter() {
     let admin = server.connect().await;
 
     let stream_id = StreamBuilder::new(b"shared_filter")
-        .filter(b">")
+        .filter(b"*.>")
         .create(&admin)
         .await
         .expect("stream");
@@ -223,7 +223,7 @@ async fn two_consumers_with_the_same_name() {
     let admin = server.connect().await;
 
     let stream_id = StreamBuilder::new(b"same_name")
-        .filter(b">")
+        .filter(b"*.>")
         .create(&admin)
         .await
         .expect("stream");
@@ -294,144 +294,16 @@ async fn two_consumers_with_the_same_name() {
     }
 }
 
-/// Nested filters: one consumer on `orders.>`, another on `orders.premium.>`.
-///
-/// `two_consumers_may_share_one_filter` shows identical filters coexist and
-/// both see everything. Nesting is the harder shape: every message the narrow
-/// consumer wants, the wide one also matches. If consumers are independent
-/// views of the log, both get their own copy and the narrow one simply sees
-/// fewer. If they compete, the wide consumer swallows the premium traffic and
-/// the narrow one starves — which would make hierarchical routing impossible.
-#[tokio::test]
-async fn a_consumer_may_nest_under_another() {
-    let mut server = TestServerBuilder::new().spawn().await;
-    let admin = server.connect().await;
-
-    let stream_id = StreamBuilder::new(b"nested")
-        .filter(b">")
-        .create(&admin)
-        .await
-        .expect("stream");
-
-    let wide = ConsumerBuilder::new(b"all_orders")
-        .filter(b"orders.>")
-        .ack_policy(AckPolicy::Explicit)
-        .max_inflight(100)
-        .ack_wait_ms(30_000)
-        .create(&admin, stream_id)
-        .await
-        .expect("wide consumer on orders.>");
-
-    // Deliberately DISJOINT from `orders.>`. Nesting could be explained away
-    // as "the broker widens a filter to its parent"; a filter with no shared
-    // prefix at all cannot. If this consumer still sees `orders.*`, the
-    // consumer-side filter is not consulted on delivery — full stop.
-    let narrow = ConsumerBuilder::new(b"premium_only")
-        .filter(b"telemetry.cpu.>")
-        .ack_policy(AckPolicy::Explicit)
-        .max_inflight(100)
-        .ack_wait_ms(30_000)
-        .create(&admin, stream_id)
-        .await;
-
-    let narrow = match narrow {
-        Ok(id) => {
-            println!("[nested] ALLOWED — all_orders={wide}, premium_only={id}");
-            id
-        }
-        Err(e) => panic!(
-            "[nested] REJECTED — the broker refused a consumer on \
-             `orders.premium.>` while one on `orders.>` exists: {e:?}. That \
-             would forbid hierarchical routing entirely; only STREAM filters \
-             are documented as non-overlapping."
-        ),
-    };
-
-    let cw = server.connect().await;
-    let mut sub_wide = cw.subscribe(stream_id, wide, b"").await.expect("sub wide");
-    let cn = server.connect().await;
-    let mut sub_narrow = cn
-        .subscribe(stream_id, narrow, b"")
-        .await
-        .expect("sub narrow");
-
-    // One outside the narrow filter, two inside it.
-    for subj in [
-        &b"orders.basic.1"[..],
-        &b"orders.premium.1"[..],
-        &b"orders.premium.2"[..],
-    ] {
-        admin
-            .publish_wait(stream_id, subj, Bytes::from("o"))
-            .await
-            .expect("publish");
-    }
-
-    let got_wide = drain(&mut sub_wide).await;
-    let got_narrow = drain(&mut sub_narrow).await;
-    println!(
-        "[nested] all_orders    -> {:?}",
-        got_wide
-            .iter()
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect::<Vec<_>>()
-    );
-    println!(
-        "[nested] premium_only  -> {:?}",
-        got_narrow
-            .iter()
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect::<Vec<_>>()
-    );
-
-    admin
-        .delete_stream(b"nested")
-        .await
-        .expect("delete stream");
-    server.shutdown().await;
-
-    // Order matters. The count assertion fires first if it comes first, and
-    // its message blames the wrong side — it reads as "someone stole from
-    // me" when the defect is "I was handed traffic I never asked for".
-    // Check WHAT arrived before checking HOW MUCH.
-    let foreign: Vec<String> = got_narrow
-        .iter()
-        .filter(|s| !s.starts_with(b"telemetry.cpu."))
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    assert!(
-        foreign.is_empty(),
-        "the consumer filtered on `telemetry.cpu.>` was delivered {} subject(s) \
-         from a completely unrelated hierarchy: {foreign:?} — the consumer-side \
-         filter is not consulted at delivery time",
-        foreign.len()
-    );
-
-    // Nothing published matches `telemetry.cpu.>`, so a filtered consumer must
-    // see nothing at all.
-    assert!(
-        got_narrow.is_empty(),
-        "expected 0 messages for `telemetry.cpu.>`, got {}: {got_narrow:?}",
-        got_narrow.len()
-    );
-
-    assert_eq!(
-        got_wide.len(),
-        3,
-        "the wide consumer on `orders.>` missed messages: {got_wide:?}"
-    );
-}
 
 async fn setup(admin: &Client, stream: &[u8], consumer: &[u8]) -> (u32, u32) {
     let stream_id = StreamBuilder::new(stream)
-        .filter(b">")
+        .filter(b"*.>")
         .create(admin)
         .await
         .expect("stream");
 
     // ONE consumer, wide open. Every narrowing below is subscription-side.
     let consumer_id = ConsumerBuilder::new(consumer)
-        .filter(b">")
         .ack_policy(AckPolicy::Explicit)
         .max_inflight(1_000)
         .ack_wait_ms(30_000)

@@ -427,7 +427,7 @@ async fn t11_reconnect_resumes_unacked_tail() {
         // Client A
         let client_a = server.connect().await;
         let resp = client_a
-            .create_stream(stream_name, filter, 0, 0, 0, 1, 0, 0, 0, 0)
+            .create_stream(stream_name, b"sub.event", 0, 0, 0, 1, 0, 0, 0, 0)
             .await
             .unwrap();
         let stream_id = TestServer::parse_id(&resp);

@@ -326,7 +326,7 @@ async fn wildcard_single_token_filter_matches_correctly() {
 async fn wildcard_multi_token_filter_matches_everything_below() {
     let server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"wcmulti", b">").await;
+    let stream_id = create_stream(&client, b"wcmulti", b"wcmulti.>").await;
 
     let consumer_id = create_consumer(
         &client,
@@ -1315,7 +1315,7 @@ async fn evict_expired_does_not_stall_publish() {
     let resp = client
         .create_stream(
             b"evict_test",
-            b"evict_test.fresh",
+            b"evict_test.>",
             0,
             0,
             /*max_age_secs*/ 1,
@@ -1639,7 +1639,7 @@ async fn dead_reading_consumer_does_not_starve_healthy_sibling() {
     let client = server.connect().await;
     let client_b = server.connect().await;
 
-    let stream_id = create_stream(&client, b"starve", b"tail").await;
+    let stream_id = create_stream(&client, b"starve", b"starve.>").await;
 
     // A — fire-and-forget fanout consumer (no inflight cap, so frames keep
     // flowing until its writer channel is full).
@@ -1810,7 +1810,7 @@ async fn nack_during_active_drain_always_redelivers() {
 
     for iter in 0..ITERATIONS {
         let stream_name = format!("nackrace{iter}");
-        let stream_id = create_stream(&client, stream_name.as_bytes(), b">").await;
+        let stream_id = create_stream(&client, stream_name.as_bytes(), format!("{stream_name}.>").as_bytes()).await;
         // Small window: the drain pauses/resumes on every few acks, so
         // cycles are guaranteed to be mid-flight while nacks land.
         let consumer_id = create_consumer(

@@ -164,7 +164,7 @@ async fn publish_batch_delivers_all() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"logs", b"logs.>", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"logs", b"logs_line", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -581,7 +581,7 @@ async fn fanout_with_subject_filters() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"filt", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"filt", b"*.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -623,7 +623,7 @@ async fn fanout_with_subject_filters() {
         .await
         .unwrap();
     let cid_c = TestServer::parse_id(&resp);
-    let mut handle_c = cli_c.subscribe(stream_id, cid_c, b">").await.unwrap();
+    let mut handle_c = cli_c.subscribe(stream_id, cid_c, b"*.>").await.unwrap();
 
     // Publish: 3 orders, 2 payments
     let publisher = server.connect().await;
@@ -719,7 +719,7 @@ async fn queue_with_subject_filters_no_false_dedup() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"qfilt", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qfilt", b"*.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -818,7 +818,7 @@ async fn queue_overlapping_filters_no_duplicates() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"qovlp", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"qovlp", b"*.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -862,7 +862,7 @@ async fn queue_overlapping_filters_no_duplicates() {
         .await
         .unwrap();
     let cid_b = TestServer::parse_id(&resp);
-    let mut handle_b = cli_b.subscribe(stream_id, cid_b, b">").await.unwrap();
+    let mut handle_b = cli_b.subscribe(stream_id, cid_b, b"*.>").await.unwrap();
 
     let publisher = server.connect().await;
     for i in 0..10u32 {
@@ -1188,7 +1188,7 @@ async fn queue_group_three_clients_100_msgs() {
 
     let setup = server.connect().await;
     let resp = setup
-        .create_stream(b"q3", b"q3.>", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"q3", b"q3_job", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);
@@ -1501,7 +1501,7 @@ async fn max_subject_inflight_multiple_patterns() {
     let client = server.connect().await;
 
     let resp = client
-        .create_stream(b"msi", b"msi.>", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"msi", b"*.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = TestServer::parse_id(&resp);

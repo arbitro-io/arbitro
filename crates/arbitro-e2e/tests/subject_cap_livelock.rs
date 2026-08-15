@@ -56,7 +56,6 @@ async fn capped_low_seq_does_not_livelock_redelivery() {
 
     let consumer_id = ConsumerBuilder::new(b"livelock_tester")
         .group(b"")
-        .filter(b">")
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .deliver_mode(DeliverMode::Fanout)

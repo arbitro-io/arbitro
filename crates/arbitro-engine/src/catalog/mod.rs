@@ -10,7 +10,7 @@ pub mod match_table;
 
 use std::collections::HashMap;
 
-use crate::common::{subject_covers, wire_hash_32};
+use crate::common::wire_hash_32;
 use crate::error::{EngineError, EngineResult};
 use crate::events::DeltaEvents;
 use crate::types::*;
@@ -420,27 +420,16 @@ impl Catalog {
             .and_then(|s| s.as_ref())
             .ok_or_else(EngineError::consumer_not_found)?;
         let queue_id = consumer.queue_id;
-        // Copied out before the mutable borrows of `self` below.
-        let consumer_filter: Box<[u8]> = consumer.filter.clone();
 
         if self.subscriptions.contains_key(&config.id) {
             return Ok(());
         }
 
-        // Effective filter: inherit the consumer's when the subscription
-        // declares none, and stay under it when it declares its own.
-        let filters: Vec<Vec<u8>> = if consumer_filter.is_empty() {
-            config.filters.clone()
-        } else if config.filters.is_empty() {
-            vec![consumer_filter.to_vec()]
-        } else {
-            for f in &config.filters {
-                if !subject_covers(&consumer_filter, f) {
-                    return Err(EngineError::subscription_filter_not_nested());
-                }
-            }
-            config.filters.clone()
-        };
+        // The filters arrive already resolved: `transport::rules` inherits
+        // the consumer's slice when none is declared and rejects anything
+        // reaching outside it. The engine's catalog is sharded and cannot
+        // see the whole picture, so admission is decided above it.
+        let filters: Vec<Vec<u8>> = config.filters.clone();
 
         self.subscriptions.insert(
             config.id,

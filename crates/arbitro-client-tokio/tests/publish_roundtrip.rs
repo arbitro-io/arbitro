@@ -46,7 +46,7 @@ async fn publish_single_and_batch_no_errors() {
 
     // Create a stream so the server accepts publishes.
     let resp = client
-        .create_stream(b"pub-test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"pub-test", b"test.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -89,7 +89,7 @@ async fn concurrent_publish_wait_no_timeout() {
     let client = connect(&addr).await;
 
     let resp = client
-        .create_stream(b"conc-test", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"conc-test", b"conc.subject", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

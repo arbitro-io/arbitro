@@ -48,7 +48,7 @@ async fn full_management_crud_roundtrip() {
 
     // ── create_stream ───────────────────────────────────────────────────
     let resp = client
-        .create_stream(b"orders", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"orders", b"orders.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     // RepOk body: first 8 bytes = ref_seq (the wire stream id, u64 LE).
@@ -125,7 +125,7 @@ async fn consumer_builder_defaults_group_so_broker_accepts_it() {
     let client = connect(&addr).await;
 
     let resp = client
-        .create_stream(b"grp_default", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"grp_default", b"grp_default.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

@@ -83,7 +83,6 @@ async fn ring_overflow_on_connection_death_does_not_starve_messages() {
     // path exercised here is the bulk retirement on connection death.
     let consumer_id = ConsumerBuilder::new(b"overflow_tester")
         .group(b"")
-        .filter(b">")
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .deliver_mode(DeliverMode::Fanout)

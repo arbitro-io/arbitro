@@ -74,7 +74,7 @@ async fn connect_purges_ackstore_against_server_cursor() {
     let c1 = connect_with(&addr, open_wal(&wal_dir)).await;
 
     let resp = c1
-        .create_stream(STREAM.as_bytes(), b">", 100_000, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(STREAM.as_bytes(), b"ackstore-connect-purge.job", 100_000, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;

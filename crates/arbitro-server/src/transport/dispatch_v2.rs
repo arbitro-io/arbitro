@@ -1170,6 +1170,21 @@ async fn v2_subscribe(
     // the engine handles both forms identically.
     let filters: Vec<Vec<u8>> = body.filters.into_iter().filter(|f| !f.is_empty()).collect();
 
+    // B1/B2/B3 — a subscription lives inside its consumer, and inherits the
+    // consumer's slice when it declares none. Decided here, next to the other
+    // admission rules; the registry holds the consumer filter. Sibling
+    // subscriptions MAY nest under one another — that is the whole point of
+    // several filtered subscriptions on one consumer.
+    let owner_filter = server.names().consumer_filter(consumer_id);
+    let filters: Vec<Vec<u8>> =
+        match crate::transport::rules::subscription_rules::on_create(&filters, &owner_filter) {
+            Ok(f) => f,
+            Err(_) => {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+                return;
+            }
+        };
+
     // deliver_policy from consumer config (stored at CreateConsumer time).
     // Default: 0 = All (replay from beginning). The NameRegistry can hold
     // per-consumer deliver_policy for management-API consumers.

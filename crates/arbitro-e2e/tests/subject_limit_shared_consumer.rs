@@ -87,7 +87,6 @@ async fn run(mode: DeliverMode, group: &[u8]) -> (usize, usize) {
     // all share its cursor, its pending set and its subject counters.
     let consumer_id = ConsumerBuilder::new(b"shared_cap_tester")
         .group(group)
-        .filter(b">")
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .deliver_mode(mode)

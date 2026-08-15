@@ -385,7 +385,7 @@ async fn test_fanout_filtered_same_connection() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let resp = client
-        .create_stream(b"ffsc", b"*.*", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(b"ffsc", b"*.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let sid = TestServer::parse_id(&resp);
@@ -409,7 +409,7 @@ async fn test_fanout_filtered_same_connection() {
         .await
         .unwrap();
     let cid_c = TestServer::parse_id(&resp);
-    let mut sub_c = client.subscribe(sid, cid_c, b">").await.unwrap();
+    let mut sub_c = client.subscribe(sid, cid_c, b"*.>").await.unwrap();
 
     for i in 0..3u32 {
         let subj = format!("orders.{i}");

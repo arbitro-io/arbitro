@@ -521,6 +521,15 @@ impl NameRegistry {
         })
     }
 
+    /// The subject slice this consumer holds. Empty = none recorded.
+    pub fn consumer_filter(&self, id: ConsumerId) -> Vec<u8> {
+        let g = self.inner.lock().expect("name registry poisoned");
+        g.consumer_filters
+            .get(id.0 as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Filters held by every consumer on `stream` other than `except`.
     pub fn sibling_consumer_filters(&self, stream: StreamId, except: ConsumerId) -> Vec<Vec<u8>> {
         let g = self.inner.lock().expect("name registry poisoned");
