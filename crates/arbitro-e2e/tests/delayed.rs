@@ -215,7 +215,7 @@ async fn delayed_publish_duplicate_msg_id_is_deduped() {
         &client
             .create_stream(
                 b"delay_dedup",
-                b"immediate-dup",
+                b"delay_dedup.>",
                 0,
                 0,
                 0,

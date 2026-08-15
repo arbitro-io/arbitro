@@ -766,7 +766,7 @@ async fn batch_publish_with_headers_delivers_clean_payload_and_dedups_after_rest
 
         let stream_id = TestServer::parse_id(
             &client
-                .create_stream(b"batch_hdrs", b"k.a", 0, 0, 0, 1, 0, 0, 0, 60_000)
+                .create_stream(b"batch_hdrs", b"k.>", 0, 0, 0, 1, 0, 0, 0, 60_000)
                 .await
                 .unwrap(),
         );
