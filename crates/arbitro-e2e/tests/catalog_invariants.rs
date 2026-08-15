@@ -1111,6 +1111,78 @@ async fn create_filtered_consumer(
     TestServer::parse_id(&resp)
 }
 
+/// The same cut, but over the BACKLOG: everything is published before either
+/// consumer subscribes.
+///
+/// [`sibling_consumer_filters_are_independent`] only exercises live drain —
+/// it subscribes first and publishes after. Backlog replay is a different
+/// walk through the store, so a filter honoured on one path says nothing
+/// about the other.
+#[tokio::test]
+async fn sibling_consumer_filters_cut_the_backlog_too() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let stream_id = create_stream(&client, b"backlog_filters", b"orders.>").await;
+
+    // PUBLISH FIRST — nobody is subscribed yet.
+    for subj in [
+        &b"orders.basic.1"[..],
+        &b"orders.premium.1"[..],
+        &b"orders.premium.2"[..],
+    ] {
+        client
+            .publish_wait(stream_id, subj, Bytes::from("o"))
+            .await
+            .expect("publish");
+    }
+
+    let basic = create_filtered_consumer(&client, stream_id, b"basic_bl", b"orders.basic.>").await;
+    let premium =
+        create_filtered_consumer(&client, stream_id, b"premium_bl", b"orders.premium.>").await;
+
+    let cb = server.connect().await;
+    let mut sub_basic = cb
+        .subscribe(stream_id, basic, b"")
+        .await
+        .expect("subscribe basic");
+    let cp = server.connect().await;
+    let mut sub_premium = cp
+        .subscribe(stream_id, premium, b"")
+        .await
+        .expect("subscribe premium");
+
+    let got_basic = drain_subjects(&mut sub_basic).await;
+    let got_premium = drain_subjects(&mut sub_premium).await;
+
+    client
+        .delete_stream(b"backlog_filters")
+        .await
+        .expect("delete stream");
+    server.shutdown().await;
+
+    let foreign: Vec<String> = got_premium
+        .iter()
+        .filter(|s| !s.starts_with(b"orders.premium."))
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "replaying the backlog handed the `orders.premium.>` consumer {foreign:?}"
+    );
+    assert_eq!(
+        got_premium.len(),
+        2,
+        "the premium consumer must replay exactly its 2, saw {}: {got_premium:?}",
+        got_premium.len()
+    );
+    assert_eq!(
+        got_basic.len(),
+        1,
+        "the basic consumer must replay exactly its 1, saw {}: {got_basic:?}",
+        got_basic.len()
+    );
+}
+
 #[tokio::test]
 async fn sibling_consumer_filters_are_independent() {
     let mut server = TestServerBuilder::new().spawn().await;
