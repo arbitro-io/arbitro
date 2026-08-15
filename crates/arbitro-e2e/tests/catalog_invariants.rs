@@ -998,19 +998,20 @@ async fn drain_subject_does_not_touch_a_shard_neighbour() {
     let mut server = TestServerBuilder::new().shard_count(1).spawn().await;
     let client = server.connect().await;
 
-    let victim = create_stream(&client, b"drain_victim", b"shared.evt").await;
-    let bystander = create_stream(&client, b"drain_bystander", b"shared.evt").await;
+    let victim = create_stream(&client, b"drain_victim", b"shared.victim").await;
+    let bystander = create_stream(&client, b"drain_bystander", b"shared.bystander").await;
 
-    // Identical subjects on both streams — that is the whole point.
+    // Both sit under `shared.` on ONE shard, so a drain that walks the shard
+    // instead of the named stream would take the neighbour with it.
     for i in 0..6u8 {
         client
-            .publish_wait(victim, b"shared.evt", Bytes::from(vec![i]))
+            .publish_wait(victim, b"shared.victim", Bytes::from(vec![i]))
             .await
             .expect("publish to victim");
     }
     for i in 0..4u8 {
         client
-            .publish_wait(bystander, b"shared.evt", Bytes::from(vec![100 + i]))
+            .publish_wait(bystander, b"shared.bystander", Bytes::from(vec![100 + i]))
             .await
             .expect("publish to bystander");
     }
