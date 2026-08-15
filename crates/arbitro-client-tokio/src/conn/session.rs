@@ -323,6 +323,7 @@ mod tests {
             pool: Arc::clone(&pool),
             pending: Arc::new(Pending::new()),
             seq_alloc: SeqAllocator::new(),
+            sub_id_alloc: crate::state::seq::SubIdAllocator::new(),
             cancel: CancellationToken::new(),
             subscriptions: Arc::new(Subscriptions::new()),
             ack_tx,

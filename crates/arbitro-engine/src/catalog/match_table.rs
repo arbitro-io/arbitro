@@ -496,28 +496,31 @@ impl MatchTable {
         self.bind_subscription(subscription_id, ConnectionId(0));
     }
 
-    /// Stamp `binding_idx` onto every match entry matching
-    /// `(consumer_id, connection_id)`.
+    /// Stamp `binding_idx` onto every match entry belonging to
+    /// `(consumer_id, connection_id, subscription_id)`.
     ///
-    /// Semantics: a binding is unique per `(consumer, connection)` pair;
-    /// a consumer may have multiple subscriptions (different patterns)
-    /// but they all reach the same underlying connection/writer. All
-    /// match entries for that pair must point to the same binding slot
-    /// in `DrainSnapshot.bindings`.
+    /// Semantics: a binding is one SUBSCRIPTION. A consumer may hold several
+    /// on one connection, each with its own filters, its own `deliver_floor`
+    /// and its own pendings — so they must NOT share a binding slot. Keying
+    /// on `(consumer, connection)` alone would let the last stamp win and
+    /// charge every subscription's deliveries to one arbitrary binding.
     ///
     /// Called by the server during `rebuild_and_swap_snapshot` on the
     /// **cloned** match table (not the engine's canonical copy) so the
     /// drain can fetch the binding with a direct `bindings[idx]` Vec
-    /// access instead of a `(consumer_id, connection_id) → idx`
-    /// HashMap lookup per match. O(S + C + P) per binding.
+    /// access instead of a HashMap lookup per match. O(S + C + P) per binding.
     pub fn set_binding_idx_for(
         &mut self,
         consumer_id: ConsumerId,
         connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
         binding_idx: u32,
     ) {
-        let matches =
-            |e: &MatchEntry| e.consumer_id == consumer_id && e.connection_id == connection_id;
+        let matches = |e: &MatchEntry| {
+            e.consumer_id == consumer_id
+                && e.connection_id == connection_id
+                && e.subscription_id == subscription_id
+        };
         for entries in self.exact.values_mut() {
             for e in entries.iter_mut() {
                 if matches(e) {
@@ -711,7 +714,7 @@ mod tests {
         mt.add_exact(0xBEEF, b"beef", e_exact);
         mt.add_catch_all(e_catch);
 
-        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), SubscriptionId(100), 777);
 
         let r = mt.lookup(0xBEEF);
         assert!(r.exact.iter().all(|e| e.binding_idx == 777));
@@ -733,8 +736,8 @@ mod tests {
         mt.add_exact(0xBEEF, b"beef", e1);
         mt.add_exact(0xBEEF, b"beef", e2);
 
-        // Stamp only (consumer 1, conn 5)
-        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 777);
+        // Stamp only (consumer 1, conn 5, sub 100)
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), SubscriptionId(100), 777);
 
         let r = mt.lookup(0xBEEF);
         let mut seen_777 = 0;
@@ -751,29 +754,23 @@ mod tests {
     }
 
     #[test]
-    fn set_binding_idx_covers_all_subs_of_pair() {
-        // A single binding (consumer 1, conn 5) might have MULTIPLE subscriptions
-        // (different patterns). All must get the same binding_idx.
+    fn each_subscription_of_a_pair_keeps_its_own_binding() {
+        // One consumer on one connection, two subscriptions with different
+        // patterns. Each is its OWN binding — sharing a slot would charge
+        // both to one deliver_floor and one max_inflight.
         let mut mt = MatchTable::new();
-        let e_sub_a = MatchEntry {
-            subscription_id: SubscriptionId(100),
-            ..entry(1, 10, 100)
-        };
-        let e_sub_b = MatchEntry {
-            subscription_id: SubscriptionId(101),
-            ..entry(1, 10, 101)
-        };
-        let mut e_sub_a = e_sub_a;
-        let mut e_sub_b = e_sub_b;
+        let mut e_sub_a = entry(1, 10, 100);
+        let mut e_sub_b = entry(1, 10, 101);
         e_sub_a.connection_id = ConnectionId(5);
         e_sub_b.connection_id = ConnectionId(5);
         mt.add_exact(0xBEEF, b"beef", e_sub_a);
         mt.add_exact(0xDEAD, b"dead", e_sub_b);
 
-        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), 42);
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), SubscriptionId(100), 42);
+        mt.set_binding_idx_for(ConsumerId(1), ConnectionId(5), SubscriptionId(101), 43);
 
         assert!(mt.lookup(0xBEEF).exact.iter().all(|e| e.binding_idx == 42));
-        assert!(mt.lookup(0xDEAD).exact.iter().all(|e| e.binding_idx == 42));
+        assert!(mt.lookup(0xDEAD).exact.iter().all(|e| e.binding_idx == 43));
     }
 
     #[test]

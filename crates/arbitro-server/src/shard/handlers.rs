@@ -311,6 +311,8 @@ impl CommandWorker {
     pub(in crate::shard) fn handle_subscribe(&mut self, cmd: SubscribeCmd) {
         let connection_id = cmd.connection_id;
         let consumer_id = cmd.consumer_config.id;
+        // Resolved above the shard split; a consumer may host several.
+        let subscription_id = cmd.subscription_config.id;
 
         let stream_ok = self.engine.create_stream(cmd.stream_config).is_ok();
         // Subscribe's ensure-consumer is best-effort — if the consumer
@@ -330,7 +332,6 @@ impl CommandWorker {
             .is_ok();
 
         if stream_ok && consumer_ok && sub_ok {
-            let subscription_id = SubscriptionId(consumer_id.0);
             let (result, events) = self.engine.subscribe(connection_id, subscription_id);
 
             if let Ok(binding_id) = result {
@@ -375,6 +376,7 @@ impl CommandWorker {
                         binding_id,
                         connection_id,
                         consumer_id,
+                        subscription_id,
                         stream_id,
                         queue_id,
                         max_inflight,
@@ -687,6 +689,7 @@ impl CommandWorker {
                     binding_id,
                     connection_id: cmd.connection_id,
                     consumer_id,
+                    subscription_id: cmd.subscription_id,
                     stream_id,
                     queue_id,
                     max_inflight,

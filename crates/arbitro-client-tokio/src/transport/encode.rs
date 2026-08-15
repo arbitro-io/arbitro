@@ -459,14 +459,13 @@ pub(crate) fn encode_sub_v2(
     seq: u64,
     _conn_id: u32,
     consumer_id: u32,
-    _options_flags: u16,
+    subscription_id: u32,
     filter: &[u8],
 ) -> Bytes {
     use arbitro_proto::v2::cold::Subscribe as SubscribeCold;
     // Legacy callers pass a single filter; future multi-filter users
-    // will call a `_with_filters` variant. `subscription_id == 0`
-    // selects the legacy "subscription_id == consumer_id" path on the
-    // server.
+    // will call a `_with_filters` variant. The broker rejects
+    // `subscription_id == 0`, so callers must allocate one.
     let filters = if filter.is_empty() {
         Vec::new()
     } else {
@@ -474,7 +473,7 @@ pub(crate) fn encode_sub_v2(
     };
     SubscribeCold {
         consumer_id,
-        subscription_id: 0,
+        subscription_id,
         filters,
     }
     .encode(seq)

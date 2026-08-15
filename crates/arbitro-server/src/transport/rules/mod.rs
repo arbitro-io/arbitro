@@ -34,6 +34,8 @@ pub enum Violation {
     ConsumerNestedUnderSibling,
     /// The subscription's filter reaches outside its consumer's.
     SubscriptionOutsideConsumer,
+    /// The subscription arrived without an id of its own.
+    SubscriptionIdMissing,
 }
 
 /// `>` claims every subject, so it is the absence of a claim rather than a

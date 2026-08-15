@@ -68,7 +68,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId};
+use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId, SubscriptionId};
 
 use crate::id_pool::IdPool;
 
@@ -223,6 +223,15 @@ struct Inner {
     /// to the same queue id (queue-group semantics).
     queues_by_key: HashMap<(StreamId, Vec<u8>), QueueId, foldhash::fast::FixedState>,
     next_queue: u32,
+
+    /// `(connection_id, client subscription id) → engine SubscriptionId`.
+    /// Clients number their subscriptions from 1 within their own
+    /// connection, so two connections would otherwise both claim `1` and
+    /// the second would retire the first's binding. Folding the connection
+    /// in here is what makes the id unique broker-wide, and keeps the
+    /// client free to count from 1 without coordinating with anyone.
+    subscriptions_by_conn: HashMap<(u64, u32), SubscriptionId, foldhash::fast::FixedState>,
+    next_subscription: u32,
 }
 
 const CONSUMER_STREAM_UNSET: u32 = u32::MAX;
@@ -280,6 +289,11 @@ impl Inner {
                 foldhash::fast::FixedState::default(),
             ),
             next_queue: 1,
+            subscriptions_by_conn: HashMap::with_capacity_and_hasher(
+                PREALLOC,
+                foldhash::fast::FixedState::default(),
+            ),
+            next_subscription: 1,
         }
     }
 }
@@ -872,6 +886,35 @@ impl NameRegistry {
         g.next_queue += 1;
         g.queues_by_key.insert(key, id);
         id
+    }
+
+    /// Translate a client-chosen subscription id into a broker-unique one.
+    ///
+    /// The client numbers its subscriptions within its own connection, so the
+    /// same number arrives from every connection. Folding the connection in
+    /// makes it unique; repeating the same pair returns the same id, which is
+    /// what makes a re-subscribe idempotent instead of leaking a slot.
+    pub fn resolve_subscription(&self, connection_id: u64, client_id: u32) -> SubscriptionId {
+        let mut g = self.inner.lock().expect("name registry poisoned");
+        let key = (connection_id, client_id);
+        if let Some(&id) = g.subscriptions_by_conn.get(&key) {
+            return id;
+        }
+        let id = SubscriptionId(g.next_subscription);
+        g.next_subscription += 1;
+        g.subscriptions_by_conn.insert(key, id);
+        id
+    }
+
+    /// Forget every subscription a connection owned. Called on disconnect —
+    /// the bindings are already retired by the engine, and leaving the
+    /// translations behind would pin ids for a connection that is gone.
+    pub fn drop_connection_subscriptions(&self, connection_id: u64) {
+        self.inner
+            .lock()
+            .expect("name registry poisoned")
+            .subscriptions_by_conn
+            .retain(|&(conn, _), _| conn != connection_id);
     }
 
     /// Record a consumer's resolved queue id so subsequent `Subscribe`

@@ -1176,14 +1176,23 @@ async fn v2_subscribe(
     // subscriptions MAY nest under one another — that is the whole point of
     // several filtered subscriptions on one consumer.
     let owner_filter = server.names().consumer_filter(consumer_id);
-    let filters: Vec<Vec<u8>> =
-        match crate::transport::rules::subscription_rules::on_create(&filters, &owner_filter) {
-            Ok(f) => f,
-            Err(_) => {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
-                return;
-            }
-        };
+    let filters: Vec<Vec<u8>> = match crate::transport::rules::subscription_rules::on_create(
+        body.subscription_id,
+        &filters,
+        &owner_filter,
+    ) {
+        Ok(f) => f,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+            return;
+        }
+    };
+
+    // The client counts its subscriptions from 1 inside its own connection;
+    // the registry folds the connection in so two clients never collide.
+    let subscription_id = server
+        .names()
+        .resolve_subscription(conn_id, body.subscription_id);
 
     // deliver_policy from consumer config (stored at CreateConsumer time).
     // Default: 0 = All (replay from beginning). The NameRegistry can hold
@@ -1221,18 +1230,7 @@ async fn v2_subscribe(
                 filter: Box::default(),
             },
             SubscriptionConfig {
-                // body.subscription_id == 0 means "legacy default": use
-                // the consumer's own id as the subscription id (one sub
-                // per consumer). A non-zero value lets a single
-                // consumer host multiple subs in parallel, each with
-                // its own filter set. Engine already supports this
-                // (`subscriptions_for_consumer`); the wire bit was the
-                // gate.
-                id: SubscriptionId(if body.subscription_id == 0 {
-                    consumer_id.0
-                } else {
-                    body.subscription_id
-                }),
+                id: subscription_id,
                 stream_id: seq_stream,
                 consumer_id,
                 filters,
@@ -2340,6 +2338,10 @@ pub(crate) async fn v2_disconnect(
 
     // Remove this connection from all cron worker pools.
     cron_registry.remove_connection(conn_id);
+
+    // Forget its subscription-id translations — the bindings are gone with
+    // the drains above, and the entries would pin ids for a dead connection.
+    server.names().drop_connection_subscriptions(conn_id);
 
     tracing::debug!(
         target = "dispatch",

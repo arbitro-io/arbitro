@@ -83,7 +83,10 @@ pub(crate) fn subscribe_async(
     names: Option<(&str, &str)>,
 ) -> impl Future<Output = Result<SubscriptionHandle, ClientError>> + Send {
     let seq = inner.seq_alloc.next();
-    let sub_body = encode_sub_v2(seq, 0, consumer_id, 0, filter);
+    // One id per subscription, not per consumer: several filtered subscriptions
+    // on one consumer must not collapse onto a single broker binding.
+    let subscription_id = inner.sub_id_alloc.next();
+    let sub_body = encode_sub_v2(seq, 0, consumer_id, subscription_id, filter);
 
     // Resolve the durable dedup slot up front (cold path, sync). Only when a
     // store is configured AND the caller supplied the `(stream, consumer)`

@@ -14,7 +14,7 @@ use crate::config::ClientConfig;
 use crate::consume::message::{AckCmd, NackCmd};
 use crate::metrics::ClientMetrics;
 use crate::state::pending::Pending;
-use crate::state::seq::SeqAllocator;
+use crate::state::seq::{SeqAllocator, SubIdAllocator};
 use crate::state::subscriptions::Subscriptions;
 use crate::transport::frame::WritePool;
 
@@ -35,6 +35,8 @@ pub(crate) struct Inner {
     pub(crate) pending: Arc<Pending>,
     /// Monotonic u64 sequence counter.
     pub(crate) seq_alloc: SeqAllocator,
+    /// Monotonic subscription-id counter, connection-scoped.
+    pub(crate) sub_id_alloc: SubIdAllocator,
     /// Root cancellation token — cancelled on `Client::close()` or drop.
     pub(crate) cancel: CancellationToken,
     /// Session-scoped cancel — set by the reconnect loop on each new session,

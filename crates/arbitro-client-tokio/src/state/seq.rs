@@ -23,3 +23,33 @@ impl Default for SeqAllocator {
         Self::new()
     }
 }
+
+/// Per-connection subscription-id allocator. The broker refuses `0` and
+/// namespaces what we send by connection, so a plain local counter is enough
+/// to keep this client's subscriptions distinct from one another.
+#[derive(Debug)]
+pub struct SubIdAllocator(std::sync::atomic::AtomicU32);
+
+impl SubIdAllocator {
+    pub fn new() -> Self {
+        // 0 is the rejected sentinel — never hand it out.
+        Self(std::sync::atomic::AtomicU32::new(1))
+    }
+
+    #[inline]
+    pub fn next(&self) -> u32 {
+        let id = self.0.fetch_add(1, Ordering::Relaxed);
+        // Wrap skips 0 rather than emitting the sentinel.
+        if id == 0 {
+            self.0.fetch_add(1, Ordering::Relaxed)
+        } else {
+            id
+        }
+    }
+}
+
+impl Default for SubIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}

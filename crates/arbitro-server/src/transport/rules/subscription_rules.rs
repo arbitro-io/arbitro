@@ -33,18 +33,29 @@ pub fn stays_inside_its_consumer(
     Ok(())
 }
 
+/// A subscription must arrive with an id of its own.
+///
+/// `0` used to mean "reuse the consumer's id", which quietly collapsed every
+/// subscription on one consumer onto a single binding — the second subscribe
+/// retired the first. The id is what separates them, so its absence is a
+/// rejection, not a default.
+pub fn has_its_own_id(subscription_id: u32) -> Result<(), Violation> {
+    if subscription_id == 0 {
+        return Err(Violation::SubscriptionIdMissing);
+    }
+    Ok(())
+}
+
 /// Every rule that applies when a subscription is created, in order.
 ///
 /// Returns the filter list to store: its own, or the consumer's when it
 /// declared none.
-///
-/// Currently enforced inside the engine catalog rather than here — that
-/// check is local to one stream, so the shard split does not hide anything
-/// from it. This module is the migration target, not yet the live path.
 pub fn on_create(
+    subscription_id: u32,
     filters: &[Vec<u8>],
     consumer_filter: &[u8],
 ) -> Result<Vec<Vec<u8>>, Violation> {
+    has_its_own_id(subscription_id)?;
     stays_inside_its_consumer(filters, consumer_filter)?;
     Ok(inherits_the_consumer_filter(filters, consumer_filter))
 }
@@ -56,7 +67,7 @@ mod tests {
     #[test]
     fn a_subscription_without_a_filter_inherits_the_consumer() {
         assert_eq!(
-            on_create(&[], b"orders.premium.>"),
+            on_create(1, &[], b"orders.premium.>"),
             Ok(vec![b"orders.premium.>".to_vec()])
         );
     }
@@ -64,7 +75,7 @@ mod tests {
     #[test]
     fn a_subscription_may_narrow_within_its_consumer() {
         assert_eq!(
-            on_create(&[b"orders.premium.eu".to_vec()], b"orders.premium.>"),
+            on_create(1, &[b"orders.premium.eu".to_vec()], b"orders.premium.>"),
             Ok(vec![b"orders.premium.eu".to_vec()])
         );
     }
@@ -72,7 +83,7 @@ mod tests {
     #[test]
     fn a_subscription_may_not_reach_outside_its_consumer() {
         assert_eq!(
-            on_create(&[b"orders.cheap.>".to_vec()], b"orders.premium.>"),
+            on_create(1, &[b"orders.cheap.>".to_vec()], b"orders.premium.>"),
             Err(Violation::SubscriptionOutsideConsumer)
         );
     }
@@ -81,10 +92,19 @@ mod tests {
     fn one_bad_filter_rejects_the_whole_list() {
         assert_eq!(
             on_create(
+                1,
                 &[b"orders.premium.eu".to_vec(), b"payments.>".to_vec()],
                 b"orders.premium.>"
             ),
             Err(Violation::SubscriptionOutsideConsumer)
+        );
+    }
+
+    #[test]
+    fn a_subscription_without_an_id_is_rejected() {
+        assert_eq!(
+            on_create(0, &[], b"orders.premium.>"),
+            Err(Violation::SubscriptionIdMissing)
         );
     }
 }
