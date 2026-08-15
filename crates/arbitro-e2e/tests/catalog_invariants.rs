@@ -1112,17 +1112,17 @@ async fn create_filtered_consumer(
 }
 
 #[tokio::test]
-async fn nested_consumer_filters_are_independent() {
+async fn sibling_consumer_filters_are_independent() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
-    let stream_id = create_stream(&client, b"nested_filters", b"evt.>").await;
+    let stream_id = create_stream(&client, b"nested_filters", b"orders.>").await;
 
-    let wide = create_filtered_consumer(&client, stream_id, b"all_orders", b"orders.>").await;
+    let wide = create_filtered_consumer(&client, stream_id, b"basic_only", b"orders.basic.>").await;
     let nested =
         create_filtered_consumer(&client, stream_id, b"premium_only", b"orders.premium.>").await;
     assert_ne!(
         wide, nested,
-        "a nested filter collapsed onto the wide consumer's id"
+        "the two sibling filters collapsed onto one consumer id"
     );
 
     let cw = server.connect().await;
@@ -1180,11 +1180,11 @@ async fn nested_consumer_filters_are_independent() {
         got_nested.len()
     );
 
-    // Nesting must not starve the parent: both are independent readers.
+    // Neither sibling starves the other: both are independent readers.
     assert_eq!(
         got_wide.len(),
-        3,
-        "the wide consumer on `orders.>` must see all 3, saw {}: {got_wide:?}",
+        1,
+        "the consumer on `orders.basic.>` must see its 1 message, saw {}: {got_wide:?}",
         got_wide.len()
     );
 }
@@ -1199,31 +1199,26 @@ async fn drain_subjects(sub: &mut arbitro_client_tokio::SubscriptionHandle) -> V
     out
 }
 
-/// Control for [`nested_consumer_filters_are_independent`].
+/// Control for [`sibling_consumer_filters_are_independent`]: same two sibling
+/// consumers, but the filter is handed to `subscribe` as well.
 ///
-/// That test passes `b""` to `subscribe`, which is the pattern the rest of the
-/// suite uses (`subject_limit_shared_consumer` and 157 other call sites). It
-/// fails — but "I removed the filter that works and then complained nothing
-/// filtered" is a fair objection, so this runs the identical flow with the
-/// SAME pattern handed to `subscribe` instead.
-///
-/// If this passes and the other fails, the split is exact: filtering happens
-/// subscription-side, the consumer-side `filter` field is inert, and the bug
-/// is a promised-but-unimplemented API rather than broken delivery.
+/// Nesting is deliberately absent. Two consumers may not nest under one
+/// another, so a nested pair cannot be built here at all — that shape belongs
+/// to two subscriptions on ONE consumer.
 #[tokio::test]
-async fn nested_filters_applied_at_subscribe_do_cut() {
+async fn sibling_filters_applied_at_subscribe_do_cut() {
     let mut server = TestServerBuilder::new().spawn().await;
     let client = server.connect().await;
     let stream_id = create_stream(&client, b"nested_at_sub", b"orders.>").await;
 
-    let wide = create_filtered_consumer(&client, stream_id, b"all_orders_s", b"orders.>").await;
+    let wide = create_filtered_consumer(&client, stream_id, b"basic_only_s", b"orders.basic.>").await;
     let nested =
         create_filtered_consumer(&client, stream_id, b"premium_only_s", b"orders.premium.>").await;
 
-    // The only difference from the sibling test: the pattern goes here too.
+    // The only difference from the other test: the pattern goes here too.
     let cw = server.connect().await;
     let mut sub_wide = cw
-        .subscribe(stream_id, wide, b"orders.>")
+        .subscribe(stream_id, wide, b"orders.basic.>")
         .await
         .expect("subscribe wide");
     let cn = server.connect().await;
@@ -1270,6 +1265,6 @@ async fn nested_filters_applied_at_subscribe_do_cut() {
         .collect();
     assert!(
         foreign.is_empty(),
-        "even with the pattern at subscribe, the nested subscription got {foreign:?}"
+        "even with the pattern at subscribe, the premium consumer got {foreign:?}"
     );
 }
