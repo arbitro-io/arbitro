@@ -149,11 +149,7 @@ pub(crate) fn subscribe_async(
                     let generation = inner2.ackrel.generation_of(consumer_id);
                     let _ = crate::publish::enqueue(
                         &inner2.pool,
-                        WriteFrame::Mono(encode_ack_state_req_v2(
-                            req_seq,
-                            consumer_id,
-                            generation,
-                        )),
+                        WriteFrame::Mono(encode_ack_state_req_v2(req_seq, consumer_id, generation)),
                     );
                 }
                 Ok(SubscriptionHandle {
@@ -230,7 +226,7 @@ pub(crate) async fn ack_batcher_task(
                     by_consumer
                         .entry(cmd.consumer_id)
                         .or_default()
-                        .push((cmd.seq, cmd.subject_hash));
+                        .push((cmd.seq, cmd.sub_id));
                 }
 
                 for (consumer_id, entries) in by_consumer {
@@ -315,13 +311,13 @@ pub(crate) async fn nack_batcher_task(
                 }
 
                 // Group by consumer_id then emit one nack frame per group.
-                // Tuple: (seq, subject_hash, delay_ms).
+                // Tuple: (seq, sub_id, delay_ms).
                 let mut by_consumer: HashMap<u32, Vec<(u64, u32, u32)>> = HashMap::new();
                 for cmd in &batch {
                     by_consumer
                         .entry(cmd.consumer_id)
                         .or_default()
-                        .push((cmd.seq, cmd.subject_hash, cmd.delay_ms));
+                        .push((cmd.seq, cmd.sub_id, cmd.delay_ms));
                 }
 
                 for (consumer_id, entries) in by_consumer {

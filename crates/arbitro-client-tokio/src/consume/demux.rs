@@ -12,7 +12,7 @@
 //! [16B Envelope]   action | flags | rsv | stream_id(4B) | msg_len(4B) | env_seq(4B)
 //! [4B  RepBatchFixed]  count(u16) | pad(u16)
 //! [N × entry]
-//!   [4B consumer_id][8B seq][2B subj_len][2B reply_len][4B data_len][4B subject_hash]
+//!   [4B consumer_id][8B seq][2B subj_len][2B reply_len][4B data_len][4B sub_id]
 //!   [subj_len bytes subject]
 //!   [reply_len bytes reply_to]
 //!   [payload …]
@@ -21,7 +21,7 @@
 //! **Deliver** (single delivery, v2 proto path) — **v2 Header** format:
 //! ```text
 //! [16B Header]     action | flags | entry_flags | msg_len(4B) | seq(8B)
-//! [12B DeliverBody]  consumer_id(4B) | subject_hash(4B) | subject_len(2B) | pad(2B)
+//! [12B DeliverBody]  consumer_id(4B) | subscription_id(4B) | subject_len(2B) | pad(2B)
 //! [subject_len bytes subject][payload …]
 //! ```
 
@@ -64,7 +64,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
     };
 
     let consumer_id = body.consumer_id.get();
-    let subject_hash = body.subject_hash.get();
+    let sub_id = body.subscription_id.get();
     let subject_len = body.subject_len.get() as usize;
     let payload_off = body_end + subject_len;
 
@@ -89,7 +89,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
             let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
                 seq: deliver_seq,
                 consumer_id,
-                subject_hash,
+                sub_id,
             });
             return;
         }
@@ -99,7 +99,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         deliver_seq,
         consumer_id,
         stream_id,
-        subject_hash,
+        sub_id,
         subject,
         reply_to,
         payload,
@@ -122,7 +122,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
 /// [16B Envelope]       action | flags | rsv | stream_id(4B) | msg_len(4B) | env_seq(4B)
 /// [4B  RepBatchFixed]  count(u16) | pad(u16)
 /// [N × (24B DeliveryEntryHeader + subject + reply_to + payload)]
-///   consumer_id(4B) | seq(8B) | subj_len(2B) | reply_len(2B) | data_len(4B) | subject_hash(4B)
+///   consumer_id(4B) | seq(8B) | subj_len(2B) | reply_len(2B) | data_len(4B) | sub_id(4B)
 /// ```
 pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
     // The Envelope (16B) precedes the batch header.
@@ -154,7 +154,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         let subj_len = entry.subj_len.get() as usize;
         let reply_len = entry.reply_len.get() as usize;
         let data_len = entry.data_len.get() as usize;
-        let subject_hash = entry.subject_hash.get();
+        let sub_id = entry.sub_id.get();
         off = entry_end;
 
         // Validate the interior layout before slicing: a malformed entry with
@@ -185,7 +185,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
                 let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
                     seq: deliver_seq,
                     consumer_id,
-                    subject_hash,
+                    sub_id,
                 });
                 continue;
             }
@@ -195,7 +195,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
             deliver_seq,
             consumer_id,
             stream_id,
-            subject_hash,
+            sub_id,
             subject,
             reply_to,
             payload,

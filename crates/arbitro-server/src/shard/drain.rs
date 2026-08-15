@@ -73,6 +73,11 @@ struct PendingNotify {
 pub(in crate::shard) struct DrainScratch {
     matches: Vec<MatchEntry>,
     served_queues: Vec<QueueId>,
+    /// Fanout collapse: `(conn, consumer)` pairs already given a copy of the
+    /// entry being dispatched. Same shape and same reasoning as
+    /// `served_queues` — tiny per entry, so a linear scan beats a hash, and
+    /// living in the scratch keeps it off the per-message allocator.
+    served_fanout: Vec<(ConnectionId, ConsumerId)>,
     dead_connections: Vec<ConnectionId>,
     /// Local pattern resolution cache. Avoids mutating shared match table.
     /// Sparse composite key (stream_id, subject_hash) → foldhash (rule: sparse IDs).
@@ -127,6 +132,7 @@ impl DrainScratch {
         Self {
             matches: Vec::with_capacity(16),
             served_queues: Vec::with_capacity(8),
+            served_fanout: Vec::with_capacity(8),
             dead_connections: Vec::with_capacity(4),
             resolve_cache: HashMap::with_capacity_and_hasher(
                 64,
@@ -469,7 +475,12 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
         });
     }
 
-    record_deliveries(counters, consumer_subjects, &scratch.deliveries, &flush_results);
+    record_deliveries(
+        counters,
+        consumer_subjects,
+        &scratch.deliveries,
+        &flush_results,
+    );
 
     // Group successful deliveries by binding_id and notify the command
     // thread once per binding (same shape Command::Delivered expects).
@@ -647,7 +658,10 @@ fn process_drain_entry(
         if let Some(cached) = scratch.resolve_cache.get(&cache_key) {
             let mut fresh = Vec::new();
             mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut fresh);
-            debug_assert_eq!(*cached, fresh, "resolve_cache stale under unchanged snapshot");
+            debug_assert_eq!(
+                *cached, fresh,
+                "resolve_cache stale under unchanged snapshot"
+            );
         }
     }
 
@@ -730,6 +744,7 @@ fn dispatch_recipients(
     lowest_skipped: &mut Option<u64>,
 ) {
     scratch.served_queues.clear();
+    scratch.served_fanout.clear();
 
     // Queue fairness — rotate the iteration start offset by `entry.seq` so
     // the same binding isn't always picked first. Combined with the existing
@@ -752,7 +767,6 @@ fn dispatch_recipients(
         (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut dbg_acked_floor = 0u32;
     let mut dbg_deliver_floor = 0u32;
-
     for i in 0..n {
         let raw = start + i;
         let idx = if raw >= n { raw - n } else { raw };
@@ -809,6 +823,16 @@ fn dispatch_recipients(
                 dbg_qdedup += 1;
                 continue;
             }
+        } else if scratch
+            .served_fanout
+            .iter()
+            .any(|&(c, k)| c == connection_id && k == consumer_id)
+        {
+            // Fanout collapse: this consumer already has its copy on this
+            // socket. Marked only AFTER a successful emit (see below) — a
+            // pair marked here would burn its turn if the entry were then
+            // dropped for capacity or a dead writer, and nobody would get it.
+            continue;
         }
 
         // F22: same shape — `dead_connections` is also small. The
@@ -956,7 +980,11 @@ fn dispatch_recipients(
             consumer_id,
             entry.seq,
             entry.subject,
-            subject_hash,
+            // Which subscription of `consumer_id` this copy belongs to. The
+            // client keys its handles by it, and echoes it back on ack so the
+            // broker reaches the pending in O(1) instead of scanning every
+            // binding of the consumer.
+            binding.subscription_id.0,
             reply_to,
             actual_payload,
         );
@@ -980,6 +1008,8 @@ fn dispatch_recipients(
 
         if queue_id != QueueId(0) {
             scratch.served_queues.push(queue_id);
+        } else {
+            scratch.served_fanout.push((connection_id, consumer_id));
         }
     }
 

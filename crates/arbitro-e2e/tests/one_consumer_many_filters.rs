@@ -117,6 +117,112 @@ async fn filtered_subs_on_one_consumer_same_connection() {
     assert_outcome("same connection", &got_orders, &got_pay, &got_all);
 }
 
+/// The same arrangement, four times over: FOUR connections, each holding the
+/// same three filtered subscriptions on the SAME consumer.
+///
+/// `filtered_subs_on_one_consumer_same_connection` proves one connection's
+/// worth. This proves the two halves compose — that collapsing per
+/// `(connection, consumer)` really is per connection, and that four clients
+/// reading one consumer neither steal from nor duplicate each other.
+///
+/// Under fanout every connection is owed the full fixture, split across its
+/// own three subscriptions. So the matrix is four identical rows, and the
+/// wire carries one copy per message per connection — 4 × 6 = 24 entries for
+/// 6 published messages, versus 4 × 11 = 44 before the collapse.
+///
+/// Two ways this can fail, and they mean opposite things:
+///   * a row that is `[0, 0, 6]` — that connection's client merged its three
+///     handles into one. Client-side, same gap the single-connection test pins.
+///   * rows that disagree with each other — the broker is treating connections
+///     differently, which would be a real distribution bug.
+#[tokio::test]
+async fn filtered_subs_on_four_connections() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let admin = server.connect().await;
+
+    let (stream_id, consumer_id) = setup(&admin, b"triage_quad", b"worker_quad").await;
+
+    const CONNS: usize = 4;
+    let mut conns = Vec::with_capacity(CONNS);
+    let mut subs = Vec::with_capacity(CONNS);
+    for _ in 0..CONNS {
+        let c = server.connect().await;
+        // Same three filters on every connection — nothing distinguishes them
+        // but the socket, which is exactly the variable under test.
+        let orders = c
+            .subscribe(stream_id, consumer_id, b"orders.*")
+            .await
+            .expect("subscribe orders");
+        let pay = c
+            .subscribe(stream_id, consumer_id, b"payments.*")
+            .await
+            .expect("subscribe payments");
+        let all = c
+            .subscribe(stream_id, consumer_id, b"*.>")
+            .await
+            .expect("subscribe all");
+        conns.push(c);
+        subs.push((orders, pay, all));
+    }
+
+    publish_fixture(&admin, stream_id).await;
+
+    let mut rows = Vec::with_capacity(CONNS);
+    for (i, (orders, pay, all)) in subs.iter_mut().enumerate() {
+        let got_orders = drain(orders).await;
+        let got_pay = drain(pay).await;
+        let got_all = drain(all).await;
+        report(&format!("conn {i}"), &got_orders, &got_pay, &got_all);
+        rows.push((got_orders, got_pay, got_all));
+    }
+
+    admin
+        .delete_stream(b"triage_quad")
+        .await
+        .expect("delete stream");
+    server.shutdown().await;
+
+    let shape: Vec<(usize, usize, usize)> = rows
+        .iter()
+        .map(|(o, p, a)| (o.len(), p.len(), a.len()))
+        .collect();
+    println!("[four conns] per connection (orders, payments, all): {shape:?}");
+
+    // Deliveries counted at the handles, not copies on the wire. The broker
+    // sends each connection ONE copy per message and the client is expected
+    // to hand it to every subscription whose filter accepts it, so the two
+    // numbers differ on purpose: 6 copies in, 11 deliveries out. A shortfall
+    // here is the client failing to fan out — the `all` column below shows
+    // whether the copies arrived at all.
+    for (i, (o, p, a)) in rows.iter().enumerate() {
+        let total = o.len() + p.len() + a.len();
+        assert_eq!(
+            total,
+            TOTAL + ORDERS + PAYMENTS,
+            "[four conns] connection {i} made {total} deliveries, expected {} \
+             ({ORDERS} orders + {PAYMENTS} payments + {TOTAL} catch-all): {shape:?}",
+            TOTAL + ORDERS + PAYMENTS
+        );
+    }
+
+    // The four rows must be identical. A row that differs means the broker
+    // singled out a connection — a distribution bug, not a client one.
+    assert!(
+        shape.windows(2).all(|w| w[0] == w[1]),
+        "[four conns] connections disagree: {shape:?} — under fanout every \
+         connection is owed the same fixture"
+    );
+
+    // And each row must show the split, not one handle holding everything.
+    for (i, (o, p, _)) in rows.iter().enumerate() {
+        assert!(
+            !o.is_empty() && !p.is_empty(),
+            "[four conns] connection {i} funnelled its three subscriptions \
+             into one handle: {shape:?}"
+        );
+    }
+}
+
 /// Two consumers, same stream, SAME filter, different names.
 ///
 /// Streams may not have overlapping filters — `StreamConfig` says so. Nothing

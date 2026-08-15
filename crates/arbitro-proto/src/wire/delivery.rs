@@ -2,12 +2,19 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// 16B — Acknowledge delivery of a single message.
+///
+/// `sub_id` names the subscription the message was delivered on. Paired
+/// with the connection the frame arrived on, it locates the binding in one
+/// lookup — `(conn, sub) → binding → pending.remove(seq)` — instead of
+/// walking every binding of the consumer looking for one holding `seq`.
+/// It rides the slot the echoed-back `subject_hash` used to occupy, which
+/// nothing ever read: the server keeps its own copy in `Pending`.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct AckAction {
     pub sequence: U64,
     pub consumer_id: U32,
-    pub _pad: U32,
+    pub sub_id: U32,
 }
 const _: () = assert!(core::mem::size_of::<AckAction>() == 16);
 
@@ -28,16 +35,16 @@ const _: () = assert!(core::mem::size_of::<BatchAckFixed>() == 8);
 /// 16B — Per-entry payload inside a `BatchAck`.
 ///
 /// ```text
-/// [8 seq][4 subject_hash][4 pad]
+/// [8 seq][4 sub_id][4 pad]
 /// ```
-/// `subject_hash` is the foldhash (fixed seed) u32 echoed from the `DeliveryEntryHeader`
-/// the client originally received. It lets the server decrement
-/// `max_subject_inflight` credits in O(1) arithmetic without any lookup.
+/// See [`AckAction`] for why `sub_id` sits where the echoed `subject_hash`
+/// used to. Entries of one batch may name different subscriptions, so the
+/// id is per entry and not on `BatchAckFixed`.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Clone, Copy)]
 #[repr(C)]
 pub struct BatchAckEntry {
     pub seq: U64,
-    pub subject_hash: U32,
+    pub sub_id: U32,
     pub _pad: U32,
 }
 pub const BATCH_ACK_ENTRY_SIZE: usize = core::mem::size_of::<BatchAckEntry>();
@@ -112,7 +119,7 @@ pub struct DeliveryEntryHeader {
     pub subj_len: U16,
     pub reply_len: U16,
     pub data_len: U32,
-    pub subject_hash: U32,
+    pub sub_id: U32,
 }
 pub const DELIVERY_ENTRY_HEADER_SIZE: usize = core::mem::size_of::<DeliveryEntryHeader>();
 const _: () = assert!(DELIVERY_ENTRY_HEADER_SIZE == 24);
@@ -417,7 +424,7 @@ impl Iterator for BatchAckEntryIter<'_> {
         let end = self.offset.checked_add(BATCH_ACK_ENTRY_SIZE)?;
         let slice = self.buf.get(self.offset..end)?;
         let entry = BatchAckEntry::ref_from_bytes(slice).ok()?;
-        let out = (entry.seq.get(), entry.subject_hash.get());
+        let out = (entry.seq.get(), entry.sub_id.get());
         self.remaining -= 1;
         self.offset = end;
         Some(out)
@@ -527,7 +534,7 @@ impl<'a> Iterator for RepBatchEntryIter<'a> {
         let subj_len = header.subj_len.get() as usize;
         let reply_len = header.reply_len.get() as usize;
         let data_len = header.data_len.get() as usize;
-        let subject_hash = header.subject_hash.get();
+        let subject_hash = header.sub_id.get();
 
         let entry_total = DELIVERY_ENTRY_HEADER_SIZE.checked_add(data_len)?;
         if entry_total > rest.len() {
@@ -621,7 +628,7 @@ mod tests {
         };
         let entry = BatchAckEntry {
             seq: U64::new(42),
-            subject_hash: U32::new(0xABCD),
+            sub_id: U32::new(0xABCD),
             _pad: U32::new(0),
         };
         let mut buf = Vec::new();

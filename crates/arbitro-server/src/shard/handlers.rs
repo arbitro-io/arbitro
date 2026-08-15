@@ -4,24 +4,63 @@
 //! After engine mutations, handlers update `SharedCounters` atomically
 //! and swap `DrainSnapshot` for structural changes.
 
-use arbitro_engine_v2::command::Command;
+use arbitro_engine_v2::command::{AckEntry, Command};
 use arbitro_engine_v2::types::*;
 
 use crate::shard::command::*;
 use crate::shard::worker::{rewind_released, ActiveBinding, CommandWorker};
 
 impl CommandWorker {
+    /// Tenant isolation for an ack/nack batch: may `conn` release these
+    /// entries on `consumer_id`?
+    ///
+    /// For an entry that names its subscription, isolation IS the lookup —
+    /// the index is keyed by (connection, subscription), so an id belonging
+    /// to someone else's connection MISSES instead of resolving to a
+    /// stranger's binding and being rejected afterwards. The id is
+    /// client-authored, so the connection has to be in the key, not in a
+    /// check that follows it. Every named entry must resolve: one foreign id
+    /// rejects the whole batch rather than letting a later valid entry
+    /// vouch for it.
+    ///
+    /// Entries that name no subscription (`AckBatchReq`'s bare seqs, nacks —
+    /// `NackAction` spends its spare word on `delay_ms`) can only be checked
+    /// at consumer granularity, which is the coarser `(conn, consumer)`
+    /// index. Still one hash, no walk over the shard's bindings.
+    #[inline]
+    fn connection_owns(
+        &self,
+        conn: ConnectionId,
+        consumer_id: ConsumerId,
+        entries: &[AckEntry],
+    ) -> bool {
+        let catalog = &self.engine.ctx().catalog;
+        let mut named = false;
+        for entry in entries {
+            if entry.sub_id.0 == 0 {
+                continue;
+            }
+
+            named = true;
+
+            let hit = catalog
+                .binding_for_subscription(conn, entry.sub_id)
+                .is_some_and(|b| b.consumer_id == consumer_id);
+
+            if !hit {
+                return false;
+            }
+        }
+        named || catalog.connection_owns_consumer(conn, consumer_id)
+    }
+
     // ── Hot path — ack / nack ───────────────────────────────────────────
 
     pub(in crate::shard) fn handle_ack(&mut self, cmd: AckCmd) {
         crate::lifecycle_trace!("a10_acker_enter", 0, cmd.entries.len() as u64, "shard");
 
-        // Tenant Isolation Check: verify connection owns this consumer
-        let owns = self
-            .bindings
-            .iter()
-            .any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
-        if !owns {
+        let conn = ConnectionId(cmd.conn_id);
+        if !self.connection_owns(conn, cmd.consumer_id, &cmd.entries) {
             let _ = cmd.reply.send(AckReply {
                 accepted: 0,
                 rejected: cmd.entries.len() as u32,
@@ -44,6 +83,16 @@ impl CommandWorker {
             let catalog = &self.engine.ctx().catalog;
             let floors = &mut self.ack_floors;
             for entry in &cmd.entries {
+                // Named acks reach their binding in one hash — the gate above
+                // already proved the pair resolves to this consumer.
+                if entry.sub_id.0 != 0 {
+                    if let Some(b) = catalog.binding_for_subscription(conn, entry.sub_id) {
+                        if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
+                            floors.record_acked(cmd.consumer_id.0, entry.seq);
+                        }
+                    }
+                    continue;
+                }
                 for &bid in catalog.bindings_for_consumer(cmd.consumer_id) {
                     if let Some(b) = catalog.binding(bid) {
                         if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
@@ -56,6 +105,7 @@ impl CommandWorker {
         }
 
         let delta = self.engine.execute(&Command::Ack {
+            conn_id: conn,
             consumer_id: cmd.consumer_id,
             entries: &cmd.entries,
         });
@@ -119,12 +169,8 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_nack(&mut self, cmd: NackCmd) {
-        // Tenant Isolation Check: verify connection owns this consumer
-        let owns = self
-            .bindings
-            .iter()
-            .any(|b| b.connection_id.0 == cmd.conn_id && b.consumer_id == cmd.consumer_id);
-        if !owns {
+        let conn = ConnectionId(cmd.conn_id);
+        if !self.connection_owns(conn, cmd.consumer_id, &cmd.entries) {
             let _ = cmd.reply.send(NackReply {
                 requeued: 0,
                 not_found: cmd.entries.len() as u32,
@@ -206,6 +252,7 @@ impl CommandWorker {
             // Engine Nack releases inflight + removes from pending NOW.
             // The wheel tick will rewind cursor later for redelivery.
             let delta = self.engine.execute(&Command::Nack {
+                conn_id: conn,
                 consumer_id: cmd.consumer_id,
                 entries: &cmd.entries,
             });
@@ -260,6 +307,7 @@ impl CommandWorker {
         } else {
             // ── Immediate nack: existing behavior ─────────────────────────
             let delta = self.engine.execute(&Command::Nack {
+                conn_id: conn,
                 consumer_id: cmd.consumer_id,
                 entries: &cmd.entries,
             });
@@ -788,10 +836,7 @@ impl CommandWorker {
         // The stream_id has always arrived on this command; it just had
         // nowhere to go, because `Store::drain` only took a subject and
         // swept the whole shard. Same defect class as PurgeStream.
-        let deleted = self
-            .store
-            .lock()
-            .drain(cmd.stream_id.0, &cmd.subject);
+        let deleted = self.store.lock().drain(cmd.stream_id.0, &cmd.subject);
         let _ = cmd.reply.send(deleted);
     }
 

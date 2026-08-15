@@ -241,6 +241,10 @@ cold_body! {
     // parallel. Future work; today's dispatcher still collapses both
     // to consumer_id, but the field is on the wire so adding the
     // multi-sub path doesn't need a wire change.
+    // NOTE: the field name IS the JSON key. TS, Go and C all send
+    // `subscription_id`; renaming it here silently breaks them (serde finds
+    // no key, the id arrives 0, and `has_its_own_id` rejects the subscribe).
+    // Internal Rust structs are free to call it `sub_id` — this one is not.
     Action::Subscribe => pub struct Subscribe {
         pub consumer_id:     u32,
         pub subscription_id: u32,

@@ -51,7 +51,7 @@ pub fn decode_reply_to(reply_to: &[u8]) -> Option<(u32, &[u8])> {
 pub(crate) struct AckCmd {
     pub seq: u64,
     pub consumer_id: u32,
-    pub subject_hash: u32,
+    pub sub_id: u32,
 }
 
 /// Internal command enqueued by `Message::nack()` / `nack_delay()` and
@@ -59,8 +59,7 @@ pub(crate) struct AckCmd {
 pub(crate) struct NackCmd {
     pub seq: u64,
     pub consumer_id: u32,
-    pub subject_hash: u32,
-    /// Delay in milliseconds before redelivery. 0 = immediate requeue.
+    pub sub_id: u32,
     pub delay_ms: u32,
 }
 
@@ -69,14 +68,10 @@ pub(crate) struct NackCmd {
 /// Holds a zero-copy `Bytes` slice of the original read-buffer frame.
 /// The subject is always copied into a `Box<[u8]>` once per delivery.
 pub struct Message {
-    /// Delivery sequence number (monotonically increasing per stream).
     pub seq: u64,
-    /// The consumer that received this delivery.
     pub consumer_id: u32,
-    /// Stream the consumer belongs to (informational — not required for ack).
     pub stream_id: u32,
-    /// FNV-1a hash of the subject, echoed back in ack/nack frames.
-    pub subject_hash: u32,
+    pub sub_id: u32,
     subject: Box<[u8]>,
     reply_to: Bytes,
     payload: Bytes,
@@ -108,7 +103,7 @@ impl Message {
         seq: u64,
         consumer_id: u32,
         stream_id: u32,
-        subject_hash: u32,
+        sub_id: u32,
         subject: Box<[u8]>,
         reply_to: Bytes,
         payload: Bytes,
@@ -121,7 +116,7 @@ impl Message {
             seq,
             consumer_id,
             stream_id,
-            subject_hash,
+            sub_id,
             subject,
             reply_to,
             payload,
@@ -219,7 +214,7 @@ impl Message {
         let cmd = AckCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
-            subject_hash: self.subject_hash,
+            sub_id: self.sub_id,
         };
         if self.ack_tx.try_send(cmd).is_err() {
             let generation = self.inner.ackrel.generation_of(self.consumer_id);
@@ -243,7 +238,7 @@ impl Message {
         let _ = self.nack_tx.try_send(NackCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
-            subject_hash: self.subject_hash,
+            sub_id: self.sub_id,
             delay_ms: 0,
         });
     }
@@ -258,7 +253,7 @@ impl Message {
         let _ = self.nack_tx.try_send(NackCmd {
             seq: self.seq,
             consumer_id: self.consumer_id,
-            subject_hash: self.subject_hash,
+            sub_id: self.sub_id,
             delay_ms,
         });
     }

@@ -3,7 +3,7 @@
 //! ACK body (16 B, no tail):
 //! ```text
 //!   offset 0:  consumer_id   u32  (4B)
-//!   offset 4:  subject_hash  u32  (4B)   ← echoed from DeliveryEntry, O(1) credit release
+//!   offset 4:  sub_id        u32  (4B)   ← subscription the message was delivered on
 //!   offset 8:  ack_seq       u64  (8B)   ← sequence being acknowledged
 //! ```
 //! (The frame's own `header.seq` is the per-connection ack frame counter.)
@@ -12,7 +12,7 @@
 //! ```text
 //!   offset 0:  consumer_id   u32  (4B)
 //!   offset 4:  count         u32  (4B)   ← number of entries that follow
-//!   entries[..]: [seq u64][subject_hash u32][_pad u32]  (16 B each)
+//!   entries[..]: [seq u64][sub_id u32][_pad u32]  (16 B each)
 //! ```
 
 use zerocopy::byteorder::little_endian::{U32, U64};
@@ -26,7 +26,7 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[repr(C)]
 pub struct AckBody {
     pub consumer_id: U32,
-    pub subject_hash: U32,
+    pub sub_id: U32,
     pub ack_seq: U64,
 }
 
@@ -46,7 +46,7 @@ impl AckFrame {
     pub const WIRE_SIZE: usize = HEADER_SIZE + ACK_BODY_SIZE;
 
     #[inline(always)]
-    pub fn new(seq: u64, consumer_id: u32, ack_seq: u64, subject_hash: u32) -> Self {
+    pub fn new(seq: u64, consumer_id: u32, ack_seq: u64, sub_id: u32) -> Self {
         Self {
             header: Header::new(
                 crate::action::Action::Ack.as_u16(),
@@ -55,7 +55,7 @@ impl AckFrame {
             ),
             body: AckBody {
                 consumer_id: U32::new(consumer_id),
-                subject_hash: U32::new(subject_hash),
+                sub_id: U32::new(sub_id),
                 ack_seq: U64::new(ack_seq),
             },
         }
@@ -77,7 +77,7 @@ const _: () = assert!(BATCH_ACK_BODY_FIXED == 8);
 #[repr(C)]
 pub struct BatchAckEntry {
     pub seq: U64,
-    pub subject_hash: U32,
+    pub sub_id: U32,
     pub _pad: U32,
 }
 pub const BATCH_ACK_ENTRY_SIZE: usize = core::mem::size_of::<BatchAckEntry>();
@@ -142,7 +142,7 @@ impl BatchAckFrame {
         let slots = <[BatchAckEntry]>::mut_from_bytes(entries_buf).expect("entries slice");
         for (slot, (seq, hash)) in slots.iter_mut().zip(entries.iter()) {
             slot.seq = U64::new(*seq);
-            slot.subject_hash = U32::new(*hash);
+            slot.sub_id = U32::new(*hash);
             slot._pad = U32::new(0);
         }
         frame
@@ -165,7 +165,7 @@ mod tests {
         let parsed = AckFrame::ref_from_bytes(bytes).unwrap();
         assert_eq!(parsed.body.consumer_id.get(), 42);
         assert_eq!(parsed.body.ack_seq.get(), 999);
-        assert_eq!(parsed.body.subject_hash.get(), 0xDEADBEEF);
+        assert_eq!(parsed.body.sub_id.get(), 0xDEADBEEF);
     }
 
     /// T1 — B2 regression: a frame with a `count` that's larger than
@@ -223,6 +223,6 @@ mod tests {
         let es = parsed.entries();
         assert_eq!(es.len(), 4);
         assert_eq!(es[0].seq.get(), 100);
-        assert_eq!(es[3].subject_hash.get(), 0x44);
+        assert_eq!(es[3].sub_id.get(), 0x44);
     }
 }

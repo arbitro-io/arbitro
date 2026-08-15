@@ -9,13 +9,13 @@
 use bytes::Bytes;
 use zerocopy::IntoBytes;
 
+use arbitro_proto::action::Action;
 use arbitro_proto::v2::cold::{
     ColdBody, ConsumerStats, CreateConsumer as CreateConsumerCold,
     CreateStream as CreateStreamCold, DeleteConsumer, DeleteMessage, DeleteStream, DrainSubject,
     GetConsumer, GetStream, ListConsumers, ListStreams, PauseConsumer, PurgeStream, ResumeConsumer,
     SubjectLimit as ColdSubjectLimit, Unsubscribe,
 };
-use arbitro_proto::action::Action;
 use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use arbitro_proto::v2::ingress::ack_frame::{AckFrame, BatchAckFrame};
 use arbitro_proto::v2::ingress::ack_state::{AckBatchFrame, AckStateReqFrame};
@@ -334,8 +334,8 @@ pub(crate) fn encode_auth_v2(token: &[u8]) -> Bytes {
 }
 
 #[inline]
-pub(crate) fn encode_ack_v2(seq: u64, consumer_id: u32, ack_seq: u64, subject_hash: u32) -> Bytes {
-    let f = AckFrame::new(seq, consumer_id, ack_seq, subject_hash);
+pub(crate) fn encode_ack_v2(seq: u64, consumer_id: u32, ack_seq: u64, sub_id: u32) -> Bytes {
+    let f = AckFrame::new(seq, consumer_id, ack_seq, sub_id);
     Bytes::copy_from_slice(f.as_bytes())
 }
 
@@ -425,17 +425,12 @@ mod tests {
 
 /// Single nack — same wire layout as `encode_ack_v2`, action = Nack.
 #[inline]
-pub(crate) fn encode_nack_v2(
-    seq: u64,
-    consumer_id: u32,
-    nack_seq: u64,
-    subject_hash: u32,
-) -> Bytes {
-    let f = NackFrame::new(seq, consumer_id, nack_seq, subject_hash);
+pub(crate) fn encode_nack_v2(seq: u64, consumer_id: u32, nack_seq: u64, sub_id: u32) -> Bytes {
+    let f = NackFrame::new(seq, consumer_id, nack_seq, sub_id);
     Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&f))
 }
 
-/// Batch nack — entries are `(seq, subject_hash, delay_ms)`.
+/// Batch nack — entries are `(seq, sub_id, delay_ms)`.
 pub(crate) fn encode_batch_nack_v2(
     seq: u64,
     consumer_id: u32,
@@ -459,7 +454,7 @@ pub(crate) fn encode_sub_v2(
     seq: u64,
     _conn_id: u32,
     consumer_id: u32,
-    subscription_id: u32,
+    sub_id: u32,
     filter: &[u8],
 ) -> Bytes {
     use arbitro_proto::v2::cold::Subscribe as SubscribeCold;
@@ -471,9 +466,10 @@ pub(crate) fn encode_sub_v2(
     } else {
         vec![filter.to_vec()]
     };
+
     SubscribeCold {
         consumer_id,
-        subscription_id,
+        subscription_id: sub_id,
         filters,
     }
     .encode(seq)

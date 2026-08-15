@@ -436,8 +436,10 @@ mod engine_tests {
         let acks = [command::AckEntry {
             stream_id: StreamId(1),
             seq: 1,
+            sub_id: SubscriptionId(1),
         }];
         let _events = engine.execute(&command::Command::Ack {
+            conn_id: ConnectionId(100),
             consumer_id: ConsumerId(1),
             entries: &acks,
         });

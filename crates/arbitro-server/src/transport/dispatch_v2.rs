@@ -899,6 +899,7 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.ack_seq.get(),
+                sub_id: SubscriptionId(f.body.sub_id.get()),
             }],
         )
         .await;
@@ -925,6 +926,7 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         entries.push(AckEntry {
             stream_id: seq_stream,
             seq: e.seq.get(),
+            sub_id: SubscriptionId(e.sub_id.get()),
         });
     }
     let _ = shard.ack(consumer_id, conn_id, entries).await;
@@ -1052,6 +1054,8 @@ async fn v2_ack_batch(
             accepted_entries.push(AckEntry {
                 stream_id: seq_stream,
                 seq,
+                // This frame carries bare seqs; 0 means "unknown, scan".
+                sub_id: SubscriptionId(0),
             });
         }
     }
@@ -1094,6 +1098,8 @@ async fn v2_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.nack_seq.get(),
+                // NackAction spends its spare word on delay_ms.
+                sub_id: SubscriptionId(0),
             }],
             0, // single nack frame has no delay field
         )
@@ -1120,6 +1126,7 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .map(|e| AckEntry {
             stream_id: seq_stream,
             seq: e.seq.get(),
+            sub_id: SubscriptionId(0),
         })
         .collect();
     // All entries in a batch share the same delay — take max.
@@ -1654,6 +1661,7 @@ async fn v2_ack_term(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.ack_seq.get(),
+                sub_id: SubscriptionId(f.body.sub_id.get()),
             }],
         )
         .await;

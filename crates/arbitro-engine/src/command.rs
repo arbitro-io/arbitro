@@ -11,7 +11,7 @@
 //! `try_send` succeeds in the drain loop. The engine bumps credits/inflight
 //! AFTER the send worked — never speculatively.
 
-use crate::types::{BindingId, ConnectionId, ConsumerId, StreamId};
+use crate::types::{BindingId, ConnectionId, ConsumerId, StreamId, SubscriptionId};
 
 /// Entry recording a successful delivery.
 #[derive(Debug, Clone, Copy)]
@@ -31,6 +31,11 @@ const _: () = assert!(core::mem::size_of::<DeliveredEntry>() == 16);
 pub struct AckEntry {
     pub stream_id: StreamId,
     pub seq: u64,
+    /// Subscription the message was delivered on, echoed by the client.
+    /// Untrusted on its own — the ack path pairs it with the connection the
+    /// frame arrived on, so an id naming another connection's subscription
+    /// misses the index instead of reaching its binding.
+    pub sub_id: SubscriptionId,
 }
 
 /// Reason a `Tombstone` command was emitted.
@@ -62,12 +67,17 @@ pub enum Command<'a> {
 
     /// Positive acknowledgement from a consumer.
     Ack {
+        /// Connection the frame arrived on. Half of the key that turns an
+        /// entry's client-authored `sub_id` into a binding.
+        conn_id: ConnectionId,
         consumer_id: ConsumerId,
         entries: &'a [AckEntry],
     },
 
     /// Negative acknowledgement — request redelivery.
     Nack {
+        /// See [`Command::Ack`].
+        conn_id: ConnectionId,
         consumer_id: ConsumerId,
         entries: &'a [AckEntry],
     },

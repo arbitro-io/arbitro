@@ -176,6 +176,29 @@ pub struct Catalog {
     /// `subscribe` to replace a stale binding cleanly instead of leaving
     /// two live bindings racing for the same subscription's deliveries.
     by_subscription: HashMap<SubscriptionId, BindingId, foldhash::fast::FixedState>,
+    /// `(connection, subscription) → binding`, for callers holding an id
+    /// that arrived in a client-authored frame (acks, nacks).
+    ///
+    /// The connection belongs in the KEY, not in a check after the lookup:
+    /// a subscription id from another connection has to MISS, not resolve
+    /// to a stranger's binding and get rejected afterwards. Within one
+    /// connection the id is a plain counter, so the pair is unique without
+    /// the consumer.
+    ///
+    /// Maintained in exactly the two places `by_subscription` is — the
+    /// insert in `subscribe` and the remove in `retire_binding`, which is
+    /// the only path that ever drops a binding.
+    by_conn_subscription:
+        HashMap<(ConnectionId, SubscriptionId), BindingId, foldhash::fast::FixedState>,
+
+    /// `(connection, consumer) → live binding count`, for frames that name
+    /// no subscription (`AckBatchReq`'s bare seqs, nacks) and can only be
+    /// authorized at consumer granularity. A count, not a flag: one
+    /// connection may hold several subscriptions on the same consumer, and
+    /// retiring one of them must not revoke the others.
+    ///
+    /// Maintained alongside `by_conn_subscription`.
+    by_conn_consumer: HashMap<(ConnectionId, ConsumerId), u32, foldhash::fast::FixedState>,
     next_binding_id: u32,
 
     // Connection tracking.
@@ -199,6 +222,8 @@ impl Catalog {
             by_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             by_connection: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             by_subscription: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_conn_subscription: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            by_conn_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_binding_id: 1,
             connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
@@ -578,6 +603,12 @@ impl Catalog {
             .or_default()
             .push(binding_id);
         self.by_subscription.insert(subscription_id, binding_id);
+        self.by_conn_subscription
+            .insert((connection_id, subscription_id), binding_id);
+        *self
+            .by_conn_consumer
+            .entry((connection_id, consumer_id))
+            .or_insert(0) += 1;
 
         // Precompute connection_id in match entries.
         self.bind_subscription_connection(stream_id, subscription_id, connection_id);
@@ -616,6 +647,22 @@ impl Catalog {
         if self.by_subscription.get(&binding.subscription_id) == Some(&binding_id) {
             self.by_subscription.remove(&binding.subscription_id);
         }
+        // Same guard: a replacement binding on the same (conn, sub) may
+        // already own the slot, and retiring the old one must not evict it.
+        let conn_sub = (binding.connection_id, binding.subscription_id);
+        if self.by_conn_subscription.get(&conn_sub) == Some(&binding_id) {
+            self.by_conn_subscription.remove(&conn_sub);
+        }
+        // Unconditional: the count tracks bindings, not slot ownership, so
+        // every retire owes exactly one decrement. Drop the entry at zero
+        // so the map does not grow with dead connections.
+        let conn_consumer = (binding.connection_id, binding.consumer_id);
+        if let Some(n) = self.by_conn_consumer.get_mut(&conn_consumer) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_conn_consumer.remove(&conn_consumer);
+            }
+        }
 
         // Unbind from match table.
         self.unbind_subscription_connection(binding.stream_id, binding.subscription_id);
@@ -640,6 +687,64 @@ impl Catalog {
     #[inline]
     pub fn binding_mut(&mut self, id: BindingId) -> Option<&mut Binding> {
         self.bindings.get_mut(&id)
+    }
+
+    /// Live entries in the `(conn, sub)` index. Tests assert on the SIZE,
+    /// not on `binding_for_subscription` returning `None` — a leaked entry
+    /// pointing at a retired binding also returns `None`, so the behaviour
+    /// check cannot tell a clean index from one that grows forever.
+    #[cfg(test)]
+    pub fn conn_subscription_index_len(&self) -> usize {
+        self.by_conn_subscription.len()
+    }
+
+    /// Whether `conn` holds any live binding on `consumer`. The coarse
+    /// check, for frames that carry no subscription id — one hash instead
+    /// of a walk over every binding in the shard.
+    #[inline]
+    pub fn connection_owns_consumer(&self, conn: ConnectionId, consumer: ConsumerId) -> bool {
+        self.by_conn_consumer.contains_key(&(conn, consumer))
+    }
+
+    /// Live entries in the `(conn, consumer)` index. Same reason as
+    /// `conn_subscription_index_len`: assert on the size, not on behaviour.
+    #[cfg(test)]
+    pub fn conn_consumer_index_len(&self) -> usize {
+        self.by_conn_consumer.len()
+    }
+
+    /// Just the id, for callers that need to borrow the binding mutably
+    /// afterwards — the index borrow ends before `binding_mut` starts.
+    #[inline]
+    pub fn binding_id_for_subscription(
+        &self,
+        conn: ConnectionId,
+        sub: SubscriptionId,
+    ) -> Option<BindingId> {
+        self.by_conn_subscription.get(&(conn, sub)).copied()
+    }
+
+    /// The binding of `sub` on `conn`. One hash into the index, one into
+    /// the store — no scan, constant whatever the consumer's fan-out.
+    #[inline]
+    pub fn binding_for_subscription(
+        &self,
+        conn: ConnectionId,
+        sub: SubscriptionId,
+    ) -> Option<&Binding> {
+        let bid = *self.by_conn_subscription.get(&(conn, sub))?;
+        self.bindings.get(&bid)
+    }
+
+    /// Mutable twin — what the ack path needs to take the pending out.
+    #[inline]
+    pub fn binding_for_subscription_mut(
+        &mut self,
+        conn: ConnectionId,
+        sub: SubscriptionId,
+    ) -> Option<&mut Binding> {
+        let bid = *self.by_conn_subscription.get(&(conn, sub))?;
+        self.bindings.get_mut(&bid)
     }
 
     /// Binding IDs on a stream.
@@ -1116,5 +1221,160 @@ mod tests {
             wire_hash_32(b"orders.created"),
             wire_hash_32(b"orders.updated")
         );
+    }
+
+    /// Every path that drops a binding must also drop its `(conn, sub)`
+    /// entry. `retire_binding` is the only place `bindings` shrinks, and the
+    /// bulk helpers (stream / consumer / connection) all funnel through it —
+    /// this pins that, so a future path that bypasses it fails here instead
+    /// of leaking an entry per subscribe until the process dies.
+    #[test]
+    fn conn_subscription_index_is_cleared_on_every_retire_path() {
+        fn setup() -> (Catalog, DeltaEvents) {
+            let mut cat = Catalog::new();
+            let events = DeltaEvents::default();
+            cat.ensure_stream(StreamConfig {
+                id: StreamId(1),
+                name: b"s".to_vec(),
+            })
+            .unwrap();
+            cat.ensure_consumer(ConsumerConfig {
+                id: ConsumerId(1),
+                queue_id: QueueId(1),
+                stream_id: StreamId(1),
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100,
+                ack_wait_ms: 0,
+                max_nack: 0,
+                filter: Box::default(),
+            })
+            .unwrap();
+            cat.ensure_subscription(SubscriptionConfig {
+                id: SubscriptionId(1),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            })
+            .unwrap();
+            cat.open_connection(ConnectionId(42), NodeId(1));
+            (cat, events)
+        }
+
+        // Direct retire.
+        let (mut cat, mut ev) = setup();
+        let bid = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut ev)
+            .unwrap();
+        assert_eq!(cat.conn_subscription_index_len(), 1);
+        assert!(cat
+            .binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+            .is_some());
+        cat.retire_binding(bid, &mut ev);
+        assert_eq!(cat.conn_subscription_index_len(), 0, "direct retire leaked");
+        assert!(cat
+            .binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+            .is_none());
+
+        // Re-subscribe: the old binding is retired while the new one already
+        // owns the slot. The guard must keep the replacement, not evict it.
+        let (mut cat, mut ev) = setup();
+        cat.subscribe(ConnectionId(42), SubscriptionId(1), &mut ev)
+            .unwrap();
+        let second = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut ev)
+            .unwrap();
+        assert_eq!(
+            cat.conn_subscription_index_len(),
+            1,
+            "re-subscribe must replace, not accumulate"
+        );
+        assert_eq!(
+            cat.binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+                .map(|b| b.binding_id),
+            Some(second),
+            "the live binding is the replacement"
+        );
+
+        // Removing the subscription ENTITY deliberately does not cascade —
+        // `remove_subscription_entity` documents that the caller retires the
+        // bindings first. So the binding outlives it and the index entry
+        // still points at something live; that is the contract, not a leak.
+        // What must hold is that retiring afterwards still clears it.
+        let (mut cat, mut ev) = setup();
+        let bid = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut ev)
+            .unwrap();
+        cat.remove_subscription_entity(SubscriptionId(1)).unwrap();
+        assert_eq!(
+            cat.conn_subscription_index_len(),
+            1,
+            "the binding outlives the subscription entity by design"
+        );
+        cat.retire_binding(bid, &mut ev);
+        assert_eq!(
+            cat.conn_subscription_index_len(),
+            0,
+            "retiring after the entity is gone must still clear the index"
+        );
+    }
+
+    /// The `(conn, consumer)` index counts bindings, so several
+    /// subscriptions of one connection on one consumer must not revoke each
+    /// other on retire. A flag instead of a count would drop ownership on
+    /// the first unsubscribe and start rejecting the survivors' nacks.
+    #[test]
+    fn conn_consumer_index_survives_partial_unsubscribe() {
+        let mut cat = Catalog::new();
+        let mut ev = DeltaEvents::default();
+        cat.ensure_stream(StreamConfig {
+            id: StreamId(1),
+            name: b"s".to_vec(),
+        })
+        .unwrap();
+        cat.ensure_consumer(ConsumerConfig {
+            id: ConsumerId(1),
+            queue_id: QueueId(1),
+            stream_id: StreamId(1),
+            durable: true,
+            ack_policy: AckPolicy::Explicit,
+            max_inflight: 100,
+            ack_wait_ms: 0,
+            max_nack: 0,
+            filter: Box::default(),
+        })
+        .unwrap();
+        for id in [1u32, 2] {
+            cat.ensure_subscription(SubscriptionConfig {
+                id: SubscriptionId(id),
+                stream_id: StreamId(1),
+                consumer_id: ConsumerId(1),
+                filters: vec![],
+            })
+            .unwrap();
+        }
+        cat.open_connection(ConnectionId(42), NodeId(1));
+
+        let first = cat
+            .subscribe(ConnectionId(42), SubscriptionId(1), &mut ev)
+            .unwrap();
+        let second = cat
+            .subscribe(ConnectionId(42), SubscriptionId(2), &mut ev)
+            .unwrap();
+        assert_eq!(cat.conn_consumer_index_len(), 1, "one pair, not one per sub");
+        assert!(cat.connection_owns_consumer(ConnectionId(42), ConsumerId(1)));
+
+        cat.retire_binding(first, &mut ev);
+        assert!(
+            cat.connection_owns_consumer(ConnectionId(42), ConsumerId(1)),
+            "one subscription left — the connection still owns the consumer"
+        );
+
+        cat.retire_binding(second, &mut ev);
+        assert!(!cat.connection_owns_consumer(ConnectionId(42), ConsumerId(1)));
+        assert_eq!(cat.conn_consumer_index_len(), 0, "last retire must drop the entry");
+
+        // A stranger never owned it.
+        assert!(!cat.connection_owns_consumer(ConnectionId(99), ConsumerId(1)));
     }
 }

@@ -5,7 +5,7 @@
 //! [Header 16B]                     ← action = Action::Deliver
 //! [DeliverBody 12B]
 //!   offset 0:  consumer_id   u32  (4B)
-//!   offset 4:  subject_hash  u32  (4B)  ← echoed back in client ack
+//!   offset 4:  subscription_id u32 (4B)  ← which sub of consumer_id
 //!   offset 8:  subject_len   u16  (2B)
 //!   offset 10: _pad          u16  (2B)
 //! [tail]
@@ -42,7 +42,7 @@ use crate::v2::header::{Header, HEADER_SIZE};
 #[repr(C)]
 pub struct DeliverBody {
     pub consumer_id: U32,
-    pub subject_hash: U32,
+    pub subscription_id: U32,
     pub subject_len: U16,
     pub _pad: U16,
 }
@@ -82,7 +82,7 @@ impl DeliverFrame {
     pub fn build_prefix(
         deliver_seq: u64,
         consumer_id: u32,
-        subject_hash: u32,
+        sub_id: u32,
         subject_len: u16,
         payload_len: usize,
     ) -> DeliverPrefix {
@@ -95,7 +95,7 @@ impl DeliverFrame {
             ),
             body: DeliverBody {
                 consumer_id: U32::new(consumer_id),
-                subject_hash: U32::new(subject_hash),
+                subscription_id: U32::new(sub_id),
                 subject_len: U16::new(subject_len),
                 _pad: U16::new(0),
             },
@@ -106,7 +106,7 @@ impl DeliverFrame {
         out: &'a mut [u8],
         deliver_seq: u64,
         consumer_id: u32,
-        subject_hash: u32,
+        sub_id: u32,
         subject: &[u8],
         payload: &[u8],
     ) -> &'a mut Self {
@@ -114,7 +114,7 @@ impl DeliverFrame {
         let prefix = Self::build_prefix(
             deliver_seq,
             consumer_id,
-            subject_hash,
+            sub_id,
             subject.len() as u16,
             payload.len(),
         );
@@ -185,7 +185,7 @@ mod tests {
         let f = DeliverFrame::ref_from_bytes(&buf).unwrap();
         assert_eq!(f.header.seq.get(), 123);
         assert_eq!(f.body.consumer_id.get(), 77);
-        assert_eq!(f.body.subject_hash.get(), 0xDEAD);
+        assert_eq!(f.body.subscription_id.get(), 0xDEAD);
         assert_eq!(f.subject(), subject);
         assert_eq!(f.payload(), &payload);
     }

@@ -71,6 +71,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
         }
 
         Command::Ack {
+            conn_id,
             consumer_id,
             entries,
         } => {
@@ -83,6 +84,30 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
             for ack in entries.iter() {
+                // Named entry: (connection, subscription) is a key, so the
+                // binding comes back in one hash. Nothing else in this arm
+                // can reach a binding the connection does not own.
+                if ack.sub_id.0 != 0 {
+                    if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
+                    {
+                        if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                            if binding.stream_id == ack.stream_id {
+                                if let Some(pending) = binding.pending.remove(&ack.seq) {
+                                    let queue_raw = binding.queue_id.raw();
+                                    events.subject_hashes_acked.push((
+                                        consumer_id.raw(),
+                                        pending.subject_hash,
+                                        pending.seq,
+                                    ));
+                                    ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
+                                    matched += 1;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Unnamed entry (`AckBatchReq`, broker-side auto-nack).
                 // Invariant: each entry is matched at most once across bindings.
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {
@@ -110,6 +135,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
         }
 
         Command::Nack {
+            conn_id,
             consumer_id,
             entries,
         } => {
@@ -121,6 +147,30 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
             for ack in entries.iter() {
+                // Named entry: (connection, subscription) is a key, so the
+                // binding comes back in one hash. Nothing else in this arm
+                // can reach a binding the connection does not own.
+                if ack.sub_id.0 != 0 {
+                    if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
+                    {
+                        if let Some(binding) = ctx.catalog.binding_mut(bid) {
+                            if binding.stream_id == ack.stream_id {
+                                if let Some(pending) = binding.pending.remove(&ack.seq) {
+                                    let queue_raw = binding.queue_id.raw();
+                                    events.subject_hashes_acked.push((
+                                        consumer_id.raw(),
+                                        pending.subject_hash,
+                                        pending.seq,
+                                    ));
+                                    ctx.inflight.dec_pending(consumer_id.raw(), queue_raw);
+                                    matched += 1;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Unnamed entry (`AckBatchReq`, broker-side auto-nack).
                 // Invariant: each entry is matched at most once across bindings.
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {

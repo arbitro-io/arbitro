@@ -988,8 +988,12 @@ impl CommandWorker {
             let ack_entry = AckEntry {
                 stream_id,
                 seq: entry.seq,
+                // Broker-side auto-nack: no client frame, so no id.
+                sub_id: SubscriptionId(0),
             };
             let delta = self.engine.execute(&Command::Nack {
+                // Broker-side auto-nack: no client frame, no connection.
+                conn_id: ConnectionId(0),
                 consumer_id,
                 entries: &[ack_entry],
             });

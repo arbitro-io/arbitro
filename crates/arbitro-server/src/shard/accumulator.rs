@@ -102,7 +102,7 @@ impl Bucket {
         &mut self,
         consumer_id: u32,
         seq: u64,
-        subject_hash: u32,
+        sub_id: u32,
         subject: &[u8],
         reply_to: &[u8],
         payload: &[u8],
@@ -118,7 +118,7 @@ impl Bucket {
             subj_len: U16::new(subj_len as u16),
             reply_len: U16::new(reply_len as u16),
             data_len: U32::new(data_len as u32),
-            subject_hash: U32::new(subject_hash),
+            sub_id: U32::new(sub_id),
         };
 
         // Reserve once, then extend directly into `body` — no intermediate
@@ -225,7 +225,7 @@ impl Accumulator {
         consumer: ConsumerId,
         seq: u64,
         subject: &[u8],
-        subject_hash: u32,
+        sub_id: u32,
         reply_to: &[u8],
         payload: &[u8],
     ) {
@@ -233,7 +233,7 @@ impl Accumulator {
         self.buckets[idx].push_entry_bytes(
             consumer.0,
             seq,
-            subject_hash,
+            sub_id,
             subject,
             reply_to,
             payload,
