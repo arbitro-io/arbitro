@@ -69,6 +69,11 @@ pub struct ActiveBinding {
     pub(super) consumer_id: ConsumerId,
     /// One binding is one subscription — the key the match table stamps by.
     pub(super) subscription_id: SubscriptionId,
+    /// Dense index of this binding's `(connection, consumer)` pair — the
+    /// fanout-collapse key. Bindings that share a pair share an index, so
+    /// the drain marks one slot per message instead of scanning a list of
+    /// pairs. Assigned by `rebuild_and_swap_snapshot`; snapshot-local.
+    pub(super) group_idx: u32,
     /// The id the client chose. Stamped on every delivery so the client can
     /// route by a number it recognises.
     pub(super) external_sub_id: u32,
@@ -1293,16 +1298,42 @@ impl CommandWorker {
     /// — a direct Vec index — instead of a `(consumer_id, connection_id)`
     /// HashMap lookup on every match.
     pub(super) fn rebuild_and_swap_snapshot(&self) {
+        // Fanout-collapse groups: one dense index per distinct
+        // `(connection, consumer)`. Siblings of the same consumer on the
+        // same socket collapse to one wire copy, so they share an index.
+        // Built here, on the cold path, so the drain never hashes it.
+        let mut group_ids: std::collections::HashMap<(u64, u32), u32, foldhash::fast::FixedState> =
+            std::collections::HashMap::with_capacity_and_hasher(
+                self.bindings.len(),
+                foldhash::fast::FixedState::default(),
+            );
+        let mut next_group = 0u32;
+        let group_of: Vec<u32> = self
+            .bindings
+            .iter()
+            .map(|b| {
+                *group_ids
+                    .entry((b.connection_id.0, b.consumer_id.0))
+                    .or_insert_with(|| {
+                        let g = next_group;
+                        next_group += 1;
+                        g
+                    })
+            })
+            .collect();
+
         // We need to clone bindings for the snapshot because drain holds Arc
         // while we might modify our local copy later.
         let snap_bindings: Vec<ActiveBinding> = self
             .bindings
             .iter()
-            .map(|b| ActiveBinding {
+            .enumerate()
+            .map(|(i, b)| ActiveBinding {
                 binding_id: b.binding_id,
                 connection_id: b.connection_id,
                 consumer_id: b.consumer_id,
                 subscription_id: b.subscription_id,
+                group_idx: group_of[i],
                 external_sub_id: b.external_sub_id,
                 stream_id: b.stream_id,
                 queue_id: b.queue_id,

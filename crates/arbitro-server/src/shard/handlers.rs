@@ -432,6 +432,8 @@ impl CommandWorker {
                         connection_id,
                         consumer_id,
                         subscription_id,
+                        // Assigned by the snapshot rebuild below.
+                        group_idx: u32::MAX,
                         external_sub_id,
                         stream_id,
                         queue_id,
@@ -753,6 +755,8 @@ impl CommandWorker {
                     connection_id: cmd.connection_id,
                     consumer_id,
                     subscription_id: cmd.subscription_id,
+                    // Assigned by the snapshot rebuild below.
+                    group_idx: u32::MAX,
                     external_sub_id,
                     stream_id,
                     queue_id,
