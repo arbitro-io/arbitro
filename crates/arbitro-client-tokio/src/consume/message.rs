@@ -65,14 +65,18 @@ pub(crate) struct NackCmd {
 
 /// A message delivered from a broker consumer subscription.
 ///
-/// Holds a zero-copy `Bytes` slice of the original read-buffer frame.
-/// The subject is always copied into a `Box<[u8]>` once per delivery.
+/// Subject, reply_to and payload are all zero-copy `Bytes` slices of the
+/// original read-buffer frame. The subject used to be copied into a
+/// `Box<[u8]>` — one allocation and one memcpy per delivery — on the
+/// reasoning that borrowing would pin the whole batch frame. It pins it
+/// either way: the payload is a slice of that same frame. So the copy
+/// bought nothing, and under fanout it was paid once per sibling.
 pub struct Message {
     pub seq: u64,
     pub consumer_id: u32,
     pub stream_id: u32,
     pub sub_id: u32,
-    subject: Box<[u8]>,
+    subject: Bytes,
     reply_to: Bytes,
     payload: Bytes,
     ack_tx: mpsc::Sender<AckCmd>,
@@ -104,7 +108,7 @@ impl Message {
         consumer_id: u32,
         stream_id: u32,
         sub_id: u32,
-        subject: Box<[u8]>,
+        subject: Bytes,
         reply_to: Bytes,
         payload: Bytes,
         ack_tx: mpsc::Sender<AckCmd>,

@@ -73,7 +73,7 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         return;
     }
 
-    let subject = &frame[body_end..payload_off];
+    let subject = frame.slice(body_end..payload_off);
     let payload = frame.slice(payload_off..);
     let mut targets = Vec::new();
     deliver(
@@ -101,14 +101,14 @@ async fn deliver(
     sub_id: u32,
     consumer_id: u32,
     seq: u64,
-    subject: &[u8],
+    subject: Bytes,
     reply_to: Bytes,
     payload: Bytes,
     targets: &mut Vec<Target>,
 ) {
     // Unknown subscription: the handle was dropped, or this arrived before a
     // reconnect replay re-registered it. Nothing to route it to.
-    let Some(d) = inner.subscriptions.route(sub_id, subject, targets) else {
+    let Some(d) = inner.subscriptions.route(sub_id, &subject, targets) else {
         return;
     };
 
@@ -134,7 +134,9 @@ async fn deliver(
             consumer_id,
             d.stream_id,
             t.sub_id,
-            Box::from(subject),
+            // Siblings share one slice of the frame. The frame is pinned by
+            // the payload anyway, so a copy per sibling bought nothing.
+            subject.clone(),
             reply_to.clone(),
             payload.clone(),
             inner.ack_tx.clone(),
@@ -201,7 +203,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         if frame.len() < off + data_len || subj_len + reply_len > data_len {
             break;
         }
-        let subject = &frame[off..off + subj_len];
+        let subject = frame.slice(off..off + subj_len);
         let reply_to = if reply_len > 0 {
             frame.slice(off + subj_len..off + subj_len + reply_len)
         } else {
