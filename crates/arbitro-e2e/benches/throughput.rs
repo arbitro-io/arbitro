@@ -26,7 +26,10 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, JournalKind, StreamBuilder};
+use arbitro_client_tokio::{
+    AckPolicy, BatchEntry, Client, ClientConfig, ConsumerBuilder, DeliverMode, DeliverPolicy,
+    JournalKind, StreamBuilder,
+};
 use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
 
@@ -1040,22 +1043,24 @@ fn main() {
                     for si in 0..n_consumers_per_client {
                         let name = format!("fanout_c{ci}_s{si}");
                         let group = format!("fanout_g{ci}_{si}");
-                        let resp = client
-                            .create_consumer(
-                                fanout_stream_id,
-                                name.as_bytes(),
-                                group.as_bytes(),
-                                b"",
-                                u16::MAX,
-                                0, // ack_policy = None
-                                0, // deliver_policy = All
-                                0, // deliver_mode = Push/Fanout
-                                30_000,
-                                0,
-                            )
+                        // `AckPolicy::None` on purpose: this measures delivery,
+                        // not the pending bookkeeping. With `Explicit` the drain
+                        // would also check capacity, open a pending per copy and
+                        // process the acks back — a different number entirely.
+                        //
+                        // No `max_inflight` and no `ack_wait_ms`: both are inert
+                        // under `None` — `fire_and_forget` skips the capacity
+                        // check and never opens a pending to time out. The
+                        // builder rejects them outright, which is how the
+                        // `u16::MAX` this used to pass got found.
+                        let consumer_id = ConsumerBuilder::new(name.as_bytes())
+                            .group(group.as_bytes())
+                            .ack_policy(AckPolicy::None)
+                            .deliver_policy(DeliverPolicy::All)
+                            .deliver_mode(DeliverMode::Fanout)
+                            .create(client, fanout_stream_id)
                             .await
                             .expect("create fanout consumer");
-                        let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
                         // SUBS_PER_CONSUMER subscriptions on ONE consumer. The
                         // broker still puts a single copy per (connection,
                         // consumer) on the wire — the fan-out to siblings is the
