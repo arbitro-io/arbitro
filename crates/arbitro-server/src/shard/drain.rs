@@ -887,6 +887,14 @@ fn dispatch_recipients(
         let collapsed =
             !has_queue && scratch.fanout_stamp[binding.group_idx as usize] == scratch.fanout_gen;
 
+        // Under `AckPolicy::None` a collapsed sibling owes nothing and gets
+        // no copy, so every line below is wasted — including the payload and
+        // reply_to parsing feeding an `acc.add` that will not run. Bail out
+        // exactly where the pre-flag code did.
+        if collapsed && binding.fire_and_forget {
+            continue;
+        }
+
         // Deliver floor (DeliverPolicy::New / ByStartSeq): seqs at or
         // below the binding's start position were never owed to this
         // consumer. Same no-side-effect discipline as the suppression
