@@ -39,6 +39,7 @@ use arbitro_proto::v2::header::{Header, HEADER_SIZE};
 use std::sync::Arc;
 
 use crate::consume::message::Message;
+use crate::state::subscriptions::Target;
 use crate::state::Inner;
 
 /// Envelope size is the same as HEADER_SIZE (16B), but the field layout differs.
@@ -72,47 +73,82 @@ pub(crate) async fn dispatch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         return;
     }
 
-    let subject = Box::from(&frame[body_end..payload_off]);
-    let reply_to = Bytes::new(); // Single Deliver does not carry reply_to
+    let subject = &frame[body_end..payload_off];
     let payload = frame.slice(payload_off..);
-    let (stream_id, slot) = inner.subscriptions.route_of(consumer_id);
+    let mut targets = Vec::new();
+    deliver(
+        inner,
+        sub_id,
+        consumer_id,
+        deliver_seq,
+        subject,
+        Bytes::new(), // single Deliver carries no reply_to
+        payload,
+        &mut targets,
+    )
+    .await;
+}
 
-    // Durable redelivery dedup: if this seq was already processed+acked
-    // (even in a prior process lifetime), re-ack so the broker advances its
-    // cursor and stops redelivering — without re-running the user handler.
-    if let Some(s) = &slot {
-        if s.seen(deliver_seq) {
+/// Route one delivered entry and hand it to every subscription it belongs
+/// to, then clear `targets` for the next entry.
+///
+/// The dedup probe runs ONCE, before the fan-out. Per subscription it would
+/// let the first sibling mark the seq and the rest discard the message as a
+/// duplicate — the slot is keyed `(stream, consumer)`, not per subscription.
+#[allow(clippy::too_many_arguments)]
+async fn deliver(
+    inner: &Arc<Inner>,
+    sub_id: u32,
+    consumer_id: u32,
+    seq: u64,
+    subject: &[u8],
+    reply_to: Bytes,
+    payload: Bytes,
+    targets: &mut Vec<Target>,
+) {
+    // Unknown subscription: the handle was dropped, or this arrived before a
+    // reconnect replay re-registered it. Nothing to route it to.
+    let Some(d) = inner.subscriptions.route(sub_id, subject, targets) else {
+        return;
+    };
+
+    if let Some(s) = &d.dedup {
+        if s.seen(seq) {
             inner
                 .metrics
                 .dedup_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
-                seq: deliver_seq,
+                seq,
                 consumer_id,
                 sub_id,
             });
+            targets.clear();
             return;
         }
     }
 
-    let msg = Message::new(
-        deliver_seq,
-        consumer_id,
-        stream_id,
-        sub_id,
-        subject,
-        reply_to,
-        payload,
-        inner.ack_tx.clone(),
-        inner.nack_tx.clone(),
-        Arc::clone(inner),
-        slot,
-    );
-    inner
-        .metrics
-        .deliveries_received
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    inner.subscriptions.send(consumer_id, msg).await;
+    for t in targets.iter() {
+        let msg = Message::new(
+            seq,
+            consumer_id,
+            d.stream_id,
+            t.sub_id,
+            Box::from(subject),
+            reply_to.clone(),
+            payload.clone(),
+            inner.ack_tx.clone(),
+            inner.nack_tx.clone(),
+            Arc::clone(inner),
+            d.dedup.clone(),
+        );
+        inner
+            .metrics
+            .deliveries_received
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _ = t.tx.send(msg).await;
+    }
+    targets.clear();
 }
 
 /// Dispatch a batch-deliver frame (action = `RepBatch`) to subscriber channels.
@@ -138,6 +174,8 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
 
     let count = batch_hdr.count.get() as usize;
     let mut off = bh_end; // start of first entry
+    // Reused across every entry in this frame — the fan-out never allocates.
+    let mut targets = Vec::new();
 
     for _ in 0..count {
         let entry_end = off + DELIVERY_ENTRY_HEADER_SIZE; // +24
@@ -163,7 +201,7 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         if frame.len() < off + data_len || subj_len + reply_len > data_len {
             break;
         }
-        let subject = Box::from(&frame[off..off + subj_len]);
+        let subject = &frame[off..off + subj_len];
         let reply_to = if reply_len > 0 {
             frame.slice(off + subj_len..off + subj_len + reply_len)
         } else {
@@ -171,43 +209,19 @@ pub(crate) async fn dispatch_batch_deliver(frame: Bytes, inner: &Arc<Inner>) {
         };
         let payload_start = off + subj_len + reply_len;
         let payload = frame.slice(payload_start..off + data_len);
-        off += data_len;
+        let next = off + data_len;
 
-        let (stream_id, slot) = inner.subscriptions.route_of(consumer_id);
-
-        // Durable redelivery dedup (see `dispatch_deliver`).
-        if let Some(s) = &slot {
-            if s.seen(deliver_seq) {
-                inner
-                    .metrics
-                    .dedup_hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let _ = inner.ack_tx.try_send(crate::consume::message::AckCmd {
-                    seq: deliver_seq,
-                    consumer_id,
-                    sub_id,
-                });
-                continue;
-            }
-        }
-
-        let msg = Message::new(
-            deliver_seq,
-            consumer_id,
-            stream_id,
+        deliver(
+            inner,
             sub_id,
+            consumer_id,
+            deliver_seq,
             subject,
             reply_to,
             payload,
-            inner.ack_tx.clone(),
-            inner.nack_tx.clone(),
-            Arc::clone(inner),
-            slot,
-        );
-        inner
-            .metrics
-            .deliveries_received
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        inner.subscriptions.send(consumer_id, msg).await;
+            &mut targets,
+        )
+        .await;
+        off = next;
     }
 }

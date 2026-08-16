@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 
-use arbitro_client_tokio::{BatchEntry, Client, ClientConfig};
+use arbitro_client_tokio::{BatchEntry, Client, ClientConfig, JournalKind, StreamBuilder};
 use arbitro_server::{ArbitroServer, Config};
 use bytes::Bytes;
 
@@ -34,8 +34,34 @@ use bytes::Bytes;
 
 /// journal_kind u8: 0=Memory, 1=Disk, 2=Tolerant
 const JOURNAL_KIND: u8 = 0; // Memory
+/// Same value as `JOURNAL_KIND`, typed for the builder.
+const JOURNAL_KIND_ENUM: JournalKind = JournalKind::Memory;
 /// Only used when JOURNAL_KIND == 2 (Tolerant).
 const TOLERANT_DATA_DIR: &str = "/tmp/arbitro_bench_tolerant";
+
+/// A stream named `x` owns `x.>`, and nothing else does.
+///
+/// The broker rejects a `>` filter outright and refuses two streams whose
+/// slices overlap — a stream owns its slice alone. So the streams this
+/// bench spreads its connections over cannot share one subject, and the
+/// slice has to come from the NAME: deriving it from the position in a
+/// list silently collides the moment two different lists are set up.
+fn stream_filter(name: &[u8]) -> Vec<u8> {
+    let mut f = name.to_vec();
+    f.extend_from_slice(b".>");
+    f
+}
+
+/// The subject published into `name`. Matches [`stream_filter`].
+fn stream_subject(name: &[u8]) -> Vec<u8> {
+    let mut s = name.to_vec();
+    s.extend_from_slice(b".msg");
+    s
+}
+
+/// The fanout stage's own slice, disjoint from every `ingest.{i}.>`.
+const FANOUT_FILTER: &[u8] = b"fanout.>";
+const FANOUT_SUBJECT: &[u8] = b"fanout.msg";
 
 // Defaults; override at runtime via env: BENCH_ITERATIONS, BENCH_MSGS,
 // BENCH_BATCH, BENCH_CONCURRENCY (comma list, e.g. "1,2,4,8,16").
@@ -177,17 +203,30 @@ async fn connect(addr: &str) -> Client {
     panic!("client must connect to {addr} — still refused after 2s");
 }
 
-/// Delete (if present) and recreate every stream in `names`.
-/// Returns Vec of stream_ids corresponding to each name.
+/// Ensure every stream in `names` exists and return its id.
+///
+/// `upsert` instead of delete-then-create: the delete was fire-and-forget
+/// (`.ok()`), so whenever it failed the create hit `StreamAlreadyExists`
+/// and the bench died before measuring anything. Upsert states the intent
+/// — "this stream, with this shape" — and is idempotent across the
+/// repeated setup this bench does per concurrency level.
 async fn reset_streams(client: &Client, names: &[Vec<u8>]) -> Vec<u32> {
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
-        let _ = client.delete_stream(name).await.ok();
-        let resp = client
-            .create_stream(name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0, 0)
+        let filter = stream_filter(name);
+        let created = StreamBuilder::new(name)
+            .filter(&filter)
+            .journal_kind(JOURNAL_KIND_ENUM)
+            .upsert(client)
             .await
-            .expect("create stream");
-        let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+            .expect("upsert stream");
+        // Existing stream: drop its backlog so each iteration measures the
+        // same starting point.
+        if !created {
+            let _ = client.purge_stream(name).await.ok();
+        }
+        let info = client.get_stream(name).await.expect("get stream");
+        let stream_id = u64::from_le_bytes(info[..8].try_into().unwrap()) as u32;
         ids.push(stream_id);
     }
     ids
@@ -198,6 +237,7 @@ async fn reset_streams(client: &Client, names: &[Vec<u8>]) -> Vec<u32> {
 async fn run_single(
     clients: &[Client],
     stream_ids: &[u32],
+    names: &[Vec<u8>],
     msgs: u32,
     payload: &Arc<[u8]>,
 ) -> Duration {
@@ -205,12 +245,14 @@ async fn run_single(
     let mut js = tokio::task::JoinSet::new();
     for (i, client) in clients.iter().enumerate() {
         let c = client.clone();
-        let stream_id = stream_ids[i % stream_ids.len()];
+        let slot = i % stream_ids.len();
+        let stream_id = stream_ids[slot];
+        let subject = stream_subject(&names[slot]);
         let payload = payload.clone();
         js.spawn(async move {
             for _ in 0..msgs {
                 loop {
-                    match c.publish(stream_id, b"bench.msg", Bytes::copy_from_slice(&payload)) {
+                    match c.publish(stream_id, &subject, Bytes::copy_from_slice(&payload)) {
                         Ok(()) => break,
                         Err(arbitro_client_tokio::ClientError::QueueFull) => {
                             tokio::task::yield_now().await;
@@ -234,6 +276,7 @@ async fn run_single(
 async fn run_batch(
     clients: &[Client],
     stream_ids: &[u32],
+    names: &[Vec<u8>],
     total: usize,
     batch_size: usize,
     payload: &Arc<[u8]>,
@@ -242,14 +285,16 @@ async fn run_batch(
     let mut js = tokio::task::JoinSet::new();
     for (i, client) in clients.iter().enumerate() {
         let c = client.clone();
-        let stream_id = stream_ids[i % stream_ids.len()];
+        let slot = i % stream_ids.len();
+        let stream_id = stream_ids[slot];
+        let subject = stream_subject(&names[slot]);
         let payload = payload.clone();
         js.spawn(async move {
             let payload_bytes = Bytes::copy_from_slice(&payload[..]);
             let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
             for _ in 0..batch_size {
                 entries.push(BatchEntry {
-                    subject: b"bench.msg".as_slice(),
+                    subject: &subject,
                     msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
@@ -282,6 +327,7 @@ async fn run_batch(
 async fn run_batch_sync(
     clients: &[Client],
     stream_ids: &[u32],
+    names: &[Vec<u8>],
     total: usize,
     batch_size: usize,
     payload: &Arc<[u8]>,
@@ -290,14 +336,16 @@ async fn run_batch_sync(
     let mut js = tokio::task::JoinSet::new();
     for (i, client) in clients.iter().enumerate() {
         let c = client.clone();
-        let stream_id = stream_ids[i % stream_ids.len()];
+        let slot = i % stream_ids.len();
+        let stream_id = stream_ids[slot];
+        let subject = stream_subject(&names[slot]);
         let payload = payload.clone();
         js.spawn(async move {
             let payload_bytes = Bytes::copy_from_slice(&payload[..]);
             let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
             for _ in 0..batch_size {
                 entries.push(BatchEntry {
-                    subject: b"bench.msg".as_slice(),
+                    subject: &subject,
                     msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
@@ -324,6 +372,7 @@ async fn run_batch_sync(
 async fn prefill_streams(
     client: &Client,
     stream_ids: &[u32],
+    names: &[Vec<u8>],
     n: usize,
     msgs: u32,
     payload: &Arc<[u8]>,
@@ -331,7 +380,9 @@ async fn prefill_streams(
     let mut js = tokio::task::JoinSet::new();
     for i in 0..n {
         let c = client.clone();
-        let stream_id = stream_ids[i % stream_ids.len()];
+        let slot = i % stream_ids.len();
+        let stream_id = stream_ids[slot];
+        let subject = stream_subject(&names[slot]);
         let payload = payload.clone();
         let total = msgs as usize;
         let batches = total.div_ceil(BATCH_SIZE);
@@ -340,7 +391,7 @@ async fn prefill_streams(
             let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(BATCH_SIZE);
             for _ in 0..BATCH_SIZE {
                 entries.push(BatchEntry {
-                    subject: b"bench.msg".as_slice(),
+                    subject: &subject,
                     msg_id: &[],
                     payload: payload_bytes.clone(),
                 });
@@ -617,7 +668,7 @@ fn main() {
                 let stream_ids = reset_streams(&setup_client, &stream_names).await;
                 let _ = tokio::time::timeout(
                     LEVEL_TIMEOUT,
-                    run_single(&clients, &stream_ids, 100, &payload),
+                    run_single(&clients, &stream_ids, &stream_names, 100, &payload),
                 )
                 .await;
 
@@ -628,7 +679,13 @@ fn main() {
                 for _ in 0..iterations {
                     match tokio::time::timeout(
                         LEVEL_TIMEOUT,
-                        run_single(&clients, &stream_ids, msgs_per_client, &payload),
+                        run_single(
+                            &clients,
+                            &stream_ids,
+                            &stream_names,
+                            msgs_per_client,
+                            &payload,
+                        ),
                     )
                     .await
                     {
@@ -687,6 +744,7 @@ fn main() {
                     run_batch(
                         &clients,
                         &stream_ids,
+                        &stream_names,
                         msgs_per_client as usize,
                         batch_size,
                         &payload,
@@ -704,6 +762,7 @@ fn main() {
                         run_batch(
                             &clients,
                             &stream_ids,
+                            &stream_names,
                             msgs_per_client as usize,
                             batch_size,
                             &payload,
@@ -766,6 +825,7 @@ fn main() {
                     run_batch_sync(
                         &clients,
                         &stream_ids,
+                        &stream_names,
                         msgs_per_client as usize,
                         batch_size,
                         &payload,
@@ -783,6 +843,7 @@ fn main() {
                         run_batch_sync(
                             &clients,
                             &stream_ids,
+                            &stream_names,
                             msgs_per_client as usize,
                             batch_size,
                             &payload,
@@ -838,7 +899,7 @@ fn main() {
                     .collect();
                 let rp_ids = reset_streams(&setup_client, &rp_names).await;
 
-                prefill_streams(&setup_client, &rp_ids, n, replay_msgs, &payload).await;
+                prefill_streams(&setup_client, &rp_ids, &rp_names, n, replay_msgs, &payload).await;
 
                 // One real TCP connection per consumer — matches the publish
                 // mode topology and lets replay throughput scale with conns.
@@ -935,10 +996,12 @@ fn main() {
         if run_fanout {
             let n_clients = 3usize;
             let n_consumers_per_client = 3usize;
+            const SUBS_PER_CONSUMER: usize = 3;
             let total_consumers = n_clients * n_consumers_per_client;
+            let total_subs = total_consumers * SUBS_PER_CONSUMER;
 
             println!(
-        "\n[ replay_fanout — {replay_msgs} msgs, {n_clients} clients × {n_consumers_per_client} consumers, fanout ]"
+        "\n[ replay_fanout — {replay_msgs} msgs, {n_clients} clients × {n_consumers_per_client} consumers × {SUBS_PER_CONSUMER} subs, fanout ]"
     );
             println!(
                 "  {:30} | {:>9} | {:>12} | {:>10} | {:>8} | {:>8} | {:>7}",
@@ -947,14 +1010,22 @@ fn main() {
             println!("  {}", "-".repeat(100));
 
             rt.block_on(async {
-                // Create fanout stream
+                // Its own slice, disjoint from every `ingest.{i}.>` above.
                 let fanout_name = b"fanout_bench".as_slice();
-                let _ = setup_client.delete_stream(fanout_name).await.ok();
-                let resp = setup_client
-                    .create_stream(fanout_name, b">", 0, 0, 0, 1, JOURNAL_KIND, 0, 0, 0)
+                let created = StreamBuilder::new(fanout_name)
+                    .filter(FANOUT_FILTER)
+                    .journal_kind(JOURNAL_KIND_ENUM)
+                    .upsert(&setup_client)
                     .await
-                    .expect("create fanout stream");
-                let fanout_stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
+                    .expect("upsert fanout stream");
+                if !created {
+                    let _ = setup_client.purge_stream(fanout_name).await.ok();
+                }
+                let info = setup_client
+                    .get_stream(fanout_name)
+                    .await
+                    .expect("get fanout stream");
+                let fanout_stream_id = u64::from_le_bytes(info[..8].try_into().unwrap()) as u32;
 
                 let mut clients = Vec::with_capacity(n_clients);
                 for _ in 0..n_clients {
@@ -985,11 +1056,19 @@ fn main() {
                             .await
                             .expect("create fanout consumer");
                         let consumer_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
-                        let handle = client
-                            .subscribe(fanout_stream_id, consumer_id, b"")
-                            .await
-                            .expect("subscribe");
-                        handles.push((ci, consumer_id, handle));
+                        // SUBS_PER_CONSUMER subscriptions on ONE consumer. The
+                        // broker still puts a single copy per (connection,
+                        // consumer) on the wire — the fan-out to siblings is the
+                        // client's, in its own memory. So the wire cost is flat
+                        // and only the delivery count multiplies. What this
+                        // measures is whether that local fan-out is free.
+                        for _ in 0..SUBS_PER_CONSUMER {
+                            let handle = client
+                                .subscribe(fanout_stream_id, consumer_id, b"")
+                                .await
+                                .expect("subscribe");
+                            handles.push((ci, consumer_id, handle));
+                        }
                     }
                 }
 
@@ -1008,7 +1087,7 @@ fn main() {
                     let mut entries: Vec<BatchEntry<'_>> = Vec::with_capacity(batch_size);
                     for _ in 0..batch_size {
                         entries.push(BatchEntry {
-                            subject: b"bench.msg".as_slice(),
+                            subject: FANOUT_SUBJECT,
                             msg_id: &[],
                             payload: payload_bytes.clone(),
                         });
@@ -1084,11 +1163,21 @@ fn main() {
 
                 let total_delivered: u64 = results.iter().map(|r| r.2 as u64).sum();
                 let aggregate_rate = total_delivered as f64 / total_elapsed.as_secs_f64();
-                let per_consumer_rate = aggregate_rate / total_consumers as f64;
+                let per_consumer_rate = aggregate_rate / total_subs as f64;
+
+                // Deliveries are `total_subs × replay_msgs`; wire copies are
+                // `total_consumers × replay_msgs`. Printing both keeps the
+                // aggregate rate honest — it counts handles, not bytes.
+                eprintln!(
+                    "[fanout] {} deliveries over {} wire copies ({}× local fan-out)",
+                    total_delivered,
+                    total_consumers as u64 * replay_msgs as u64,
+                    SUBS_PER_CONSUMER,
+                );
 
                 let label = format!(
-                    "{}cli×{}cons/{}msgs",
-                    n_clients, n_consumers_per_client, replay_msgs
+                    "{}cli×{}cons×{}sub/{}msgs",
+                    n_clients, n_consumers_per_client, SUBS_PER_CONSUMER, replay_msgs
                 );
                 print_result(&BenchResult {
                     label,

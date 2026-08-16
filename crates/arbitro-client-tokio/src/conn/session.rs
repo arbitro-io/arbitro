@@ -205,7 +205,7 @@ async fn write_handshake<W: AsyncWrite + Unpin + ?Sized>(
 /// place left that gives it a fresh timeout window after a reconnect.
 fn replay_subscriptions(inner: &Inner, lease: &mut WriteLease) {
     inner.last_pong_ns.store(Inner::now_ns(), Ordering::Relaxed);
-    for sub_body in inner.subscriptions.all_sub_bodies() {
+    for sub_body in inner.subscriptions.replay_frames() {
         let _ = lease.try_send(WriteFrame::Mono(sub_body));
     }
 }
@@ -236,7 +236,7 @@ fn send_ack_state_reqs(inner: &Inner, lease: &mut WriteLease) {
     }
     // Durable-dedup consumers with no outstanding deferred acks still need
     // the cursor snapshot (idle consumers never see an AckBatchResp).
-    for consumer_id in inner.subscriptions.slotted_consumer_ids() {
+    for consumer_id in inner.subscriptions.dedup_consumers() {
         if !sent.insert(consumer_id) {
             continue; // already covered by the deferred-ack sweep above
         }
@@ -301,6 +301,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::state::subscriptions::Registration;
     use super::*;
     use crate::config::ClientConfig;
     use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions};
@@ -342,9 +343,25 @@ mod tests {
         let slot = store.slot("s", "c").unwrap();
         let _rx7 = inner
             .subscriptions
-            .register(7, 1, bytes::Bytes::new(), Some(slot));
+            .register(Registration {
+                consumer_id: 7,
+                stream_id: 1,
+                fanout: false,
+                dedup: Some(slot),
+                sub_id: 7,
+                filter: b"",
+                frame: bytes::Bytes::new(),
+            });
         // Consumer 8: plain subscription, no slot, no deferred acks.
-        let _rx8 = inner.subscriptions.register(8, 1, bytes::Bytes::new(), None);
+        let _rx8 = inner.subscriptions.register(Registration {
+            consumer_id: 8,
+            stream_id: 1,
+            fanout: false,
+            dedup: None,
+            sub_id: 8,
+            filter: b"",
+            frame: bytes::Bytes::new(),
+        });
 
         let mut lease = pool.acquire().expect("fresh pool has slots");
         send_ack_state_reqs(&inner, &mut lease);

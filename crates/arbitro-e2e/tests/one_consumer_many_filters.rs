@@ -403,6 +403,123 @@ async fn two_consumers_with_the_same_name() {
 }
 
 
+/// Both shapes at once: three connections × three CONSUMERS × three filtered
+/// SUBSCRIPTIONS. Twenty-seven bindings over the same six-message fixture.
+///
+/// This is `benches/throughput.rs::replay_fanout`'s topology (nine consumers
+/// over three sockets) with the filters the tests above use, so the two axes
+/// are separated. Consumers are independent — separate cursors, no collapse
+/// between them, and folding them would be wrong. Subscriptions of ONE
+/// consumer are not: the broker sends that consumer one copy per connection
+/// and the client hands it to whichever filters accept it.
+///
+/// So per connection the wire carries 3 consumers × 6 = 18 copies, and the
+/// handles see 3 × 11 = 33 deliveries. The gap is exactly what the collapse
+/// buys, measured rather than argued.
+#[tokio::test]
+async fn nine_consumers_each_with_three_filtered_subscriptions() {
+    let mut server = TestServerBuilder::new().spawn().await;
+    let admin = server.connect().await;
+
+    let stream_id = StreamBuilder::new(b"triage_nine")
+        .filter(b"*.>")
+        .create(&admin)
+        .await
+        .expect("stream");
+
+    const CONNS: usize = 3;
+    const CONSUMERS_PER_CONN: usize = 3;
+    /// 3 orders + 2 payments + 6 catch-all, per consumer.
+    const PER_CONSUMER: usize = ORDERS + PAYMENTS + TOTAL;
+
+    let mut conns = Vec::with_capacity(CONNS);
+    let mut subs = Vec::with_capacity(CONNS);
+    for ci in 0..CONNS {
+        let c = server.connect().await;
+        let mut row = Vec::with_capacity(CONSUMERS_PER_CONN);
+        for si in 0..CONSUMERS_PER_CONN {
+            // Its own consumer, wide open. Every narrowing is subscription-side.
+            let consumer_id = ConsumerBuilder::new(format!("w_{ci}_{si}").as_bytes())
+                .ack_policy(AckPolicy::Explicit)
+                .deliver_mode(DeliverMode::Fanout)
+                .max_inflight(1_000)
+                .ack_wait_ms(30_000)
+                .create(&admin, stream_id)
+                .await
+                .expect("consumer");
+
+            let orders = c
+                .subscribe(stream_id, consumer_id, b"orders.*")
+                .await
+                .expect("subscribe orders");
+            let pay = c
+                .subscribe(stream_id, consumer_id, b"payments.*")
+                .await
+                .expect("subscribe payments");
+            let all = c
+                .subscribe(stream_id, consumer_id, b"*.>")
+                .await
+                .expect("subscribe all");
+            row.push((orders, pay, all));
+        }
+        conns.push(c);
+        subs.push(row);
+    }
+
+    publish_fixture(&admin, stream_id).await;
+
+    let mut shape = Vec::with_capacity(CONNS);
+    for (ci, row) in subs.iter_mut().enumerate() {
+        let mut per_conn = Vec::with_capacity(CONSUMERS_PER_CONN);
+        for (si, (orders, pay, all)) in row.iter_mut().enumerate() {
+            let got_orders = drain(orders).await;
+            let got_pay = drain(pay).await;
+            let got_all = drain(all).await;
+            report(&format!("conn {ci} consumer {si}"), &got_orders, &got_pay, &got_all);
+            per_conn.push((got_orders, got_pay, got_all));
+        }
+        shape.push(per_conn);
+    }
+
+    admin
+        .delete_stream(b"triage_nine")
+        .await
+        .expect("delete stream");
+    server.shutdown().await;
+
+    let counts: Vec<Vec<(usize, usize, usize)>> = shape
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|(o, p, a)| (o.len(), p.len(), a.len()))
+                .collect()
+        })
+        .collect();
+    println!("[nine] per connection (orders, payments, all): {counts:?}");
+
+    for (ci, row) in shape.iter().enumerate() {
+        for (si, (o, p, a)) in row.iter().enumerate() {
+            let case = format!("nine c{ci}s{si}");
+            assert_outcome(&case, o, p, a);
+            let total = o.len() + p.len() + a.len();
+            assert_eq!(
+                total, PER_CONSUMER,
+                "[{case}] {total} deliveries, expected {PER_CONSUMER} \
+                 ({ORDERS} orders + {PAYMENTS} payments + {TOTAL} catch-all): {counts:?}"
+            );
+        }
+    }
+
+    // Nine independent consumers, so nothing may be shared between them:
+    // every row identical, and no consumer short of a full copy.
+    let total: usize = counts.iter().flatten().map(|(o, p, a)| o + p + a).sum();
+    assert_eq!(
+        total,
+        CONNS * CONSUMERS_PER_CONN * PER_CONSUMER,
+        "[nine] {total} deliveries across the nine consumers: {counts:?}"
+    );
+}
+
 async fn setup(admin: &Client, stream: &[u8], consumer: &[u8]) -> (u32, u32) {
     let stream_id = StreamBuilder::new(stream)
         .filter(b"*.>")

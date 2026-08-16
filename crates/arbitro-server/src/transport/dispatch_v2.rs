@@ -899,7 +899,7 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.ack_seq.get(),
-                sub_id: SubscriptionId(f.body.sub_id.get()),
+                sub_id: f.body.sub_id.get(),
             }],
         )
         .await;
@@ -926,7 +926,7 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         entries.push(AckEntry {
             stream_id: seq_stream,
             seq: e.seq.get(),
-            sub_id: SubscriptionId(e.sub_id.get()),
+            sub_id: e.sub_id.get(),
         });
     }
     let _ = shard.ack(consumer_id, conn_id, entries).await;
@@ -1055,7 +1055,7 @@ async fn v2_ack_batch(
                 stream_id: seq_stream,
                 seq,
                 // This frame carries bare seqs; 0 means "unknown, scan".
-                sub_id: SubscriptionId(0),
+                sub_id: 0,
             });
         }
     }
@@ -1099,7 +1099,7 @@ async fn v2_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
                 stream_id: seq_stream,
                 seq: f.body.nack_seq.get(),
                 // NackAction spends its spare word on delay_ms.
-                sub_id: SubscriptionId(0),
+                sub_id: 0,
             }],
             0, // single nack frame has no delay field
         )
@@ -1126,7 +1126,7 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .map(|e| AckEntry {
             stream_id: seq_stream,
             seq: e.seq.get(),
-            sub_id: SubscriptionId(0),
+            sub_id: 0,
         })
         .collect();
     // All entries in a batch share the same delay — take max.
@@ -1238,6 +1238,9 @@ async fn v2_subscribe(
             },
             SubscriptionConfig {
                 id: subscription_id,
+                // What the client chose. It rides every delivery and comes
+                // back on every ack; `id` never leaves the broker.
+                external_id: body.subscription_id,
                 stream_id: seq_stream,
                 consumer_id,
                 filters,
@@ -1261,8 +1264,14 @@ async fn v2_subscribe(
     // multi-subscribes (or follows a redirect) confirm WHICH consumer
     // is now active without an extra round-trip. Backward compatible
     // for clients that ignore `ref_seq`.
+    // `ref_seq` keeps `consumer_id` in its low 32 bits (old clients read
+    // exactly that) and spends bit 63 on the consumer's delivery mode. The
+    // broker owns that mode: a caller whose `create_consumer` found an
+    // EXISTING consumer would otherwise believe the `deliver_mode` it sent
+    // rather than the one in force, and silently skip the local fan-out.
+    let ref_seq = (consumer_id.0 as u64) | ((queue_id == QueueId(0)) as u64) << 63;
     match reply {
-        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, consumer_id.0 as u64),
+        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, ref_seq),
         Ok(false) => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
         Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
@@ -1661,7 +1670,7 @@ async fn v2_ack_term(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.ack_seq.get(),
-                sub_id: SubscriptionId(f.body.sub_id.get()),
+                sub_id: f.body.sub_id.get(),
             }],
         )
         .await;

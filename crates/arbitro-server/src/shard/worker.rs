@@ -69,6 +69,9 @@ pub struct ActiveBinding {
     pub(super) consumer_id: ConsumerId,
     /// One binding is one subscription — the key the match table stamps by.
     pub(super) subscription_id: SubscriptionId,
+    /// The id the client chose. Stamped on every delivery so the client can
+    /// route by a number it recognises.
+    pub(super) external_sub_id: u32,
     pub(super) stream_id: StreamId,
     pub(super) queue_id: QueueId,
     /// Configured `max_inflight` cached at subscribe time.
@@ -989,7 +992,7 @@ impl CommandWorker {
                 stream_id,
                 seq: entry.seq,
                 // Broker-side auto-nack: no client frame, so no id.
-                sub_id: SubscriptionId(0),
+                sub_id: 0,
             };
             let delta = self.engine.execute(&Command::Nack {
                 // Broker-side auto-nack: no client frame, no connection.
@@ -1300,6 +1303,7 @@ impl CommandWorker {
                 connection_id: b.connection_id,
                 consumer_id: b.consumer_id,
                 subscription_id: b.subscription_id,
+                external_sub_id: b.external_sub_id,
                 stream_id: b.stream_id,
                 queue_id: b.queue_id,
                 max_inflight: b.max_inflight,

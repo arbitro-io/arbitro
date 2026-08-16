@@ -13,6 +13,7 @@ use tracing::warn;
 
 use crate::consume::message::{AckCmd, Message, NackCmd};
 use crate::error::ClientError;
+use crate::state::subscriptions::Registration;
 use crate::state::Inner;
 use crate::transport::encode::{
     encode_ack_batch_v2, encode_ack_state_req_v2, encode_batch_ack_v2, encode_batch_nack_v2,
@@ -33,6 +34,7 @@ pub mod message;
 /// sufficient for correctness).
 pub struct SubscriptionHandle {
     pub(crate) rx: mpsc::Receiver<Message>,
+    pub(crate) sub_id: u32,
     pub(crate) consumer_id: u32,
     pub(crate) inner: Arc<Inner>,
 }
@@ -58,7 +60,10 @@ impl SubscriptionHandle {
 
 impl Drop for SubscriptionHandle {
     fn drop(&mut self) {
-        self.inner.subscriptions.remove(self.consumer_id);
+        // Retires THIS subscription; siblings on the same consumer keep
+        // running, and the registry drops the consumer once the last one
+        // goes. Nothing here has to sequence that.
+        self.inner.subscriptions.remove(self.sub_id);
         // Fire-and-forget Unsubscribe to the broker.
         // Silently dropped if the pool is exhausted, full, or torn down.
         let seq = self.inner.seq_alloc.next();
@@ -110,11 +115,25 @@ pub(crate) fn subscribe_async(
 
     // 1. Register channel BEFORE enqueuing the SubFrame.
     //    Any Deliver frames that arrive while the round-trip is in flight
-    //    are buffered in the channel (capacity = 4096).
+    //    are buffered in the channel (capacity = 4096). Keying the registry
+    //    by the id THIS client picked is what makes that possible: the
+    //    broker echoes it back on every delivery, so nothing has to be
+    //    learned from the reply before routing can work.
+    //
+    //    `fanout` is the exception — only the broker knows the consumer's
+    //    mode, and it reports it in the reply. Until then the subscription
+    //    behaves as queue: at worst a message in that window reaches this
+    //    subscription and not its siblings.
     let has_slot = slot.is_some();
-    let rx = inner
-        .subscriptions
-        .register(consumer_id, stream_id, sub_body.clone(), slot);
+    let rx = inner.subscriptions.register(Registration {
+        consumer_id,
+        stream_id,
+        fanout: false,
+        dedup: slot,
+        sub_id: subscription_id,
+        filter,
+        frame: sub_body.clone(),
+    });
 
     // 2. Reserve a pending slot for the RepOk reply.
     let rx_pending = inner.pending.register(seq);
@@ -133,7 +152,15 @@ pub(crate) fn subscribe_async(
                 .and_then(|r| r)
         };
         match wire_result {
-            Ok(_) => {
+            Ok(body) => {
+                // RepOk body: consumer_id in the low 32 bits, delivery mode
+                // in bit 63. See `dispatch_v2::v2_subscribe`.
+                if let Some(b) = body.get(..8) {
+                    let ref_seq = u64::from_le_bytes(b.try_into().unwrap());
+                    inner2
+                        .subscriptions
+                        .set_fanout(consumer_id, ref_seq >> 63 == 1);
+                }
                 // On-connect ackstore purge: the WAL may hold entries recorded
                 // by a previous, dead session (its `AckBatchResp` never
                 // arrived, so nothing confirmed them). Ask the broker for its
@@ -154,12 +181,13 @@ pub(crate) fn subscribe_async(
                 }
                 Ok(SubscriptionHandle {
                     rx,
+                    sub_id: subscription_id,
                     consumer_id,
                     inner: inner2,
                 })
             }
             Err(e) => {
-                inner2.subscriptions.remove(consumer_id);
+                inner2.subscriptions.remove(subscription_id);
                 Err(e)
             }
         }

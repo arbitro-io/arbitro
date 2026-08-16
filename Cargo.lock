@@ -49,6 +49,7 @@ dependencies = [
  "bytes",
  "criterion 0.7.0",
  "fastrand",
+ "foldhash",
  "libc",
  "rustls",
  "serde",

@@ -37,7 +37,7 @@ impl CommandWorker {
         let catalog = &self.engine.ctx().catalog;
         let mut named = false;
         for entry in entries {
-            if entry.sub_id.0 == 0 {
+            if entry.sub_id == 0 {
                 continue;
             }
 
@@ -85,7 +85,7 @@ impl CommandWorker {
             for entry in &cmd.entries {
                 // Named acks reach their binding in one hash — the gate above
                 // already proved the pair resolves to this consumer.
-                if entry.sub_id.0 != 0 {
+                if entry.sub_id != 0 {
                     if let Some(b) = catalog.binding_for_subscription(conn, entry.sub_id) {
                         if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
                             floors.record_acked(cmd.consumer_id.0, entry.seq);
@@ -413,6 +413,13 @@ impl CommandWorker {
 
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
+                let external_sub_id = self
+                    .engine
+                    .ctx()
+                    .catalog
+                    .binding(binding_id)
+                    .map(|b| b.external_sub_id)
+                    .unwrap_or(0);
                 if let Some(write_tx) = self.registry.get_write_tx(connection_id.0) {
                     let write_failed = self
                         .registry
@@ -425,6 +432,7 @@ impl CommandWorker {
                         connection_id,
                         consumer_id,
                         subscription_id,
+                        external_sub_id,
                         stream_id,
                         queue_id,
                         max_inflight,
@@ -726,6 +734,13 @@ impl CommandWorker {
                 self.ack_floors.seed(consumer_id.0, deliver_floor);
             }
 
+            let external_sub_id = self
+                .engine
+                .ctx()
+                .catalog
+                .binding(binding_id)
+                .map(|b| b.external_sub_id)
+                .unwrap_or(0);
             if let Some(write_tx) = self.registry.get_write_tx(cmd.connection_id.0) {
                 let write_failed = self
                     .registry
@@ -738,6 +753,7 @@ impl CommandWorker {
                     connection_id: cmd.connection_id,
                     consumer_id,
                     subscription_id: cmd.subscription_id,
+                    external_sub_id,
                     stream_id,
                     queue_id,
                     max_inflight,

@@ -24,6 +24,7 @@ tracing       = { workspace = true }
 bytes         = { workspace = true }
 zerocopy      = { workspace = true }
 fastrand      = "2"
+foldhash      = "0.1"
 thiserror     = "1"
 
 # TLS (optional — enable with `features = ["tls"]`)

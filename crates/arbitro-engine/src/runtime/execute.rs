@@ -87,7 +87,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // Named entry: (connection, subscription) is a key, so the
                 // binding comes back in one hash. Nothing else in this arm
                 // can reach a binding the connection does not own.
-                if ack.sub_id.0 != 0 {
+                if ack.sub_id != 0 {
                     if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
                     {
                         if let Some(binding) = ctx.catalog.binding_mut(bid) {
@@ -150,7 +150,7 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // Named entry: (connection, subscription) is a key, so the
                 // binding comes back in one hash. Nothing else in this arm
                 // can reach a binding the connection does not own.
-                if ack.sub_id.0 != 0 {
+                if ack.sub_id != 0 {
                     if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
                     {
                         if let Some(binding) = ctx.catalog.binding_mut(bid) {

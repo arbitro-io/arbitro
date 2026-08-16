@@ -984,7 +984,7 @@ fn dispatch_recipients(
             // client keys its handles by it, and echoes it back on ack so the
             // broker reaches the pending in O(1) instead of scanning every
             // binding of the consumer.
-            binding.subscription_id.0,
+            binding.external_sub_id,
             reply_to,
             actual_payload,
         );

@@ -242,7 +242,7 @@ fn dispatch_ack_state_rep(inner: &Arc<Inner>, frame: &Bytes) {
     // little disk; a wrongly dropped one costs a duplicate execution of
     // real work.
     if status == ACK_STATUS_OK {
-        if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
+        if let Some(slot) = inner.subscriptions.dedup_of(consumer_id) {
             if let Err(e) = slot.confirm_up_to(cursor) {
                 inner
                     .metrics
@@ -305,7 +305,7 @@ fn dispatch_ack_batch_resp(inner: &Arc<Inner>, frame: &Bytes) {
 
     // Durable dedup cleanup: the broker confirmed cumulative ack up to
     // `new_cursor`, so those seqs are safe to drop from the WAL live set.
-    if let Some(slot) = inner.subscriptions.slot_of(consumer_id) {
+    if let Some(slot) = inner.subscriptions.dedup_of(consumer_id) {
         if let Err(e) = slot.confirm_up_to(new_cursor) {
             inner
                 .metrics
@@ -341,6 +341,7 @@ fn warn_rate_limited(consumer_id: u32, seq: u64, high_seq: u64) {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::subscriptions::Registration;
     use super::*;
     use crate::config::ClientConfig;
     use crate::state::{pending::Pending, seq::SeqAllocator, subscriptions::Subscriptions, Inner};
@@ -457,7 +458,15 @@ mod tests {
         let inner = make_inner_with_store(CancellationToken::new(), Some(store));
         let _rx = inner
             .subscriptions
-            .register(cid, 1, Bytes::new(), Some(slot.clone()));
+            .register(Registration {
+                consumer_id: cid,
+                stream_id: 1,
+                fanout: false,
+                dedup: Some(slot.clone()),
+                sub_id: cid,
+                filter: b"",
+                frame: Bytes::new(),
+            });
         (inner, slot)
     }
 

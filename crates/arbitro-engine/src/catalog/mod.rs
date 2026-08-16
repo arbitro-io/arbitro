@@ -65,6 +65,10 @@ pub struct ConsumerConfig {
 #[derive(Debug, Clone)]
 pub struct SubscriptionConfig {
     pub id: SubscriptionId,
+    /// The id the CLIENT chose, unique only within its connection. Rides
+    /// every delivery and comes back on every ack: the client cannot
+    /// recognise `id`, which the broker assigns and never tells it.
+    pub external_id: u32,
     pub stream_id: StreamId,
     pub consumer_id: ConsumerId,
     /// Subject filters. Empty = accept all subjects (catch-all).
@@ -103,6 +107,7 @@ pub struct ConsumerInfo {
 pub struct SubscriptionInfo {
     pub stream_id: StreamId,
     pub consumer_id: ConsumerId,
+    pub external_id: u32,
     pub filters: Vec<Vec<u8>>,
 }
 
@@ -130,6 +135,9 @@ pub struct Binding {
     pub consumer_id: ConsumerId,
     pub connection_id: ConnectionId,
     pub subscription_id: SubscriptionId,
+    /// See [`SubscriptionConfig::external_id`]. What the drain stamps on
+    /// deliveries and what the ack index is keyed by.
+    pub external_sub_id: u32,
     pub queue_id: QueueId,
     pub max_inflight: u32,
     pub paused: bool,
@@ -188,8 +196,7 @@ pub struct Catalog {
     /// Maintained in exactly the two places `by_subscription` is — the
     /// insert in `subscribe` and the remove in `retire_binding`, which is
     /// the only path that ever drops a binding.
-    by_conn_subscription:
-        HashMap<(ConnectionId, SubscriptionId), BindingId, foldhash::fast::FixedState>,
+    by_conn_subscription: HashMap<(ConnectionId, u32), BindingId, foldhash::fast::FixedState>,
 
     /// `(connection, consumer) → live binding count`, for frames that name
     /// no subscription (`AckBatchReq`'s bare seqs, nacks) and can only be
@@ -461,6 +468,7 @@ impl Catalog {
             SubscriptionInfo {
                 stream_id: config.stream_id,
                 consumer_id: config.consumer_id,
+                external_id: config.external_id,
                 filters: filters.clone(),
             },
         );
@@ -564,6 +572,7 @@ impl Catalog {
 
         let stream_id = sub.stream_id;
         let consumer_id = sub.consumer_id;
+        let external_sub_id = sub.external_id;
         let queue_id = consumer.queue_id;
         let max_inflight = consumer.max_inflight;
         let paused = consumer.paused;
@@ -582,6 +591,7 @@ impl Catalog {
             consumer_id,
             connection_id,
             subscription_id,
+            external_sub_id,
             queue_id,
             max_inflight,
             paused,
@@ -604,7 +614,7 @@ impl Catalog {
             .push(binding_id);
         self.by_subscription.insert(subscription_id, binding_id);
         self.by_conn_subscription
-            .insert((connection_id, subscription_id), binding_id);
+            .insert((connection_id, external_sub_id), binding_id);
         *self
             .by_conn_consumer
             .entry((connection_id, consumer_id))
@@ -649,7 +659,7 @@ impl Catalog {
         }
         // Same guard: a replacement binding on the same (conn, sub) may
         // already own the slot, and retiring the old one must not evict it.
-        let conn_sub = (binding.connection_id, binding.subscription_id);
+        let conn_sub = (binding.connection_id, binding.external_sub_id);
         if self.by_conn_subscription.get(&conn_sub) == Some(&binding_id) {
             self.by_conn_subscription.remove(&conn_sub);
         }
@@ -716,33 +726,21 @@ impl Catalog {
     /// Just the id, for callers that need to borrow the binding mutably
     /// afterwards — the index borrow ends before `binding_mut` starts.
     #[inline]
-    pub fn binding_id_for_subscription(
-        &self,
-        conn: ConnectionId,
-        sub: SubscriptionId,
-    ) -> Option<BindingId> {
+    pub fn binding_id_for_subscription(&self, conn: ConnectionId, sub: u32) -> Option<BindingId> {
         self.by_conn_subscription.get(&(conn, sub)).copied()
     }
 
     /// The binding of `sub` on `conn`. One hash into the index, one into
     /// the store — no scan, constant whatever the consumer's fan-out.
     #[inline]
-    pub fn binding_for_subscription(
-        &self,
-        conn: ConnectionId,
-        sub: SubscriptionId,
-    ) -> Option<&Binding> {
+    pub fn binding_for_subscription(&self, conn: ConnectionId, sub: u32) -> Option<&Binding> {
         let bid = *self.by_conn_subscription.get(&(conn, sub))?;
         self.bindings.get(&bid)
     }
 
     /// Mutable twin — what the ack path needs to take the pending out.
     #[inline]
-    pub fn binding_for_subscription_mut(
-        &mut self,
-        conn: ConnectionId,
-        sub: SubscriptionId,
-    ) -> Option<&mut Binding> {
+    pub fn binding_for_subscription_mut(&mut self, conn: ConnectionId, sub: u32) -> Option<&mut Binding> {
         let bid = *self.by_conn_subscription.get(&(conn, sub))?;
         self.bindings.get_mut(&bid)
     }
@@ -1081,6 +1079,7 @@ mod tests {
 
         cat.ensure_subscription(SubscriptionConfig {
             id: SubscriptionId(20),
+            external_id: 20,
             stream_id: StreamId(1),
             consumer_id: ConsumerId(10),
             filters: vec![b"message.meta.>".to_vec(), b"message.qr.>".to_vec()],
@@ -1114,6 +1113,7 @@ mod tests {
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
             id: SubscriptionId(1),
+            external_id: 1,
             stream_id: StreamId(1),
             consumer_id: ConsumerId(1),
             filters: vec![],
@@ -1150,6 +1150,7 @@ mod tests {
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
             id: SubscriptionId(1),
+            external_id: 1,
             stream_id: StreamId(1),
             consumer_id: ConsumerId(1),
             filters: vec![],
@@ -1191,6 +1192,7 @@ mod tests {
         .unwrap();
         cat.ensure_subscription(SubscriptionConfig {
             id: SubscriptionId(1),
+            external_id: 1,
             stream_id: StreamId(1),
             consumer_id: ConsumerId(1),
             filters: vec![],
@@ -1252,6 +1254,7 @@ mod tests {
             .unwrap();
             cat.ensure_subscription(SubscriptionConfig {
                 id: SubscriptionId(1),
+                external_id: 1,
                 stream_id: StreamId(1),
                 consumer_id: ConsumerId(1),
                 filters: vec![],
@@ -1268,12 +1271,12 @@ mod tests {
             .unwrap();
         assert_eq!(cat.conn_subscription_index_len(), 1);
         assert!(cat
-            .binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+            .binding_for_subscription(ConnectionId(42), 1)
             .is_some());
         cat.retire_binding(bid, &mut ev);
         assert_eq!(cat.conn_subscription_index_len(), 0, "direct retire leaked");
         assert!(cat
-            .binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+            .binding_for_subscription(ConnectionId(42), 1)
             .is_none());
 
         // Re-subscribe: the old binding is retired while the new one already
@@ -1290,7 +1293,7 @@ mod tests {
             "re-subscribe must replace, not accumulate"
         );
         assert_eq!(
-            cat.binding_for_subscription(ConnectionId(42), SubscriptionId(1))
+            cat.binding_for_subscription(ConnectionId(42), 1)
                 .map(|b| b.binding_id),
             Some(second),
             "the live binding is the replacement"
@@ -1347,6 +1350,7 @@ mod tests {
         for id in [1u32, 2] {
             cat.ensure_subscription(SubscriptionConfig {
                 id: SubscriptionId(id),
+                external_id: id,
                 stream_id: StreamId(1),
                 consumer_id: ConsumerId(1),
                 filters: vec![],

@@ -399,6 +399,7 @@ mod engine_tests {
         engine
             .create_subscription(catalog::SubscriptionConfig {
                 id: SubscriptionId(1),
+                external_id: 1,
                 stream_id: StreamId(1),
                 consumer_id: ConsumerId(1),
                 filters: vec![],
@@ -436,7 +437,7 @@ mod engine_tests {
         let acks = [command::AckEntry {
             stream_id: StreamId(1),
             seq: 1,
-            sub_id: SubscriptionId(1),
+            sub_id: 1,
         }];
         let _events = engine.execute(&command::Command::Ack {
             conn_id: ConnectionId(100),
@@ -480,6 +481,7 @@ mod engine_tests {
         engine
             .create_subscription(catalog::SubscriptionConfig {
                 id: SubscriptionId(1),
+                external_id: 1,
                 stream_id: StreamId(1),
                 consumer_id: ConsumerId(1),
                 filters: vec![],
@@ -523,6 +525,7 @@ mod engine_tests {
         engine
             .create_subscription(catalog::SubscriptionConfig {
                 id: SubscriptionId(1),
+                external_id: 1,
                 stream_id: StreamId(1),
                 consumer_id: ConsumerId(1),
                 filters: vec![],
