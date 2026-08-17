@@ -219,8 +219,7 @@ impl<'a> StreamBuilder<'a> {
                 format!(
                     "stream name is {} bytes, max is {MAX_NAME_LEN}",
                     self.name.len()
-                )
-                .into(),
+                ),
             ));
         }
         if let Some(bad) = self
@@ -229,10 +228,7 @@ impl<'a> StreamBuilder<'a> {
             .find(|b| !(b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-'))
         {
             return Err(ClientError::InvalidConfig(
-                format!(
-                    "stream name must match [a-zA-Z0-9_-], found byte {bad:#04x}"
-                )
-                .into(),
+                format!("stream name must match [a-zA-Z0-9_-], found byte {bad:#04x}"),
             ));
         }
         if self.filter.is_empty() {

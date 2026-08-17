@@ -30,7 +30,7 @@ pub fn filter_is_not_duplicate(filter: &[u8], claimed: &[&[u8]]) -> Result<(), V
     if is_global(filter) {
         return Ok(());
     }
-    if claimed.iter().any(|other| *other == filter) {
+    if claimed.contains(&filter) {
         return Err(Violation::StreamFilterDuplicate);
     }
     Ok(())

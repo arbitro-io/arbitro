@@ -901,14 +901,22 @@ impl Client {
         .await
     }
 
+    /// Delete a consumer server-side and retire its local routes.
+    ///
+    /// The routing table is dropped only after the broker confirms, so a
+    /// failed delete leaves a consumer that still exists reachable. Leaving
+    /// the routes behind would strand them until teardown, and let them catch
+    /// deliveries if the id were ever recycled.
     pub async fn delete_consumer(&self, consumer_id: u32) -> Result<Bytes, ClientError> {
-        crate::manage::delete_consumer(
+        let resp = crate::manage::delete_consumer(
             &self.inner.pool,
             &self.inner.pending,
             &self.inner.seq_alloc,
             consumer_id,
         )
-        .await
+        .await?;
+        self.inner.subscriptions.remove_consumer(consumer_id);
+        Ok(resp)
     }
 
     /// Pause delivery for a consumer (broker action `0x0506`). The broker

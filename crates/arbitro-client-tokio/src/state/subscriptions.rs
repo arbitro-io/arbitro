@@ -277,40 +277,22 @@ impl Subscriptions {
         g.by_sub.remove(&sub_id);
     }
 
-    /// Retire a consumer and everything under it. Callers deleting a
-    /// consumer server-side call this and nothing else.
+    /// Retire a consumer and everything under it. Called when the broker has
+    /// been told to delete the consumer, so the local routes cannot outlive
+    /// it — a stale route would otherwise sit in the table until teardown and
+    /// catch deliveries if the id were ever recycled.
     pub fn remove_consumer(&self, consumer_id: u32) {
         let mut g = self.inner.write().unwrap();
         drop_consumer(&mut g, consumer_id);
     }
 
-    /// Retire every consumer on a stream. Same contract as
-    /// [`Subscriptions::remove_consumer`], one level up.
-    pub fn remove_stream(&self, stream_id: u32) {
-        let mut g = self.inner.write().unwrap();
-        let doomed: Vec<u32> = g
-            .by_consumer
-            .values()
-            .filter(|c| c.stream_id == stream_id)
-            .map(|c| c.id)
-            .collect();
-        for id in doomed {
-            drop_consumer(&mut g, id);
-        }
-    }
-
-    /// Drop everything. Used on client teardown.
-    pub fn clear(&self) {
-        let mut g = self.inner.write().unwrap();
-        g.by_sub.clear();
-        g.by_consumer.clear();
-    }
+    // The stream-level counterpart is deliberately absent: `delete_stream`
+    // takes a name and the client keeps no name → id map, so it cannot say
+    // which consumers to retire. Deleting a stream therefore still strands
+    // its routes until teardown — the same shape as the consumer leak above,
+    // one level up, and not fixable without that map.
 
     // ── Queries ─────────────────────────────────────────────────────────
-
-    pub fn consumer(&self, consumer_id: u32) -> Option<Arc<Consumer>> {
-        self.inner.read().unwrap().by_consumer.get(&consumer_id).cloned()
-    }
 
     /// Durable dedup slot of a consumer. Used by the broker-cursor path
     /// (`AckBatchResp` / `AckStateRep`), which speaks in consumers.
@@ -501,7 +483,6 @@ mod tests {
         s.register(reg(7, 1, b"", true));
         s.remove(1);
         assert_eq!(s.sizes(), (0, 0), "no consumer left behind");
-        assert!(s.consumer(7).is_none());
     }
 
     #[test]
@@ -515,21 +496,6 @@ mod tests {
         assert_eq!(s.sizes(), (1, 1), "only consumer 8 survives");
         assert!(s.route(1, b"a.x", &mut Vec::new()).is_none());
         assert!(s.route(3, b"anything", &mut Vec::new()).is_some());
-    }
-
-    #[test]
-    fn dropping_a_stream_erases_every_consumer_on_it() {
-        let s = Subscriptions::new();
-        s.register(reg(7, 1, b"", true));
-        s.register(reg(8, 2, b"", true));
-        s.register(Registration {
-            stream_id: 2,
-            ..reg(9, 3, b"", true)
-        });
-
-        s.remove_stream(1);
-        assert_eq!(s.sizes(), (1, 1), "only the consumer on stream 2 survives");
-        assert!(s.route(3, b"x", &mut Vec::new()).is_some());
     }
 
     #[test]
