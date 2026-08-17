@@ -363,6 +363,12 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 last_writer
             };
             let Some(writer) = writer else {
+                crate::lifecycle_trace!(
+                    "31_writer_not_in_index",
+                    frame.connection_id.0,
+                    frame.first_seq,
+                    "shard"
+                );
                 probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, true);
                 flush_results.push((
                     frame.connection_id,
@@ -374,6 +380,12 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 .write_failed
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
+                crate::lifecycle_trace!(
+                    "31_writer_marked_failed",
+                    frame.connection_id.0,
+                    frame.first_seq,
+                    "shard"
+                );
                 probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, false);
                 flush_results.push((
                     frame.connection_id,
@@ -876,6 +888,21 @@ fn dispatch_recipients(
             continue;
         }
         let binding = &bindings[binding_idx];
+
+        // Does the entry's own connection agree with the binding its
+        // stamped index lands on?
+        crate::lifecycle_trace!(
+            "28_pick_conn_match_vs_binding",
+            connection_id.0,
+            binding.connection_id.0,
+            "shard"
+        );
+        crate::lifecycle_trace!(
+            "28_pick_stream_and_consumer",
+            u64::from(binding.stream_id.raw()),
+            u64::from(consumer_id.0),
+            "shard"
+        );
 
         // Fanout collapse: a sibling of this consumer already took the wire
         // copy on this socket, and the client will hand it to this
