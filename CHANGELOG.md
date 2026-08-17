@@ -5,6 +5,59 @@ All notable changes to `arbitro-server` (and the in-tree Rust reference client
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer with
 the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
+## [Unreleased]
+
+### Breaking — a stream owns its slice, outright and alone
+
+Catalog admission rules are now enforced, in one place (`transport::rules`),
+and three of them reject configurations the broker used to accept:
+
+- **A stream may not claim `>`.** It captures every subject, so it overlaps
+  every peer by construction and no second stream could ever exist. A stream
+  must declare a bounded slice.
+- **Two streams may not claim overlapping slices.** `orders.premium.>` is
+  refused next to `orders.>`, because `orders.premium.1` would belong to both
+  and neither would be authoritative.
+- **A consumer's filter must stay inside its stream's slice, and a
+  subscription's inside its consumer's.** Reaching outside used to succeed and
+  then quietly deliver nothing.
+
+Existing deployments that create a stream with `subject_filter = ">"` stop
+working on upgrade. Give each stream the slice it actually publishes under.
+
+### Added
+
+- **Every subscription has an id of its own.** The broker sends one wire copy
+  per `(connection, consumer)`, stamped with the id of whichever subscription
+  matched, and the client fans it out locally to the siblings whose filter
+  accepts the subject. Acks travel under the subscription's id, not the
+  consumer's — the broker opens one pending per subscription, so acking under
+  the wrong id left the real one outstanding until `ack_wait`.
+- **Four error codes** so a rejected creation names the rule that refused it:
+  `InvalidStreamFilter` (0x0207), `StreamFilterConflict` (0x0208),
+  `InvalidConsumerFilter` (0x0305), `InvalidSubscriptionFilter` (0x0306).
+  Clients that predate them will surface the number.
+
+### Fixed
+
+- **`Client::delete_consumer` retires the routes it orphaned.** It sent the
+  frame and left the local routing entries in place; they sat there until
+  teardown and would catch deliveries if the consumer id were recycled. The
+  entries are dropped only after the broker confirms.
+- **Every catalog rejection reported the wrong code.** A stream refused for
+  claiming `>` came back as `StreamAlreadyExists`, a subscription refused for
+  reaching outside its consumer as `InvalidLength`. Each rule now answers for
+  itself, and `catalog_rules` pins the codes rather than only the refusal.
+- **`chaos` and `max_inflights` benches ran again.** Both created their stream
+  with `>` and had died at the first call since the rules landed, so any number
+  they last reported predates it.
+
+### Known gaps
+
+- `delete_stream` still strands the routes of the consumers it cascades. It
+  takes a name and the client keeps no name → id map, so it cannot say which
+  consumers to retire.
+
 ## [0.7.1] - 2026-08-08
 
 ### Added — connection authentication
