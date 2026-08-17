@@ -81,12 +81,22 @@ pub(in crate::shard) struct DrainScratch {
     fanout_stamp: Vec<u64>,
     fanout_gen: u64,
     dead_connections: Vec<ConnectionId>,
-    /// Local pattern resolution cache. Avoids mutating shared match table.
-    /// Sparse composite key (stream_id, subject_hash) → foldhash (rule: sparse IDs).
-    resolve_cache: HashMap<(u32, u32), Vec<MatchEntry>, foldhash::fast::FixedState>,
-    /// Local subject limit cache. (stream_id, subject_hash) → Option<max>.
-    /// Sparse composite key → foldhash (rule: sparse IDs).
-    subject_limit_cache: HashMap<(u32, u32), Option<u32>, foldhash::fast::FixedState>,
+    /// Per-stream caches of what a subject resolves to. Nested — keyed by
+    /// stream FIRST, subject second — so a stream can be forgotten in one
+    /// removal.
+    ///
+    /// The flat `(stream_id, subject_hash)` key that preceded this had no
+    /// way to express "forget this stream": the entries were scattered
+    /// through one map, one per subject ever published, and the only
+    /// eviction was a wholesale `clear()` of every stream. So a deleted
+    /// stream left its entries behind, and because `stream_id` is a dense
+    /// catalog index that gets REUSED by the next create, the recreated
+    /// stream inherited them — routing its messages to the connection that
+    /// served the previous incarnation. That connection has no writer, the
+    /// batch flushes as `WriterGone`, and the drain spins on it forever
+    /// (`recreated_stream_delivery.rs`). One hash hop per message buys the
+    /// ability to evict correctly.
+    caches: StreamCaches,
 
     /// Wire-level frame accumulator. One bucket per (conn, stream)
     /// active this cycle; each bucket emits one `RepBatch` frame at
@@ -129,6 +139,102 @@ pub(in crate::shard) struct DrainScratch {
     stalled_conns: Vec<(ConnectionId, std::time::Instant)>,
 }
 
+/// Everything the drain memoizes about one stream's subjects.
+///
+/// Both maps are pure functions of the snapshot's match table for that
+/// stream, so they share a lifetime and are evicted together.
+#[derive(Default)]
+struct SubjectCache {
+    /// Which incarnation of the stream id these entries describe. Compared
+    /// on every access; a mismatch empties the whole entry.
+    ///
+    /// This is the eviction. Routing it through a command or an event ring
+    /// would work until the one message announcing the delete got dropped —
+    /// and then the cache would lie for the rest of the process's life. The
+    /// birth seq already rides the snapshot the drain is reading, so the
+    /// check cannot be missed, cannot be late, and costs one compare.
+    birth_seq: u64,
+    /// Which subscriptions a subject's PATTERNS resolve to. Literals come
+    /// straight from the snapshot and are never cached.
+    resolved: HashMap<u32, Vec<MatchEntry>, foldhash::fast::FixedState>,
+    /// The stream-wide per-subject inflight limit, or `None`.
+    limit: HashMap<u32, Option<u32>, foldhash::fast::FixedState>,
+}
+
+impl SubjectCache {
+    /// Return this stream's cache, emptied first if it belongs to a previous
+    /// incarnation of the id.
+    fn for_incarnation(&mut self, birth_seq: u64) -> &mut Self {
+        if self.birth_seq != birth_seq {
+            self.resolved.clear();
+            self.limit.clear();
+            self.birth_seq = birth_seq;
+        }
+        self
+    }
+}
+
+/// The drain's per-stream memoization, behind methods.
+///
+/// Callers get `resolve_*` and `forget_stream` and nothing else. The maps
+/// are private on purpose: every previous bug here came from a call site
+/// reaching into the map and taking on an invariant it did not know it
+/// owned. Eviction is one call, so no path can forget half of it.
+#[derive(Default)]
+pub(in crate::shard) struct StreamCaches {
+    by_stream: HashMap<u32, SubjectCache, foldhash::fast::FixedState>,
+}
+
+impl StreamCaches {
+    /// Pattern matches for `subject`, resolving through the match table on
+    /// a miss. `MatchTable::resolve_patterns_readonly` is the source of
+    /// truth; this only remembers what it said.
+    fn resolve_patterns(
+        &mut self,
+        stream_id: u32,
+        birth_seq: u64,
+        subject_hash: u32,
+        subject: &[u8],
+        mt: &arbitro_engine_v2::catalog::match_table::MatchTable,
+    ) -> &[MatchEntry] {
+        let cache = self
+            .by_stream
+            .entry(stream_id)
+            .or_default()
+            .for_incarnation(birth_seq);
+        cache.resolved.entry(subject_hash).or_insert_with(|| {
+            let mut resolved = Vec::new();
+            mt.resolve_patterns_readonly(subject_hash, subject, &mut resolved);
+            resolved
+        })
+    }
+
+    /// The per-subject inflight limit, resolving on a miss.
+    fn resolve_limit(
+        &mut self,
+        stream_id: u32,
+        birth_seq: u64,
+        subject_hash: u32,
+        subject: &[u8],
+        mt: &arbitro_engine_v2::catalog::match_table::MatchTable,
+    ) -> Option<u32> {
+        let cache = self
+            .by_stream
+            .entry(stream_id)
+            .or_default()
+            .for_incarnation(birth_seq);
+        *cache
+            .limit
+            .entry(subject_hash)
+            .or_insert_with(|| mt.resolve_subject_limit_readonly(subject_hash, subject))
+    }
+
+    /// Drop everything. The snapshot the entries were derived from is gone.
+    fn clear(&mut self) {
+        self.by_stream.clear();
+    }
+}
+
 impl DrainScratch {
     pub(in crate::shard) fn new() -> Self {
         Self {
@@ -137,14 +243,7 @@ impl DrainScratch {
             fanout_stamp: Vec::new(),
             fanout_gen: 0,
             dead_connections: Vec::with_capacity(4),
-            resolve_cache: HashMap::with_capacity_and_hasher(
-                64,
-                foldhash::fast::FixedState::default(),
-            ),
-            subject_limit_cache: HashMap::with_capacity_and_hasher(
-                64,
-                foldhash::fast::FixedState::default(),
-            ),
+            caches: StreamCaches::default(),
             acc: Accumulator::new(),
             deliveries: Vec::with_capacity(256),
             local_inflight: Vec::with_capacity(8),
@@ -267,8 +366,7 @@ pub(in crate::shard) fn drain_read(
     // in the worker, ABA-safe because it holds the previous Arc). Stale
     // entries after a swap would drop late-binding fanout subscribers.
     if snap_changed {
-        scratch.resolve_cache.clear();
-        scratch.subject_limit_cache.clear();
+        scratch.caches.clear();
     }
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
@@ -641,12 +739,17 @@ fn process_drain_entry(
     }
 
     // Skip entries from previous incarnations of a recycled stream_id.
-    // created_at_seq == 0 means "no filter" (backward compat).
+    // created_at_seq == 0 means "no filter" (backward compat). The same
+    // birth seq keys the drain's per-stream caches below — one incarnation
+    // marker, used for both the messages and what they resolve to.
     let stream_raw = stream_id.raw();
-    if let Some(&birth_seq) = snap.stream_created_at_seq.get(stream_raw as usize) {
-        if birth_seq > 0 && entry.seq < birth_seq {
-            return;
-        }
+    let birth_seq = snap
+        .stream_created_at_seq
+        .get(stream_raw as usize)
+        .copied()
+        .unwrap_or(0);
+    if birth_seq > 0 && entry.seq < birth_seq {
+        return;
     }
 
     // Demand check — atomic read.
@@ -666,7 +769,6 @@ fn process_drain_entry(
     else {
         return;
     };
-    let cache_key = (stream_raw, subject_hash);
     // SEC-5: verify the literal bytes — a 32-bit hash collision misdelivers.
     let lookup = mt.lookup_verified(subject_hash, entry.subject);
 
@@ -674,22 +776,24 @@ fn process_drain_entry(
     // `lookup.is_empty()` starved every pattern subscriber as soon as one
     // catch-all existed — `catch_all` ignores the subject, so the set was
     // never empty and this branch never ran.
-    if mt.pattern_count() > 0 && !scratch.resolve_cache.contains_key(&cache_key) {
-        let mut resolved = Vec::new();
-        mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut resolved);
-        scratch.resolve_cache.insert(cache_key, resolved);
-    }
-    // Snapshot-pin purity guard: a retained entry must equal a fresh
-    // resolve against the same (ptr-identical) snapshot.
-    #[cfg(debug_assertions)]
+    //
+    // `scratch.matches` takes a copy rather than borrowing the cache: the
+    // literals below are appended to the same Vec, and the cache stays
+    // borrowed for the rest of the entry otherwise.
+    scratch.matches.clear();
+    scratch.matches.extend(lookup.iter());
     if mt.pattern_count() > 0 {
-        if let Some(cached) = scratch.resolve_cache.get(&cache_key) {
-            let mut fresh = Vec::new();
-            mt.resolve_patterns_readonly(subject_hash, entry.subject, &mut fresh);
-            debug_assert_eq!(
-                *cached, fresh,
-                "resolve_cache stale under unchanged snapshot"
-            );
+        let resolved = scratch
+            .caches
+            .resolve_patterns(stream_raw, birth_seq, subject_hash, entry.subject, mt);
+        // Dedup across the merge: one subscription can sit in both buckets
+        // (literal + pattern). A duplicate delivers twice AND increments
+        // inflight twice against a single ack, permanently starving the
+        // consumer. `MatchEntry` equality excludes `binding_idx` by design.
+        for e in resolved {
+            if !scratch.matches.contains(e) {
+                scratch.matches.push(*e);
+            }
         }
     }
 
@@ -699,36 +803,21 @@ fn process_drain_entry(
     // counter is keyed by (consumer_id, subject_hash) for per-consumer
     // isolation.
     let subject_limit = if mt.has_subject_limits() {
-        *scratch
-            .subject_limit_cache
-            .entry(cache_key)
-            .or_insert_with(|| mt.resolve_subject_limit_readonly(subject_hash, entry.subject))
+        scratch
+            .caches
+            .resolve_limit(stream_raw, birth_seq, subject_hash, entry.subject, mt)
     } else {
         None
     };
-    // Same snapshot-pin purity guard for the subject-limit cache.
+    // Purity guard: a retained value must equal a fresh resolve against
+    // the same snapshot. Both caches are checked the same way.
     #[cfg(debug_assertions)]
     if mt.has_subject_limits() {
         debug_assert_eq!(
             subject_limit,
             mt.resolve_subject_limit_readonly(subject_hash, entry.subject),
-            "subject_limit_cache stale under unchanged snapshot"
+            "subject limit cache stale under unchanged snapshot"
         );
-    }
-
-    // Step 3: collect matches — reuse `lookup` computed above.
-    scratch.matches.clear();
-    scratch.matches.extend(lookup.iter());
-    if let Some(resolved) = scratch.resolve_cache.get(&cache_key) {
-        // Dedup across the merge: one subscription can sit in both buckets
-        // (literal + pattern). A duplicate delivers twice AND increments
-        // inflight twice against a single ack, permanently starving the
-        // consumer. `MatchEntry` equality excludes `binding_idx` by design.
-        for e in resolved.iter() {
-            if !scratch.matches.contains(e) {
-                scratch.matches.push(*e);
-            }
-        }
     }
 
     if scratch.matches.is_empty() {
