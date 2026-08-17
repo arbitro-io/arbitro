@@ -540,6 +540,34 @@ impl Client {
         )
     }
 
+    /// Open N filtered subscriptions on `consumer_id` in ONE round-trip.
+    ///
+    /// A hundred [`Client::subscribe`] calls cost a hundred round-trips; the
+    /// broker's work per subscription is a filter check and a binding, so the
+    /// trip is nearly the whole cost. Every entry runs the same admission
+    /// rules as a single subscribe.
+    ///
+    /// An empty filter inherits the consumer's, exactly as `subscribe` does.
+    /// Entries the broker refuses — a filter outside the consumer's slice —
+    /// come back in [`SubscribeBatchOutcome::rejected`] naming their index,
+    /// while their legal peers stay open. A whole-frame refusal is an `Err`.
+    ///
+    /// Capped at 1024 entries by the broker.
+    pub fn subscribe_batch(
+        &self,
+        stream_id: u32,
+        consumer_id: u32,
+        filters: Vec<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<crate::SubscribeBatchOutcome, ClientError>> + Send
+    {
+        crate::consume::subscribe_batch_async(
+            Arc::clone(&self.inner),
+            stream_id,
+            consumer_id,
+            filters,
+        )
+    }
+
     /// Subscribe with durable redelivery dedup keyed by
     /// `(stream_name, consumer_name)`.
     ///

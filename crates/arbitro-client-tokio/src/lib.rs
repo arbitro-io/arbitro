@@ -79,7 +79,7 @@ pub use config::{ClientConfig, KeepAlive, ReconnectPolicy};
 // store's location is ordinary client configuration.
 pub use ackstore::WalConfig;
 pub use consume::message::{decode_reply_to, encode_reply_to, Message, REPLY_TO_MAGIC};
-pub use consume::SubscriptionHandle;
+pub use consume::{SubscribeBatchOutcome, SubscribeReject, SubscriptionHandle};
 pub use error::{ClientError, RequestResult};
 pub use metrics::{ClientMetrics, ClientMetricsSnapshot};
 pub use publish::PUBLISH_BATCH_MAX;

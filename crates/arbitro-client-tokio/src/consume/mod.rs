@@ -194,6 +194,159 @@ pub(crate) fn subscribe_async(
     }
 }
 
+// ── subscribe_batch_async ─────────────────────────────────────────────────────
+
+/// One refused entry of a [`subscribe_batch_async`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct SubscribeReject {
+    /// Position in the slice the caller passed.
+    pub index: usize,
+    /// Wire error code — usually `InvalidSubscriptionFilter`.
+    pub code: u16,
+}
+
+/// Outcome of a batched subscribe: what opened, and what did not.
+///
+/// A refusal is per entry, not all-or-nothing — rolling back accepted
+/// bindings across shards would cost more than it buys — so the accepted
+/// handles come back alongside the rejections rather than instead of them.
+#[derive(Debug)]
+pub struct SubscribeBatchOutcome {
+    /// Handles for the accepted entries, in the order requested.
+    pub accepted: Vec<SubscriptionHandle>,
+    /// Refused entries, each naming its index in the request.
+    pub rejected: Vec<SubscribeReject>,
+}
+
+/// Open N filtered subscriptions on `consumer_id` in ONE round-trip.
+///
+/// A hundred [`subscribe_async`] calls cost a hundred round-trips; the
+/// broker's work per subscription is a filter check and a binding, so the
+/// trip is nearly the whole cost. Every entry runs the same admission rules
+/// as a single subscribe — the batch buys a trip, not a different contract.
+///
+/// An empty `filters` entry inherits the consumer's filter, exactly as a
+/// single subscribe does. A whole-frame refusal (malformed, empty, over
+/// 1024 entries) returns `Err`; per-entry refusals land in
+/// [`SubscribeBatchOutcome::rejected`].
+pub(crate) fn subscribe_batch_async(
+    inner: Arc<Inner>,
+    stream_id: u32,
+    consumer_id: u32,
+    filters: Vec<Vec<u8>>,
+) -> impl Future<Output = Result<SubscribeBatchOutcome, ClientError>> + Send {
+    use arbitro_proto::v2::cold::{
+        ColdBody, RepSubscribeBatch, Subscribe as SubscribeCold, SubscribeBatch,
+    };
+
+    let seq = inner.seq_alloc.next();
+    // One id per entry, allocated here. The broker never invents one, which
+    // is why a batch needs no per-entry correlation on the way back.
+    let sub_ids: Vec<u32> = filters.iter().map(|_| inner.sub_id_alloc.next()).collect();
+
+    let body = SubscribeBatch {
+        entries: filters
+            .iter()
+            .zip(&sub_ids)
+            .map(|(f, &sub_id)| SubscribeCold {
+                consumer_id,
+                subscription_id: sub_id,
+                filters: if f.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![f.clone()]
+                },
+            })
+            .collect(),
+    }
+    .encode(seq);
+
+    // Channels registered BEFORE the frame goes out, for the reason
+    // `subscribe_async` documents: the broker serves each backlog as soon as
+    // it processes the entry, and those deliveries can outrun the reply.
+    let receivers: Vec<_> = filters
+        .iter()
+        .zip(&sub_ids)
+        .map(|(f, &sub_id)| {
+            inner.subscriptions.register(Registration {
+                consumer_id,
+                stream_id,
+                fanout: false,
+                dedup: None,
+                sub_id,
+                filter: f,
+                frame: body.clone(),
+            })
+        })
+        .collect();
+
+    let rx_pending = inner.pending.register(seq);
+    let enqueue_result = crate::publish::enqueue(&inner.pool, WriteFrame::Mono(body));
+
+    let inner2 = Arc::clone(&inner);
+    async move {
+        let wire_result: Result<Bytes, ClientError> = {
+            enqueue_result?;
+            rx_pending
+                .recv_async()
+                .await
+                .map_err(|_| ClientError::ChannelClosed)
+                .and_then(|r| r)
+        };
+        let reply_body = match wire_result {
+            Ok(b) => b,
+            Err(e) => {
+                // Whole-frame refusal: no entry has a verdict of its own, so
+                // none of these routes may survive.
+                for &sub_id in &sub_ids {
+                    inner2.subscriptions.remove(sub_id);
+                }
+                return Err(e);
+            }
+        };
+        let reply = match RepSubscribeBatch::decode_body(&reply_body) {
+            Ok(r) => r,
+            Err(_) => {
+                for &sub_id in &sub_ids {
+                    inner2.subscriptions.remove(sub_id);
+                }
+                return Err(ClientError::Proto(
+                    arbitro_proto::error::ProtoError::InvalidLength,
+                ));
+            }
+        };
+
+        inner2
+            .subscriptions
+            .set_fanout(consumer_id, reply.fanout_consumers.contains(&consumer_id));
+
+        let mut accepted = Vec::with_capacity(receivers.len());
+        let mut rejected = Vec::new();
+        for (index, (rx, &sub_id)) in receivers.into_iter().zip(&sub_ids).enumerate() {
+            // The reply names only failures — this client allocated every id,
+            // so an id absent from `errors` was accepted.
+            match reply.errors.iter().find(|e| e.subscription_id == sub_id) {
+                Some(e) => {
+                    // A rejected entry has no binding on the broker; leaving
+                    // its route behind would strand a sibling's deliveries.
+                    inner2.subscriptions.remove(sub_id);
+                    rejected.push(SubscribeReject {
+                        index,
+                        code: e.code,
+                    });
+                }
+                None => accepted.push(SubscriptionHandle {
+                    rx,
+                    sub_id,
+                    consumer_id,
+                    inner: Arc::clone(&inner2),
+                }),
+            }
+        }
+        Ok(SubscribeBatchOutcome { accepted, rejected })
+    }
+}
+
 // ── ack_batcher_task ──────────────────────────────────────────────────────────
 
 #[inline]
