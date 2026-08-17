@@ -124,6 +124,9 @@ pub async fn dispatch_frame_v2(
         Action::Nack => v2_nack(conn_id, &frame, server).await,
         Action::BatchNack => v2_batch_nack(conn_id, &frame, server).await,
         Action::Subscribe => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
+        Action::SubscribeBatch => {
+            v2_subscribe_batch(conn_id, req_seq, &frame, server, registry).await
+        }
         Action::Unsubscribe => v2_unsubscribe(conn_id, req_seq, &frame, server, registry).await,
 
         // ── Stream management ───────────────────────────────────────
@@ -1149,22 +1152,34 @@ async fn v2_subscribe(
             return;
         }
     };
+    match subscribe_one(conn_id, body, server).await {
+        Ok(ref_seq) => send_rep_ok_v2(registry, conn_id, req_seq, ref_seq),
+        Err(code) => send_error_v2(registry, conn_id, req_seq, code),
+    }
+}
+
+/// Open one subscription. Shared by `Subscribe` and every entry of
+/// `SubscribeBatch` so both paths validate and register identically —
+/// the batch is a transport optimisation, never a second set of rules.
+///
+/// `Ok` carries the `ref_seq` the single-subscribe reply reports.
+async fn subscribe_one(
+    conn_id: u64,
+    body: arbitro_proto::v2::cold::Subscribe,
+    server: &ShardRouter,
+) -> Result<u64, ErrorCode> {
     // H1: every filter validated. Empty `filters` = catch-all (legacy
     // single-empty-filter behaviour); each non-empty entry must parse
     // as a valid subject pattern.
     for f in &body.filters {
         if !f.is_empty() && arbitro_proto::validate::validate_subject(f).is_err() {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
-            return;
+            return Err(ErrorCode::InvalidLength);
         }
     }
     let consumer_id = ConsumerId(body.consumer_id);
     let seq_stream = match server.names().consumer_stream(consumer_id) {
         Some(s) => s,
-        None => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound);
-            return;
-        }
+        None => return Err(ErrorCode::ConsumerNotFound),
     };
     let queue_id = server
         .names()
@@ -1189,10 +1204,7 @@ async fn v2_subscribe(
         &owner_filter,
     ) {
         Ok(f) => f,
-        Err(v) => {
-            send_error_v2(registry, conn_id, req_seq, v.wire_code());
-            return;
-        }
+        Err(v) => return Err(v.wire_code()),
     };
 
     // The client counts its subscriptions from 1 inside its own connection;
@@ -1271,10 +1283,96 @@ async fn v2_subscribe(
     // rather than the one in force, and silently skip the local fan-out.
     let ref_seq = (consumer_id.0 as u64) | ((queue_id == QueueId(0)) as u64) << 63;
     match reply {
-        Ok(true) => send_rep_ok_v2(registry, conn_id, req_seq, ref_seq),
-        Ok(false) => send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerNotFound),
-        Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
+        Ok(true) => Ok(ref_seq),
+        Ok(false) => Err(ErrorCode::ConsumerNotFound),
+        Err(_) => Err(ErrorCode::InternalError),
     }
+}
+
+/// N subscriptions, one round-trip. Each entry runs the identical
+/// `subscribe_one` path; a rejected entry does not abort the rest, because
+/// rolling back accepted bindings across shards would cost more than it
+/// buys and MQTT's SUBACK settled this question the same way.
+///
+/// The reply names only failures. When every entry failed for the same
+/// reason — an unknown `consumer_id` is the usual case — that is a setup
+/// mistake, not N independent ones, so it collapses to a single `RepError`
+/// instead of repeating one code a thousand times.
+async fn v2_subscribe_batch(
+    conn_id: u64,
+    req_seq: u64,
+    frame: &Bytes,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    use arbitro_proto::v2::cold::{
+        ColdBody, RepSubscribeBatch, SubscribeBatch, SubscribeReject, MAX_SUBSCRIBE_BATCH,
+    };
+    let body = match SubscribeBatch::decode_body(&frame[HEADER_SIZE..]) {
+        Ok(b) => b,
+        Err(_) => {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            return;
+        }
+    };
+    if body.entries.is_empty() || body.entries.len() > MAX_SUBSCRIBE_BATCH {
+        send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidEntryCount);
+        return;
+    }
+
+    let mut ok: u32 = 0;
+    let mut errors: Vec<SubscribeReject> = Vec::new();
+    let mut fanout_consumers: Vec<u32> = Vec::new();
+    let mut seen_ids: Vec<u32> = Vec::with_capacity(body.entries.len());
+    for entry in body.entries {
+        let subscription_id = entry.subscription_id;
+        // Two entries claiming one id would resolve to a single binding and
+        // the second would retire the first — while `ok` counted both. The
+        // id is what separates siblings, so a repeat inside one frame is a
+        // rejection, not a last-writer-wins.
+        if seen_ids.contains(&subscription_id) {
+            errors.push(SubscribeReject {
+                subscription_id,
+                code: ErrorCode::InvalidSubscriptionFilter.as_u16(),
+            });
+            continue;
+        }
+        seen_ids.push(subscription_id);
+        match subscribe_one(conn_id, entry, server).await {
+            Ok(ref_seq) => {
+                ok += 1;
+                // Same two fields the single-subscribe `ref_seq` packs:
+                // consumer id in the low 32 bits, fanout in bit 63.
+                let consumer = ref_seq as u32;
+                if ref_seq >> 63 == 1 && !fanout_consumers.contains(&consumer) {
+                    fanout_consumers.push(consumer);
+                }
+            }
+            Err(code) => errors.push(SubscribeReject {
+                subscription_id,
+                code: code.as_u16(),
+            }),
+        }
+    }
+
+    if ok == 0 {
+        let first = errors[0].code;
+        if errors.iter().all(|e| e.code == first) {
+            let code = ErrorCode::from_u16(first).unwrap_or(ErrorCode::InternalError);
+            send_error_v2(registry, conn_id, req_seq, code);
+            return;
+        }
+    }
+
+    registry.send_bytes(
+        conn_id,
+        RepSubscribeBatch {
+            ok,
+            errors,
+            fanout_consumers,
+        }
+        .encode(req_seq),
+    );
 }
 
 async fn v2_unsubscribe(

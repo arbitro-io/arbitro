@@ -250,7 +250,59 @@ cold_body! {
         pub subscription_id: u32,
         pub filters:         Vec<Vec<u8>>,
     },
+
+    // ── SubscribeBatch ───────────────────────────────────────────────
+    //
+    // N subscriptions in one round-trip. An app that opens 100 filtered
+    // subscriptions pays 100 round-trips today; the work per subscription
+    // is trivial (validate the filter, register a binding) and the cost is
+    // almost entirely the trip. Entries are plain `Subscribe` bodies, so
+    // the batch decodes into exactly what the single-subscribe path
+    // already validates — one code path, not two.
+    //
+    // Entries may name different consumers: `consumer_id` is per entry.
+    //
+    // Capped at `MAX_SUBSCRIBE_BATCH`; over that the broker answers a
+    // single `RepError(TooManyEntries)` rather than a partial result.
+    Action::SubscribeBatch => pub struct SubscribeBatch {
+        pub entries: Vec<Subscribe>,
+    },
+
+    // ── RepSubscribeBatch ────────────────────────────────────────────
+    //
+    // Failures only. MQTT's SUBACK has to return a code per filter because
+    // the server owns the subscription identity and the client can only
+    // correlate positionally. Here the CLIENT allocated every id before
+    // sending, so silence is a sufficient acknowledgement: any id not
+    // named in `errors` was accepted. The common case (all good) is a
+    // ~22 byte reply regardless of batch size.
+    // `fanout_consumers` carries what bit 63 of the single-subscribe
+    // `ref_seq` carries: which of these consumers deliver in fanout mode.
+    // The broker owns that mode — a client that created a consumer which
+    // already existed would otherwise trust the `deliver_mode` it sent and
+    // silently skip its local fan-out. Deduplicated, so it is one entry in
+    // the normal case of a batch bound to a single consumer.
+    Action::RepSubscribeBatch => pub struct RepSubscribeBatch {
+        pub ok:               u32,
+        pub errors:           Vec<SubscribeReject>,
+        pub fanout_consumers: Vec<u32>,
+    },
 }
+
+/// Per-entry rejection inside [`RepSubscribeBatch`]. `code` is an
+/// `ErrorCode` as u16 — `InvalidSubscriptionFilter` when the filter
+/// escapes the consumer's slice, `ConsumerNotFound` when the entry names
+/// a consumer that does not exist.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubscribeReject {
+    pub subscription_id: u32,
+    pub code: u16,
+}
+
+/// Upper bound on `SubscribeBatch.entries`. Bounds the work one frame can
+/// buy and keeps a hostile client from asking the broker to allocate an
+/// unbounded binding set in a single dispatch.
+pub const MAX_SUBSCRIBE_BATCH: usize = 1024;
 
 /// Per-subject inflight cap. Carried inside `CreateConsumer.subject_limits`.
 ///

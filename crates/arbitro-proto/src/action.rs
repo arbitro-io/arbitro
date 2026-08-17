@@ -43,6 +43,14 @@ pub enum Action {
     // 0x03xx — Subscription
     Subscribe = 0x0301,
     Unsubscribe = 0x0302,
+    /// N subscriptions in one frame. Body: JSON `{ entries: [Subscribe] }`.
+    /// Reply: `RepSubscribeBatch`, or a single `RepError` when the whole
+    /// frame is unusable (malformed, empty, over the cap).
+    SubscribeBatch = 0x0303,
+    /// Answer to `SubscribeBatch`. Body: JSON `{ ok, errors }` — only the
+    /// rejected entries are listed, because the client owns the ids it sent
+    /// and can infer the rest.
+    RepSubscribeBatch = 0x0304,
 
     // 0x04xx — Stream management
     CreateStream = 0x0401,
@@ -139,6 +147,8 @@ impl Action {
 
             0x0301 => Some(Self::Subscribe),
             0x0302 => Some(Self::Unsubscribe),
+            0x0303 => Some(Self::SubscribeBatch),
+            0x0304 => Some(Self::RepSubscribeBatch),
 
             0x0401 => Some(Self::CreateStream),
             0x0402 => Some(Self::DeleteStream),

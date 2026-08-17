@@ -7,6 +7,26 @@ the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
 ## [Unreleased]
 
+### Added — `SubscribeBatch`: N subscriptions in one round-trip
+
+An application that opens a hundred filtered subscriptions used to pay a
+hundred round-trips. The broker's work per subscription is a filter check and
+a binding, so the trip was nearly the whole cost.
+
+- **`SubscribeBatch` (0x0303)** — body `{ entries: [Subscribe] }`. Entries are
+  exactly the single-`Subscribe` body and run the identical admission rules;
+  `consumer_id` is per entry, so one frame may span several consumers. Capped
+  at 1024 entries.
+- **`RepSubscribeBatch` (0x0304)** — body `{ ok, errors, fanout_consumers }`.
+  Only **rejections** are listed: the client allocates every `subscription_id`
+  before sending, so an id absent from `errors` was accepted. MQTT's SUBACK
+  has to return a code per filter because there the server owns subscription
+  identity; here it does not.
+- A rejected entry does not abort its peers. When every entry failed for the
+  same reason — an unknown `consumer_id` is the usual case — the reply
+  collapses to a single `RepError` rather than repeating one code N times.
+- `Subscribe` is unchanged on the wire and in behaviour.
+
 ### Breaking — a stream owns its slice, outright and alone
 
 Catalog admission rules are now enforced, in one place (`transport::rules`),
