@@ -26,6 +26,15 @@ pub enum ErrorCode {
     /// stored. Safe for the client to treat as a successful publish
     /// (same logical effect — the original write is what's stored).
     IdempotencyDuplicate = 0x0206,
+    /// The stream's own filter is unusable: absent, or a bare `>` that would
+    /// claim every subject and leave no slice for any other stream. Nothing
+    /// was created. Distinct from `StreamFilterConflict`, which is about a
+    /// filter that is fine on its own but collides with a peer.
+    InvalidStreamFilter = 0x0207,
+    /// The stream's filter collides with a slice another stream already
+    /// owns — identical to it, overlapping it, or differing from what this
+    /// same name was created with. Nothing was created.
+    StreamFilterConflict = 0x0208,
 
     // 0x03xx — Consumer
     ConsumerNotFound = 0x0301,
@@ -36,6 +45,12 @@ pub enum ErrorCode {
     /// must default it to `group`, else the consumer name, else the stream
     /// name. The consumer was NOT created.
     InvalidConsumerConfig = 0x0304,
+    /// The consumer's filter reaches outside its stream's slice, or nests
+    /// strictly inside a sibling consumer's. The consumer was NOT created.
+    InvalidConsumerFilter = 0x0305,
+    /// The subscription's filter reaches outside its consumer's, or the
+    /// subscription arrived without an id of its own. Nothing was created.
+    InvalidSubscriptionFilter = 0x0306,
 
     // 0x04xx — Delivery
     // 0x0401 reserved (deleted InvalidSequence) — §5.2.
@@ -69,11 +84,15 @@ impl ErrorCode {
             0x0203 => Some(Self::StreamFull),
             // 0x0204, 0x0205 reserved (deleted §5.2).
             0x0206 => Some(Self::IdempotencyDuplicate),
+            0x0207 => Some(Self::InvalidStreamFilter),
+            0x0208 => Some(Self::StreamFilterConflict),
 
             0x0301 => Some(Self::ConsumerNotFound),
             0x0302 => Some(Self::ConsumerAlreadyExists),
             // 0x0303 reserved (deleted §5.2).
             0x0304 => Some(Self::InvalidConsumerConfig),
+            0x0305 => Some(Self::InvalidConsumerFilter),
+            0x0306 => Some(Self::InvalidSubscriptionFilter),
 
             // 0x0401..=0x0403 reserved (deleted §5.2).
             0x0501 => Some(Self::ServerShuttingDown),

@@ -1189,8 +1189,8 @@ async fn v2_subscribe(
         &owner_filter,
     ) {
         Ok(f) => f,
-        Err(_) => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidLength);
+        Err(v) => {
+            send_error_v2(registry, conn_id, req_seq, v.wire_code());
             return;
         }
     };
@@ -1360,8 +1360,8 @@ async fn v2_create_stream(
     );
     let (seq_stream, _created) = match checked {
         Ok(v) => v,
-        Err(_) => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists);
+        Err(violation) => {
+            send_error_v2(registry, conn_id, req_seq, violation.wire_code());
             return;
         }
     };
@@ -1852,8 +1852,8 @@ async fn v2_create_consumer(
         &siblings,
     ) {
         Ok(f) => f.to_vec(),
-        Err(_) => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig);
+        Err(v) => {
+            send_error_v2(registry, conn_id, req_seq, v.wire_code());
             return;
         }
     };

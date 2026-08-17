@@ -38,6 +38,30 @@ pub enum Violation {
     SubscriptionIdMissing,
 }
 
+impl Violation {
+    /// The wire code a rejected creation travels back as.
+    ///
+    /// Every variant answers for itself here so no caller can flatten the
+    /// set into one code. It used to: a stream rejected for claiming `>`
+    /// came back as `StreamAlreadyExists`, which sent whoever hit it looking
+    /// for a duplicate that did not exist.
+    pub fn wire_code(self) -> arbitro_proto::error::ErrorCode {
+        use arbitro_proto::error::ErrorCode as E;
+        match self {
+            Self::StreamFilterMissing | Self::StreamFilterGlobal => E::InvalidStreamFilter,
+            Self::StreamFilterDuplicate
+            | Self::StreamFilterOverlap
+            | Self::StreamFilterMismatch => E::StreamFilterConflict,
+            Self::ConsumerOutsideStream | Self::ConsumerNestedUnderSibling => {
+                E::InvalidConsumerFilter
+            }
+            Self::SubscriptionOutsideConsumer | Self::SubscriptionIdMissing => {
+                E::InvalidSubscriptionFilter
+            }
+        }
+    }
+}
+
 /// `>` claims every subject, so it is the absence of a claim rather than a
 /// claim to a slice. Containment and overlap rules skip it: with `>` on
 /// both sides every pair collides and nothing could ever be created.

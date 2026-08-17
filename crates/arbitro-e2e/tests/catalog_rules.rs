@@ -310,3 +310,93 @@ async fn subscribe_validates_against_stream_and_consumer_together() {
          stream's `orders.>` was never consulted"
     );
 }
+
+// ── The verdict must reach the client intact ─────────────────────────────
+//
+// Every rule above pins only THAT a creation was refused. The code carrying
+// the refusal went unchecked, and it was wrong: a stream refused for
+// claiming `>` came back as StreamAlreadyExists, sending whoever hit it
+// hunting a duplicate that did not exist; a subscription refused for
+// reaching outside its consumer came back as InvalidLength.
+//
+// These pin the code itself, so the mapping cannot collapse again.
+
+async fn rejection_code(
+    result: Result<Bytes, arbitro_client_tokio::ClientError>,
+) -> u16 {
+    use arbitro_client_tokio::ClientError;
+    match result {
+        Err(ClientError::Broker { code }) => code.as_u16(),
+        other => panic!("expected a broker rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_global_stream_filter_is_named_as_a_filter_problem() {
+    use arbitro_proto::error::ErrorCode;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let code = rejection_code(
+        client
+            .create_stream(b"global_code", b">", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await,
+    )
+    .await;
+
+    server.shutdown().await;
+    assert_eq!(
+        code,
+        ErrorCode::InvalidStreamFilter.as_u16(),
+        "a stream refused for claiming `>` must say so — StreamAlreadyExists \
+         sends the caller hunting a duplicate that does not exist"
+    );
+}
+
+#[tokio::test]
+async fn an_overlapping_stream_filter_is_named_as_a_conflict() {
+    use arbitro_proto::error::ErrorCode;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    make_stream(&client, b"orders_a", b"orders.>").await;
+    let code = rejection_code(
+        client
+            .create_stream(b"orders_b", b"orders.premium.>", 0, 0, 0, 1, 0, 0, 0, 0)
+            .await,
+    )
+    .await;
+
+    server.shutdown().await;
+    assert_eq!(
+        code,
+        ErrorCode::StreamFilterConflict.as_u16(),
+        "the filter is well-formed; what fails is that a peer already owns \
+         subjects inside it — a different problem from an unusable filter"
+    );
+}
+
+#[tokio::test]
+async fn a_consumer_reaching_outside_its_stream_is_named_as_a_filter_problem() {
+    use arbitro_proto::error::ErrorCode;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+
+    let sid = make_stream(&client, b"orders_c", b"orders.>").await;
+    let code = rejection_code(
+        client
+            .create_consumer(
+                sid, b"wide", b"wide", b"payments.>", 100u16, 1u8, 0u8, 0u8, 30_000u32, 0u64,
+            )
+            .await,
+    )
+    .await;
+
+    server.shutdown().await;
+    assert_eq!(
+        code,
+        ErrorCode::InvalidConsumerFilter.as_u16(),
+        "the filter is what was refused, so the code must point at the \
+         filter and not at the rest of the config"
+    );
+}
