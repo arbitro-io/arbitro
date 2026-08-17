@@ -5,7 +5,7 @@ All notable changes to `arbitro-server` (and the in-tree Rust reference client
 [Keep a Changelog](https://keepachangelog.com/); this project uses SemVer with
 the pre-1.0 interpretation (breaking changes may land on a minor bump).
 
-## [Unreleased]
+## [0.8.0] — 2026-08-17
 
 ### Added — `SubscribeBatch`: N subscriptions in one round-trip
 
