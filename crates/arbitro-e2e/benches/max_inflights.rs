@@ -63,6 +63,11 @@ const DEFAULT_ITERS: u64 = 1_000;
 const BASIC_BACKLOG: u32 = 100;
 const PAYLOAD_SIZE: usize = 64;
 const STREAM: &[u8] = b"limits_e2e";
+/// The slice each stage's stream claims. A bare `>` is refused since
+/// stream_rules landed, and a consumer filter must stay inside its stream's
+/// slice, so both sides carry the same value.
+const SLICE_ORDERS: &[u8] = b"orders.>";
+const SLICE_NOTIF: &[u8] = b"notif.>";
 /// Default users for Stage 4 (dynamic subjects throughput).
 const DEFAULT_DYNAMIC_USERS: u64 = 10_000;
 
@@ -122,9 +127,9 @@ async fn connect(addr: &str) -> Client {
     .expect("client connects")
 }
 
-async fn create_stream(client: &Client, name: &[u8]) -> u32 {
+async fn create_stream(client: &Client, name: &[u8], slice: &[u8]) -> u32 {
     let resp = client
-        .create_stream(name, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(name, slice, 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32
@@ -329,10 +334,10 @@ const CONSUMER_INFLIGHT_PUBLISHED: u32 = 40;
 async fn stage00_consumer_inflight_enforced() -> (u32, Duration) {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let stream_id = create_stream(&client, b"limits_consumer_inflight").await;
+    let stream_id = create_stream(&client, b"limits_consumer_inflight", SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"consumer_inflight")
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(CONSUMER_INFLIGHT_CAP)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -396,10 +401,10 @@ async fn stage00_consumer_inflight_enforced() -> (u32, Duration) {
 async fn stage0_cap_enforced() -> (u32, u32, Duration) {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let stream_id = create_stream(&client, b"limits_cap_enforced").await;
+    let stream_id = create_stream(&client, b"limits_cap_enforced", SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"cap_enforced")
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -461,10 +466,10 @@ async fn stage0_cap_enforced() -> (u32, u32, Duration) {
 async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let stream_id = create_stream(&client, b"limits_burst_isolation").await;
+    let stream_id = create_stream(&client, b"limits_burst_isolation", SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"burst_isolation")
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -555,10 +560,10 @@ async fn stage2b_burst_isolation() -> (u32, u32, Duration) {
 async fn baseline_latency(iters: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let stream_id = create_stream(&client, STREAM).await;
+    let stream_id = create_stream(&client, STREAM, SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"baseline")
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -588,10 +593,10 @@ async fn baseline_latency(iters: u64) -> Vec<Duration> {
 async fn isolated_latency(iters: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let client = connect(&addr).await;
-    let stream_id = create_stream(&client, STREAM).await;
+    let stream_id = create_stream(&client, STREAM, SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"isolation_tester")
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -663,14 +668,14 @@ async fn recv_any(
 async fn shared_consumer_latency(iters: u64, n_conns: u64) -> Vec<Duration> {
     let addr = spawn_server().await;
     let admin = connect(&addr).await;
-    let stream_id = create_stream(&admin, b"limits_shared").await;
+    let stream_id = create_stream(&admin, b"limits_shared", SLICE_ORDERS).await;
 
     let consumer_id = ConsumerBuilder::new(b"shared_isolation_tester")
         // Queue group so the connections are competing members of one
         // consumer rather than independent readers.
         .group(b"shared_isolation_tester")
         .deliver_mode(DeliverMode::Queue)
-        .filter(b">")
+        .filter(SLICE_ORDERS)
         .max_inflight(10_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
@@ -775,10 +780,10 @@ async fn dynamic_subjects_throughput(n_users: u64) -> (Duration, u64) {
     let client = connect(&addr).await;
 
     let stream_name: &[u8] = b"dynamic_subjects";
-    let stream_id = create_stream(&client, stream_name).await;
+    let stream_id = create_stream(&client, stream_name, SLICE_NOTIF).await;
 
     let consumer_id = ConsumerBuilder::new(b"dyn_consumer")
-        .filter(b">")
+        .filter(SLICE_NOTIF)
         .max_inflight(60_000)
         .ack_policy(AckPolicy::Explicit)
         .ack_wait_ms(30_000)
