@@ -305,13 +305,33 @@ async fn run_batch(
             let batches = total.div_ceil(batch_size);
             for b in 0..batches {
                 let size = batch_size.min(total - b * batch_size);
-                loop {
-                    match c.publish_batch(stream_id, &entries[..size]) {
-                        Ok(()) => break,
-                        Err(arbitro_client_tokio::ClientError::QueueFull) => {
-                            tokio::task::yield_now().await;
+                // The LAST batch waits. `publish_batch` returns as soon as the
+                // frame is queued in this client's write ring — the bytes have
+                // not reached the socket, the broker has not seen them, and
+                // nothing is stored. Timing only the enqueue reported tens of
+                // millions of msg/s and got FASTER with fewer connections,
+                // which is the signature of measuring a local buffer rather
+                // than work.
+                //
+                // TCP is ordered and the broker handles frames in order, so
+                // one wait on the final batch proves every preceding batch is
+                // already stored. That is fire-and-forget as a caller means
+                // it — never blocking per message — while still measuring
+                // what the broker actually ingested. One round-trip, spread
+                // over the whole run.
+                if b + 1 == batches {
+                    c.publish_batch_wait(stream_id, &entries[..size])
+                        .await
+                        .expect("publish_batch_wait (tail confirmation)");
+                } else {
+                    loop {
+                        match c.publish_batch(stream_id, &entries[..size]) {
+                            Ok(()) => break,
+                            Err(arbitro_client_tokio::ClientError::QueueFull) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(e) => panic!("publish_batch: {e:?}"),
                         }
-                        Err(e) => panic!("publish_batch: {e:?}"),
                     }
                 }
             }
@@ -724,7 +744,10 @@ fn main() {
         }
 
         // ── Batch publish ───────────────────────────────────────────
-        println!("\n[ publish_batch — batch={batch_size}, {total_msgs} msgs total/iter ]");
+        println!(
+            "\n[ publish_batch — batch={batch_size}, {total_msgs} msgs total/iter, \
+             fire-and-forget, tail-confirmed ]"
+        );
         print_header();
 
         for &n in &concurrency {
