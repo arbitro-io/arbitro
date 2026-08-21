@@ -163,6 +163,7 @@ dependencies = [
  "crc32fast",
  "croner",
  "foldhash",
+ "libc",
  "nohash-hasher",
  "parking_lot",
  "rcgen",

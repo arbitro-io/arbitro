@@ -35,11 +35,24 @@ use bytes::Bytes;
 
 // ── Settings ────────────────────────────────────────────────────
 
-/// journal_kind u8: 0=Memory, 1=Disk, 2=Tolerant
-const JOURNAL_KIND: u8 = 0; // Memory
-/// Same value as `JOURNAL_KIND`, typed for the builder.
-const JOURNAL_KIND_ENUM: JournalKind = JournalKind::Memory;
-/// Only used when JOURNAL_KIND == 2 (Tolerant).
+/// journal_kind u8: 0=Memory, 1=Disk, 2=Tolerant. `BENCH_JOURNAL` picks it
+/// at runtime — the store's cost per append is what decides how much the
+/// drain's lock hold matters, so this has to be switchable without a rebuild.
+fn journal_kind() -> u8 {
+    match std::env::var("BENCH_JOURNAL").as_deref() {
+        Ok("disk") => 1,
+        Ok("tolerant") => 2,
+        _ => 0,
+    }
+}
+fn journal_kind_enum() -> JournalKind {
+    match journal_kind() {
+        1 => JournalKind::Disk,
+        2 => JournalKind::Tolerant,
+        _ => JournalKind::Memory,
+    }
+}
+/// Only used when journal_kind() == 2 (Tolerant).
 const TOLERANT_DATA_DIR: &str = "/tmp/arbitro_bench_tolerant";
 
 /// A stream named `x` owns `x.>`, and nothing else does.
@@ -128,9 +141,12 @@ const MAX_STREAMS: usize = 32;
 const LEVEL_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLAY_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Pre-allocated 64B payload shared across all spawned tasks.
+/// Pre-allocated payload shared across all spawned tasks. `BENCH_PAYLOAD`
+/// overrides the 64B default — the staging buffer the drain copies into is
+/// `max_feed * payload`, so payload size is what decides whether copying the
+/// window out is cheap or expensive.
 fn shared_payload() -> Arc<[u8]> {
-    Arc::from(vec![0u8; 64].into_boxed_slice())
+    Arc::from(vec![0u8; env_usize("BENCH_PAYLOAD", 64)].into_boxed_slice())
 }
 
 // ── Metrics ─────────────────────────────────────────────────────
@@ -176,7 +192,7 @@ async fn start_server() -> String {
         .max_connections(500)
         .write_buffer_cap(65536);
 
-    if JOURNAL_KIND == 2 {
+    if journal_kind() == 2 {
         config = config.data_dir(TOLERANT_DATA_DIR);
     }
 
@@ -219,7 +235,7 @@ async fn reset_streams(client: &Client, names: &[Vec<u8>]) -> Vec<u32> {
         let filter = stream_filter(name);
         let created = StreamBuilder::new(name)
             .filter(&filter)
-            .journal_kind(JOURNAL_KIND_ENUM)
+            .journal_kind(journal_kind_enum())
             .upsert(client)
             .await
             .expect("upsert stream");
@@ -581,7 +597,7 @@ fn print_result(r: &BenchResult) {
 // ── Cleanup ─────────────────────────────────────────────────────
 
 fn cleanup_tolerant() {
-    if JOURNAL_KIND != 2 {
+    if journal_kind() != 2 {
         return;
     }
     let data_path = std::path::Path::new(TOLERANT_DATA_DIR);
@@ -622,7 +638,7 @@ fn walkdir(p: &std::path::Path) -> u64 {
 // ── Main ────────────────────────────────────────────────────────
 
 fn main() {
-    let journal_label = match JOURNAL_KIND {
+    let journal_label = match journal_kind() {
         0 => "memory",
         1 => "disk",
         2 => "tolerant",
@@ -1040,7 +1056,7 @@ fn main() {
                 let fanout_name = b"fanout_bench".as_slice();
                 let created = StreamBuilder::new(fanout_name)
                     .filter(FANOUT_FILTER)
-                    .journal_kind(JOURNAL_KIND_ENUM)
+                    .journal_kind(journal_kind_enum())
                     .upsert(&setup_client)
                     .await
                     .expect("upsert fanout stream");
