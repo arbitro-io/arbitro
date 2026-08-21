@@ -32,6 +32,7 @@ serde_json     = { workspace = true }
 
 [features]
 lifecycle_trace = ["arbitro-server/lifecycle_trace"]
+drain_profile = ["arbitro-server/drain_profile"]
 cluster = ["arbitro-server/cluster"]
 
 

@@ -38,6 +38,19 @@ use bytes::Bytes;
 /// journal_kind u8: 0=Memory, 1=Disk, 2=Tolerant. `BENCH_JOURNAL` picks it
 /// at runtime — the store's cost per append is what decides how much the
 /// drain's lock hold matters, so this has to be switchable without a rebuild.
+/// Inflight window per fanout consumer under `BENCH_ACK=explicit`. Large
+/// enough that acks, not capacity, set the pace — the point is to price the
+/// ack path, not to benchmark backpressure.
+const FANOUT_MAX_INFLIGHT: u16 = 4096;
+
+/// `BENCH_ACK=explicit` runs the fanout scenario with `AckPolicy::Explicit`
+/// so the collapse path is exercised WITH per-consumer ack tracking: one
+/// wire copy per (connection, consumer), each sibling acking its own. That
+/// crossing is covered by tests but was never priced.
+fn ack_explicit() -> bool {
+    matches!(std::env::var("BENCH_ACK").as_deref(), Ok("explicit"))
+}
+
 fn journal_kind() -> u8 {
     match std::env::var("BENCH_JOURNAL").as_deref() {
         Ok("disk") => 1,
@@ -1082,21 +1095,31 @@ fn main() {
                     for si in 0..n_consumers_per_client {
                         let name = format!("fanout_c{ci}_s{si}");
                         let group = format!("fanout_g{ci}_{si}");
-                        // `AckPolicy::None` on purpose: this measures delivery,
-                        // not the pending bookkeeping. With `Explicit` the drain
-                        // would also check capacity, open a pending per copy and
-                        // process the acks back — a different number entirely.
+                        // `AckPolicy::None` by default: that measures delivery,
+                        // not the pending bookkeeping. `BENCH_ACK=explicit`
+                        // switches it, and then the drain ALSO runs the capacity
+                        // checks, opens a pending per copy and processes the acks
+                        // back — a different number entirely, which is the point.
                         //
-                        // No `max_inflight` and no `ack_wait_ms`: both are inert
-                        // under `None` — `fire_and_forget` skips the capacity
-                        // check and never opens a pending to time out. The
-                        // builder rejects them outright, which is how the
-                        // `u16::MAX` this used to pass got found.
-                        let consumer_id = ConsumerBuilder::new(name.as_bytes())
+                        // Under `None` the builder rejects `max_inflight` and
+                        // `ack_wait_ms` outright (both are inert — fire-and-forget
+                        // skips the capacity check and never opens a pending),
+                        // which is how the `u16::MAX` this used to pass got found.
+                        // Under `Explicit` they are required, and the receive loop
+                        // below must ack or the run stalls at the first full
+                        // window.
+                        let b = ConsumerBuilder::new(name.as_bytes())
                             .group(group.as_bytes())
-                            .ack_policy(AckPolicy::None)
                             .deliver_policy(DeliverPolicy::All)
-                            .deliver_mode(DeliverMode::Fanout)
+                            .deliver_mode(DeliverMode::Fanout);
+                        let b = if ack_explicit() {
+                            b.ack_policy(AckPolicy::Explicit)
+                                .max_inflight(FANOUT_MAX_INFLIGHT)
+                                .ack_wait_ms(30_000)
+                        } else {
+                            b.ack_policy(AckPolicy::None)
+                        };
+                        let consumer_id = b
                             .create(client, fanout_stream_id)
                             .await
                             .expect("create fanout consumer");
@@ -1171,8 +1194,17 @@ fn main() {
                         let t0 = Instant::now();
                         let mut count = 0u32;
                         while count < expected {
-                            if handle.recv().await.is_none() {
-                                break;
+                            match handle.recv().await {
+                                // Fire-and-forget ack: the client coalesces
+                                // these into BatchAck frames. Skipping it under
+                                // Explicit stalls the run the moment
+                                // max_inflight fills.
+                                Some(msg) => {
+                                    if ack_explicit() {
+                                        msg.ack();
+                                    }
+                                }
+                                None => break,
                             }
                             count += 1;
                         }
@@ -1245,5 +1277,7 @@ fn main() {
     let _ = all_stream_ids;
 
     println!("\n{}", "=".repeat(110));
+    // No-op unless arbitro-server was built with `--features drain_profile`.
+    arbitro_server::shard::drain_profile::report();
     cleanup_tolerant();
 }
