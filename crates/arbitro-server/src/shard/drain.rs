@@ -824,6 +824,7 @@ fn process_drain_entry(
     more_pending: &mut bool,
     lowest_skipped: &mut Option<u64>,
 ) {
+    crate::shard::drain_profile::walked();
     let stream_id = StreamId(entry.stream_id);
 
     // TTL expiration — cheapest check, runs first.
@@ -1205,6 +1206,7 @@ fn dispatch_recipients(
         // A collapsed sibling gets no wire copy — its group already has one
         // in this frame, and the client fans it out locally.
         if !collapsed {
+            crate::shard::drain_profile::emit();
             scratch.acc.add(
                 connection_id,
                 stream_id,

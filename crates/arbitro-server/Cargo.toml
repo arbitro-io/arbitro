@@ -25,6 +25,9 @@ default = []
 # Enable with `cargo test --features lifecycle_trace` when you need to
 # profile end-to-end timings of a single message through the server.
 lifecycle_trace = []
+# Per-cycle drain phase timings (fill / dispatch / flush). OFF by default;
+# every call site compiles away. See shard/drain_profile.rs.
+drain_profile = []
 # TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:thiserror"]
 cluster = ["dep:arbitro-raft"]
@@ -74,3 +77,7 @@ tempfile = { workspace = true }
 # Benches removed: they were strategy comparisons used during
 # development, not regression benchmarks. Add a new bench under
 # `benches/` when targeting a specific production path.
+
+[[bench]]
+name = "scratch_shape"
+harness = false

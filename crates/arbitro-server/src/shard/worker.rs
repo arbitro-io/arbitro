@@ -213,6 +213,7 @@ impl DrainWorker {
                     let g = self.store.lock();
                     let w = super::drain::window(&self.counters, &**g, &self.drain_config);
                     if let super::drain::Window::Range { start, end, .. } = w {
+                        let _p = super::drain_profile::fill();
                         self.staged.fill(&**g, start, end);
                     }
                     w
@@ -228,6 +229,8 @@ impl DrainWorker {
                         last_seq,
                     } => {
                         super::drain::reset_cycle(&mut self.drain_scratch, snap_changed);
+                        super::drain_profile::cycle((end - start) as usize);
+                        let _p = super::drain_profile::dispatch();
                         let (more_pending, lowest_skipped) = super::drain::drain_dispatch_staged(
                             &self.counters,
                             &snap,
@@ -250,6 +253,7 @@ impl DrainWorker {
                 // `drain_deliver` re-opens the gate iff more work remains;
                 // non-`Fed` verdicts leave it cleared by the top-of-loop lock.
                 if let ReadVerdict::Fed(result) = verdict {
+                    let _p = super::drain_profile::flush();
                     super::drain::drain_deliver(
                         &self.counters,
                         &snap,
