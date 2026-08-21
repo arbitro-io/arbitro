@@ -20,6 +20,7 @@ use memmap2::{MmapMut, MmapOptions};
 /// do not use `with_capacity`.
 pub const DEFAULT_SEGMENT_SIZE: usize = 16 * 1024 * 1024;
 
+
 /// Minimum sensible segment size (no point going below a page).
 const MIN_SEGMENT_SIZE: usize = 4 * 1024;
 
@@ -44,22 +45,10 @@ pub struct MemoryStore {
     segment_size: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LogMetadata {
-    pub seq: u64,
-    pub ts: u64,
-    pub subj_len: u16,
-    pub payload_len: u32,
-    /// Offset within the segment identified by `segment_idx`.
-    pub offset: u32,
-    /// Index into `sealed` (if `< sealed.len()`) or the active segment
-    /// (if `== sealed.len()`).
-    pub segment_idx: u32,
-    #[allow(dead_code)]
-    pub subject_hash: u32,
-    pub stream_id: u32,
-    pub flags: u8,
-}
+/// The index element is the shared `EntryLoc`, so a window of it can be
+/// handed out as a slice. `segment_idx` indexes `sealed`, or names the
+/// active segment when `== sealed.len()`.
+use crate::store::EntryLoc as LogMetadata;
 
 impl Default for MemoryStore {
     fn default() -> Self {
@@ -221,6 +210,7 @@ impl MemoryStore {
             subject: &data[subj_start..payload_start],
             payload: &data[payload_start..payload_end],
             flags: meta.flags,
+            subject_hash: meta.subject_hash,
         }
     }
 
@@ -425,6 +415,19 @@ impl Store for MemoryStore {
             }
             None => Ok(false),
         }
+    }
+
+    /// Slice of the index — one bound lookup, no per-entry work.
+    #[inline]
+    fn index_window(&self, start: u64, end: u64) -> &[LogMetadata] {
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end).min(self.index.len());
+        &self.index[s.min(e)..e]
+    }
+
+    #[inline]
+    fn segment_bytes(&self, segment_idx: u32) -> &[u8] {
+        self.segment_slice(segment_idx)
     }
 
     fn for_each(

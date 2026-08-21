@@ -12,3 +12,7 @@ tracing   = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "read_cost"
+harness = false

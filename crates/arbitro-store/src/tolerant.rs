@@ -12,19 +12,9 @@ use crate::store::{
 };
 use arbitro_engine_v2::common::wire_hash_32;
 
-#[derive(Debug, Clone, Copy)]
-struct LogMetadata {
-    pub seq: u64,
-    pub ts: u64,
-    pub subj_len: u16,
-    pub payload_len: u32,
-    pub offset: u32,
-    pub segment_idx: u32,
-    #[allow(dead_code)]
-    pub subject_hash: u32,
-    pub stream_id: u32,
-    pub flags: u8,
-}
+/// Shared with `MemoryStore` so both expose the same index slice.
+/// `offset` points past the 28-byte record header, at the subject.
+use crate::store::EntryLoc as LogMetadata;
 
 pub struct TolerantStore {
     base_path: PathBuf,
@@ -398,12 +388,6 @@ impl TolerantStore {
         }
 
         if first != 0 {
-            if std::env::var("ARBITRO_CHAOS_DEBUG").is_ok() {
-                eprintln!(
-                    "[STORE-LOAD-SEG] path={:?} first_seq={} last_seq={} next_seq={} scan_end_off={}",
-                    path.file_name().unwrap_or_default(), first, last, self.next_seq, offset
-                );
-            }
             self.segments.push(SegmentMetadata {
                 path: path.to_path_buf(),
                 first_seq: first,
@@ -411,12 +395,6 @@ impl TolerantStore {
             });
             self.sealed_segments.push(mmap);
             self.load_tombstones_for_segment(first);
-        } else if std::env::var("ARBITRO_CHAOS_DEBUG").is_ok() {
-            eprintln!(
-                "[STORE-LOAD-SEG-EMPTY] path={:?} scan_end_off={}",
-                path.file_name().unwrap_or_default(),
-                offset
-            );
         }
         Ok(())
     }
@@ -617,6 +595,7 @@ impl TolerantStore {
             subject: &data[m.offset as usize..sub_end],
             payload: &data[sub_end..body_end],
             flags: m.flags,
+            subject_hash: m.subject_hash,
         });
         Ok(true)
     }
@@ -798,6 +777,7 @@ impl Store for TolerantStore {
             subject: &data[m.offset as usize..sub_end],
             payload: &data[sub_end..sub_end + (m.payload_len as usize)],
             flags: m.flags,
+            subject_hash: m.subject_hash,
         });
         Ok(true)
     }
@@ -1021,6 +1001,7 @@ impl Store for TolerantStore {
             subject: &data[m.offset as usize..sub_end],
             payload: &data[sub_end..sub_end + (m.payload_len as usize)],
             flags: m.flags,
+            subject_hash: m.subject_hash,
         }))
     }
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<Entry<'_>>, StoreError> {
@@ -1048,6 +1029,7 @@ impl Store for TolerantStore {
                 subject: &data[m.offset as usize..sub_end],
                 payload: &data[sub_end..sub_end + (m.payload_len as usize)],
                 flags: m.flags,
+                subject_hash: m.subject_hash,
             });
         }
         Ok(result)
@@ -1098,6 +1080,7 @@ impl Store for TolerantStore {
                     subject: subj,
                     payload: &[][..],
                     flags: m.flags,
+                    subject_hash: m.subject_hash,
                 },
                 subject,
             ) {
@@ -1178,6 +1161,30 @@ impl Store for TolerantStore {
         count
     }
 
+    /// Slice of the index — identical shape to `MemoryStore`. The index
+    /// lives in RAM and is never read from disk here, so this costs the
+    /// same on a disk-backed store as on an in-memory one and cannot
+    /// fault a page.
+    #[inline]
+    fn index_window(&self, start: u64, end: u64) -> &[LogMetadata] {
+        let s = self.find_lower_bound(start);
+        let e = self.find_lower_bound(end).min(self.index.len());
+        &self.index[s.min(e)..e]
+    }
+
+    /// Segment bytes. `segment_idx == sealed_segments.len()` names the
+    /// active mmap; anything lower indexes the sealed ones.
+    #[inline]
+    fn segment_bytes(&self, segment_idx: u32) -> &[u8] {
+        if segment_idx as usize == self.sealed_segments.len() {
+            self.active_mmap.as_ref().map_or(&[][..], |m| &m[..])
+        } else {
+            self.sealed_segments
+                .get(segment_idx as usize)
+                .map_or(&[][..], |m| &m[..])
+        }
+    }
+
     fn for_each(&self, s: u64, e: u64, f: &mut dyn FnMut(&Entry<'_>)) -> Result<(), StoreError> {
         let start = self.find_lower_bound(s);
         let end = self.find_lower_bound(e);
@@ -1209,6 +1216,7 @@ impl Store for TolerantStore {
                 subject: &data[sub_start..sub_end],
                 payload: &data[sub_end..pld_end],
                 flags: m.flags,
+                subject_hash: m.subject_hash,
             };
             f(&entry);
         }

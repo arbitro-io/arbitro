@@ -35,6 +35,57 @@ pub struct Entry<'a> {
     pub subject: &'a [u8],
     pub payload: &'a [u8],
     pub flags: u8,
+    /// `wire_hash_32(subject)`, computed once on append and carried in the
+    /// index. Readers must NOT recompute it — the drain hashes the subject
+    /// of every delivered message otherwise, and the field is free: it sits
+    /// in `EntryLoc`'s alignment padding.
+    pub subject_hash: u32,
+}
+
+/// Where one entry lives, and everything about it that is not its bytes.
+///
+/// This is the element type of every backend's in-memory index, so a window
+/// of it can be handed out as a plain slice — no walk, no construction, no
+/// allocation. `offset` points at the SUBJECT (past any on-disk record
+/// header); `payload` follows it contiguously.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryLoc {
+    pub seq: u64,
+    pub ts: u64,
+    /// Offset of the subject within the segment named by `segment_idx`.
+    pub offset: u32,
+    pub payload_len: u32,
+    pub segment_idx: u32,
+    pub subject_hash: u32,
+    pub stream_id: u32,
+    pub subj_len: u16,
+    pub flags: u8,
+}
+
+impl EntryLoc {
+    /// Byte range of `subject ++ payload` within its segment — they are
+    /// stored contiguously, so one range covers both.
+    #[inline]
+    pub fn range(&self) -> std::ops::Range<usize> {
+        let start = self.offset as usize;
+        start..start + self.subj_len as usize + self.payload_len as usize
+    }
+
+    /// Resolve against the segment bytes from `Store::segment_bytes`.
+    #[inline]
+    pub fn entry<'a>(&self, segment: &'a [u8]) -> Entry<'a> {
+        let start = self.offset as usize;
+        let mid = start + self.subj_len as usize;
+        Entry {
+            seq: self.seq,
+            stream_id: self.stream_id,
+            timestamp: self.ts,
+            subject: &segment[start..mid],
+            payload: &segment[mid..mid + self.payload_len as usize],
+            flags: self.flags,
+            subject_hash: self.subject_hash,
+        }
+    }
 }
 
 /// Message reference for appending — borrows data, no allocation.
@@ -174,6 +225,28 @@ pub trait Store: Send + Sync {
         end: u64,
         f: &mut dyn FnMut(&Entry<'_>),
     ) -> Result<(), StoreError>;
+
+    /// The index window for `[start, end)` as a SLICE — no walk, no
+    /// construction, no allocation. Costs one bound lookup regardless of
+    /// how many entries it covers.
+    ///
+    /// Prefer this over `for_each` when the caller has its own loop: it
+    /// hands back the metadata directly instead of paying a `&mut dyn
+    /// FnMut` virtual call per entry, and the caller resolves bytes via
+    /// `segment_bytes` + `EntryLoc::entry`.
+    ///
+    /// Backends with no in-memory index return an empty slice; callers
+    /// must fall back to `for_each` when this is empty and the window is
+    /// not.
+    fn index_window(&self, _start: u64, _end: u64) -> &[EntryLoc] {
+        &[]
+    }
+
+    /// Bytes of one segment, for resolving an `EntryLoc` returned by
+    /// `index_window`. Empty when the backend has no such segment.
+    fn segment_bytes(&self, _segment_idx: u32) -> &[u8] {
+        &[]
+    }
 
     // ── Management ──────────────────────────────────────────────────
 
