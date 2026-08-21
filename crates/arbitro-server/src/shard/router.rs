@@ -2,7 +2,7 @@
 //!
 //! Each shard has THREE independent services:
 //! - **Publish**: dispatch layer writes directly to the store, signals gate.
-//! - **Drain**: dedicated OS thread reads from store, delivers via atomics.
+//! - **Drain**: tokio task reads from store, delivers via atomics.
 //! - **Commands**: tokio task processes ack/nack/subscribe/admin.
 //!
 //! **Zero Mutex between drain and commands.** Shared state is atomics +
@@ -158,7 +158,7 @@ impl ShardRouter {
 }
 
 impl ShardRouter {
-    /// Spawn N shard workers. Per shard: one drain OS thread + one command tokio task.
+    /// Spawn N shard workers. Per shard: one drain tokio task + one command tokio task.
     pub fn spawn(config: &Config, registry: &ConnectionRegistry) -> Self {
         let shard_count = config.shard_count;
         let channel_capacity = config.channel_capacity;
@@ -243,7 +243,7 @@ impl ShardRouter {
             // the producer, drain owns the consumer.
             let (drain_evt_tx, drain_evt_rx) = DrainEventRing::new();
 
-            // ── Drain task — pure: gate.acquire → drain_read/deliver ──
+            // ── Drain task — pure: gate.acquire → fill/dispatch/deliver ──
             let drain_worker = DrainWorker {
                 shard_id: id as u32,
                 counters: Arc::clone(&counters),
@@ -258,6 +258,7 @@ impl ShardRouter {
                     stall_evict_ms: config.drain_stall_evict_ms,
                 },
                 drain_scratch: super::drain::DrainScratch::new(),
+                staged: super::drain::Staged::default(),
                 running: Arc::clone(&running),
                 notify_ring: notify_tx,
                 drain_evt_rx,

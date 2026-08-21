@@ -4,7 +4,7 @@
 //! ```text
 //! loop {
 //!     gate.acquire();
-//!     while gate.is_open() { drain_read(); drain_deliver(); }
+//!     while gate.is_open() { staged.fill(); dispatch(); drain_deliver(); }
 //! }
 //! ```
 //! Reads `SharedCounters` (atomics) + `SnapshotSwap<DrainSnapshot>` (Arc).
@@ -62,7 +62,7 @@ pub(super) struct StreamRetention {
 /// A bound consumer↔connection pair for delivery.
 ///
 /// Created by `handle_subscribe` / `handle_bind`, iterated by the
-/// drain cycle (`drain::drain_read`), filtered on unsubscribe / delete.
+/// drain cycle, filtered on unsubscribe / delete.
 pub struct ActiveBinding {
     pub(super) binding_id: BindingId,
     pub(super) connection_id: ConnectionId,
@@ -101,7 +101,7 @@ pub struct ActiveBinding {
 
 // ── Drain worker ────────────────────────────────────────────────────────────
 
-/// Pure drain thread — gate.acquire → drain_read/drain_deliver → loop.
+/// Pure drain thread — gate.acquire → fill/dispatch → drain_deliver → loop.
 /// Nothing else runs here. No commands, no engine, no Mutex.
 ///
 /// Reads atomics (`SharedCounters`) and snapshots (`SnapshotSwap`)
@@ -121,6 +121,9 @@ pub struct DrainWorker {
     pub(super) names: Arc<crate::common::NameRegistry>,
     pub(super) drain_config: super::drain::DrainConfig,
     pub(super) drain_scratch: super::drain::DrainScratch,
+    /// EXPERIMENT (ARBITRO_DRAIN_STAGE=1) — owned copy of the window, so the
+    /// store lock is released before dispatch.
+    pub(super) staged: super::drain::Staged,
     pub(super) running: Arc<std::sync::atomic::AtomicBool>,
     /// Notifications to command thread (deliveries + dead connections).
     /// SPSC — drain owns the sole producer half (this task).
@@ -159,7 +162,7 @@ impl DrainWorker {
         }
 
         // Previous cycle's snapshot — held so the `Arc::ptr_eq` compare is
-        // ABA-safe; gates the scratch-cache clear in `drain_read`.
+        // ABA-safe; gates the scratch-cache clear in `reset_cycle`.
         let mut prev_snap: Option<Arc<DrainSnapshot>> = None;
 
         loop {
@@ -199,20 +202,49 @@ impl DrainWorker {
                 let snap_changed = prev_snap.as_ref().is_none_or(|p| !Arc::ptr_eq(p, &snap));
                 let prev_cursor = self.counters.cursor();
 
-                // Phase split: store lock held for the walk only; delivery
-                // and bookkeeping run lock-free.
-                let verdict = {
-                    let store_guard = self.store.lock();
-                    super::drain::drain_read(
-                        &self.counters,
-                        &snap,
-                        &**store_guard,
-                        &self.drain_config,
-                        &mut self.drain_scratch,
-                        &mut self.consumer_subjects,
-                        now_ms,
-                        snap_changed,
-                    )
+                // Phase split: the store lock covers the COPY only. Matching,
+                // per-recipient checks and frame building all run released.
+                //
+                // Dispatching under the guard instead costs ~20% of fanout
+                // wall time and blocks publish ~10x longer (measured, memory
+                // and disk journals): the drain holds the lock for the whole
+                // walk while every publisher waits on it.
+                let w = {
+                    let g = self.store.lock();
+                    let w = super::drain::window(&self.counters, &**g, &self.drain_config);
+                    if let super::drain::Window::Range { start, end, .. } = w {
+                        self.staged.fill(&**g, start, end);
+                    }
+                    w
+                };
+                let verdict = match w {
+                    super::drain::Window::NoDemand => ReadVerdict::NoDemand,
+                    super::drain::Window::UpToDate { last_seq, cursor } => {
+                        ReadVerdict::UpToDate { last_seq, cursor }
+                    }
+                    super::drain::Window::Range {
+                        start,
+                        end,
+                        last_seq,
+                    } => {
+                        super::drain::reset_cycle(&mut self.drain_scratch, snap_changed);
+                        let (more_pending, lowest_skipped) = super::drain::drain_dispatch_staged(
+                            &self.counters,
+                            &snap,
+                            &self.drain_config,
+                            &self.staged,
+                            &mut self.drain_scratch,
+                            &mut self.consumer_subjects,
+                            now_ms,
+                        );
+                        ReadVerdict::Fed(super::drain::DrainReadResult {
+                            start,
+                            end,
+                            more_pending,
+                            lowest_skipped,
+                            last_seq,
+                        })
+                    }
                 };
                 probe.read_verdict(verdict);
                 // `drain_deliver` re-opens the gate iff more work remains;

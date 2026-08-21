@@ -22,14 +22,13 @@ use std::sync::Arc;
 
 use arbitro_engine_v2::catalog::match_table::MatchEntry;
 use arbitro_engine_v2::command::DeliveredEntry;
-use arbitro_engine_v2::common::wire_hash_32;
 use arbitro_engine_v2::types::*;
 use arbitro_store::Store;
 
 use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
-use crate::shard::drain_probe::{DrainProbe, ReadVerdict};
+use crate::shard::drain_probe::DrainProbe;
 use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
@@ -129,7 +128,7 @@ pub(in crate::shard) struct DrainScratch {
     sorted_notify: Vec<PendingNotify>,
 
     /// ROB-23 — per-connection stall clock, persistent ACROSS cycles
-    /// (never cleared in `drain_read`). An entry `(conn, since)` means
+    /// (never cleared per cycle). An entry `(conn, since)` means
     /// every flush to `conn` has come back `Backpressured` (writer
     /// channel full, zero progress) in every cycle since `since`. The
     /// entry is dropped the moment a frame flushes `Ok` or the conn
@@ -308,7 +307,7 @@ fn local_delta_inc(list: &mut Vec<(u32, u32)>, key: u32) {
 
 // ── Drain cycle (entry point) ───────────────────────────────────────────────
 
-/// Result of Phase 1 (store read). Passed from `drain_read` to `drain_deliver`
+/// Result of Phase 1 (store read). Passed from the staged dispatch to `drain_deliver`
 /// so the store lock can be released in between.
 #[derive(Clone, Copy)]
 pub(in crate::shard) struct DrainReadResult {
@@ -326,83 +325,181 @@ pub(in crate::shard) struct DrainReadResult {
 /// Non-`Fed` verdicts mean no work; the gate stays cleared by the
 /// worker's top-of-cycle `lock()`.
 #[allow(clippy::too_many_arguments)]
-pub(in crate::shard) fn drain_read(
-    counters: &SharedCounters,
-    snap: &DrainSnapshot,
-    store: &dyn Store,
-    cfg: &DrainConfig,
-    scratch: &mut DrainScratch,
-    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-    now_ms: u64,
-    snap_changed: bool,
-) -> ReadVerdict {
-    crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
+/// Owned copy of a window, so the store lock can be dropped before dispatch.
+///
+/// `Entry<'a>` borrows the store arena and cannot outlive the guard, so
+/// releasing the lock early means the bytes come along. The metadata is
+/// the store's own `EntryLoc`, rebased so `offset` indexes `bytes`.
+#[derive(Default)]
+pub(in crate::shard) struct Staged {
+    bytes: Vec<u8>,
+    entries: Vec<arbitro_store::EntryLoc>,
+}
 
-    if !counters.has_any_demand() {
-        return ReadVerdict::NoDemand;
+impl Staged {
+    /// Copy `[start, end)` out of the store. THE ONLY THING that needs the
+    /// lock: no matching, no per-recipient checks, no frame building.
+    ///
+    /// Walks the index slice rather than `for_each`, which costs a
+    /// `&mut dyn FnMut` virtual call per entry. Subject and payload are
+    /// contiguous in the segment, so one `extend_from_slice` covers both.
+    pub(in crate::shard) fn fill(&mut self, store: &dyn Store, start: u64, end: u64) {
+        self.bytes.clear();
+        self.entries.clear();
+        let locs = store.index_window(start, end);
+        if locs.is_empty() {
+            // Backend with no in-memory index — fall back to the walk. A
+            // genuinely empty window makes this a no-op either way.
+            store
+                .for_each(start, end, &mut |e| {
+                    let offset = self.bytes.len() as u32;
+                    self.bytes.extend_from_slice(e.subject);
+                    self.bytes.extend_from_slice(e.payload);
+                    self.entries.push(arbitro_store::EntryLoc {
+                        seq: e.seq,
+                        ts: e.timestamp,
+                        offset,
+                        payload_len: e.payload.len() as u32,
+                        segment_idx: 0,
+                        // MUST carry the real hash: the dispatcher trusts
+                        // this field now and a zero here matches nothing.
+                        subject_hash: e.subject_hash,
+                        stream_id: e.stream_id,
+                        subj_len: e.subject.len() as u16,
+                        flags: e.flags,
+                    });
+                })
+                .ok();
+            return;
+        }
+        for loc in locs {
+            let seg = store.segment_bytes(loc.segment_idx);
+            let mut rebased = *loc;
+            rebased.offset = self.bytes.len() as u32;
+            self.bytes.extend_from_slice(&seg[loc.range()]);
+            self.entries.push(rebased);
+        }
     }
 
-    let info = store.info();
-    let cursor = counters.cursor();
-    if info.last_seq <= cursor {
-        return ReadVerdict::UpToDate {
-            last_seq: info.last_seq,
-            cursor,
-        };
+    /// The entries, resolved lazily against the copy. No intermediate
+    /// `Vec<Entry>` — `process_entries` consumes the iterator directly.
+    pub(in crate::shard) fn iter(&self) -> impl Iterator<Item = arbitro_store::Entry<'_>> + '_ {
+        self.entries.iter().map(|loc| loc.entry(&self.bytes))
     }
+}
 
-    let start = cursor + 1;
-    let end = (start + cfg.max_feed as u64).min(info.last_seq + 1);
-    let mut more_pending = false;
-    let mut lowest_skipped: Option<u64> = None;
-
+/// Per-cycle scratch reset. Runs ONCE per cycle, never per message: the
+/// accumulator and the inflight deltas belong to the whole window.
+pub(in crate::shard) fn reset_cycle(scratch: &mut DrainScratch, snap_changed: bool) {
     scratch.dead_connections.clear();
     scratch.local_inflight.clear();
     scratch.local_subject.clear();
     scratch.deliveries.clear();
     scratch.acc.clear();
-    // Pattern/subject-limit caches are pure functions of the snapshot's
-    // match tables — valid while the snapshot Arc is unchanged (ptr_eq
-    // in the worker, ABA-safe because it holds the previous Arc). Stale
-    // entries after a swap would drop late-binding fanout subscribers.
     if snap_changed {
         scratch.caches.clear();
     }
+}
 
-    crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
+/// Window bounds, or why there is no window. Lets the caller take the lock,
+/// decide, and drop it before dispatching.
+pub(in crate::shard) enum Window {
+    NoDemand,
+    UpToDate { last_seq: u64, cursor: u64 },
+    Range { start: u64, end: u64, last_seq: u64 },
+}
 
-    // Walk the store, accumulate into per-connection buckets.
-    store
-        .for_each(start, end, &mut |entry| {
-            // Per-stream max_age_ms takes precedence over the global default;
-            // falls back to global cfg if the stream has no specific limit.
-            let stream_max_age = snap
-                .stream_max_age_ms
-                .get(entry.stream_id as usize)
-                .copied()
-                .filter(|&v| v > 0)
-                .unwrap_or(cfg.max_age_ms);
-            process_drain_entry(
-                counters,
-                snap,
-                entry,
-                scratch,
-                consumer_subjects,
-                now_ms,
-                stream_max_age,
-                &mut more_pending,
-                &mut lowest_skipped,
-            );
-        })
-        .ok();
-
-    ReadVerdict::Fed(DrainReadResult {
+/// Where the walk should go this cycle. Cheap — one atomic and `store.info()`.
+pub(in crate::shard) fn window(
+    counters: &SharedCounters,
+    store: &dyn Store,
+    cfg: &DrainConfig,
+) -> Window {
+    if !counters.has_any_demand() {
+        return Window::NoDemand;
+    }
+    let info = store.info();
+    let cursor = counters.cursor();
+    if info.last_seq <= cursor {
+        return Window::UpToDate {
+            last_seq: info.last_seq,
+            cursor,
+        };
+    }
+    let start = cursor + 1;
+    Window::Range {
         start,
-        end,
-        more_pending,
-        lowest_skipped,
+        end: (start + cfg.max_feed as u64).min(info.last_seq + 1),
         last_seq: info.last_seq,
-    })
+    }
+}
+
+/// Dispatch a staged window with the lock already released. Same dispatch as
+/// the borrowed path — only the list's provenance differs.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::shard) fn drain_dispatch_staged(
+    counters: &SharedCounters,
+    snap: &DrainSnapshot,
+    cfg: &DrainConfig,
+    staged: &Staged,
+    scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+    now_ms: u64,
+) -> (bool, Option<u64>) {
+    process_entries(
+        counters,
+        snap,
+        staged.iter(),
+        cfg,
+        scratch,
+        consumer_subjects,
+        now_ms,
+    )
+}
+
+/// Dispatch a SEQUENCE of entries.
+///
+/// Everything the drain does per message lives here. HOW the entries were
+/// obtained — borrowed straight from the store with the lock held, or copied
+/// out first so the lock could be released — is the caller's decision and is
+/// invisible from in here. That is the whole point of taking an iterator: the
+/// acquisition strategy becomes a policy at the call site instead of being
+/// welded into the walk, and no caller has to materialise a `Vec` to get here.
+///
+/// Returns `(more_pending, lowest_skipped)`.
+fn process_entries<'a>(
+    counters: &SharedCounters,
+    snap: &DrainSnapshot,
+    entries: impl Iterator<Item = arbitro_store::Entry<'a>>,
+    cfg: &DrainConfig,
+    scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+    now_ms: u64,
+) -> (bool, Option<u64>) {
+    let mut more_pending = false;
+    let mut lowest_skipped: Option<u64> = None;
+    for entry in entries {
+        // Per-stream max_age_ms takes precedence over the global default;
+        // falls back to global cfg if the stream has no specific limit.
+        let stream_max_age = snap
+            .stream_max_age_ms
+            .get(entry.stream_id as usize)
+            .copied()
+            .filter(|&v| v > 0)
+            .unwrap_or(cfg.max_age_ms);
+        process_drain_entry(
+            counters,
+            snap,
+            &entry,
+            scratch,
+            consumer_subjects,
+            now_ms,
+            stream_max_age,
+            &mut more_pending,
+            &mut lowest_skipped,
+        );
+    }
+    (more_pending, lowest_skipped)
 }
 
 /// Phase 2+3 — flush accumulated frames to TCP + bookkeeping.
@@ -757,7 +854,10 @@ fn process_drain_entry(
         return;
     }
 
-    let subject_hash = wire_hash_32(entry.subject);
+    // Carried from the index — hashed once on append. Recomputing it here
+    // hashed the subject of every delivered message, and the field is free:
+    // it sits in `EntryLoc`'s alignment padding.
+    let subject_hash = entry.subject_hash;
 
     // Single match_table lookup — reused across all three steps below.
     // Early return when no match table: all three steps would skip and
@@ -882,15 +982,6 @@ fn dispatch_recipients(
     }
     let start = (entry.seq as usize) % n;
 
-    // TEMP chaos-debug — per-entry skip accounting, removed after diagnosis.
-    let mut dbg_tracked = false;
-    let mut dbg_recipients = 0u32;
-    let mut dbg_acked_floor = 0u32;
-    let mut dbg_deliver_floor = 0u32;
-
-    let (mut dbg_conn0, mut dbg_qdedup, mut dbg_dead, mut dbg_unbound, mut dbg_wf) =
-        (0u32, 0u32, 0u32, 0u32, 0u32);
-
     for i in 0..n {
         let raw = start + i;
         let idx = if raw >= n { raw - n } else { raw };
@@ -901,7 +992,6 @@ fn dispatch_recipients(
         let has_queue = queue_id != QueueId(0);
 
         if connection_id == ConnectionId(0) {
-            dbg_conn0 += 1;
             continue;
         }
 
@@ -928,7 +1018,6 @@ fn dispatch_recipients(
         // atomics, no alloc.
         if let Some(cs) = consumer_subjects_slot(consumer_subjects, consumer_id.0) {
             if cs.is_suppressed(entry.seq) {
-                dbg_acked_floor += 1;
                 continue;
             }
         }
@@ -945,7 +1034,6 @@ fn dispatch_recipients(
                 }
             }
             if already_served {
-                dbg_qdedup += 1;
                 continue;
             }
         }
@@ -961,7 +1049,6 @@ fn dispatch_recipients(
             }
         }
         if conn_is_dead {
-            dbg_dead += 1;
             continue;
         }
 
@@ -973,7 +1060,6 @@ fn dispatch_recipients(
         if me.binding_idx == arbitro_engine_v2::catalog::match_table::BINDING_IDX_UNBOUND
             || binding_idx >= bindings.len()
         {
-            dbg_unbound += 1;
             continue;
         }
         let binding = &bindings[binding_idx];
@@ -1018,7 +1104,6 @@ fn dispatch_recipients(
         // below-floor entry neither pins the cursor nor starves a queue
         // sibling. One u64 compare on the hot path.
         if entry.seq <= binding.deliver_floor {
-            dbg_deliver_floor += 1;
             continue;
         }
 
@@ -1031,7 +1116,6 @@ fn dispatch_recipients(
             .write_failed
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            dbg_wf += 1;
             continue;
         }
 
@@ -1039,7 +1123,6 @@ fn dispatch_recipients(
         if counters.is_paused(consumer_id.0) {
             *more_pending = true;
             track_skipped(lowest_skipped, entry.seq);
-            dbg_tracked = true;
             continue;
         }
 
@@ -1051,7 +1134,6 @@ fn dispatch_recipients(
             {
                 *more_pending = true;
                 track_skipped(lowest_skipped, entry.seq);
-                dbg_tracked = true;
                 continue;
             }
 
@@ -1070,7 +1152,6 @@ fn dispatch_recipients(
                 if pending_subj + committed >= max {
                     *more_pending = true;
                     track_skipped(lowest_skipped, entry.seq);
-                    dbg_tracked = true;
                     continue;
                 }
             }
@@ -1124,7 +1205,6 @@ fn dispatch_recipients(
         // A collapsed sibling gets no wire copy — its group already has one
         // in this frame, and the client fans it out locally.
         if !collapsed {
-            dbg_recipients += 1;
             scratch.acc.add(
                 connection_id,
                 stream_id,
@@ -1164,14 +1244,6 @@ fn dispatch_recipients(
         }
     }
 
-    // TEMP chaos-debug — an entry with matches but zero recipients and no
-    // skip-track is the loss signature: the cursor will advance past it.
-    if dbg_recipients == 0 && !dbg_tracked && chaos_debug() {
-        eprintln!(
-            "[chaos-debug] NO-RECIPIENT seq={} matches={} conn0={} qdedup={} dead={} unbound={} write_failed={} acked_floor={} deliver_floor={}",
-            entry.seq, n, dbg_conn0, dbg_qdedup, dbg_dead, dbg_unbound, dbg_wf, dbg_acked_floor, dbg_deliver_floor
-        );
-    }
 }
 
 // ── Ack-mode notifications ──────────────────────────────────────────────────
