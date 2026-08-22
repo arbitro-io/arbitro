@@ -445,6 +445,17 @@ pub(in crate::shard) fn consumer_subjects_slot(
 /// mutations, updates `SharedCounters` atomically and swaps
 /// `DrainSnapshot` for structural changes.
 #[allow(dead_code)] // `names`, `drain_config_batch_size` kept for upcoming features
+/// What woke the command loop. The `select!` yields one of these rather
+/// than acting inline, because the worker is published to the thread for
+/// the duration of the wait and must not be touched until it is taken back.
+enum Woke {
+    Command(ShardCommand),
+    Closed,
+    Notification(DrainNotification),
+    Evict,
+    Timers,
+}
+
 pub struct CommandWorker {
     /// Engine — owned exclusively. `&mut self`, no sharing, no lock.
     pub(super) engine: ArbitroEngine,
@@ -458,10 +469,21 @@ pub struct CommandWorker {
     pub(super) gate: Arc<Gate>,
     pub(super) registry: ConnectionRegistry,
     pub(super) names: Arc<crate::common::NameRegistry>,
-    pub(super) rx: mpsc::Receiver<ShardCommand>,
+    /// Taken out for good by `run`, which is the only thing that awaits
+    /// it. A published worker must not expose it — a connection reaching
+    /// into the receiver would steal commands from the loop.
+    pub(super) rx: Option<mpsc::Receiver<ShardCommand>>,
     /// Notifications from drain thread (deliveries + dead connections).
     /// SPSC — command owns the sole consumer half (this task).
-    pub(super) notify_ring: crate::shard::shared::NotifyConsumer,
+    /// `None` exactly while the run loop is parked awaiting it.
+    ///
+    /// The loop must not hold a borrow of this worker across its `await`
+    /// — a connection task on the same thread would then find the
+    /// `RefCell` already borrowed and panic. So the ring is taken out for
+    /// the wait and put back before dispatch. A direct caller that finds
+    /// `None` simply applies nothing, which is safe because
+    /// `SharedCounters::notifications_settled` gates that path.
+    pub(super) notify_ring: Option<crate::shard::shared::NotifyConsumer>,
     /// Drain-event ring shared with DrainWorker — command owns the sole
     /// producer half (this task), drain thread is the sole consumer.
     /// Used to push ack-driven subject inflight decrements + consumer
@@ -507,7 +529,7 @@ pub struct CommandWorker {
     /// (lazy allocation). Cost when None: zero — the publish hot path
     /// fast-bails via `NameRegistry::stream_idempotency_window_ms`
     /// before touching this Arc.
-    pub(super) idempotency_tracker: crate::shard::idempotency::SharedIdempotency,
+
     /// F10 — cached "has idempotency tracker been allocated" flag.
     /// Used in `tokio::select!` predicates to avoid locking the shared
     /// `Arc<Mutex<Option<IdempotencyTracker>>>` on every iteration just
@@ -593,14 +615,30 @@ impl CommandWorker {
     /// and there is one tracker per stream.
     const IDEMPOTENCY_INTERVAL_MS: u64 = 1_000;
 
-    /// Async command loop — runs as a `tokio::spawn` task.
-    pub async fn run(mut self) {
-        // Initialize eviction timer.
-        self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+        /// Async command loop — runs as a `tokio::spawn` task.
+    ///
+    /// The worker is PUBLISHED to this thread while the loop is parked and
+    /// taken back on wake (see `shard::local::install_worker`). That window
+    /// is when a connection on the same thread can release an ack by
+    /// calling into the state directly instead of queueing a command —
+    /// which is the whole point, since the loop is idle exactly then.
+    ///
+    /// Ownership moves in and out rather than being borrowed: a borrow held
+    /// across the `await` below would panic the moment a connection task
+    /// tried to use it.
+    pub async fn run(self) {
+        let mut me = Box::new(self);
+        me.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+        // `rx` leaves the struct for good — it is awaited here and nowhere
+        // else, so it must not be reachable from a published worker.
+        let mut rx = match me.rx.take() {
+            Some(rx) => rx,
+            None => return,
+        };
 
         loop {
             // Process any pending drain notifications first (non-blocking).
-            self.drain_notifications();
+            me.drain_notifications();
 
             // Retry `DrainEvent::Ack`s that lost a `try_send` because the
             // drain-event ring was full (bulk nack / connection death with
@@ -618,11 +656,11 @@ impl CommandWorker {
             // impossible while an event is queued (an `Acked` for a seq
             // requires a redelivery, which requires its `Released` to have
             // been applied first).
-            if !self.pending_drain_acks.is_empty() {
+            if !me.pending_drain_acks.is_empty() {
                 let mut sent_any = false;
                 let mut min_released: Option<u64> = None;
-                while let Some(&evt) = self.pending_drain_acks.first() {
-                    if self.drain_evt_tx.try_send(evt).is_err() {
+                while let Some(&evt) = me.pending_drain_acks.first() {
+                    if me.drain_evt_tx.try_send(evt).is_err() {
                         // Ring full again — keep the rest for the next pass.
                         break;
                     }
@@ -635,13 +673,13 @@ impl CommandWorker {
                         min_released = Some(min_released.map_or(seq, |m| m.min(seq)));
                     }
                     sent_any = true;
-                    self.pending_drain_acks.swap_remove(0);
+                    me.pending_drain_acks.swap_remove(0);
                 }
                 if let Some(min_seq) = min_released {
-                    rewind_released(&self.counters, min_seq);
+                    rewind_released(&me.counters, min_seq);
                 }
                 if sent_any {
-                    self.gate.release();
+                    me.gate.release();
                 }
             }
 
@@ -650,18 +688,18 @@ impl CommandWorker {
             // keep retrying until the ring has room — losing a
             // ConsumerRemoved leaks the consumer's subject inflight
             // slot inside the drain thread forever.
-            if !self.pending_consumer_remove.is_empty() {
+            if !me.pending_consumer_remove.is_empty() {
                 let mut i = 0;
-                while i < self.pending_consumer_remove.len() {
-                    let cid = self.pending_consumer_remove[i];
-                    if self
+                while i < me.pending_consumer_remove.len() {
+                    let cid = me.pending_consumer_remove[i];
+                    if me
                         .drain_evt_tx
                         .try_send(crate::shard::drain_events::DrainEvent::ConsumerRemoved {
                             consumer_id: cid,
                         })
                         .is_ok()
                     {
-                        self.pending_consumer_remove.swap_remove(i);
+                        me.pending_consumer_remove.swap_remove(i);
                     } else {
                         i += 1;
                     }
@@ -669,7 +707,7 @@ impl CommandWorker {
             }
 
             // Check if eviction is due.
-            let eviction_sleep = self
+            let eviction_sleep = me
                 .next_eviction
                 .map(|t| t.saturating_duration_since(Instant::now()))
                 .unwrap_or(Self::EVICTION_INTERVAL);
@@ -678,46 +716,94 @@ impl CommandWorker {
             // idempotency trackers are allocated lazily by the publish
             // path, which runs elsewhere and cannot re-arm anything.
             // A few bit ops and one relaxed load.
-            self.rearm_timer();
+            me.rearm_timer();
 
             // The wheel's own next deadline, not a tick.
-            let timer_sleep = self
+            let timer_sleep = me
                 .next_timer_ms
-                .map(|due| Duration::from_millis(due.saturating_sub(self.now_ms())))
+                .map(|due| Duration::from_millis(due.saturating_sub(me.now_ms())))
                 .unwrap_or(Self::EVICTION_INTERVAL);
 
-            tokio::select! {
-                cmd = self.rx.recv() => {
-                    match cmd {
-                        Some(cmd) => {
-                            if self.handle_or_shutdown(cmd) {
-                                return;
-                            }
-                        }
+            // Take the ring out and PUBLISH the worker for the duration of
+            // the wait. While parked, a connection on this thread owns the
+            // right to release acks against this state directly — that
+            // window is precisely when the loop is not using it.
+            let mut ring = match me.notify_ring.take() {
+                Some(r) => r,
+                None => return,
+            };
+            let timers_armed = me.next_timer_ms.is_some();
+            crate::shard::local::install_worker(me);
+
+            let event = tokio::select! {
+                cmd = rx.recv() => match cmd {
+                    Some(cmd) => Woke::Command(cmd),
+                    None => Woke::Closed,
+                },
+                Ok(n) = ring.recv_async_send() => Woke::Notification(n),
+                _ = tokio::time::sleep(eviction_sleep) => Woke::Evict,
+                _ = tokio::time::sleep(timer_sleep), if timers_armed => Woke::Timers,
+            };
+
+            // Take it back BEFORE touching any state. Nothing between the
+            // await and here may use the worker.
+            me = match crate::shard::local::take_worker::<Self>() {
+                Some(w) => w,
+                // A direct caller is mid-flight with it; it will be back on
+                // the next poll. Losing the loop here would strand the
+                // shard, so yield rather than return.
+                None => {
+                    tokio::task::yield_now().await;
+                    match crate::shard::local::take_worker::<Self>() {
+                        Some(w) => w,
                         None => return,
                     }
                 }
-                Ok(n) = self.notify_ring.recv_async_send() => {
-                    self.handle_notification(n);
+            };
+            me.notify_ring = Some(ring);
+
+            match event {
+                Woke::Command(cmd) => {
+                    if me.handle_or_shutdown(cmd) {
+                        crate::shard::local::uninstall_worker();
+                        return;
+                    }
                 }
-                _ = tokio::time::sleep(eviction_sleep) => {
-                    self.evict_expired();
-                    self.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
+                Woke::Closed => {
+                    crate::shard::local::uninstall_worker();
+                    return;
                 }
-                _ = tokio::time::sleep(timer_sleep), if self.next_timer_ms.is_some() => {
-                    // One sleep, two wheels, no shared cadence: the
-                    // deadline is whichever comes first and each gets
-                    // the wall time that actually elapsed.
-                    self.run_timers();
+                Woke::Notification(n) => me.handle_notification(n),
+                Woke::Evict => {
+                    me.evict_expired();
+                    me.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
                 }
+                // One sleep, two wheels, no shared cadence: the deadline is
+                // whichever comes first and each gets the wall time that
+                // actually elapsed.
+                Woke::Timers => me.run_timers(),
             }
         }
     }
 
     /// Process drain notifications (non-blocking batch drain).
     pub(super) fn drain_notifications(&mut self) {
-        while let Some(n) = self.notify_ring.try_recv() {
+        // Taken out and put back: `handle_notification` needs `&mut self`,
+        // and holding a borrow of `self.notify_ring` across it would be a
+        // double mutable borrow.
+        let Some(mut ring) = self.notify_ring.take() else {
+            // The run loop is parked holding it. Callers reaching here are
+            // gated on `notifications_settled`, so there is nothing owed.
+            return;
+        };
+        let mut applied = 0u32;
+        while let Some(n) = ring.try_recv() {
             self.handle_notification(n);
+            applied += 1;
+        }
+        self.notify_ring = Some(ring);
+        if applied > 0 {
+            self.counters.notif_applied(applied);
         }
     }
 
@@ -1094,11 +1180,15 @@ impl CommandWorker {
                 .has_idempotency
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let guard = self.idempotency_tracker.read();
-            for tracker_arc in guard.values() {
-                tracker_arc.lock().advance_by_ms(elapsed);
+            // Same thread as every publish that records into these, so
+            // the sweep needs no lock — only the discipline of not
+            // holding the borrow while calling out.
+            if let Some(map) = crate::shard::local::idempotency(self.shard_id) {
+                let trackers: Vec<_> = map.borrow().values().cloned().collect();
+                for tracker in trackers {
+                    tracker.borrow_mut().advance_by_ms(elapsed);
+                }
             }
-            drop(guard);
             self.last_idempotency_ms = now_ms;
         }
 

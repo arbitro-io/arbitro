@@ -43,6 +43,18 @@ pub enum Append {
     Refused,
 }
 
+/// `Some(true)` = force direct, `Some(false)` = force queued, `None` = let
+/// the router decide. Read once and cached: this is on the ack path.
+fn command_path_override() -> Option<bool> {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| match std::env::var("ARBITRO_COMMAND_PATH").as_deref() {
+        Ok("direct") => Some(true),
+        Ok("queued") => Some(false),
+        _ => None,
+    })
+}
+
 /// Routes commands to the correct shard worker by stream_id.
 #[derive(Clone)]
 pub struct ShardRouter {
@@ -51,6 +63,10 @@ pub struct ShardRouter {
     /// now live on their own threads and the router never holds one.
     shard_count: usize,
     gates: Arc<[Arc<Gate>]>,
+    /// Per-shard counters. Held here so `commands_for` can ask whether the
+    /// notification ring is settled without borrowing anything the run loop
+    /// might be holding.
+    counters: Arc<[Arc<SharedCounters>]>,
     names: Arc<NameRegistry>,
     /// H5: drain task join handles, one per shard. After the migration
     /// from `std::thread` to `tokio::spawn`, these are `tokio::task::JoinHandle`
@@ -68,7 +84,6 @@ pub struct ShardRouter {
     /// on first idempotent publish for that shard). Shared between
     /// the dispatch publish path (membership check + record) and the
     /// shard worker's tick loop (expiration sweep).
-    idempotency: Arc<[crate::shard::idempotency::SharedIdempotency]>,
     /// Per-shard "tracker allocated" flag (F10) — flipped to `true` the
     /// first time the publish hot path lazily allocates the idempotency
     /// tracker for that shard. The command worker reads this with a
@@ -187,7 +202,7 @@ impl ShardRouter {
 
         let mut handles = Vec::with_capacity(shard_count);
         let mut gates = Vec::with_capacity(shard_count);
-        let mut idempotency = Vec::with_capacity(shard_count);
+        let mut counter_set = Vec::with_capacity(shard_count);
         let mut has_idempotency = Vec::with_capacity(shard_count);
         let mut drain_joins = Vec::with_capacity(shard_count);
         let mut drain_running = Vec::with_capacity(shard_count);
@@ -260,8 +275,7 @@ impl ShardRouter {
             // path allocates on first idempotent stream. Both the
             // command worker (tick loop) and dispatch_v2 (publish
             // check + record) hold clones of this Arc.
-            let shard_idempotency = super::idempotency::new_shared_idempotency();
-            let shard_has_idempotency = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shard_has_idempotency = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Notification ring: drain → command (deliveries + dead connections).
             // SPSC — drain owns the single producer, command task owns the consumer.
@@ -330,8 +344,8 @@ impl ShardRouter {
                 gate: Arc::clone(&gate),
                 registry: registry.clone(),
                 names: Arc::clone(&names),
-                rx,
-                notify_ring: notify_rx,
+                rx: Some(rx),
+                notify_ring: Some(notify_rx),
                 drain_evt_tx,
                 running: Arc::clone(&running),
                 drain_config_batch_size: config.drain_batch_size,
@@ -345,7 +359,6 @@ impl ShardRouter {
                 next_timer_ms: None,
                 epoch: std::time::Instant::now(),
                 last_idempotency_ms: 0,
-                idempotency_tracker: Arc::clone(&shard_idempotency),
                 has_idempotency: Arc::clone(&shard_has_idempotency),
                 silent_drops: Arc::clone(&silent_drops),
                 pending_consumer_remove: Vec::new(),
@@ -397,7 +410,7 @@ impl ShardRouter {
             });
 
             gates.push(Arc::clone(&gate));
-            idempotency.push(Arc::clone(&shard_idempotency));
+            counter_set.push(Arc::clone(&counters));
             has_idempotency.push(Arc::clone(&shard_has_idempotency));
 
             handles.push(ShardHandle::new(
@@ -430,10 +443,10 @@ impl ShardRouter {
             shards: handles.into(),
             shard_count,
             gates: gates.into(),
+            counters: counter_set.into(),
             names,
             drain_joins: Arc::new(parking_lot::Mutex::new(drain_joins)),
             drain_running: drain_running.into(),
-            idempotency: idempotency.into(),
             has_idempotency: has_idempotency.into(),
             command_log: None,
             clock,
@@ -562,6 +575,7 @@ impl ShardRouter {
         use crate::sink::StreamSink;
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
         if super::local::owns(idx) {
+            let _p = crate::transport::ingress_profile::append_local();
             return match crate::sink::LocalSink::new(idx, &self.gates[idx])
                 .publish(entries, now_ms)
             {
@@ -569,6 +583,7 @@ impl ShardRouter {
                 Err(_) => Append::Refused,
             };
         }
+        let _p = crate::transport::ingress_profile::append_routed();
         // Deliberately NOT awaited. The shard answers the client itself;
         // waiting here for the sequence just to forward it would serialise
         // a fire-and-forget publisher against its own broker.
@@ -648,6 +663,53 @@ impl ShardRouter {
         self.store_stats(&cat, stream_id).await
     }
 
+    /// Which door this caller uses for commands against `stream_id`.
+    ///
+    /// `Local` requires TWO things, and the second is the subtle one:
+    ///
+    /// 1. This thread owns the shard, so the state is reachable at all.
+    /// 2. No drain notifications are waiting to be applied.
+    ///
+    /// (2) matters because `handle_ack` refreshes the pending list from the
+    /// notification ring before releasing, and a direct caller cannot touch
+    /// that ring — the run loop holds it across its await. Acking against a
+    /// stale pending list would not find the entry, reject it, and have the
+    /// message redelivered later: no error, no loss, but a duplicate the
+    /// client did nothing to earn. So when anything is owed, this routes
+    /// instead, and the worker applies the notifications on its own wake.
+    ///
+    /// The check is one relaxed atomic load, and the ring is empty in the
+    /// ordinary case.
+    pub fn commands_for(&self, stream_id: StreamId) -> crate::shard::commands::CommandPath<'_> {
+        let idx = self.shard_index(stream_id, self.shard_count);
+        // `ARBITRO_COMMAND_PATH` forces one wiring, for measuring them
+        // against each other. `direct` does NOT bypass safety: the direct
+        // wiring still falls back to the queue when the worker is not
+        // reachable, so forcing it measures how often that fallback fires,
+        // not a shortcut around it.
+        match command_path_override() {
+            Some(true) => {
+                return crate::shard::commands::CommandPath::Direct(
+                    crate::shard::commands::DirectCommands::new(&self.shards[idx]),
+                )
+            }
+            Some(false) => {
+                return crate::shard::commands::CommandPath::Queued(
+                    crate::shard::commands::QueuedCommands::new(&self.shards[idx]),
+                )
+            }
+            None => {}
+        }
+        if super::local::owns(idx) && self.counters[idx].notifications_settled() {
+            return crate::shard::commands::CommandPath::Direct(
+                crate::shard::commands::DirectCommands::new(&self.shards[idx]),
+            );
+        }
+        crate::shard::commands::CommandPath::Queued(
+            crate::shard::commands::QueuedCommands::new(&self.shards[idx]),
+        )
+    }
+
     /// The lock-free sink, when THIS thread owns the stream's shard.
     ///
     /// `None` means the caller is somewhere else — the shared pool, the
@@ -695,10 +757,20 @@ impl ShardRouter {
     /// dedup state when the stream has `idempotency_window_ms > 0`.
     /// `Option<...>` inside the Mutex is `None` until the first
     /// idempotent publish allocates it lazily.
+    /// This thread's dedup map for `stream_id`'s shard.
+    ///
+    /// `None` means the caller is not on that shard's thread, so the state
+    /// is unreachable from here — the dedup check then belongs to the
+    /// shard, not to a lock. The map is `Rc<RefCell<_>>`: no `RwLock` on
+    /// the map, no `Mutex` on the tracker, because only one thread ever
+    /// touches either.
     #[inline]
-    pub fn idempotency_for(&self, stream_id: StreamId) -> &super::idempotency::SharedIdempotency {
-        let idx = self.shard_index(stream_id, self.idempotency.len());
-        &self.idempotency[idx]
+    pub fn idempotency_for(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<super::idempotency::SharedIdempotency> {
+        let idx = self.shard_index(stream_id, self.shard_count);
+        super::local::idempotency(idx)
     }
 
     /// Per-shard "tracker allocated" flag — flip to `true` after the

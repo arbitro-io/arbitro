@@ -5,6 +5,8 @@
 //! * `tls` — optional TLS support via `tokio-rustls` (feature `tls`).
 
 pub mod dispatch_v2;
+pub mod egress;
+pub mod ingress_profile;
 pub mod rules;
 pub mod registry;
 #[cfg(feature = "tls")]

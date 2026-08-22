@@ -196,7 +196,36 @@ pub struct AckCmd {
     pub consumer_id: ConsumerId,
     pub conn_id: u64,
     pub entries: Vec<AckEntry>,
-    pub reply: oneshot::Sender<AckReply>,
+    /// `None` on the ack path, which is every caller today.
+    ///
+    /// `AckReply` is read NOWHERE — all six call sites do
+    /// `let _ = shard.ack(..).await` and drop it. Building a `OneShot` per
+    /// ack to carry a value nobody looks at costs 62 ns of the 92.5 ns the
+    /// routed ack loses to ceremony (`arbitro-kit/benches/
+    /// same_thread_handoff.rs`). Kept as an `Option` rather than deleted
+    /// because the reply is the only way a caller could ever learn how many
+    /// entries were rejected, and that is a real answer to want.
+    pub reply: Option<oneshot::Sender<AckReply>>,
+}
+
+impl AckCmd {
+    /// Answer, if anyone asked. Takes the sender so a handler with several
+    /// early-return paths cannot answer twice.
+    #[inline]
+    pub fn answer(&mut self, r: AckReply) {
+        if let Some(tx) = self.reply.take() {
+            let _ = tx.send(r);
+        }
+    }
+}
+
+impl NackCmd {
+    #[inline]
+    pub fn answer(&mut self, r: NackReply) {
+        if let Some(tx) = self.reply.take() {
+            let _ = tx.send(r);
+        }
+    }
 }
 
 /// Ack reply — zero alloc, inline u32s.
@@ -212,7 +241,8 @@ pub struct NackCmd {
     pub entries: Vec<AckEntry>,
     /// Delay in ms before redelivery. 0 = immediate cursor rewind.
     pub delay_ms: u32,
-    pub reply: oneshot::Sender<NackReply>,
+    /// Same as `AckCmd::reply` — nobody reads it today.
+    pub reply: Option<oneshot::Sender<NackReply>>,
 }
 
 /// Nack reply — zero alloc, inline u32s.

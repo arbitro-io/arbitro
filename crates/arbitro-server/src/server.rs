@@ -908,11 +908,12 @@ impl ArbitroServer {
                                         writer = ConnWriter::Plain(w);
                                     }
 
-                                    let conn_id = reg.register_on_shard(writer, listener_shard);
+                                    let (conn_id, conn) =
+                                        reg.register_on_shard(writer, listener_shard);
                                     tracing::debug!(conn_id, %addr, "accepted");
 
                                     read_loop(
-                                        conn_id, reader, srv, reg, sd, authenticator,
+                                        conn_id, conn, reader, srv, reg, sd, authenticator,
                                         max_frame_size, max_ops_per_sec, cron,
                                         delayed,
                                         #[cfg(feature = "cluster")]
@@ -1126,6 +1127,7 @@ impl ArbitroServer {
 /// 4. Drain `Header`-prefixed v2 frames from the accumulator forever.
 async fn read_loop(
     conn_id: u64,
+    conn: crate::common::session::ConnHandle,
     mut reader: ConnReader,
     server: ShardRouter,
     registry: ConnectionRegistry,
@@ -1298,10 +1300,15 @@ async fn read_loop(
                 if acc.len() < total {
                     break;
                 }
+                let _p_frame = crate::transport::ingress_profile::frame();
                 let frame = acc.split_to(total).freeze();
-                registry.touch(conn_id);
+                conn.touch();
+                // Wraps the ENTIRE dispatch. Every inner phase happens
+                // under it, so the difference is what nothing times.
+                let _p_total = crate::transport::ingress_profile::total();
+                drop(_p_frame);
                 if dispatch_v2::dispatch_frame_v2(
-                    conn_id,
+                    &conn,
                     frame,
                     &server,
                     &registry,

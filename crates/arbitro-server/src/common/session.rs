@@ -24,7 +24,7 @@ pub struct Session {
     /// idle timeout / keepalive. **F8**: AtomicU64 instead of `Instant`
     /// so `touch()` doesn't need to take the registry mutex; readers
     /// (idle sweep + keepalive sweep) load with Relaxed.
-    pub last_activity: AtomicU64,
+    pub last_activity: Arc<AtomicU64>,
     /// **M8**: writer feedback — set to `true` by the writer task when
     /// `write_all` hits an I/O error. The drain path reads this with
     /// `Relaxed` to detect dead connections before wasting frames into
@@ -56,6 +56,80 @@ pub struct Session {
     /// ports are indistinguishable doors to the same path, and nothing
     /// downstream could ever tell a client dialed the right shard.
     pub listener_shard: Option<u16>,
+}
+
+/// Everything the connection's own read loop needs, handed over once at
+/// registration.
+///
+/// This exists so the hot path never looks itself up. `touch` used to take
+/// the registry's global `Mutex<HashMap<Session>>` and a `RwLock` on the
+/// clock — on EVERY frame, from every connection of every shard, against
+/// one lock. Instrumentation put that phase at ~880 ns/frame, which is not
+/// the cost of splitting a frame; it is the cost of contending for a map
+/// the caller did not need to consult.
+///
+/// A connection knows who it is. Under share-nothing there is nothing to
+/// coordinate here, so there is nothing to lock.
+#[derive(Clone)]
+pub struct ConnHandle {
+    pub conn_id: u64,
+    /// This connection's outbound queue, held directly.
+    ///
+    /// The reply path used to reach it through the registry's global
+    /// `Mutex<HashMap<Session>>` — on every reply, from every connection
+    /// of every shard, against one lock. A connection replying to itself
+    /// has no reason to consult a map of everyone.
+    write_tx: mpsc::Sender<Bytes>,
+    last_activity: Arc<AtomicU64>,
+    /// `None` only in unit tests that build a registry without a clock;
+    /// those pay a `SystemTime::now()` per touch, which is fine on a path
+    /// nothing measures.
+    clock: Option<arbitro_common::SharedClock>,
+}
+
+impl ConnHandle {
+    pub fn new(
+        conn_id: u64,
+        write_tx: mpsc::Sender<Bytes>,
+        last_activity: Arc<AtomicU64>,
+        clock: Option<arbitro_common::SharedClock>,
+    ) -> Self {
+        Self {
+            conn_id,
+            write_tx,
+            last_activity,
+            clock,
+        }
+    }
+
+    /// Queue a frame for this connection. No lock, no lookup.
+    ///
+    /// `false` means the outbound queue is full and the frame was
+    /// dropped — the same behaviour the registry had, surfaced to the
+    /// caller instead of buried.
+    #[inline]
+    pub fn send(&self, frame: Bytes) -> bool {
+        self.write_tx.try_send(frame).is_ok()
+    }
+
+    /// Mark this connection alive. One relaxed store — no lock, no lookup.
+    ///
+    /// Relaxed is right: the only reader is the idle sweep, which asks "was
+    /// this touched within the last N seconds". A sweep that sees a
+    /// slightly stale value re-checks seconds later, and being off by a few
+    /// microseconds cannot make a live connection look idle.
+    #[inline]
+    pub fn touch(&self) {
+        let now = match &self.clock {
+            Some(c) => c.now_ms(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        };
+        self.last_activity
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Atomic connection ID generator.

@@ -39,61 +39,55 @@
 //! the worst-case total is ~230 MB at peak — comparable to a single
 //! medium-sized message store.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use arbitro_common::{foldhash::fast::FixedState, TimingWheel};
 use arbitro_engine_v2::types::StreamId;
 
-/// Shared handle to a shard's idempotency state.
+/// A shard's idempotency state. NO LOCKS.
 ///
-/// **F26 / TODO H4**: this used to be `Arc<Mutex<Option<IdempotencyTracker>>>`
-/// — a single per-shard lock that serialised every idempotent publish
-/// on the shard. Under load on one hot stream, every cold stream on
-/// the same shard would also stall.
+/// History, because the shape looks over-engineered without it: this was
+/// `Arc<Mutex<Option<Tracker>>>` — one per-shard lock serialising every
+/// idempotent publish. That was split into an `RwLock` over a per-stream
+/// map of `Arc<Mutex<Tracker>>`, so a hot stream would stop stalling the
+/// cold ones sharing its shard.
 ///
-/// Now: outer `RwLock` over a per-stream map of small per-stream
-/// trackers, each behind its own `parking_lot::Mutex`. The publish
-/// hot path:
-///   1. read-lock the outer map (lock-free in steady state),
-///   2. clone the per-stream `Arc<Mutex<Tracker>>` if present,
-///   3. drop the outer read lock, then lock the per-stream mutex.
+/// Both shapes solved a problem that no longer exists. A shard's state
+/// lives on the shard's thread; the publish that reads this and the
+/// worker tick that expires it are tasks on ONE thread, and tasks on one
+/// thread do not run simultaneously. There is nothing to serialise.
 ///
-/// Different streams take different locks → no false sharing. The
-/// worker tick iterates the map under a read lock and `tick()`s each
-/// tracker. The outer write-lock is only taken on first publish for a
-/// given stream (lazy allocation) and on stream deletion.
-pub type SharedIdempotency =
-    Arc<parking_lot::RwLock<HashMap<u32, Arc<parking_lot::Mutex<IdempotencyTracker>>, FixedState>>>;
+/// `RefCell` rather than `Mutex` for the same reason as the journal: the
+/// invariant is single-threaded aliasing, which is what `RefCell` checks,
+/// and reaching it from a second thread fails to compile instead of
+/// silently working and putting the contention back.
+///
+/// **Never hold the borrow across an `.await`.** Tasks yield there, and a
+/// second task entering would panic — which is correct, because it means
+/// two tasks interleaved inside the tracker.
+pub type SharedIdempotency = Rc<RefCell<HashMap<u32, Rc<RefCell<IdempotencyTracker>>, FixedState>>>;
 
-/// Build a fresh shared handle with no trackers allocated yet.
+/// Build a fresh handle with no trackers allocated yet.
 pub fn new_shared_idempotency() -> SharedIdempotency {
-    Arc::new(parking_lot::RwLock::new(HashMap::with_hasher(
-        FixedState::default(),
-    )))
+    Rc::new(RefCell::new(HashMap::with_hasher(FixedState::default())))
 }
 
-/// Get-or-create the per-stream tracker handle. Cheap when the entry
-/// already exists (read lock + Arc clone); takes the write lock once
-/// per fresh stream to insert. Caller then locks the returned Mutex.
+/// Get-or-create the per-stream tracker. One `RefCell` borrow and an `Rc`
+/// clone — no lock on either the map or the tracker.
 #[inline]
 pub fn idempotency_for_stream(
     shared: &SharedIdempotency,
     stream: StreamId,
-) -> Arc<parking_lot::Mutex<IdempotencyTracker>> {
+) -> Rc<RefCell<IdempotencyTracker>> {
     let key = stream.0;
-    // Fast path: existing entry.
-    {
-        let g = shared.read();
-        if let Some(t) = g.get(&key) {
-            return Arc::clone(t);
-        }
-    }
-    // Slow path: insert under write lock.
-    let mut g = shared.write();
-    Arc::clone(
+    // The borrow ends before the caller touches the tracker, so a
+    // get-or-create cannot collide with a read of a different stream.
+    let mut g = shared.borrow_mut();
+    Rc::clone(
         g.entry(key)
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(IdempotencyTracker::new()))),
+            .or_insert_with(|| Rc::new(RefCell::new(IdempotencyTracker::new()))),
     )
 }
 

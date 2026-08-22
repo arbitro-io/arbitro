@@ -50,6 +50,16 @@ pub struct SharedCounters {
     total_demand: AtomicU32,
     /// Per-consumer paused flag. Index = ConsumerId.raw().
     paused: Box<[AtomicBool]>,
+    /// Notifications sitting in the drain->command ring, unapplied.
+    ///
+    /// Bumped by the drain when it pushes, cleared by the command worker
+    /// when it drains. Exists so a connection on this shard's thread can
+    /// answer "is the pending list current?" WITHOUT borrowing the ring —
+    /// the run loop holds that borrow across its await, so anyone else
+    /// touching it would panic the `RefCell`. A relaxed load is the whole
+    /// cost, and a stale-high read only costs a fall back to the queued
+    /// path, never a wrong ack.
+    notif_pending: AtomicU32,
     /// Drain cursor position. Written by drain, read by command for rewind.
     cursor: AtomicU64,
     /// Rewind signal from command → drain. `NO_REWIND` = no rewind.
@@ -64,6 +74,25 @@ impl Default for SharedCounters {
 }
 
 impl SharedCounters {
+    /// Drain side: a notification just entered the ring.
+    #[inline]
+    pub fn notif_pushed(&self) {
+        self.notif_pending.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Command side: `n` notifications were applied.
+    #[inline]
+    pub fn notif_applied(&self, n: u32) {
+        self.notif_pending.fetch_sub(n.min(self.notif_pending.load(Ordering::Relaxed)), Ordering::Relaxed);
+    }
+
+    /// True when nothing is waiting to be applied, so a caller on this
+    /// thread may act on the pending list as it stands.
+    #[inline]
+    pub fn notifications_settled(&self) -> bool {
+        self.notif_pending.load(Ordering::Relaxed) == 0
+    }
+
     pub fn new() -> Self {
         let mk_u32 = || -> Box<[AtomicU32]> {
             (0..SLOT_COUNT)
@@ -83,6 +112,7 @@ impl SharedCounters {
             demand: mk_u32(),
             total_demand: AtomicU32::new(0),
             paused: mk_bool(),
+            notif_pending: AtomicU32::new(0),
             cursor: AtomicU64::new(0),
             rewind: AtomicU64::new(NO_REWIND),
         }

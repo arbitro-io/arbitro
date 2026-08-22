@@ -68,7 +68,7 @@ use arbitro_proto::metadata::{
 
 /// Dispatch one v2 frame. `frame` covers `[Header(16) || body(msg_len)]`.
 pub async fn dispatch_frame_v2(
-    conn_id: u64,
+    conn: &crate::common::session::ConnHandle,
     frame: Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
@@ -76,6 +76,7 @@ pub async fn dispatch_frame_v2(
     delayed_journal: &Option<crate::delayed::SharedDelayedJournal>,
     #[cfg(feature = "cluster")] cluster_state: &std::sync::Arc<crate::cluster::ClusterState>,
 ) -> Result<(), ()> {
+    let conn_id = conn.conn_id;
     if frame.len() < HEADER_SIZE {
         return Err(());
     }
@@ -113,8 +114,8 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish => v2_publish(conn_id, req_seq, &frame, server, registry).await,
-        Action::PublishBatch => v2_publish_batch(conn_id, req_seq, &frame, server, registry).await,
+        Action::Publish => v2_publish(conn, req_seq, &frame, server, registry).await,
+        Action::PublishBatch => v2_publish_batch(conn, req_seq, &frame, server, registry).await,
         Action::PublishWithReply => {
             v2_publish_with_reply(conn_id, req_seq, &frame, server, registry).await
         }
@@ -250,16 +251,17 @@ pub async fn dispatch_frame_v2(
 // ── Hot path ───────────────────────────────────────────────────────────────
 
 async fn v2_publish(
-    conn_id: u64,
+    conn: &crate::common::session::ConnHandle,
     req_seq: u64,
     frame: &Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let conn_id = conn.conn_id;
     let f = match PubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::BufferTooShort);
             return;
         }
     };
@@ -267,10 +269,11 @@ async fn v2_publish(
     // touching subject() / msg_id() / payload(). Without this a crafted
     // frame with subject_len > tail.len() panics the broker.
     if let Err(code) = f.validate() {
-        send_error_v2(registry, conn_id, req_seq, code);
+        crate::common::reply_v2::reply_err(conn, req_seq, code);
         return;
     }
     let wire_stream = f.body.stream_id.get();
+    let _p_lookup = crate::transport::ingress_profile::lookup();
     // One catalog guard for the whole frame. These four reads used to take
     // four, and the guard — not the lookup — is what they cost: 43.6 ns of
     // guards against 10.5 ns for one snapshot plus four indexes
@@ -280,7 +283,7 @@ async fn v2_publish(
     let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamNotFound);
             return;
         }
     };
@@ -318,13 +321,18 @@ async fn v2_publish(
     };
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
+        let _p_dedup = crate::transport::ingress_profile::dedup();
         let hash = idempotency_hash(msg_id);
         // F26: per-stream lock. Different streams contend on different
         // mutexes. The outer map read-lock + Arc clone is sub-µs in
         // steady state (no allocation, no contention).
-        let shared = server.idempotency_for(seq_stream);
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
-        let mut t = tracker_arc.lock();
+        // `None` = this thread does not own the shard, so the dedup state
+        // is not reachable from here. The check then happens ON the shard,
+        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
+        // would let a duplicate through with nothing to show for it.
+        if let Some(shared) = server.idempotency_for(seq_stream) {
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
+        let mut t = tracker_arc.borrow_mut();
         // F10: announce allocation so the worker's select! predicate
         // stops paying the lock to test Option::is_some.
         server.mark_idempotency_allocated(seq_stream);
@@ -332,10 +340,11 @@ async fn v2_publish(
         // distinct ids doesn't silently dedup the second publish.
         if !t.record(seq_stream, hash, msg_id, window_ms) {
             drop(t);
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
         }
         drop(t);
+        }
     }
 
     // ── Stream quota pre-check (DiscardPolicy::New) ────────────────────
@@ -345,12 +354,12 @@ async fn v2_publish(
         if quota.discard == 1 {
             let info = server.store_stats(&cat, seq_stream).await;
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
                 return;
             }
             let entry_bytes = (f.subject().len() + f.payload().len()) as u64;
             if quota.max_bytes > 0 && info.bytes + entry_bytes > quota.max_bytes {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
                 return;
             }
         }
@@ -407,12 +416,20 @@ async fn v2_publish(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
+    drop(_p_lookup);
+    // Counted HERE, not at the successful exit: the phase timers stop on
+    // Drop, which runs on every early return too. Counting only the path
+    // that reaches the end put all the time in the numerator and a
+    // fraction of the messages in the denominator, and reported an append
+    // 25x more expensive than it is.
+    crate::transport::ingress_profile::frame_done(entries.len());
+    let _p_append = crate::transport::ingress_profile::append();
     let first_seq = match server
         .append(
             &cat,
             seq_stream,
             &entries,
-            || owned_entries(&entries),
+            || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
@@ -423,12 +440,14 @@ async fn v2_publish(
         // a second reply to a single request.
         Append::Delegated => return,
         Append::Refused => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
             return;
         }
     };
 
-    send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
+    drop(_p_append);
+    let _p_reply = crate::transport::ingress_profile::reply();
+    crate::common::reply_v2::reply_ok(conn, req_seq, first_seq);
 }
 
 /// Hash an opaque `msg_id` for the idempotency tracker.
@@ -484,9 +503,13 @@ async fn v2_publish_with_reply(
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
-        let shared = server.idempotency_for(seq_stream);
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
-        let mut t = tracker_arc.lock();
+        // `None` = this thread does not own the shard, so the dedup state
+        // is not reachable from here. The check then happens ON the shard,
+        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
+        // would let a duplicate through with nothing to show for it.
+        if let Some(shared) = server.idempotency_for(seq_stream) {
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
+        let mut t = tracker_arc.borrow_mut();
         server.mark_idempotency_allocated(seq_stream);
         if !t.record(seq_stream, hash, msg_id, window_ms) {
             drop(t);
@@ -494,6 +517,7 @@ async fn v2_publish_with_reply(
             return;
         }
         drop(t);
+        }
     }
 
     // F5: Encode reply_to into the payload prefix using a `SmallVec` —
@@ -528,7 +552,7 @@ async fn v2_publish_with_reply(
             &cat,
             seq_stream,
             &entries,
-            || owned_entries(&entries),
+            || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
@@ -548,16 +572,17 @@ async fn v2_publish_with_reply(
 }
 
 async fn v2_publish_batch(
-    conn_id: u64,
+    conn: &crate::common::session::ConnHandle,
     req_seq: u64,
     frame: &Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
+    let conn_id = conn.conn_id;
     let f = match BatchPubFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::BufferTooShort);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::BufferTooShort);
             return;
         }
     };
@@ -570,7 +595,7 @@ async fn v2_publish_batch(
         let expected = f.body.count.get();
         let actual: u32 = f.iter().count() as u32;
         if actual != expected {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidEntryCount);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::InvalidEntryCount);
             return;
         }
     }
@@ -578,11 +603,12 @@ async fn v2_publish_batch(
     // One catalog guard for the whole frame — see v2_publish for the
     // measurement. Straight-line code with no await, so the pinned
     // version cannot go stale under us.
+    let _p_lookup = crate::transport::ingress_profile::lookup();
     let cat = server.names().snapshot();
     let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamNotFound);
             return;
         }
     };
@@ -605,11 +631,11 @@ async fn v2_publish_batch(
             }
             let info = server.store_stats(&cat, seq_stream).await;
             if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
                 return;
             }
             if quota.max_bytes > 0 && info.bytes + batch_bytes > quota.max_bytes {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
                 return;
             }
         }
@@ -657,9 +683,13 @@ async fn v2_publish_batch(
         && f.iter()
             .any(|v| !msg_id_of_view(&v, batch_has_headers).is_empty())
     {
-        let shared = server.idempotency_for(seq_stream);
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
-        let mut tracker = tracker_arc.lock();
+        // `None` = this thread does not own the shard, so the dedup state
+        // is not reachable from here. The check then happens ON the shard,
+        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
+        // would let a duplicate through with nothing to show for it.
+        if let Some(shared) = server.idempotency_for(seq_stream) {
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
+        let mut tracker = tracker_arc.borrow_mut();
         server.mark_idempotency_allocated(seq_stream);
 
         // M2: track inserted `(hash, msg_id bytes)` for rollback on
@@ -686,10 +716,11 @@ async fn v2_publish_batch(
                 tracker.forget(seq_stream, *hash, id);
             }
             drop(tracker);
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
         }
         drop(tracker);
+        }
     }
 
     // Stream-build EntryRef vec — one allocation, no intermediate
@@ -756,12 +787,20 @@ async fn v2_publish_batch(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
+    drop(_p_lookup);
+    // Counted HERE, not at the successful exit: the phase timers stop on
+    // Drop, which runs on every early return too. Counting only the path
+    // that reaches the end put all the time in the numerator and a
+    // fraction of the messages in the denominator, and reported an append
+    // 25x more expensive than it is.
+    crate::transport::ingress_profile::frame_done(entries.len());
+    let _p_append = crate::transport::ingress_profile::append();
     let first_seq = match server
         .append(
             &cat,
             seq_stream,
             &entries,
-            || owned_entries(&entries),
+            || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
@@ -772,12 +811,14 @@ async fn v2_publish_batch(
         // a second reply to a single request.
         Append::Delegated => return,
         Append::Refused => {
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
             return;
         }
     };
 
-    send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
+    drop(_p_append);
+    let _p_reply = crate::transport::ingress_profile::reply();
+    crate::common::reply_v2::reply_ok(conn, req_seq, first_seq);
 }
 
 async fn v2_publish_delayed(
@@ -826,9 +867,13 @@ async fn v2_publish_delayed(
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
-        let shared = server.idempotency_for(seq_stream);
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(shared, seq_stream);
-        let mut t = tracker_arc.lock();
+        // `None` = this thread does not own the shard, so the dedup state
+        // is not reachable from here. The check then happens ON the shard,
+        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
+        // would let a duplicate through with nothing to show for it.
+        if let Some(shared) = server.idempotency_for(seq_stream) {
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
+        let mut t = tracker_arc.borrow_mut();
         server.mark_idempotency_allocated(seq_stream);
         if !t.record(seq_stream, hash, msg_id, window_ms) {
             drop(t);
@@ -836,6 +881,7 @@ async fn v2_publish_delayed(
             return;
         }
         drop(t);
+        }
     }
 
     // ── Stream quota pre-check (DiscardPolicy::New) — mirror of the
@@ -894,7 +940,7 @@ async fn v2_publish_delayed(
                 &cat,
                 seq_stream,
                 &entries,
-                || owned_entries(&entries),
+                || owned_entries(frame, &entries),
                 now_ms,
                 crate::shard::command::PublishReply::Client { conn_id, req_seq },
             )
@@ -965,11 +1011,13 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         Some(s) => s,
         None => return, // consumer unknown — fire-and-forget, no reply
     };
-    let shard = server.shard_for(seq_stream);
-    let _ = shard
-        .ack(
+    // No channel when this connection is already on the shard's thread —
+    // the seam decides, this call site does not know which happened.
+    let _ = server
+        .commands_for(seq_stream)
+        .release(
             consumer_id,
-            conn_id,
+            arbitro_engine_v2::types::ConnectionId(conn_id),
             vec![AckEntry {
                 stream_id: seq_stream,
                 seq: f.body.ack_seq.get(),
@@ -1003,7 +1051,14 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
             sub_id: e.sub_id.get(),
         });
     }
-    let _ = shard.ack(consumer_id, conn_id, entries).await;
+    let _ = server
+        .commands_for(seq_stream)
+        .release(
+            consumer_id,
+            arbitro_engine_v2::types::ConnectionId(conn_id),
+            entries,
+        )
+        .await;
 }
 
 /// AckStateReq — read-only cursor/retention query, no mutation.
@@ -1135,7 +1190,14 @@ async fn v2_ack_batch(
     }
 
     let shard = server.shard_for(seq_stream);
-    let _ = shard.ack(consumer_id, conn_id, accepted_entries).await;
+    let _ = server
+        .commands_for(seq_stream)
+        .release(
+            consumer_id,
+            arbitro_engine_v2::types::ConnectionId(conn_id),
+            accepted_entries,
+        )
+        .await;
 
     let new_cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
     // still_pending: no watermark tracked yet — later server task.
@@ -1205,7 +1267,15 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .collect();
     // All entries in a batch share the same delay — take max.
     let delay_ms = raw.iter().map(|e| e.delay_ms.get()).max().unwrap_or(0);
-    let _ = shard.nack(consumer_id, conn_id, entries, delay_ms).await;
+    let _ = server
+        .commands_for(seq_stream)
+        .requeue(
+            consumer_id,
+            arbitro_engine_v2::types::ConnectionId(conn_id),
+            entries,
+            delay_ms,
+        )
+        .await;
 }
 
 async fn v2_subscribe(
@@ -2593,16 +2663,46 @@ fn v2_shard_topology(
 ///
 /// The fast path never calls this: `ShardRouter::append` takes it as a
 /// closure and only invokes it after deciding the local door is shut.
-fn owned_entries(entries: &[arbitro_store::EntryRef<'_>]) -> Vec<PublishEntryOwned> {
+fn owned_entries(frame: &Bytes, entries: &[arbitro_store::EntryRef<'_>]) -> Vec<PublishEntryOwned> {
     entries
         .iter()
         .map(|e| PublishEntryOwned {
-            subject: Bytes::copy_from_slice(e.subject),
-            payload: Bytes::copy_from_slice(e.payload),
+            subject: share(frame, e.subject),
+            payload: share(frame, e.payload),
             flags: e.flags,
             deliver_at_ms: e.deliver_at_ms,
         })
         .collect()
+}
+
+/// A `Bytes` over `slice` that does not copy it, when `slice` lives inside
+/// `frame`.
+///
+/// Crossing a thread forces the data to be owned, but owned does not mean
+/// copied: `Bytes::slice_ref` hands back a refcount over the SAME buffer
+/// and keeps the frame alive for as long as any slice of it is held. So a
+/// publish that routes carries pointers, not bytes.
+///
+/// The earlier version copied unconditionally because `slice_ref` panics
+/// on a slice that is not inside the buffer, and one publish path really
+/// does hand over a rebuilt payload — the `msg-id` injection, which builds
+/// a fresh `Vec`. That single exception was paid for by every entry of
+/// every routed publish: 99.34 ns/msg against 2.73 for the local door.
+///
+/// The check is a range comparison on the pointers, which is what
+/// `slice_ref` does internally before deciding to panic. Doing it here
+/// turns "panic" into "copy just this one".
+#[inline]
+fn share(frame: &Bytes, slice: &[u8]) -> Bytes {
+    let base = frame.as_ptr() as usize;
+    let start = slice.as_ptr() as usize;
+    if start >= base && start + slice.len() <= base + frame.len() {
+        frame.slice_ref(slice)
+    } else {
+        // A payload that was rebuilt rather than viewed. Copying one entry
+        // is the price of the feature that rebuilt it.
+        Bytes::copy_from_slice(slice)
+    }
 }
 
 fn v2_ping(conn_id: u64, registry: &ConnectionRegistry) {

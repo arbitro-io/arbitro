@@ -119,7 +119,31 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
+    /// Release these entries. Does NOT wait for a reply.
+    ///
+    /// Every caller discarded the `AckReply`, so building a `OneShot` per
+    /// ack and awaiting it bought nothing — 62 ns of ceremony to carry a
+    /// value straight to the floor. The command is still queued in order;
+    /// what is gone is the round trip back.
     pub async fn ack(
+        &self,
+        consumer_id: ConsumerId,
+        conn_id: u64,
+        entries: Vec<AckEntry>,
+    ) -> Result<(), SendError> {
+        self.send(ShardCommand::Ack(AckCmd {
+            consumer_id,
+            conn_id,
+            entries,
+            reply: None,
+        }))
+        .await
+    }
+
+    /// Release and report how many were accepted. The waiting variant —
+    /// no caller needs it yet, and it exists so the counts stay reachable
+    /// rather than being deleted along with the round trip.
+    pub async fn ack_counted(
         &self,
         consumer_id: ConsumerId,
         conn_id: u64,
@@ -130,7 +154,7 @@ impl ShardHandle {
             consumer_id,
             conn_id,
             entries,
-            reply: tx,
+            reply: Some(tx),
         }))
         .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
@@ -142,16 +166,14 @@ impl ShardHandle {
         consumer_id: ConsumerId,
         conn_id: u64,
         entries: Vec<AckEntry>,
-    ) -> Result<AckReply, SendError> {
-        let (tx, rx) = oneshot::channel();
+    ) -> Result<(), SendError> {
         self.send(ShardCommand::AckTerm(AckCmd {
             consumer_id,
             conn_id,
             entries,
-            reply: tx,
+            reply: None,
         }))
-        .await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
+        .await
     }
 
     pub async fn nack(
@@ -160,17 +182,15 @@ impl ShardHandle {
         conn_id: u64,
         entries: Vec<AckEntry>,
         delay_ms: u32,
-    ) -> Result<NackReply, SendError> {
-        let (tx, rx) = oneshot::channel();
+    ) -> Result<(), SendError> {
         self.send(ShardCommand::Nack(NackCmd {
             consumer_id,
             conn_id,
             entries,
             delay_ms,
-            reply: tx,
+            reply: None,
         }))
-        .await?;
-        rx.await.map_err(|_| SendError::SHARD_DOWN)
+        .await
     }
 
     // ── Subscription management ─────────────────────────────────────────

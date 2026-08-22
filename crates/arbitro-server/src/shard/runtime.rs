@@ -79,6 +79,10 @@ impl ShardRuntime {
             .name(format!("arbitro-shard-{id}"))
             .spawn(move || {
                 super::local::install(id, store);
+                super::local::install_idempotency(
+                    id,
+                    super::idempotency::new_shared_idempotency(),
+                );
                 let _ = ready_tx.send(());
                 // `block_on` drives every task spawned through the handle,
                 // not just this future. Parking on the notify is what keeps

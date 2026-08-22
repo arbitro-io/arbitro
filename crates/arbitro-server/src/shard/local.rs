@@ -119,6 +119,106 @@ pub(crate) fn store<R>(shard_id: usize, f: impl FnOnce(&mut dyn Store) -> R) -> 
         .unwrap_or_else(|| panic!("shard {shard_id}: journal not installed on this thread"))
 }
 
+thread_local! {
+    /// The shard's dedup trackers, owned by the shard's thread.
+    ///
+    /// Here rather than in a struct for the same reason as the journal:
+    /// the map is `Rc<RefCell<_>>`, which is not `Send`, and a worker
+    /// holding it could not be spawned. Putting it on the thread keeps it
+    /// lock-free without making anything non-`Send` travel.
+    ///
+    /// It used to be `Arc<RwLock<HashMap<_, Arc<Mutex<Tracker>>>>>` — two
+    /// lock acquisitions on every idempotent publish, for state only the
+    /// shard's own thread ever touches.
+    static IDEMPOTENCY: RefCell<Option<(usize, super::idempotency::SharedIdempotency)>> =
+        const { RefCell::new(None) };
+}
+
+/// Give this thread its shard's dedup map. Called once, from the shard's
+/// runtime thread.
+pub(crate) fn install_idempotency(shard_id: usize, map: super::idempotency::SharedIdempotency) {
+    IDEMPOTENCY.with(|slot| {
+        *slot.borrow_mut() = Some((shard_id, map));
+    });
+}
+
+/// This thread's dedup map for `shard_id`, or `None` if it owns another
+/// shard's — or none, which is every connection on the bootstrap port.
+pub(crate) fn idempotency(shard_id: usize) -> Option<super::idempotency::SharedIdempotency> {
+    IDEMPOTENCY.with(|slot| {
+        let g = slot.borrow();
+        let (owned, map) = g.as_ref()?;
+        if *owned != shard_id {
+            return None;
+        }
+        Some(std::rc::Rc::clone(map))
+    })
+}
+
+thread_local! {
+    /// The command worker owned by THIS thread, if it is a shard runtime
+    /// thread. Holds the engine, the ack floors and the counters — the
+    /// state an ack mutates.
+    ///
+    /// Separate from the journal slot above because the two have different
+    /// lifetimes: the journal is installed when the thread starts, the
+    /// worker when its task begins running.
+    static WORKER: RefCell<Option<Box<dyn std::any::Any>>> = const { RefCell::new(None) };
+}
+
+/// Publish the worker to this thread.
+///
+/// The run loop does this around its `await` and takes it back on wake, so
+/// the worker is reachable exactly while the loop is idle — which is when
+/// a connection on this thread would want it. Ownership moves rather than
+/// being borrowed, which is what keeps a borrow from ever spanning the
+/// await. The value is already boxed, so each hand-off is a pointer move,
+/// not a copy of the struct.
+pub(crate) fn install_worker<W: 'static>(w: Box<W>) {
+    WORKER.with(|slot| {
+        let mut g = slot.borrow_mut();
+        assert!(
+            g.is_none(),
+            "a command worker is already published on this thread"
+        );
+        *g = Some(w);
+    });
+}
+
+/// Take the worker back. `None` if it was never published.
+pub(crate) fn take_worker<W: 'static>() -> Option<Box<W>> {
+    WORKER.with(|slot| {
+        let boxed = slot.borrow_mut().take()?;
+        boxed.downcast::<W>().ok()
+    })
+}
+
+/// Run `f` against this thread's command worker.
+///
+/// `None` when this thread owns none — the shared pool, the accept loop —
+/// which is what makes the caller fall back to the queued path instead of
+/// reaching for state that is not here.
+///
+/// **Never call this while holding the borrow across an `.await`.** Tasks
+/// on one thread yield at await points, and a second task entering here
+/// would find the `RefCell` borrowed and panic. That panic is a real bug,
+/// not noise: it means two tasks interleaved inside the shard's state.
+pub(crate) fn with_worker<W: 'static, R>(f: impl FnOnce(&mut W) -> R) -> Option<R> {
+    WORKER.with(|slot| {
+        let mut g = slot.borrow_mut();
+        let w = g.as_mut()?.downcast_mut::<W>()?;
+        Some(f(w))
+    })
+}
+
+/// Take the worker back off this thread. Used by the run loop at exit so a
+/// restarted shard on a reused thread can install cleanly.
+pub(crate) fn uninstall_worker() {
+    WORKER.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
 /// Whether this thread owns `shard_id`'s journal. For the publish path to
 /// decide, once, which door it is going through.
 pub(crate) fn owns(shard_id: usize) -> bool {

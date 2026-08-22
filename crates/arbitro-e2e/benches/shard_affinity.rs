@@ -209,5 +209,8 @@ fn main() {
             all.join(", ")
         );
     }
+    // Where the time actually went, if the server was built with the
+    // feature. Without it this prints nothing and costs nothing.
+    arbitro_server::transport::ingress_profile::report();
     println!();
 }

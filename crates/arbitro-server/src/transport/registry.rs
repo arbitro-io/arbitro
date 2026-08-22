@@ -155,6 +155,9 @@ struct Inner {
     /// either run on the cold path or do a quick map lookup.
     sessions: parking_lot::Mutex<HashMap<u64, Session, foldhash::fast::FixedState>>,
     conn_id_gen: ConnIdGen,
+    /// Live connection count, so the accept path's cap check does not take
+    /// the sessions lock just to read a length.
+    live: std::sync::atomic::AtomicUsize,
     /// Optional shared millisecond clock for last-activity reads.
     /// Server wires it in `set_clock()`; tests can leave it None and
     /// pay a per-call `SystemTime::now()` (rare paths).
@@ -187,6 +190,7 @@ impl ConnectionRegistry {
                     foldhash::fast::FixedState::default(),
                 )),
                 conn_id_gen: ConnIdGen::new(),
+                live: std::sync::atomic::AtomicUsize::new(0),
                 clock: parking_lot::RwLock::new(None),
                 write_buffer_cap: cap,
                 silent_drops: None,
@@ -274,12 +278,16 @@ impl ConnectionRegistry {
     ///
     /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
     pub fn register(&self, writer: ConnWriter) -> u64 {
-        self.register_on_shard(writer, None)
+        self.register_on_shard(writer, None).0
     }
 
     /// Register a connection, recording which shard's listener accepted it.
     /// `None` is the bootstrap socket.
-    pub fn register_on_shard(&self, writer: ConnWriter, listener_shard: Option<u16>) -> u64 {
+    pub fn register_on_shard(
+        &self,
+        writer: ConnWriter,
+        listener_shard: Option<u16>,
+    ) -> (u64, crate::common::session::ConnHandle) {
         let conn_id = self.inner.conn_id_gen.next();
         // H13: honour the configured per-connection capacity. Fallback
         // is the historical default if the field is unset (zero).
@@ -289,6 +297,7 @@ impl ConnectionRegistry {
             self.inner.write_buffer_cap
         };
         let (tx, rx) = mpsc::channel::<Bytes>(cap);
+        let tx_for_handle = tx.clone();
         // M8: shared feedback atomics — writer task signals failures and
         // counts successful writes so the drain path skips dead connections.
         let write_failed = Arc::new(AtomicBool::new(false));
@@ -328,9 +337,10 @@ impl ConnectionRegistry {
             }
         });
         let clock = self.inner.clock.read().clone();
+        let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms(&clock)));
         let session = Session {
             write_tx: tx,
-            last_activity: std::sync::atomic::AtomicU64::new(now_ms(&clock)),
+            last_activity: Arc::clone(&last_activity),
             write_failed,
             frames_written,
             // Registration happens before the handshake runs, so the
@@ -341,7 +351,13 @@ impl ConnectionRegistry {
             listener_shard,
         };
         self.inner.sessions.lock().insert(conn_id, session);
-        conn_id
+        self.inner
+            .live
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (
+            conn_id,
+            crate::common::session::ConnHandle::new(conn_id, tx_for_handle, last_activity, clock),
+        )
     }
 
     /// Which shard's listener accepted this connection. `None` for the
@@ -384,7 +400,11 @@ impl ConnectionRegistry {
 
     /// Remove a session — drops the Sender, which closes the writer task.
     pub fn remove(&self, conn_id: u64) {
-        self.inner.sessions.lock().remove(&conn_id);
+        if self.inner.sessions.lock().remove(&conn_id).is_some() {
+            self.inner
+                .live
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // SEC-6: drop the quota counters along with the session so they
         // don't accumulate forever across connect/disconnect cycles.
         self.inner.quotas.lock().remove(&conn_id);
@@ -419,8 +439,14 @@ impl ConnectionRegistry {
     }
 
     /// Number of active sessions.
+    /// Live connections, from a counter rather than the map's length.
+    ///
+    /// The accept loop asks this per connection, and taking the sessions
+    /// lock to read a length put an unrelated global mutex on the accept
+    /// path. The count can lag a removal by a few instructions; the cap it
+    /// guards is 10_000, so that is noise.
     pub fn active_count(&self) -> usize {
-        self.inner.sessions.lock().len()
+        self.inner.live.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn idle_connections(&self, timeout: std::time::Duration) -> Vec<u64> {

@@ -710,6 +710,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     if !scratch.deliveries.is_empty() {
         notify_delivered_grouped(
             notify_tx,
+            counters,
             &snap.bindings,
             &scratch.deliveries,
             &flush_results,
@@ -722,7 +723,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
 
     advance_cursor(counters, &result, probe);
     close_window(&mut result);
-    report_dead_connections(&mut scratch.dead_connections, notify_tx, silent_drops);
+    report_dead_connections(&mut scratch.dead_connections, notify_tx, counters, silent_drops);
     reopen_if_pending(gate, &result);
 }
 
@@ -786,13 +787,20 @@ fn close_window(result: &mut DrainReadResult) {
 fn report_dead_connections(
     dead: &mut Vec<ConnectionId>,
     notify_tx: &mut crate::shard::shared::NotifyProducer,
+    counters: &SharedCounters,
     silent_drops: &crate::common::SilentDrops,
 ) {
     for conn_id in dead.drain(..) {
-        if notify_tx
-            .try_send(DrainNotification::ConnectionDead(conn_id))
-            .is_err()
-        {
+        // Counted BEFORE the error branch so the count reflects what
+        // actually entered the ring — an uncounted push is a direct ack
+        // acting on a stale pending list, which shows up as a duplicate
+        // delivery and nothing else.
+        let pushed = notify_tx
+            .try_send(DrainNotification::ConnectionDead(conn_id));
+        if pushed.is_ok() {
+            counters.notif_pushed();
+        }
+        if pushed.is_err() {
             silent_drops.inc_notify_ring();
         }
     }
@@ -1260,6 +1268,7 @@ fn dispatch_recipients(
 #[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
     notify_tx: &mut crate::shard::shared::NotifyProducer,
+    counters: &SharedCounters,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
     flush_results: &[(ConnectionId, FlushOutcome)],
@@ -1305,6 +1314,8 @@ fn notify_delivered_grouped(
                 .is_err()
             {
                 silent_drops.inc_notify_ring();
+            } else {
+                counters.notif_pushed();
             }
             return;
         }
@@ -1382,6 +1393,8 @@ fn notify_delivered_grouped(
             .is_err()
         {
             silent_drops.inc_notify_ring();
+        } else {
+            counters.notif_pushed();
         }
     }
 }

@@ -28,6 +28,9 @@ lifecycle_trace = []
 # Per-cycle drain phase timings (fill / dispatch / flush). OFF by default;
 # every call site compiles away. See shard/drain_profile.rs.
 drain_profile = []
+# Per-frame breakdown of the publish path, socket read to reply. Off by
+# default; every call site compiles away. See transport/ingress_profile.rs.
+ingress_profile = []
 # TLS support via rustls. Requires ARBITRO_TLS_CERT and ARBITRO_TLS_KEY env vars.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:thiserror"]
 cluster = ["dep:arbitro-raft"]

@@ -23,6 +23,29 @@ pub fn send_rep_ok_v2(registry: &ConnectionRegistry, conn_id: u64, req_seq: u64,
     registry.send_inline(conn_id, frame.as_bytes());
 }
 
+/// Same reply, sent through the connection's own handle.
+///
+/// No `sessions.lock()` and no map lookup: a connection answering itself
+/// does not need a directory of every other one. The registry version
+/// stays for callers that only hold a `conn_id` — the drain, the cron
+/// registry — which are not on the publish path.
+#[inline]
+pub fn reply_ok(conn: &crate::common::session::ConnHandle, req_seq: u64, ref_seq: u64) -> bool {
+    let frame = RepOkFrame::new(req_seq, ref_seq);
+    conn.send(bytes::Bytes::copy_from_slice(frame.as_bytes()))
+}
+
+/// Error reply through the connection's own handle.
+#[inline]
+pub fn reply_err(
+    conn: &crate::common::session::ConnHandle,
+    req_seq: u64,
+    code: ErrorCode,
+) -> bool {
+    let frame = RepErrFrame::new(req_seq, req_seq, code.as_u16());
+    conn.send(bytes::Bytes::copy_from_slice(frame.as_bytes()))
+}
+
 /// Send a v2 `RepError`.
 /// F34: RepErrFrame is 32B — marginal; still benefits from avoiding BytesMut.
 #[inline]
