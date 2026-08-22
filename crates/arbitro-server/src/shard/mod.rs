@@ -17,6 +17,7 @@ pub mod drain;
 pub mod drain_events;
 pub mod drain_probe;
 pub mod drain_profile;
+pub(in crate::shard) mod source;
 pub mod handle;
 pub mod handlers;
 pub mod idempotency;

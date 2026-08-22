@@ -450,7 +450,6 @@ impl ShardRouter {
         &self.names
     }
 
-    #[inline]
     /// One stream's storage, with the lock, the gate and the shard index
     /// hidden. This is what callers should use; `store_for` and `gate_for`
     /// remain for the paths that genuinely need the raw handles.

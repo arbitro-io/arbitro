@@ -12,6 +12,7 @@ use arbitro_engine_v2::{ConsumerStateSnapshot, EngineMetrics, MetricsSnapshot};
 use arbitro_store::EntryRef;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::sink::StreamSink;
 use crate::common::reply_v2::send_rep_ok_v2;
 use crate::common::Gate;
 use crate::shard::command::*;
@@ -84,14 +85,11 @@ impl ShardHandle {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let first_seq = self
-            .store
-            .lock()
-            .append_batch(&store_entries, now_ms)
+        let first_seq = crate::sink::SharedStoreSink::new(&self.store, &self.gate)
+            .publish(&store_entries, now_ms)
             .map_err(|_| SendError::SHARD_DOWN)?;
 
         send_rep_ok_v2(&self.registry, conn_id, env_seq as u64, first_seq);
-        self.gate.release();
         Ok(())
     }
 

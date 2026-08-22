@@ -17,6 +17,7 @@
 //!
 //! **Zero Mutex between threads.** Drain and commands run fully in parallel.
 
+use crate::shard::source::WindowSource;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -209,15 +210,11 @@ impl DrainWorker {
                 // wall time and blocks publish ~10x longer (measured, memory
                 // and disk journals): the drain holds the lock for the whole
                 // walk while every publisher waits on it.
-                let w = {
-                    let g = self.store.lock();
-                    let w = super::drain::window(&self.counters, &**g, &self.drain_config);
-                    if let super::drain::Window::Range { start, end, .. } = w {
-                        let _p = super::drain_profile::fill();
-                        self.staged.fill(&**g, start, end);
-                    }
-                    w
-                };
+                let w = crate::shard::source::SharedStoreSource::new(&self.store).take_window(
+                    &self.counters,
+                    &self.drain_config,
+                    &mut self.staged,
+                );
                 let verdict = match w {
                     super::drain::Window::NoDemand => ReadVerdict::NoDemand,
                     super::drain::Window::UpToDate { last_seq, cursor } => {
