@@ -16,7 +16,6 @@ use crate::sink::StreamSink;
 use crate::common::reply_v2::send_rep_ok_v2;
 use crate::common::Gate;
 use crate::shard::command::*;
-use crate::shard::router::SharedStore;
 use crate::transport::ConnectionRegistry;
 
 /// Async handle to a shard worker.
@@ -24,8 +23,6 @@ use crate::transport::ConnectionRegistry;
 pub struct ShardHandle {
     shard_id: u32,
     tx: mpsc::Sender<ShardCommand>,
-    /// Shared store — publish writes directly, bypassing the shard worker.
-    store: SharedStore,
     /// Shared gate — publish notifies drain after store append.
     gate: Arc<Gate>,
     /// Connection registry — publish replies directly to the client.
@@ -38,7 +35,6 @@ impl ShardHandle {
     pub fn new(
         shard_id: u32,
         tx: mpsc::Sender<ShardCommand>,
-        store: SharedStore,
         gate: Arc<Gate>,
         registry: ConnectionRegistry,
         metrics: Arc<EngineMetrics>,
@@ -46,7 +42,6 @@ impl ShardHandle {
         Self {
             shard_id,
             tx,
-            store,
             gate,
             registry,
             metrics,
@@ -70,55 +65,42 @@ impl ShardHandle {
     /// Returns the first assigned sequence. `None` means the shard refused
     /// the append (quota) — distinct from `Err`, which means the shard is
     /// gone.
+    /// Returns as soon as the command is queued. The shard answers the
+    /// client directly — see `PublishCmd::conn_id` for why waiting here
+    /// would be a throughput bug rather than a nicety.
     pub async fn publish_routed(
         &self,
         stream_id: StreamId,
         entries: Vec<PublishEntryOwned>,
         now_ms: u64,
-    ) -> Result<Option<u64>, SendError> {
-        let (tx, rx) = oneshot::channel();
+        reply_to: Option<(u64, u64)>,
+    ) -> Result<(), SendError> {
         self.send(ShardCommand::Publish(crate::shard::command::PublishCmd {
             stream_id,
             entries,
+            now_ms,
+            reply_to,
+        }))
+        .await
+    }
+
+    /// Startup: ask this shard to rebuild a stream's dedup tracker from its
+    /// own journal. Returns how many entries were re-recorded.
+    pub async fn rebuild_idempotency(
+        &self,
+        stream_id: StreamId,
+        window_ms: u32,
+        now_ms: u64,
+    ) -> Result<u64, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::RebuildIdempotency(RebuildIdempotencyCmd {
+            stream_id,
+            window_ms,
             now_ms,
             reply: tx,
         }))
         .await?;
         rx.await.map_err(|_| SendError::SHARD_DOWN)
-    }
-
-    /// Fire & forget — writes directly to the shared store, signals gate.
-    /// Does NOT go through the shard worker. Publish and drain are
-    /// independent services connected only by store and gate.
-    pub async fn publish(
-        &self,
-        stream_id: StreamId,
-        conn_id: u64,
-        env_seq: u32,
-        entries: Vec<PublishEntryOwned>,
-    ) -> Result<(), SendError> {
-        let store_entries: Vec<EntryRef<'_>> = entries
-            .iter()
-            .map(|e| EntryRef {
-                stream_id: stream_id.raw(),
-                subject: &e.subject,
-                payload: &e.payload,
-                flags: 0,
-                deliver_at_ms: 0,
-            })
-            .collect();
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let first_seq = crate::sink::SharedStoreSink::new(&self.store, &self.gate)
-            .publish(&store_entries, now_ms)
-            .map_err(|_| SendError::SHARD_DOWN)?;
-
-        send_rep_ok_v2(&self.registry, conn_id, env_seq as u64, first_seq);
-        Ok(())
     }
 
     pub async fn ack(

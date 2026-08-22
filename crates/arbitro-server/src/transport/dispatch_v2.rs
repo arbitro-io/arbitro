@@ -57,7 +57,8 @@ use crate::cluster::ClusterState;
 use crate::common::reply_v2::{
     send_ack_batch_resp_v2, send_ack_state_rep_v2, send_error_v2, send_rep_ok_v2,
 };
-use crate::shard::router::ShardRouter;
+use crate::shard::command::PublishEntryOwned;
+use crate::shard::router::{Append, ShardRouter};
 use crate::sink::StreamSink;
 use crate::transport::ConnectionRegistry;
 
@@ -112,10 +113,10 @@ pub async fn dispatch_frame_v2(
 
     match action {
         // ── Hot path ────────────────────────────────────────────────
-        Action::Publish => v2_publish(conn_id, req_seq, &frame, server, registry),
-        Action::PublishBatch => v2_publish_batch(conn_id, req_seq, &frame, server, registry),
+        Action::Publish => v2_publish(conn_id, req_seq, &frame, server, registry).await,
+        Action::PublishBatch => v2_publish_batch(conn_id, req_seq, &frame, server, registry).await,
         Action::PublishWithReply => {
-            v2_publish_with_reply(conn_id, req_seq, &frame, server, registry)
+            v2_publish_with_reply(conn_id, req_seq, &frame, server, registry).await
         }
         Action::Ack => v2_ack(conn_id, &frame, server).await,
         Action::AckTerm => v2_ack_term(conn_id, &frame, server).await,
@@ -200,7 +201,7 @@ pub async fn dispatch_frame_v2(
 
         // ── Delayed publish ─────────────────────────────────────────
         Action::PublishDelayed => {
-            v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal)
+            v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal).await
         }
 
         // ── Cron scheduling ─────────────────────────────────────────
@@ -248,7 +249,7 @@ pub async fn dispatch_frame_v2(
 
 // ── Hot path ───────────────────────────────────────────────────────────────
 
-fn v2_publish(
+async fn v2_publish(
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -342,7 +343,7 @@ fn v2_publish(
     // would exceed max_msgs or max_bytes, reject BEFORE appending.
     if let Some(quota) = cat.stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let info = server.sink_with(&cat, seq_stream).info();
+            let info = server.store_stats(&cat, seq_stream).await;
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -406,9 +407,22 @@ fn v2_publish(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
-        Ok(seq) => seq,
-        Err(_) => {
+    let first_seq = match server
+        .append(
+            &cat,
+            seq_stream,
+            &entries,
+            || owned_entries(&entries),
+            now_ms,
+            Some((conn_id, req_seq)),
+        )
+        .await
+    {
+        Append::Stored(seq) => seq,
+        // The shard is answering this one; sending anything here would be
+        // a second reply to a single request.
+        Append::Delegated => return,
+        Append::Refused => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
             return;
         }
@@ -433,7 +447,7 @@ pub(crate) fn idempotency_hash(msg_id: &[u8]) -> u64 {
     h.finish()
 }
 
-fn v2_publish_with_reply(
+async fn v2_publish_with_reply(
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -509,9 +523,22 @@ fn v2_publish_with_reply(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
-        Ok(seq) => seq,
-        Err(_) => {
+    let first_seq = match server
+        .append(
+            &cat,
+            seq_stream,
+            &entries,
+            || owned_entries(&entries),
+            now_ms,
+            Some((conn_id, req_seq)),
+        )
+        .await
+    {
+        Append::Stored(seq) => seq,
+        // The shard is answering this one; sending anything here would be
+        // a second reply to a single request.
+        Append::Delegated => return,
+        Append::Refused => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
             return;
         }
@@ -520,7 +547,7 @@ fn v2_publish_with_reply(
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
 }
 
-fn v2_publish_batch(
+async fn v2_publish_batch(
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -576,7 +603,7 @@ fn v2_publish_batch(
             for v in f.iter() {
                 batch_bytes += (v.subject().len() + v.payload().len()) as u64;
             }
-            let info = server.sink_with(&cat, seq_stream).info();
+            let info = server.store_stats(&cat, seq_stream).await;
             if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -729,9 +756,22 @@ fn v2_publish_batch(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
-        Ok(seq) => seq,
-        Err(_) => {
+    let first_seq = match server
+        .append(
+            &cat,
+            seq_stream,
+            &entries,
+            || owned_entries(&entries),
+            now_ms,
+            Some((conn_id, req_seq)),
+        )
+        .await
+    {
+        Append::Stored(seq) => seq,
+        // The shard is answering this one; sending anything here would be
+        // a second reply to a single request.
+        Append::Delegated => return,
+        Append::Refused => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
             return;
         }
@@ -740,7 +780,7 @@ fn v2_publish_batch(
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
 }
 
-fn v2_publish_delayed(
+async fn v2_publish_delayed(
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -808,7 +848,7 @@ fn v2_publish_delayed(
     // (documented in ROBUSTNESS_AUDIT.md).
     if let Some(quota) = cat.stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let info = server.sink_with(&cat, seq_stream).info();
+            let info = server.store_stats(&cat, seq_stream).await;
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -849,9 +889,22 @@ fn v2_publish_delayed(
             deliver_at_ms: 0,
         }];
         let now_ms = server.now_ms();
-        let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
-            Ok(seq) => seq,
-            Err(_) => {
+        let first_seq = match server
+            .append(
+                &cat,
+                seq_stream,
+                &entries,
+                || owned_entries(&entries),
+                now_ms,
+                Some((conn_id, req_seq)),
+            )
+            .await
+        {
+            Append::Stored(seq) => seq,
+            // The shard is answering this one; sending anything here would be
+            // a second reply to a single request.
+            Append::Delegated => return,
+            Append::Refused => {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
             }
@@ -988,7 +1041,7 @@ async fn v2_ack_state(
     };
     let cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
     let generation = server.names().consumer_generation(consumer_id).unwrap_or(0);
-    let info = server.sink_for(seq_stream).info();
+    let info = server.store_stats_for(seq_stream).await;
     send_ack_state_rep_v2(
         registry,
         conn_id,
@@ -1058,7 +1111,7 @@ async fn v2_ack_batch(
     };
 
     let cursor_before = server.names().consumer_cursor(consumer_id).unwrap_or(0);
-    let low = server.sink_for(seq_stream).info().first_seq;
+    let low = server.store_stats_for(seq_stream).await.first_seq;
 
     let mut accepted_entries: Vec<AckEntry> = Vec::with_capacity(seqs.len());
     let mut accepted: u32 = 0;
@@ -2527,6 +2580,29 @@ fn v2_shard_topology(
         })
         .collect();
     registry.send_bytes(conn_id, ShardTopology { shards }.encode(req_seq));
+}
+
+/// Owned copies of the entries, built ONLY for the routed path.
+///
+/// This copies, and the copy is the honest cost of publishing to a shard
+/// this thread does not own. Slicing the original frame with `slice_ref`
+/// would be free, but it panics on any slice that is not inside that frame
+/// — and the publish paths sometimes hand over a rebuilt payload rather
+/// than a view into the frame. A copy on the exceptional path beats a
+/// panic on a payload shape nobody remembered.
+///
+/// The fast path never calls this: `ShardRouter::append` takes it as a
+/// closure and only invokes it after deciding the local door is shut.
+fn owned_entries(entries: &[arbitro_store::EntryRef<'_>]) -> Vec<PublishEntryOwned> {
+    entries
+        .iter()
+        .map(|e| PublishEntryOwned {
+            subject: Bytes::copy_from_slice(e.subject),
+            payload: Bytes::copy_from_slice(e.payload),
+            flags: e.flags,
+            deliver_at_ms: e.deliver_at_ms,
+        })
+        .collect()
 }
 
 fn v2_ping(conn_id: u64, registry: &ConnectionRegistry) {

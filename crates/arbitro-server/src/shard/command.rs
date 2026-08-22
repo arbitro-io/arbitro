@@ -72,6 +72,13 @@ pub enum ShardCommand {
     // System
     Shutdown,
 
+    /// Rebuild one stream's dedup tracker by scanning this shard's journal.
+    ///
+    /// Startup only. It moved here from `recovery` for the same reason
+    /// everything else did: the scan reads the journal, and the journal is
+    /// only reachable from the shard's own thread.
+    RebuildIdempotency(RebuildIdempotencyCmd),
+
     /// Load the stream_lifecycle.bin sidecar after replay completes.
     /// Patches `created_at_seq` in stream_retention and rebuilds snapshot.
     LoadStreamLifecycle,
@@ -80,9 +87,17 @@ pub enum ShardCommand {
 // ── Hot path commands ───────────────────────────────────────────────────────
 
 /// Owned publish entry — subject and payload cross the channel.
+///
+/// `flags` and `deliver_at_ms` are carried too, and that is not incidental:
+/// without them the routed path would rebuild every entry as a plain
+/// immediate publish, silently dropping header flags and turning a delayed
+/// message into an instant one. Nothing would error; the message would just
+/// arrive at the wrong time, or without its headers.
 pub struct PublishEntryOwned {
     pub subject: Bytes,
     pub payload: Bytes,
+    pub flags: u8,
+    pub deliver_at_ms: u64,
 }
 
 impl PublishEntryOwned {
@@ -93,23 +108,46 @@ impl PublishEntryOwned {
         Self {
             subject: frame.slice_ref(view.subject()),
             payload: frame.slice_ref(view.payload()),
+            flags: 0,
+            deliver_at_ms: 0,
         }
     }
 }
 
 /// Append to this shard's journal, from a thread that is not the shard's.
 ///
-/// Nothing here borrows the store. The payloads are `Bytes` slices of the
-/// original frame, so the hand-off is a refcount bump, not a copy — the
-/// cost of routing a publish through the channel is the wake and the reply,
-/// never the data.
+/// Nothing here borrows the store. The payloads are owned `Bytes`, which
+/// for the dispatch path means a copy — see `owned_entries` for why slicing
+/// the frame is not safe there. So routing a publish costs the wake, the
+/// reply AND the payload copy. That is the price of publishing to a shard
+/// this thread does not own, and it is why the local door exists.
 pub struct PublishCmd {
     pub stream_id: StreamId,
     pub entries: Vec<PublishEntryOwned>,
     pub now_ms: u64,
-    /// First assigned sequence, or `None` if the append was rejected
-    /// (quota). The publisher owes this to its client.
-    pub reply: oneshot::Sender<Option<u64>>,
+    /// Who to answer, and under which request sequence.
+    ///
+    /// The SHARD sends this reply, not the publisher. That is the whole
+    /// reason this field exists instead of a `oneshot`: awaiting the
+    /// sequence back would turn a fire-and-forget publish into a lockstep
+    /// round trip, and a client publishing in a tight loop fills its
+    /// outgoing ring and starts failing with `QueueFull`. Measured, not
+    /// theorised — it broke `drop_client_cancels_all_tasks_under_500ms`
+    /// deterministically until the await came out.
+    /// `None` for an internal append with no client waiting — the delayed
+    /// journal republishing a matured entry, for instance. A sentinel
+    /// conn_id would have been a silent way to send a reply to connection
+    /// zero.
+    pub reply_to: Option<(u64, u64)>,
+}
+
+/// Rebuild a stream's dedup tracker from the shard's journal at startup.
+/// The reply is how many entries were re-recorded.
+pub struct RebuildIdempotencyCmd {
+    pub stream_id: StreamId,
+    pub window_ms: u32,
+    pub now_ms: u64,
+    pub reply: oneshot::Sender<u64>,
 }
 
 /// Acknowledge messages. Uses engine's AckEntry (stream_id + seq).

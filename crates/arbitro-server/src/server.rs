@@ -345,16 +345,34 @@ impl ArbitroServer {
                                 flags: entry.flags,
                                 deliver_at_ms: 0,
                             };
+                            // The delayed journal flush runs on the shared
+                            // pool, so it takes the routed door like any
+                            // other off-thread publisher.
+                            let cat = self.server.names().snapshot();
                             match self
                                 .server
-                                .sink_for(seq_stream)
-                                .publish(&[store_entry], now_ms)
+                                .append(
+                                    &cat,
+                                    seq_stream,
+                                    &[store_entry],
+                                    || {
+                                        vec![crate::shard::command::PublishEntryOwned {
+                                            subject: bytes::Bytes::copy_from_slice(&entry.subject),
+                                            payload: bytes::Bytes::copy_from_slice(&entry.payload),
+                                            flags: entry.flags,
+                                            deliver_at_ms: 0,
+                                        }]
+                                    },
+                                    now_ms,
+                                    None,
+                                )
+                                .await
                             {
-                                Ok(_) => {}
-                                Err(e) => {
+                                crate::shard::router::Append::Stored(_)
+                                | crate::shard::router::Append::Delegated => {}
+                                crate::shard::router::Append::Refused => {
                                     tracing::error!(
                                         stream_id = entry.stream_id,
-                                        error = ?e,
                                         "delayed catch-up: failed to append to main store"
                                     );
                                 }

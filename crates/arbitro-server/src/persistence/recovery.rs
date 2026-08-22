@@ -479,58 +479,14 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
 
             let cutoff_ms = now_ms.saturating_sub(window_ms as u64);
 
-            let shared_store = server.store_for(stream_id);
-            let store = shared_store.lock();
-            let info = store.info();
-            if info.messages == 0 {
-                continue;
-            }
+            // The scan reads the shard's journal, so it runs ON the shard.
+            // Recovery's job is to say which streams need it, not to reach
+            // into a store it does not own.
+            let stream_recovered = shard
+                .rebuild_idempotency(stream_id, window_ms, now_ms)
+                .await
+                .unwrap_or(0);
 
-            let shared_idemp = server.idempotency_for(stream_id);
-            let tracker_arc =
-                crate::shard::idempotency::idempotency_for_stream(shared_idemp, stream_id);
-            let mut tracker = tracker_arc.lock();
-
-            let mut stream_recovered = 0u64;
-            store
-                .for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
-                    // Skip entries older than the idempotency window.
-                    if entry.timestamp < cutoff_ms {
-                        return;
-                    }
-
-                    // Only process entries with HAS_HEADERS flag.
-                    if entry.flags & arbitro_store::flags::HAS_HEADERS == 0 {
-                        return;
-                    }
-
-                    // Parse the extended payload to extract msg-id header.
-                    let ext = match ExtendedPayload::ref_from_bytes(entry.payload) {
-                        Ok(e) => e,
-                        Err(_) => return,
-                    };
-                    let hdr = match ext.headers_block() {
-                        Some(h) => h,
-                        None => return,
-                    };
-                    let msg_id = match hdr.get(HDR_MSG_ID) {
-                        Some(id) if !id.is_empty() => id,
-                        _ => return,
-                    };
-
-                    // Repopulate the tracker.
-                    let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
-                    // Remaining window = window_ms - (now - entry.timestamp).
-                    let elapsed = now_ms.saturating_sub(entry.timestamp);
-                    let remaining_ms = (window_ms as u64).saturating_sub(elapsed);
-                    if remaining_ms > 0 {
-                        tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
-                        stream_recovered += 1;
-                    }
-                })
-                .ok();
-
-            drop(tracker);
             if stream_recovered > 0 {
                 server.mark_idempotency_allocated(stream_id);
                 total_recovered += stream_recovered;

@@ -490,18 +490,40 @@ pub async fn delayed_maturation_loop(
                 deliver_at_ms: 0,
             };
 
-            match server.sink_for(seq_stream).publish(&[store_entry], now_ms) {
-                Ok(_seq) => {
+            // The maturation loop runs on the shared pool, not on any
+            // shard's thread, so this takes the routed door. `deliver_at_ms`
+            // is deliberately 0: the delay has already elapsed, and carrying
+            // the original timestamp forward would park the entry again.
+            let cat = server.names().snapshot();
+            match server
+                .append(
+                    &cat,
+                    seq_stream,
+                    &[store_entry],
+                    || {
+                        vec![crate::shard::command::PublishEntryOwned {
+                            subject: bytes::Bytes::copy_from_slice(&entry.subject),
+                            payload: bytes::Bytes::copy_from_slice(&entry.payload),
+                            flags: entry.flags,
+                            deliver_at_ms: 0,
+                        }]
+                    },
+                    now_ms,
+                    None,
+                )
+                .await
+            {
+                crate::shard::router::Append::Stored(_)
+                | crate::shard::router::Append::Delegated => {
                     tracing::debug!(
                         stream_id = entry.stream_id,
                         deliver_at_ms = entry.deliver_at_ms,
                         "delayed entry matured and appended to main store"
                     );
                 }
-                Err(e) => {
+                crate::shard::router::Append::Refused => {
                     tracing::error!(
                         stream_id = entry.stream_id,
-                        error = ?e,
                         "failed to append matured delayed entry to main store"
                     );
                 }

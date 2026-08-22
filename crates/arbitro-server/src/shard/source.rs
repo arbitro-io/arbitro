@@ -6,7 +6,7 @@
 //! layers — transport uses it — and this one does not.
 
 use crate::shard::drain::{self, DrainConfig, Staged, Window};
-use crate::shard::router::SharedStore;
+
 use crate::shard::shared::SharedCounters;
 
 /// The drain's side of the same idea: hand it a window, without saying how
@@ -34,20 +34,29 @@ pub(in crate::shard) trait WindowSource {
     ) -> Window;
 }
 
-/// Today's model: the store is shared, so the window is read under the lock
-/// and copied out before releasing it.
-pub(in crate::shard) struct SharedStoreSource<'a> {
-    store: &'a SharedStore,
+/// The journal owned by this thread. No lock — the drain, the command
+/// worker and this shard's connections are all tasks on one thread.
+///
+/// The copy into `staged` is still here, and now for a weaker reason than
+/// before. It used to be mandatory: `evict_expired` could `munmap` a
+/// segment from another thread mid-walk. Eviction is a task on THIS thread
+/// now, so it cannot run while this borrow is held, and the window could be
+/// walked in place. Removing the copy is a separate change with its own
+/// measurement — the doc above puts it at ~82us per cycle at 8KB payloads
+/// — and doing it in the same pass as the ownership move would make a
+/// regression in either impossible to attribute.
+pub(in crate::shard) struct LocalSource {
+    shard_id: usize,
 }
 
-impl<'a> SharedStoreSource<'a> {
+impl LocalSource {
     #[inline]
-    pub(in crate::shard) fn new(store: &'a SharedStore) -> Self {
-        Self { store }
+    pub(in crate::shard) fn new(shard_id: usize) -> Self {
+        Self { shard_id }
     }
 }
 
-impl WindowSource for SharedStoreSource<'_> {
+impl WindowSource for LocalSource {
     #[inline]
     fn take_window(
         &self,
@@ -55,12 +64,13 @@ impl WindowSource for SharedStoreSource<'_> {
         cfg: &DrainConfig,
         staged: &mut Staged,
     ) -> Window {
-        let g = self.store.lock();
-        let w = drain::window(counters, &**g, cfg);
-        if let Window::Range { start, end, .. } = w {
-            let _p = crate::shard::drain_profile::fill();
-            staged.fill(&**g, start, end);
-        }
-        w
+        crate::shard::local::store(self.shard_id, |s| {
+            let w = drain::window(counters, s, cfg);
+            if let Window::Range { start, end, .. } = w {
+                let _p = crate::shard::drain_profile::fill();
+                staged.fill(s, start, end);
+            }
+            w
+        })
     }
 }

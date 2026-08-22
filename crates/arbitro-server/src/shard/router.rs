@@ -27,17 +27,29 @@ use crate::shard::worker::{CommandWorker, DrainWorker};
 use crate::transport::ConnectionRegistry;
 use arbitro_common::SharedClock;
 
-/// Shared store handle — publish writes, drain reads.
-/// Shared store handle — publish writes, drain reads.
-/// **F2**: `parking_lot::Mutex` for faster uncontested path; no
-/// `block_in_place` wrapper needed (append is a sub-µs mmap memcpy).
-pub type SharedStore = Arc<parking_lot::Mutex<Box<dyn arbitro_store::Store>>>;
+
+/// What happened to an append, and — the part callers must respect — who
+/// owes the client an answer.
+///
+/// Getting this wrong sends two replies for one request, which desynchronises
+/// the client's sequence bookkeeping far more confusingly than sending none.
+pub enum Append {
+    /// Appended on this thread. The CALLER still owes the client its RepOk.
+    Stored(u64),
+    /// Handed to the owning shard, which will answer the client itself.
+    /// The caller must send nothing.
+    Delegated,
+    /// Refused — quota, or the shard is gone. The caller owes the error.
+    Refused,
+}
 
 /// Routes commands to the correct shard worker by stream_id.
 #[derive(Clone)]
 pub struct ShardRouter {
     shards: Arc<[ShardHandle]>,
-    stores: Arc<[SharedStore]>,
+    /// How many shards exist. Was `stores.len()`; the stores themselves
+    /// now live on their own threads and the router never holds one.
+    shard_count: usize,
     gates: Arc<[Arc<Gate>]>,
     names: Arc<NameRegistry>,
     /// H5: drain task join handles, one per shard. After the migration
@@ -174,32 +186,18 @@ impl ShardRouter {
         let channel_capacity = config.channel_capacity;
 
         let mut handles = Vec::with_capacity(shard_count);
-        let mut stores = Vec::with_capacity(shard_count);
         let mut gates = Vec::with_capacity(shard_count);
         let mut idempotency = Vec::with_capacity(shard_count);
         let mut has_idempotency = Vec::with_capacity(shard_count);
         let mut drain_joins = Vec::with_capacity(shard_count);
         let mut drain_running = Vec::with_capacity(shard_count);
-        // One runtime per shard when enabled, so a shard's drain and command
-        // worker share a thread instead of competing for its store from two.
-        // A failure to start one is fatal rather than a silent fallback: a
-        // broker half on private runtimes and half on the shared pool has
-        // the cost of both models and the benefit of neither, and nothing
-        // in a log would say so.
-        let shard_runtimes: Vec<super::runtime::ShardRuntime> = if config.shard_runtimes {
-            (0..shard_count)
-                .map(|id| {
-                    super::runtime::ShardRuntime::start(id)
-                        .unwrap_or_else(|e| panic!("shard {id} runtime failed to start: {e}"))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        // `None` = use the ambient runtime, which is the default model.
-        let spawn_on = |id: usize| -> Option<tokio::runtime::Handle> {
-            shard_runtimes.get(id).map(|r| r.handle().clone())
-        };
+        // One runtime per shard, always — the journal is MOVED onto that
+        // thread and lives there. There is no second model to fall back to:
+        // a shard whose journal sat in a shared `Arc<Mutex<_>>` would put
+        // the lock back, and a broker running half of each would carry the
+        // cost of both and the benefit of neither.
+        let mut shard_runtimes: Vec<super::runtime::ShardRuntime> =
+            Vec::with_capacity(shard_count);
         let names = Arc::new(NameRegistry::new());
         // H10: one SilentDrops shared by every shard + the registry.
         let silent_drops = Arc::new(crate::common::SilentDrops::new());
@@ -241,7 +239,13 @@ impl ShardRouter {
                 }
                 None => Box::new(MemoryStore::new()),
             };
-            let shared_store: SharedStore = Arc::new(parking_lot::Mutex::new(store));
+            // The journal moves onto the shard's own thread here and never
+            // comes back. Everything that touches it from now on is a task
+            // on that thread, which is why none of them takes a lock.
+            let runtime = super::runtime::ShardRuntime::start(id, store)
+                .unwrap_or_else(|e| panic!("shard {id} runtime failed to start: {e}"));
+            let rt = runtime.handle().clone();
+            shard_runtimes.push(runtime);
 
             // Shared atomics — zero Mutex, zero contention.
             let counters = Arc::new(SharedCounters::new());
@@ -278,7 +282,6 @@ impl ShardRouter {
                 shard_id: id as u32,
                 counters: Arc::clone(&counters),
                 snapshot: Arc::clone(&snapshot),
-                store: Arc::clone(&shared_store),
                 gate: Arc::clone(&gate),
                 names: Arc::clone(&names),
                 drain_config: super::drain::DrainConfig {
@@ -310,12 +313,10 @@ impl ShardRouter {
             // each and shift the timing they are meant to observe.
             let verbose = std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
             let probe_on = verbose || std::env::var("ARBITRO_DRAIN_PROBE").is_ok();
-            let rt = spawn_on(id);
-            let join = match (&rt, probe_on) {
-                (Some(h), true) => h.spawn(drain_worker.run(ProbeOn::new(verbose))),
-                (Some(h), false) => h.spawn(drain_worker.run(ProbeOff)),
-                (None, true) => tokio::spawn(drain_worker.run(ProbeOn::new(verbose))),
-                (None, false) => tokio::spawn(drain_worker.run(ProbeOff)),
+            let join = if probe_on {
+                rt.spawn(drain_worker.run(ProbeOn::new(verbose)))
+            } else {
+                rt.spawn(drain_worker.run(ProbeOff))
             };
             drain_joins.push(Some(join));
             drain_running.push(Arc::clone(&running));
@@ -323,9 +324,9 @@ impl ShardRouter {
             // ── Command task — tokio::spawn, owns engine ────────────
             let cmd_worker = CommandWorker {
                 engine,
+                shard_id: id,
                 counters: Arc::clone(&counters),
                 snapshot: Arc::clone(&snapshot),
-                store: Arc::clone(&shared_store),
                 gate: Arc::clone(&gate),
                 registry: registry.clone(),
                 names: Arc::clone(&names),
@@ -368,10 +369,7 @@ impl ShardRouter {
             let shard_id_for_log = id;
             // Same runtime as this shard's drain — that pairing IS the
             // change. Two tasks on one thread cannot contend for the store.
-            let cmd_handle = match &rt {
-                Some(h) => h.spawn(cmd_worker.run()),
-                None => tokio::spawn(cmd_worker.run()),
-            };
+            let cmd_handle = rt.spawn(cmd_worker.run());
             tokio::spawn(async move {
                 match cmd_handle.await {
                     Ok(()) => {
@@ -398,7 +396,6 @@ impl ShardRouter {
                 }
             });
 
-            stores.push(Arc::clone(&shared_store));
             gates.push(Arc::clone(&gate));
             idempotency.push(Arc::clone(&shard_idempotency));
             has_idempotency.push(Arc::clone(&shard_has_idempotency));
@@ -406,7 +403,6 @@ impl ShardRouter {
             handles.push(ShardHandle::new(
                 id as u32,
                 tx,
-                Arc::clone(&shared_store),
                 Arc::clone(&gate),
                 registry.clone(),
                 shard_metrics,
@@ -432,7 +428,7 @@ impl ShardRouter {
 
         Self {
             shards: handles.into(),
-            stores: stores.into(),
+            shard_count,
             gates: gates.into(),
             names,
             drain_joins: Arc::new(parking_lot::Mutex::new(drain_joins)),
@@ -499,11 +495,6 @@ impl ShardRouter {
     /// looked equivalent but asked the registry twice per publish frame,
     /// and the store and the gate must belong to the same shard anyway —
     /// two independent lookups is the shape that lets them disagree.
-    #[inline]
-    pub fn sink_for(&self, stream_id: StreamId) -> crate::sink::SharedStoreSink<'_> {
-        let idx = self.shard_index(stream_id, self.stores.len());
-        crate::sink::SharedStoreSink::new(&self.stores[idx], &self.gates[idx])
-    }
 
     /// The runtime owning `shard`, when shards have private runtimes.
     ///
@@ -550,6 +541,79 @@ impl ShardRouter {
         }
     }
 
+    /// Append, through whichever door this thread is entitled to.
+    ///
+    /// Same-thread is a direct call into the journal — no lock, no channel.
+    /// Otherwise the entries go to the owning shard as a command and the
+    /// sequence comes back on a oneshot. `owned` is a closure so the fast
+    /// path never builds the owned `Vec` it would not use.
+    ///
+    /// `None` means the append was refused (quota) or the shard is gone;
+    /// both are "no sequence to report", which is all the caller can act on.
+    pub async fn append(
+        &self,
+        cat: &arbitro_common::name_registry::Snapshot<'_>,
+        stream_id: StreamId,
+        entries: &[arbitro_store::EntryRef<'_>],
+        owned: impl FnOnce() -> Vec<crate::shard::command::PublishEntryOwned>,
+        now_ms: u64,
+        reply_to: Option<(u64, u64)>,
+    ) -> Append {
+        use crate::sink::StreamSink;
+        let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
+        if super::local::owns(idx) {
+            return match crate::sink::LocalSink::new(idx, &self.gates[idx])
+                .publish(entries, now_ms)
+            {
+                Ok(seq) => Append::Stored(seq),
+                Err(_) => Append::Refused,
+            };
+        }
+        // Deliberately NOT awaited. The shard answers the client itself;
+        // waiting here for the sequence just to forward it would serialise
+        // a fire-and-forget publisher against its own broker.
+        match self.shards[idx]
+            .publish_routed(stream_id, owned(), now_ms, reply_to)
+            .await
+        {
+            Ok(()) => Append::Delegated,
+            Err(_) => Append::Refused,
+        }
+    }
+
+    /// Journal stats for a stream, through whichever door applies.
+    ///
+    /// Async for the same reason `append` is: off-thread callers have to ask
+    /// the owning shard. Quota pre-checks read this, so it is on the publish
+    /// path — but only for streams that actually declare a quota.
+    pub async fn store_stats(
+        &self,
+        cat: &arbitro_common::name_registry::Snapshot<'_>,
+        stream_id: StreamId,
+    ) -> arbitro_store::StoreInfo {
+        use crate::sink::StreamSink;
+        let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
+        if super::local::owns(idx) {
+            return crate::sink::LocalSink::new(idx, &self.gates[idx]).info();
+        }
+        match self.shards[idx].store_info(stream_id).await {
+            Ok(r) => arbitro_store::StoreInfo {
+                messages: r.messages,
+                bytes: r.bytes,
+                ..Default::default()
+            },
+            Err(_) => arbitro_store::StoreInfo::default(),
+        }
+    }
+
+    /// `store_stats` for callers that hold no catalog snapshot — the cold
+    /// ack-state paths, which read this once per request rather than per
+    /// entry and have no reason to carry one.
+    pub async fn store_stats_for(&self, stream_id: StreamId) -> arbitro_store::StoreInfo {
+        let cat = self.names.snapshot();
+        self.store_stats(&cat, stream_id).await
+    }
+
     /// The lock-free sink, when THIS thread owns the stream's shard.
     ///
     /// `None` means the caller is somewhere else — the shared pool, the
@@ -560,24 +624,13 @@ impl ShardRouter {
     /// measured or reasoned about.
     #[inline]
     pub fn local_sink(&self, stream_id: StreamId) -> Option<crate::sink::LocalSink<'_>> {
-        let idx = self.shard_index(stream_id, self.stores.len());
+        let idx = self.shard_index(stream_id, self.shard_count);
         if !super::local::owns(idx) {
             return None;
         }
         Some(crate::sink::LocalSink::new(idx, &self.gates[idx]))
     }
 
-    /// A stream's sink, resolved off a snapshot the caller already holds.
-    /// Same answer as `sink_for`, one guard cheaper.
-    #[inline]
-    pub fn sink_with(
-        &self,
-        snap: &arbitro_common::name_registry::Snapshot<'_>,
-        stream_id: StreamId,
-    ) -> crate::sink::SharedStoreSink<'_> {
-        let idx = Self::place(snap.stream_shard(stream_id), stream_id, self.stores.len());
-        crate::sink::SharedStoreSink::new(&self.stores[idx], &self.gates[idx])
-    }
 
     #[inline]
     fn shard_index(&self, stream_id: StreamId, len: usize) -> usize {
@@ -593,13 +646,9 @@ impl ShardRouter {
     /// DOWN, so a later change to the shard count cannot move the stream.
     #[inline]
     pub fn shard_index_for_new(&self, stream_id: StreamId) -> u16 {
-        (stream_id.raw() as usize % self.stores.len()) as u16
+        (stream_id.raw() as usize % self.shard_count) as u16
     }
 
-    pub fn store_for(&self, stream_id: StreamId) -> &SharedStore {
-        let idx = self.shard_index(stream_id, self.stores.len());
-        &self.stores[idx]
-    }
 
     #[inline]
     pub fn gate_for(&self, stream_id: StreamId) -> &Arc<Gate> {

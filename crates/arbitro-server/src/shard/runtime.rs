@@ -55,22 +55,42 @@ impl ShardRuntime {
     /// is identifiable in `top`/`perf` — an unnamed thread per shard makes
     /// a 16-shard broker unreadable in exactly the profile you would open
     /// to check whether this was worth it.
-    pub(crate) fn start(id: usize) -> std::io::Result<Self> {
+    /// `store` is MOVED onto the new thread and installed there. That move
+    /// is the whole ownership story: after it, no other thread holds the
+    /// journal, which is why nothing has to lock it.
+    ///
+    /// The caller blocks until the install has happened. Without that,
+    /// tasks spawned onto the handle could run before the journal exists
+    /// and see "this thread owns no shard" — indistinguishable from a
+    /// misrouted connection, and intermittent.
+    pub(crate) fn start(
+        id: usize,
+        store: Box<dyn arbitro_store::Store>,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let handle = rt.handle().clone();
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let stop = Arc::clone(&shutdown);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
 
         let thread = std::thread::Builder::new()
             .name(format!("arbitro-shard-{id}"))
             .spawn(move || {
+                super::local::install(id, store);
+                let _ = ready_tx.send(());
                 // `block_on` drives every task spawned through the handle,
                 // not just this future. Parking on the notify is what keeps
                 // the runtime alive and polling until shutdown.
                 rt.block_on(async move { stop.notified().await });
             })?;
+        // A dropped sender means the thread died before installing; treat
+        // that as the fatal condition it is rather than returning a runtime
+        // whose journal never arrives.
+        ready_rx
+            .recv()
+            .expect("shard runtime thread died before installing its journal");
 
         Ok(Self {
             handle,

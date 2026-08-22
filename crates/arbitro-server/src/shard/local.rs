@@ -88,6 +88,37 @@ pub(crate) fn with_store<R>(shard_id: usize, f: impl FnOnce(&mut dyn Store) -> R
     })
 }
 
+/// Test-only: install a journal, REPLACING any already on this thread.
+///
+/// `install` refuses to overwrite because in production a second journal
+/// means two live handles to one shard. Tests are the opposite case: cargo
+/// reuses threads between them, so a test that ran earlier will have left
+/// its journal behind, and refusing would fail the second test for the
+/// first one's success. Replacing also keeps tests isolated — each starts
+/// on an empty store rather than inheriting a neighbour's entries.
+#[cfg(test)]
+pub(crate) fn install_for_test(shard_id: usize, store: Box<dyn Store>) {
+    LOCAL.with(|l| {
+        *l.borrow_mut() = Some(LocalShard {
+            shard_id,
+            store: RefCell::new(store),
+        });
+    });
+}
+
+/// Like [`with_store`], but for callers that already know this thread owns
+/// the shard — the shard's own drain and command worker, which cannot run
+/// anywhere else.
+///
+/// Panics rather than returning `Option` because there is no sensible
+/// recovery: a shard worker that cannot find its own journal is a broken
+/// invariant, and silently returning a default would let it report empty
+/// stores and advance cursors over messages that exist.
+pub(crate) fn store<R>(shard_id: usize, f: impl FnOnce(&mut dyn Store) -> R) -> R {
+    with_store(shard_id, f)
+        .unwrap_or_else(|| panic!("shard {shard_id}: journal not installed on this thread"))
+}
+
 /// Whether this thread owns `shard_id`'s journal. For the publish path to
 /// decide, once, which door it is going through.
 pub(crate) fn owns(shard_id: usize) -> bool {

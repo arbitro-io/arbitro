@@ -74,16 +74,99 @@ impl CommandWorker {
                 stream_id: cmd.stream_id.raw(),
                 subject: &e.subject,
                 payload: &e.payload,
-                flags: 0,
-                deliver_at_ms: 0,
+                flags: e.flags,
+                deliver_at_ms: e.deliver_at_ms,
             })
             .collect();
 
         use crate::sink::StreamSink;
-        let first = crate::sink::SharedStoreSink::new(&self.store, &self.gate)
+        // This worker IS the shard's thread, so it takes the same lock-free
+        // door a local connection takes — the routed path exists to move
+        // the work here, not to give it a second way in.
+        let first = crate::sink::LocalSink::new(self.shard_id, &self.gate)
             .publish(&refs, cmd.now_ms)
             .ok();
-        let _ = cmd.reply.send(first);
+
+        // Answer the client from HERE. Sending the sequence back to the
+        // publisher to forward would make it wait, which is exactly what
+        // this path must not do.
+        if let Some((conn_id, req_seq)) = cmd.reply_to {
+            match first {
+                Some(seq) => {
+                    crate::common::reply_v2::send_rep_ok_v2(&self.registry, conn_id, req_seq, seq)
+                }
+                None => crate::common::reply_v2::send_error_v2(
+                    &self.registry,
+                    conn_id,
+                    req_seq,
+                    arbitro_proto::error::ErrorCode::StreamFull,
+                ),
+            }
+        }
+    }
+
+    /// Rebuild one stream's dedup tracker by scanning this shard's journal.
+    ///
+    /// Startup only, and it lives here rather than in `recovery` because
+    /// the scan reads the journal — which no other thread can reach.
+    pub(in crate::shard) fn handle_rebuild_idempotency(&mut self, cmd: RebuildIdempotencyCmd) {
+        use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
+        use zerocopy::FromBytes;
+
+        let stream_id = cmd.stream_id;
+        let cutoff_ms = cmd.now_ms.saturating_sub(cmd.window_ms as u64);
+
+        let info = crate::shard::local::store(self.shard_id, |s| s.info());
+        if info.messages == 0 {
+            let _ = cmd.reply.send(0);
+            return;
+        }
+
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(
+            &self.idempotency_tracker,
+            stream_id,
+        );
+        let mut tracker = tracker_arc.lock();
+        let mut recovered = 0u64;
+
+        crate::shard::local::store(self.shard_id, |store| {
+            store
+                .for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
+                    // Older than the window — its dedup key has expired.
+                    if entry.timestamp < cutoff_ms {
+                        return;
+                    }
+                    if entry.flags & arbitro_store::flags::HAS_HEADERS == 0 {
+                        return;
+                    }
+                    let ext = match ExtendedPayload::ref_from_bytes(entry.payload) {
+                        Ok(e) => e,
+                        Err(_) => return,
+                    };
+                    let hdr = match ext.headers_block() {
+                        Some(h) => h,
+                        None => return,
+                    };
+                    let msg_id = match hdr.get(HDR_MSG_ID) {
+                        Some(id) if !id.is_empty() => id,
+                        _ => return,
+                    };
+                    let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
+                    // Re-record with the REMAINING window, not the full one:
+                    // restoring the original TTL would keep a key alive past
+                    // the point the publisher was promised it would expire.
+                    let elapsed = cmd.now_ms.saturating_sub(entry.timestamp);
+                    let remaining_ms = (cmd.window_ms as u64).saturating_sub(elapsed);
+                    if remaining_ms > 0 {
+                        tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
+                        recovered += 1;
+                    }
+                })
+                .ok();
+        });
+
+        drop(tracker);
+        let _ = cmd.reply.send(recovered);
     }
 
     // ── Hot path — ack / nack ───────────────────────────────────────────
@@ -572,7 +655,7 @@ impl CommandWorker {
             let created_at_seq = if self.replay_mode {
                 0
             } else {
-                self.store.lock().info().last_seq.wrapping_add(1)
+                crate::shard::local::store(self.shard_id, |s| s.info()).last_seq.wrapping_add(1)
             };
 
             self.stream_retention.insert(
@@ -626,7 +709,7 @@ impl CommandWorker {
         // and is still delivered — over-delivery to a brand-new consumer
         // is benign, silently skipping a message published after creation
         // would be loss.
-        let journal_tail = self.store.lock().info().last_seq;
+        let journal_tail = crate::shard::local::store(self.shard_id, |s| s.info()).last_seq;
         match self.engine.create_consumer(cmd.config) {
             Ok(true) => {
                 // Newly created — apply subject limits.
@@ -848,7 +931,7 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_store_info(&mut self, cmd: StoreInfoCmd) {
-        let info = self.store.lock().info();
+        let info = crate::shard::local::store(self.shard_id, |s| s.info());
         let _ = cmd.reply.send(StoreInfoReply {
             messages: info.messages,
             bytes: info.bytes,
@@ -859,7 +942,7 @@ impl CommandWorker {
 
     pub(in crate::shard) fn handle_purge_stream(&mut self, cmd: PurgeStreamCmd) {
         let new_last_seq = {
-            let mut g = self.store.lock();
+            crate::shard::local::store(self.shard_id, |g| {
             // Scope the purge to the named stream. `Store::purge()` clears
             // the WHOLE shard, and a shard holds every stream routed to it
             // — so purging one stream destroyed its neighbours' messages
@@ -868,6 +951,7 @@ impl CommandWorker {
             let deleted = g.tombstone_stream(cmd.stream_id.0);
             let info = g.info();
             (deleted, info.last_seq)
+            })
         };
         let (deleted, _last_seq) = new_last_seq;
         // The cursor is deliberately NOT snapped forward any more.
@@ -888,12 +972,13 @@ impl CommandWorker {
         // The stream_id has always arrived on this command; it just had
         // nowhere to go, because `Store::drain` only took a subject and
         // swept the whole shard. Same defect class as PurgeStream.
-        let deleted = self.store.lock().drain(cmd.stream_id.0, &cmd.subject);
+        let deleted =
+            crate::shard::local::store(self.shard_id, |s| s.drain(cmd.stream_id.0, &cmd.subject));
         let _ = cmd.reply.send(deleted);
     }
 
     pub(in crate::shard) fn handle_delete_message(&mut self, cmd: DeleteMessageCmd) {
-        let found = self.store.lock().tombstone_at(cmd.seq);
+        let found = crate::shard::local::store(self.shard_id, |s| s.tombstone_at(cmd.seq));
         let _ = cmd.reply.send(found);
     }
 
@@ -901,10 +986,11 @@ impl CommandWorker {
     pub(in crate::shard) fn handle_ack_term(&mut self, cmd: AckCmd) {
         // Tombstone each entry in the store.
         {
-            let mut store = self.store.lock();
-            for entry in &cmd.entries {
-                store.tombstone_at(entry.seq);
-            }
+            crate::shard::local::store(self.shard_id, |store| {
+                for entry in &cmd.entries {
+                    store.tombstone_at(entry.seq);
+                }
+            });
         }
         // Proceed with normal ack logic (release pending + inflight).
         self.handle_ack(cmd);
@@ -939,8 +1025,13 @@ impl CommandWorker {
             .unwrap_or_default()
             .as_millis() as u64;
 
-        let mut store = self.store.lock();
-        let info = store.info();
+        // Three separate touches rather than one borrow spanning the whole
+        // function. The logic between them reads and mutates `self`, and a
+        // borrow held across that would collide; splitting also keeps the
+        // journal free while this computes cutoffs, which matters now that
+        // the drain is a task on this same thread.
+        let shard = self.shard_id;
+        let info = crate::shard::local::store(shard, |s| s.info());
 
         if info.messages == 0 {
             return;
@@ -997,6 +1088,7 @@ impl CommandWorker {
 
         // Collect oldest_ts updates in a local vec to avoid borrow conflict.
         let mut ts_updates: Vec<(u32, u64)> = Vec::new();
+        crate::shard::local::store(shard, |store| {
         let _ = store.for_each(start, end, &mut |entry| {
             let sid = entry.stream_id as usize;
             if sid >= resolved.len() {
@@ -1027,6 +1119,7 @@ impl CommandWorker {
             }
             // else: entry is expired for this stream, keep scanning.
         });
+        });
 
         // F16: apply oldest_ts cache updates collected during the walk.
         for (sid_raw, ts) in ts_updates {
@@ -1035,7 +1128,8 @@ impl CommandWorker {
 
         // Truncate if we found a valid boundary past current first_seq.
         if min_valid_seq > info.first_seq {
-            let deleted = store.truncate_front(min_valid_seq);
+            let deleted =
+                crate::shard::local::store(shard, |s| s.truncate_front(min_valid_seq));
             if deleted > 0 {
                 tracing::debug!(
                     deleted,

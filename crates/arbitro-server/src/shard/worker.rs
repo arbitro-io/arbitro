@@ -32,7 +32,6 @@ use crate::shard::command::*;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::drain_events::DrainEvent;
 use crate::shard::drain_probe::{DrainProbe, ParkVerdict, ReadVerdict, RewindApplied};
-use crate::shard::router::SharedStore;
 use crate::shard::shared::{DrainNotification, DrainSnapshot, SharedCounters, SnapshotSwap};
 use crate::transport::ConnectionRegistry;
 
@@ -117,7 +116,6 @@ pub struct DrainWorker {
     pub(super) shard_id: u32,
     pub(super) counters: Arc<SharedCounters>,
     pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
-    pub(super) store: SharedStore,
     pub(super) gate: Arc<Gate>,
     pub(super) names: Arc<crate::common::NameRegistry>,
     pub(super) drain_config: super::drain::DrainConfig,
@@ -152,11 +150,12 @@ impl DrainWorker {
     pub(in crate::shard) async fn run<P: DrainProbe>(mut self, mut probe: P) {
         // ── Store init ───────────────────────────────────────────────────
         {
-            let mut store_guard = self.store.lock();
-            if let Err(e) = store_guard.init() {
-                tracing::error!(error = ?e, "store init failed");
-            }
-            let info = store_guard.info();
+            let info = crate::shard::local::store(self.shard_id as usize, |s| {
+                if let Err(e) = s.init() {
+                    tracing::error!(error = ?e, "store init failed");
+                }
+                s.info()
+            });
             if info.last_seq > 0 {
                 self.counters.set_cursor(info.last_seq);
             }
@@ -210,7 +209,7 @@ impl DrainWorker {
                 // wall time and blocks publish ~10x longer (measured, memory
                 // and disk journals): the drain holds the lock for the whole
                 // walk while every publisher waits on it.
-                let w = crate::shard::source::SharedStoreSource::new(&self.store).take_window(
+                let w = crate::shard::source::LocalSource::new(self.shard_id as usize).take_window(
                     &self.counters,
                     &self.drain_config,
                     &mut self.staged,
@@ -449,11 +448,13 @@ pub(in crate::shard) fn consumer_subjects_slot(
 pub struct CommandWorker {
     /// Engine — owned exclusively. `&mut self`, no sharing, no lock.
     pub(super) engine: ArbitroEngine,
+    /// Which shard's journal this worker may touch. It runs on that shard's
+    /// thread and the journal lives there; this is the key that reaches it.
+    pub(super) shard_id: usize,
     /// Atomic counters shared with drain.
     pub(super) counters: Arc<SharedCounters>,
     /// Structural snapshot shared with drain.
     pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
-    pub(super) store: SharedStore,
     pub(super) gate: Arc<Gate>,
     pub(super) registry: ConnectionRegistry,
     pub(super) names: Arc<crate::common::NameRegistry>,
@@ -1121,17 +1122,17 @@ impl CommandWorker {
     fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
         if matches!(cmd, ShardCommand::Shutdown) {
             if crate::shard::drain::chaos_debug() {
-                let info = self.store.lock().info();
+                let info = crate::shard::local::store(self.shard_id, |s| s.info());
                 eprintln!(
                     "[SHUTDOWN-BEGIN] store_first={} store_last={} messages={}",
                     info.first_seq, info.last_seq, info.messages
                 );
             }
-            if let Err(e) = self.store.lock().shutdown() {
+            if let Err(e) = crate::shard::local::store(self.shard_id, |s| s.shutdown()) {
                 tracing::error!(error = ?e, "store shutdown failed");
             }
             if crate::shard::drain::chaos_debug() {
-                let info = self.store.lock().info();
+                let info = crate::shard::local::store(self.shard_id, |s| s.info());
                 eprintln!(
                     "[SHUTDOWN-DONE] store_first={} store_last={} messages={}",
                     info.first_seq, info.last_seq, info.messages
@@ -1152,6 +1153,7 @@ impl CommandWorker {
     fn dispatch_command(&mut self, cmd: ShardCommand) {
         match cmd {
             ShardCommand::Publish(cmd) => self.handle_publish(cmd),
+            ShardCommand::RebuildIdempotency(cmd) => self.handle_rebuild_idempotency(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
             ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),
@@ -1559,13 +1561,17 @@ mod tests {
             crate::shard::shared::NotifyRing::new(1);
         let _notify_tx = notify_producers.pop();
         let (drain_evt_tx, drain_evt_rx) = crate::shard::drain_events::DrainEventRing::new();
+        // The journal now belongs to the shard's thread, not to the worker
+        // struct, so the test installs one on ITS thread instead of handing
+        // the worker a store. `install_for_test` replaces rather than
+        // refuses: cargo reuses threads between tests, so an earlier test's
+        // journal is normally still here, and each test wants an empty one.
+        crate::shard::local::install_for_test(0, Box::new(arbitro_store::MemoryStore::new()));
         let worker = CommandWorker {
             engine: ArbitroEngine::new(),
+            shard_id: 0,
             counters: Arc::new(SharedCounters::new()),
             snapshot: Arc::new(SnapshotSwap::new(DrainSnapshot::empty())),
-            store: Arc::new(parking_lot::Mutex::new(Box::new(
-                arbitro_store::MemoryStore::new(),
-            ))),
             gate: Arc::new(Gate::new()),
             registry: crate::transport::ConnectionRegistry::new(64),
             names: Arc::new(crate::common::NameRegistry::new()),

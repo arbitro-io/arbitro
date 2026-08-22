@@ -30,7 +30,6 @@
 use arbitro_store::{EntryRef, StoreError, StoreInfo};
 
 use crate::common::Gate;
-use crate::shard::router::SharedStore;
 
 /// One stream's storage, as the rest of the server sees it.
 pub trait StreamSink {
@@ -43,43 +42,6 @@ pub trait StreamSink {
 
     /// Message/byte counts and sequence bounds — for quota checks.
     fn info(&self) -> StoreInfo;
-}
-
-/// Today's model: the store is shared, so reaching it means taking a lock,
-/// and the deliverer is woken through a gate.
-///
-/// Borrowed, not owned: it is built per call from the router's existing
-/// `Arc`s and costs nothing to create.
-pub struct SharedStoreSink<'a> {
-    store: &'a SharedStore,
-    gate: &'a Gate,
-}
-
-impl<'a> SharedStoreSink<'a> {
-    #[inline]
-    pub fn new(store: &'a SharedStore, gate: &'a Gate) -> Self {
-        Self { store, gate }
-    }
-}
-
-impl StreamSink for SharedStoreSink<'_> {
-    #[inline]
-    fn publish(&self, entries: &[EntryRef<'_>], now_ms: u64) -> Result<u64, StoreError> {
-        // Scoped so the guard is released BEFORE the gate fires. Waking the
-        // drain while still holding the lock hands it a mutex it will
-        // immediately block on.
-        let first = {
-            let mut g = self.store.lock();
-            g.append_batch(entries, now_ms)?
-        };
-        self.gate.release();
-        Ok(first)
-    }
-
-    #[inline]
-    fn info(&self) -> StoreInfo {
-        self.store.lock().info()
-    }
 }
 
 /// The shard's journal reached from the shard's OWN thread. No lock.
