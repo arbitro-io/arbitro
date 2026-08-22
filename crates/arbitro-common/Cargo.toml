@@ -15,3 +15,7 @@ tokio             = { workspace = true }
 [[bench]]
 name = "consumer_cursor"
 harness = false
+
+[[bench]]
+name = "stream_shard"
+harness = false
