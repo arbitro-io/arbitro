@@ -79,6 +79,14 @@ pub enum ShardCommand {
     /// only reachable from the shard's own thread.
     RebuildIdempotency(RebuildIdempotencyCmd),
 
+    /// Read a range of this shard's journal as owned entries.
+    ///
+    /// Cluster catch-up: the follower is behind and the leader must ship it
+    /// the entries it missed. The scan reads the journal, so it runs on the
+    /// shard, and the caller gets owned copies because nothing borrowing the
+    /// journal may leave the thread that owns it.
+    ScanRange(ScanRangeCmd),
+
     /// Load the stream_lifecycle.bin sidecar after replay completes.
     /// Patches `created_at_seq` in stream_retention and rebuilds snapshot.
     LoadStreamLifecycle,
@@ -134,11 +142,28 @@ pub struct PublishCmd {
     /// outgoing ring and starts failing with `QueueFull`. Measured, not
     /// theorised — it broke `drop_client_cancels_all_tasks_under_500ms`
     /// deterministically until the await came out.
-    /// `None` for an internal append with no client waiting — the delayed
-    /// journal republishing a matured entry, for instance. A sentinel
-    /// conn_id would have been a silent way to send a reply to connection
-    /// zero.
-    pub reply_to: Option<(u64, u64)>,
+    pub reply_to: PublishReply,
+}
+
+/// Who, if anyone, is owed an answer for an append — and in what form.
+///
+/// An enum rather than an `Option<(conn_id, req_seq)>` because there are
+/// genuinely three cases, and two of them used to be encoded by accident:
+/// a sentinel `conn_id = 0` would have answered connection zero in
+/// silence, and replication needs the assigned sequence rather than a
+/// wire reply.
+pub enum PublishReply {
+    /// Answer this connection directly, from the shard. The publisher does
+    /// NOT wait — waiting turns fire-and-forget publishing into lockstep.
+    Client { conn_id: u64, req_seq: u64 },
+    /// Hand the first assigned sequence back to the caller. For the paths
+    /// that need the number itself, like replication acking its leader.
+    /// This one DOES make the caller wait, which is why it is not the
+    /// default.
+    Seq(oneshot::Sender<Option<u64>>),
+    /// Nobody is waiting — the delayed journal republishing a matured
+    /// entry, for instance.
+    None,
 }
 
 /// Rebuild a stream's dedup tracker from the shard's journal at startup.
@@ -148,6 +173,22 @@ pub struct RebuildIdempotencyCmd {
     pub window_ms: u32,
     pub now_ms: u64,
     pub reply: oneshot::Sender<u64>,
+}
+
+/// Read `[from_seq, from_seq+limit)` from the shard's journal.
+pub struct ScanRangeCmd {
+    pub from_seq: u64,
+    /// Cap on entries returned, so a catch-up over a huge journal cannot
+    /// build one unbounded reply.
+    pub limit: usize,
+    pub reply: oneshot::Sender<Vec<ScannedEntry>>,
+}
+
+/// One entry copied out of the journal for a caller on another thread.
+pub struct ScannedEntry {
+    pub seq: u64,
+    pub subject: Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 /// Acknowledge messages. Uses engine's AckEntry (stream_id + seq).

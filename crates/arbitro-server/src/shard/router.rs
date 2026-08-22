@@ -557,7 +557,7 @@ impl ShardRouter {
         entries: &[arbitro_store::EntryRef<'_>],
         owned: impl FnOnce() -> Vec<crate::shard::command::PublishEntryOwned>,
         now_ms: u64,
-        reply_to: Option<(u64, u64)>,
+        reply_to: crate::shard::command::PublishReply,
     ) -> Append {
         use crate::sink::StreamSink;
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
@@ -579,6 +579,40 @@ impl ShardRouter {
             Ok(()) => Append::Delegated,
             Err(_) => Append::Refused,
         }
+    }
+
+    /// `append`, for the callers that need the assigned sequence itself.
+    ///
+    /// This one WAITS on the routed path, which is exactly what `append`
+    /// refuses to do — so it is not the default and should stay rare.
+    /// Replication is the legitimate case: it cannot ack its leader without
+    /// the number. `None` means refused or the shard is gone.
+    pub async fn append_for_seq(
+        &self,
+        cat: &arbitro_common::name_registry::Snapshot<'_>,
+        stream_id: StreamId,
+        entries: &[arbitro_store::EntryRef<'_>],
+        owned: impl FnOnce() -> Vec<crate::shard::command::PublishEntryOwned>,
+        now_ms: u64,
+    ) -> Option<u64> {
+        use crate::sink::StreamSink;
+        let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
+        if super::local::owns(idx) {
+            return crate::sink::LocalSink::new(idx, &self.gates[idx])
+                .publish(entries, now_ms)
+                .ok();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shards[idx]
+            .publish_routed(
+                stream_id,
+                owned(),
+                now_ms,
+                crate::shard::command::PublishReply::Seq(tx),
+            )
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
     }
 
     /// Journal stats for a stream, through whichever door applies.

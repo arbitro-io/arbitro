@@ -90,8 +90,8 @@ impl CommandWorker {
         // Answer the client from HERE. Sending the sequence back to the
         // publisher to forward would make it wait, which is exactly what
         // this path must not do.
-        if let Some((conn_id, req_seq)) = cmd.reply_to {
-            match first {
+        match cmd.reply_to {
+            PublishReply::Client { conn_id, req_seq } => match first {
                 Some(seq) => {
                     crate::common::reply_v2::send_rep_ok_v2(&self.registry, conn_id, req_seq, seq)
                 }
@@ -101,7 +101,11 @@ impl CommandWorker {
                     req_seq,
                     arbitro_proto::error::ErrorCode::StreamFull,
                 ),
+            },
+            PublishReply::Seq(tx) => {
+                let _ = tx.send(first);
             }
+            PublishReply::None => {}
         }
     }
 
@@ -167,6 +171,27 @@ impl CommandWorker {
 
         drop(tracker);
         let _ = cmd.reply.send(recovered);
+    }
+
+    /// Copy a range of this shard's journal out for a caller on another
+    /// thread. Cold path — cluster catch-up only.
+    pub(in crate::shard) fn handle_scan_range(&mut self, cmd: ScanRangeCmd) {
+        let info = crate::shard::local::store(self.shard_id, |s| s.info());
+        let start = cmd.from_seq.max(info.first_seq);
+        let end = (start + cmd.limit as u64).min(info.last_seq.saturating_add(1));
+        let mut out = Vec::new();
+        if start < end {
+            crate::shard::local::store(self.shard_id, |store| {
+                let _ = store.for_each(start, end, &mut |entry| {
+                    out.push(ScannedEntry {
+                        seq: entry.seq,
+                        subject: entry.subject.to_vec(),
+                        payload: entry.payload.to_vec(),
+                    });
+                });
+            });
+        }
+        let _ = cmd.reply.send(out);
     }
 
     // ── Hot path — ack / nack ───────────────────────────────────────────

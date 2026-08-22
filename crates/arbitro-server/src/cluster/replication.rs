@@ -528,10 +528,13 @@ pub async fn follower_replication_loop(
                 // follower stays behind — loudly, not silently — until the
                 // cluster catch-up workstream lands.
                 let stream_id = arbitro_engine_v2::types::StreamId(stream_id_raw);
-                let store = store_lookup.store_for(stream_id);
+                // This loop runs on the shared pool, not on any shard's
+                // thread, so it reaches the journal the same way any other
+                // off-thread writer does: by asking the shard. Replication
+                // is just another producer.
+                let cat = store_lookup.names().snapshot();
                 {
-                    let guard = store.lock();
-                    let info = guard.info();
+                    let info = store_lookup.store_stats(&cat, stream_id).await;
                     let expected = follower_expected_first_seq(info.last_seq);
                     if expected != leader_first_seq {
                         tracing::warn!(
@@ -542,17 +545,36 @@ pub async fn follower_replication_loop(
                             "replication: seq divergence, dropping batch — catch-up required \
                              (catch-up transport not wired yet; follower will stay behind)"
                         );
-                        drop(guard);
                         continue;
                     }
                 }
-                let last_seq = match store.lock().append_batch(&refs, timestamp_ms) {
-                    Ok(first) => {
+                // `Seq`, not `Client`: this path needs the assigned
+                // sequence itself to ack the leader over the cluster
+                // transport, so it is one of the few callers that legitimately
+                // waits for the number to come back.
+                let appended = store_lookup
+                    .append_for_seq(
+                        &cat,
+                        stream_id,
+                        &refs,
+                        || {
+                            refs.iter()
+                                .map(|r| crate::shard::command::PublishEntryOwned {
+                                    subject: bytes::Bytes::copy_from_slice(r.subject),
+                                    payload: bytes::Bytes::copy_from_slice(r.payload),
+                                    flags: r.flags,
+                                    deliver_at_ms: r.deliver_at_ms,
+                                })
+                                .collect()
+                        },
+                        timestamp_ms,
+                    )
+                    .await;
+                let last_seq = match appended {
+                    Some(first) => {
                         let count = refs.len() as u64;
                         let last = first + count.saturating_sub(1);
-                        // Wake the drain so followers can deliver to
-                        // local consumers.
-                        store_lookup.gate_for(stream_id).release();
+                        // The local sink already fired the gate.
                         tracing::debug!(
                             stream_id = stream_id_raw,
                             first_seq = first,
@@ -561,10 +583,9 @@ pub async fn follower_replication_loop(
                         );
                         last
                     }
-                    Err(e) => {
+                    None => {
                         tracing::warn!(
                             stream_id = stream_id_raw,
-                            error = ?e,
                             "replication: failed to append entries"
                         );
                         continue;
@@ -682,7 +703,7 @@ pub async fn isr_tick_loop(
 /// (plus ISR `record_ack` and high-watermark visibility gating) is
 /// deferred to the arbitro-raft / cluster workstream
 /// (ROBUSTNESS_AUDIT.md §2.5, action #8).
-pub fn handle_catch_up_request(
+pub async fn handle_catch_up_request(
     request: &CatchUpRequest,
     server: &crate::shard::router::ShardRouter,
     _peer: PeerId,
@@ -691,9 +712,9 @@ pub fn handle_catch_up_request(
     let stream_id_raw = request.stream_id.get();
     let from_seq = request.from_seq.get();
     let stream_id = StreamId(stream_id_raw);
-    let store = server.store_for(stream_id);
-
-    let info = store.lock().info();
+    // The journal belongs to its shard's thread, so this asks rather than
+    // reaches. Cold path — catch-up only.
+    let info = server.store_stats_for(stream_id).await;
     if info.messages == 0 || from_seq > info.last_seq {
         // Nothing to catch up — the follower is already up to date
         // or the store is empty.
@@ -716,16 +737,26 @@ pub fn handle_catch_up_request(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Lock the store once and iterate.
-    let guard = store.lock();
-    let _ = guard.for_each(from_seq, end_seq, &mut |entry| {
+    let _ = end_seq;
+    // One bounded copy out of the shard, then encode here. The cap is the
+    // same frame limit used below, so a catch-up over a huge journal cannot
+    // build one unbounded reply.
+    let scanned = match server
+        .shard_for(stream_id)
+        .scan_range(from_seq, MAX_ENTRIES_PER_FRAME * 16)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    scanned.iter().for_each(|entry| {
         // Encode entry: [total_len:u32][subject_len:u16][subject][payload]
         let subj_len = entry.subject.len();
         let total_len = 2 + subj_len + entry.payload.len();
         entries_bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
         entries_bytes.extend_from_slice(&(subj_len as u16).to_le_bytes());
-        entries_bytes.extend_from_slice(entry.subject);
-        entries_bytes.extend_from_slice(entry.payload);
+        entries_bytes.extend_from_slice(&entry.subject);
+        entries_bytes.extend_from_slice(&entry.payload);
         entry_count += 1;
 
         // Flush a frame when we hit the batch limit.
@@ -742,7 +773,6 @@ pub fn handle_catch_up_request(
             entry_count = 0;
         }
     });
-    drop(guard);
 
     // Flush remaining entries.
     if entry_count > 0 {

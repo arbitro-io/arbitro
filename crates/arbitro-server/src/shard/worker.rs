@@ -1154,6 +1154,7 @@ impl CommandWorker {
         match cmd {
             ShardCommand::Publish(cmd) => self.handle_publish(cmd),
             ShardCommand::RebuildIdempotency(cmd) => self.handle_rebuild_idempotency(cmd),
+            ShardCommand::ScanRange(cmd) => self.handle_scan_range(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
             ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),

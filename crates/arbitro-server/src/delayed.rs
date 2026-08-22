@@ -509,7 +509,7 @@ pub async fn delayed_maturation_loop(
                         }]
                     },
                     now_ms,
-                    None,
+                    crate::shard::command::PublishReply::None,
                 )
                 .await
             {

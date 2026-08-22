@@ -414,7 +414,7 @@ async fn v2_publish(
             &entries,
             || owned_entries(&entries),
             now_ms,
-            Some((conn_id, req_seq)),
+            crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
         .await
     {
@@ -530,7 +530,7 @@ async fn v2_publish_with_reply(
             &entries,
             || owned_entries(&entries),
             now_ms,
-            Some((conn_id, req_seq)),
+            crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
         .await
     {
@@ -763,7 +763,7 @@ async fn v2_publish_batch(
             &entries,
             || owned_entries(&entries),
             now_ms,
-            Some((conn_id, req_seq)),
+            crate::shard::command::PublishReply::Client { conn_id, req_seq },
         )
         .await
     {
@@ -896,7 +896,7 @@ async fn v2_publish_delayed(
                 &entries,
                 || owned_entries(&entries),
                 now_ms,
-                Some((conn_id, req_seq)),
+                crate::shard::command::PublishReply::Client { conn_id, req_seq },
             )
             .await
         {

@@ -364,7 +364,7 @@ impl ArbitroServer {
                                         }]
                                     },
                                     now_ms,
-                                    None,
+                                    crate::shard::command::PublishReply::None,
                                 )
                                 .await
                             {

@@ -73,7 +73,7 @@ impl ShardHandle {
         stream_id: StreamId,
         entries: Vec<PublishEntryOwned>,
         now_ms: u64,
-        reply_to: Option<(u64, u64)>,
+        reply_to: PublishReply,
     ) -> Result<(), SendError> {
         self.send(ShardCommand::Publish(crate::shard::command::PublishCmd {
             stream_id,
@@ -97,6 +97,22 @@ impl ShardHandle {
             stream_id,
             window_ms,
             now_ms,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
+    /// Cluster catch-up: copy a range of this shard's journal out.
+    pub async fn scan_range(
+        &self,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ScannedEntry>, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::ScanRange(ScanRangeCmd {
+            from_seq,
+            limit,
             reply: tx,
         }))
         .await?;
