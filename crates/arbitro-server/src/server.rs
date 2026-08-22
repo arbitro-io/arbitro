@@ -901,7 +901,29 @@ impl ArbitroServer {
                                         cluster,
                                     ).await;
                                 };
-                                accept_background_tasks.lock().await.spawn(conn_task);
+                                // Pin the connection to the runtime that owns
+                                // its shard, when it dialed a shard's own
+                                // port and that shard has a private runtime.
+                                // Then the publish runs ON the owning thread
+                                // instead of on whichever pool thread tokio
+                                // picked — the whole point, and the only way
+                                // the store's lock can ever stop being
+                                // load-bearing.
+                                //
+                                // A bootstrap connection has no shard, so it
+                                // stays on the shared pool and keeps needing
+                                // the lock. Both models coexist by design:
+                                // the lock is correct for either.
+                                match listener_shard
+                                    .and_then(|s| accept_server.runtime_for_shard(s))
+                                {
+                                    Some(rt) => {
+                                        rt.spawn(conn_task);
+                                    }
+                                    None => {
+                                        accept_background_tasks.lock().await.spawn(conn_task);
+                                    }
+                                }
                             }
                             None => {
                                 tracing::info!("all listeners closed, accept loop stopping");

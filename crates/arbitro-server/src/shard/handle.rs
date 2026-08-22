@@ -59,6 +59,34 @@ impl ShardHandle {
 
     // ── Hot path ────────────────────────────────────────────────────────
 
+    /// Append through the shard's own worker instead of reaching into its
+    /// store from here.
+    ///
+    /// This is the routed path: the caller's thread never touches the
+    /// journal, so the journal does not have to be shareable. The entries
+    /// are `Bytes` slices of the original frame, so what crosses the
+    /// channel is a refcount, not the payload.
+    ///
+    /// Returns the first assigned sequence. `None` means the shard refused
+    /// the append (quota) — distinct from `Err`, which means the shard is
+    /// gone.
+    pub async fn publish_routed(
+        &self,
+        stream_id: StreamId,
+        entries: Vec<PublishEntryOwned>,
+        now_ms: u64,
+    ) -> Result<Option<u64>, SendError> {
+        let (tx, rx) = oneshot::channel();
+        self.send(ShardCommand::Publish(crate::shard::command::PublishCmd {
+            stream_id,
+            entries,
+            now_ms,
+            reply: tx,
+        }))
+        .await?;
+        rx.await.map_err(|_| SendError::SHARD_DOWN)
+    }
+
     /// Fire & forget — writes directly to the shared store, signals gate.
     /// Does NOT go through the shard worker. Publish and drain are
     /// independent services connected only by store and gate.

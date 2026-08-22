@@ -85,6 +85,11 @@ pub struct ShardRouter {
     /// forever when `shard_listeners` is off — the answer in that case is
     /// "no port of my own", not a guess.
     shard_ports: Arc<std::sync::OnceLock<Vec<u16>>>,
+    /// Per-shard runtimes, empty unless `shard_runtimes` is on. Held here
+    /// ONLY to keep them alive: dropping a `ShardRuntime` stops its thread,
+    /// so leaving these in `spawn` would kill every shard the moment it
+    /// returned. `Arc` because `ShardRouter` is cloned per connection.
+    _shard_runtimes: Arc<[super::runtime::ShardRuntime]>,
     /// Optional replication sender — set when clustered. Shard workers
     /// send `ReplicationBatch`es through this channel; the replication
     /// loop forwards them to followers via the cluster transport.
@@ -175,6 +180,26 @@ impl ShardRouter {
         let mut has_idempotency = Vec::with_capacity(shard_count);
         let mut drain_joins = Vec::with_capacity(shard_count);
         let mut drain_running = Vec::with_capacity(shard_count);
+        // One runtime per shard when enabled, so a shard's drain and command
+        // worker share a thread instead of competing for its store from two.
+        // A failure to start one is fatal rather than a silent fallback: a
+        // broker half on private runtimes and half on the shared pool has
+        // the cost of both models and the benefit of neither, and nothing
+        // in a log would say so.
+        let shard_runtimes: Vec<super::runtime::ShardRuntime> = if config.shard_runtimes {
+            (0..shard_count)
+                .map(|id| {
+                    super::runtime::ShardRuntime::start(id)
+                        .unwrap_or_else(|e| panic!("shard {id} runtime failed to start: {e}"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // `None` = use the ambient runtime, which is the default model.
+        let spawn_on = |id: usize| -> Option<tokio::runtime::Handle> {
+            shard_runtimes.get(id).map(|r| r.handle().clone())
+        };
         let names = Arc::new(NameRegistry::new());
         // H10: one SilentDrops shared by every shard + the registry.
         let silent_drops = Arc::new(crate::common::SilentDrops::new());
@@ -285,10 +310,12 @@ impl ShardRouter {
             // each and shift the timing they are meant to observe.
             let verbose = std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
             let probe_on = verbose || std::env::var("ARBITRO_DRAIN_PROBE").is_ok();
-            let join = if probe_on {
-                tokio::spawn(drain_worker.run(ProbeOn::new(verbose)))
-            } else {
-                tokio::spawn(drain_worker.run(ProbeOff))
+            let rt = spawn_on(id);
+            let join = match (&rt, probe_on) {
+                (Some(h), true) => h.spawn(drain_worker.run(ProbeOn::new(verbose))),
+                (Some(h), false) => h.spawn(drain_worker.run(ProbeOff)),
+                (None, true) => tokio::spawn(drain_worker.run(ProbeOn::new(verbose))),
+                (None, false) => tokio::spawn(drain_worker.run(ProbeOff)),
             };
             drain_joins.push(Some(join));
             drain_running.push(Arc::clone(&running));
@@ -339,7 +366,12 @@ impl ShardRouter {
             // silently-dead shard. The `JoinHandle` is awaited in a
             // watcher task that logs and exits when the child resolves.
             let shard_id_for_log = id;
-            let cmd_handle = tokio::spawn(cmd_worker.run());
+            // Same runtime as this shard's drain — that pairing IS the
+            // change. Two tasks on one thread cannot contend for the store.
+            let cmd_handle = match &rt {
+                Some(h) => h.spawn(cmd_worker.run()),
+                None => tokio::spawn(cmd_worker.run()),
+            };
             tokio::spawn(async move {
                 match cmd_handle.await {
                     Ok(()) => {
@@ -414,6 +446,7 @@ impl ShardRouter {
             // populates it.
             list_cache: Arc::new(parking_lot::Mutex::new(ListCache::default())),
             shard_ports: Arc::new(std::sync::OnceLock::new()),
+            _shard_runtimes: shard_runtimes.into(),
             #[cfg(feature = "cluster")]
             replication_tx,
         }
@@ -470,6 +503,19 @@ impl ShardRouter {
     pub fn sink_for(&self, stream_id: StreamId) -> crate::sink::SharedStoreSink<'_> {
         let idx = self.shard_index(stream_id, self.stores.len());
         crate::sink::SharedStoreSink::new(&self.stores[idx], &self.gates[idx])
+    }
+
+    /// The runtime owning `shard`, when shards have private runtimes.
+    ///
+    /// This is how a connection gets pinned to the thread that owns the
+    /// store it will publish to. Until a connection runs here, its publish
+    /// arrives from an arbitrary pool thread and the store's lock is what
+    /// keeps that sound — so this is the prerequisite for the lock ever
+    /// going away, not a scheduling nicety.
+    pub(crate) fn runtime_for_shard(&self, shard: u16) -> Option<tokio::runtime::Handle> {
+        self._shard_runtimes
+            .get(shard as usize)
+            .map(|r| r.handle().clone())
     }
 
     /// Publish the per-shard listening ports. Called once, after the

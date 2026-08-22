@@ -19,6 +19,7 @@ pub struct TestServerBuilder {
     max_connections: Option<u32>,
     auth_token: Option<String>,
     shard_listeners: bool,
+    shard_runtimes: bool,
 }
 
 impl Default for TestServerBuilder {
@@ -43,6 +44,7 @@ impl TestServerBuilder {
             max_connections: None,
             auth_token: None,
             shard_listeners: false,
+            shard_runtimes: false,
         }
     }
 
@@ -64,6 +66,11 @@ impl TestServerBuilder {
 
     pub fn shard_listeners(mut self, on: bool) -> Self {
         self.shard_listeners = on;
+        self
+    }
+
+    pub fn shard_runtimes(mut self, on: bool) -> Self {
+        self.shard_runtimes = on;
         self
     }
 
@@ -139,6 +146,7 @@ impl TestServerBuilder {
             .listen_addr(addr)
             .shard_count(self.shard_count)
             .shard_listeners(self.shard_listeners)
+            .shard_runtimes(self.shard_runtimes)
             .shutdown_timeout(self.shutdown_timeout);
 
         if let Some(size) = self.max_frame_size {

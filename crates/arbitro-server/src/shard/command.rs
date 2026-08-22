@@ -16,10 +16,19 @@ pub use arbitro_engine_v2::AckEntry;
 
 /// Commands dispatched to a shard worker via mpsc channel.
 ///
-/// Publish is NOT here — it goes directly to the store from the
-/// dispatch layer, bypassing the shard worker entirely.
+/// Publish used to be deliberately absent here — it wrote straight to the
+/// shared store from the dispatch layer, which is what forced the store to
+/// be `Arc<Mutex<_>>`: any connection thread could reach any shard's
+/// journal. `Publish` exists now so the store can stop crossing threads at
+/// all. What crosses is this message; the journal stays inside its shard.
 pub enum ShardCommand {
     // Hot path
+    /// Append entries to this shard's journal and wake its drain.
+    ///
+    /// The reply carries the first assigned sequence, which the publisher
+    /// owes its client. It is a `oneshot` rather than a fire-and-forget
+    /// because `publish_batch_wait` cannot answer without it.
+    Publish(PublishCmd),
     Ack(AckCmd),
     Nack(NackCmd),
     /// Terminate — ack + tombstone (never redeliver to any consumer).
@@ -86,6 +95,21 @@ impl PublishEntryOwned {
             payload: frame.slice_ref(view.payload()),
         }
     }
+}
+
+/// Append to this shard's journal, from a thread that is not the shard's.
+///
+/// Nothing here borrows the store. The payloads are `Bytes` slices of the
+/// original frame, so the hand-off is a refcount bump, not a copy — the
+/// cost of routing a publish through the channel is the wake and the reply,
+/// never the data.
+pub struct PublishCmd {
+    pub stream_id: StreamId,
+    pub entries: Vec<PublishEntryOwned>,
+    pub now_ms: u64,
+    /// First assigned sequence, or `None` if the append was rejected
+    /// (quota). The publisher owes this to its client.
+    pub reply: oneshot::Sender<Option<u64>>,
 }
 
 /// Acknowledge messages. Uses engine's AckEntry (stream_id + seq).

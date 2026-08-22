@@ -51,6 +51,10 @@ crossbeam-utils = "0.8"
 tokio-uring = { workspace = true }
 
 [[bench]]
+name    = "shard_affinity"
+harness = false
+
+[[bench]]
 name    = "throughput"
 harness = false
 

@@ -1151,6 +1151,7 @@ impl CommandWorker {
     /// Dispatch a single command to its handler.
     fn dispatch_command(&mut self, cmd: ShardCommand) {
         match cmd {
+            ShardCommand::Publish(cmd) => self.handle_publish(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
             ShardCommand::Subscribe(cmd) => self.handle_subscribe(cmd),

@@ -54,6 +54,38 @@ impl CommandWorker {
         named || catalog.connection_owns_consumer(conn, consumer_id)
     }
 
+    // ── Hot path — publish ──────────────────────────────────────────────
+
+    /// Append on the shard's own thread.
+    ///
+    /// This is the same work `SharedStoreSink::publish` does from the
+    /// caller's thread; the difference is WHERE it runs. Once every
+    /// publisher arrives here instead of reaching into the journal, the
+    /// store stops needing to be shareable at all.
+    ///
+    /// The gate fires after the append, never during: waking the drain
+    /// while the store is still held hands it a lock it immediately blocks
+    /// on. That ordering is why the sink owns both and callers get neither.
+    pub(in crate::shard) fn handle_publish(&mut self, cmd: crate::shard::command::PublishCmd) {
+        let refs: Vec<arbitro_store::EntryRef<'_>> = cmd
+            .entries
+            .iter()
+            .map(|e| arbitro_store::EntryRef {
+                stream_id: cmd.stream_id.raw(),
+                subject: &e.subject,
+                payload: &e.payload,
+                flags: 0,
+                deliver_at_ms: 0,
+            })
+            .collect();
+
+        use crate::sink::StreamSink;
+        let first = crate::sink::SharedStoreSink::new(&self.store, &self.gate)
+            .publish(&refs, cmd.now_ms)
+            .ok();
+        let _ = cmd.reply.send(first);
+    }
+
     // ── Hot path — ack / nack ───────────────────────────────────────────
 
     pub(in crate::shard) fn handle_ack(&mut self, cmd: AckCmd) {

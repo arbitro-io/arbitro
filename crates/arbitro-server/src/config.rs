@@ -8,6 +8,19 @@ pub struct Config {
     pub listen_addr: String,
     /// Number of engine shards (default: CPU count).
     pub shard_count: usize,
+    /// Give each shard its own single-threaded runtime on its own OS thread
+    /// (default: false).
+    ///
+    /// The shard's drain and command worker then run on ONE thread, so the
+    /// store lock stops being contended between them. The measured prize is
+    /// the whole point and it scales with shard count: on the shardbench
+    /// data path, share-nothing beats the shared-mutex model by 4% at 4
+    /// shards, 22% at 8 and 28% at 16.
+    ///
+    /// Off by default because it costs `shard_count` OS threads per broker,
+    /// and a test suite running many brokers in parallel is exactly where
+    /// that stops being free.
+    pub shard_runtimes: bool,
     /// Open one extra listener per shard on an OS-assigned port, on top of
     /// `listen_addr` (default: false).
     ///
@@ -119,6 +132,7 @@ impl Config {
                     .map(|p| p.get())
                     .unwrap_or(4),
             ),
+            shard_runtimes: env_parse("ARBITRO_SHARD_RUNTIMES", false),
             shard_listeners: env_parse("ARBITRO_SHARD_LISTENERS", false),
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
             max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
@@ -197,6 +211,11 @@ impl Config {
 
     pub fn shard_count(mut self, count: usize) -> Self {
         self.shard_count = count;
+        self
+    }
+
+    pub fn shard_runtimes(mut self, on: bool) -> Self {
+        self.shard_runtimes = on;
         self
     }
 
@@ -298,6 +317,7 @@ impl Default for Config {
             shard_count: std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(4),
+            shard_runtimes: false,
             shard_listeners: false,
             channel_capacity: 4096,
             max_feed_per_cycle: 256,
