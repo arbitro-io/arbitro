@@ -768,8 +768,22 @@ impl ArbitroServer {
         // capacity here would turn the overshoot into a way to hold file
         // descriptors past the limit.
         let (conn_tx, mut conn_rx) =
-            tokio::sync::mpsc::channel::<(tokio::net::TcpStream, std::net::SocketAddr)>(256);
-        for l in std::iter::once(listener).chain(shard_listeners) {
+            tokio::sync::mpsc::channel::<(tokio::net::TcpStream, std::net::SocketAddr, Option<u16>)>(
+                256,
+            );
+        // `None` is the bootstrap socket; the rest carry their shard, in the
+        // order they were bound. The shard travels WITH the socket because
+        // this is the only place it is knowable — once the connection is in
+        // the channel, one accepted socket looks like any other.
+        let feeds: Vec<(tokio::net::TcpListener, Option<u16>)> = std::iter::once((listener, None))
+            .chain(
+                shard_listeners
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| (l, Some(i as u16))),
+            )
+            .collect();
+        for (l, shard) in feeds {
             let tx = conn_tx.clone();
             // Each feeder watches shutdown itself. Without this the task
             // outlives `shutdown()` holding the listener, so the port stays
@@ -783,10 +797,10 @@ impl ArbitroServer {
                     tokio::select! {
                         _ = sd.changed() => return,
                         res = l.accept() => match res {
-                            Ok(pair) => {
+                            Ok((sock, peer)) => {
                                 // Receiver gone => the accept loop already
                                 // stopped; stop accepting on this socket too.
-                                if tx.send(pair).await.is_err() {
+                                if tx.send((sock, peer, shard)).await.is_err() {
                                     return;
                                 }
                             }
@@ -811,7 +825,7 @@ impl ArbitroServer {
                 tokio::select! {
                     result = conn_rx.recv() => {
                         match result {
-                            Some((stream, addr)) => {
+                            Some((stream, addr, listener_shard)) => {
                                 if accept_registry.active_count() >= max_connections as usize {
                                     tracing::warn!(%addr, "max connections reached, rejecting");
                                     let _ = reject_connection(stream).await;
@@ -876,7 +890,7 @@ impl ArbitroServer {
                                         writer = ConnWriter::Plain(w);
                                     }
 
-                                    let conn_id = reg.register(writer);
+                                    let conn_id = reg.register_on_shard(writer, listener_shard);
                                     tracing::debug!(conn_id, %addr, "accepted");
 
                                     read_loop(

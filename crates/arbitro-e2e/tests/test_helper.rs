@@ -188,6 +188,7 @@ impl TestServerBuilder {
 
         // Grab the shared catalog before `server` moves into the task.
         let names = std::sync::Arc::clone(server.server().names());
+        let registry = server.registry().clone();
 
         let handle = tokio::spawn(async move {
             let _ = server.run_with_shutdown(rx).await;
@@ -198,6 +199,7 @@ impl TestServerBuilder {
             shutdown_tx: tx,
             handle: Some(handle),
             names,
+            registry,
         }
     }
 }
@@ -212,6 +214,9 @@ pub struct TestServer {
     /// and steer catalog state (stream placement, filters) that has no wire
     /// representation.
     names: std::sync::Arc<arbitro_common::NameRegistry>,
+    /// Same reason as `names`: which listener accepted a connection has no
+    /// wire representation, so a test can only see it from in-process.
+    registry: arbitro_server::ConnectionRegistry,
 }
 
 #[allow(dead_code)]
@@ -266,6 +271,10 @@ impl TestServer {
     /// crosses the wire (placement, filters, quotas).
     pub fn names(&self) -> &arbitro_common::NameRegistry {
         &self.names
+    }
+
+    pub fn registry(&self) -> &arbitro_server::ConnectionRegistry {
+        &self.registry
     }
 
     /// Quick helper to parse response IDs.

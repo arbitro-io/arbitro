@@ -274,6 +274,12 @@ impl ConnectionRegistry {
     ///
     /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
     pub fn register(&self, writer: ConnWriter) -> u64 {
+        self.register_on_shard(writer, None)
+    }
+
+    /// Register a connection, recording which shard's listener accepted it.
+    /// `None` is the bootstrap socket.
+    pub fn register_on_shard(&self, writer: ConnWriter, listener_shard: Option<u16>) -> u64 {
         let conn_id = self.inner.conn_id_gen.next();
         // H13: honour the configured per-connection capacity. Fallback
         // is the historical default if the field is unset (zero).
@@ -332,9 +338,31 @@ impl ConnectionRegistry {
             // credentials are accepted; a connection that never authenticates
             // is closed before it can dispatch anything.
             identity: Arc::new(crate::auth::Identity::default()),
+            listener_shard,
         };
         self.inner.sessions.lock().insert(conn_id, session);
         conn_id
+    }
+
+    /// Which shard's listener accepted this connection. `None` for the
+    /// bootstrap socket, and `None` for a connection that is already gone.
+    pub fn listener_shard(&self, conn_id: u64) -> Option<u16> {
+        self.inner
+            .sessions
+            .lock()
+            .get(&conn_id)
+            .and_then(|s| s.listener_shard)
+    }
+
+    /// Every live connection's listener shard. Diagnostic — the order is
+    /// the map's, so callers should treat it as a set.
+    pub fn all_listener_shards(&self) -> Vec<Option<u16>> {
+        self.inner
+            .sessions
+            .lock()
+            .values()
+            .map(|s| s.listener_shard)
+            .collect()
     }
 
     /// Bind the authenticated identity to a connection. Called once, from the

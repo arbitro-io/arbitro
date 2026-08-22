@@ -46,6 +46,16 @@ pub struct Session {
     /// registry, so no signature anywhere needs to change. `Arc` so readers
     /// clone a pointer, not a `Vec<Permission>`, while holding the map lock.
     pub identity: Arc<crate::auth::Identity>,
+    /// Which shard's listener accepted this connection, or `None` for the
+    /// bootstrap socket (and for every connection when per-shard listeners
+    /// are off).
+    ///
+    /// Recorded, not enforced. Routing is still per stream, so a connection
+    /// that arrived on shard 3's port can still publish to a stream on
+    /// shard 0 — this only makes that fact observable. Without it the extra
+    /// ports are indistinguishable doors to the same path, and nothing
+    /// downstream could ever tell a client dialed the right shard.
+    pub listener_shard: Option<u16>,
 }
 
 /// Atomic connection ID generator.

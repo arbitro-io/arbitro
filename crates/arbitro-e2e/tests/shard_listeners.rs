@@ -75,6 +75,62 @@ async fn each_shard_listens_on_its_own_usable_port() {
     server.shutdown().await;
 }
 
+/// A connection must remember which shard's listener accepted it.
+///
+/// Without this the extra ports are indistinguishable doors to the same
+/// path: the feeder hands the accept loop a socket and the shard is lost,
+/// so nothing downstream can tell that a client dialed the shard it wanted.
+/// Recording it is what makes the port mean something; it is a prerequisite
+/// for any affinity, not affinity itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_remembers_the_listener_that_accepted_it() {
+    let mut server = TestServerBuilder::new()
+        .shard_count(SHARDS)
+        .shard_listeners(true)
+        .spawn()
+        .await;
+
+    // Bootstrap port: no shard of its own.
+    let boot = server.connect().await;
+    boot.create_stream(b"boot_probe", b"bootprobe.>", 0, 0, 0, 1, 0, 0, 0, 0)
+        .await
+        .expect("stream");
+    let boot_shards: Vec<Option<u16>> = server.registry().all_listener_shards();
+    assert_eq!(
+        boot_shards,
+        vec![None],
+        "the bootstrap connection must record no shard, got {boot_shards:?}"
+    );
+
+    let topo = boot.shard_topology().await.expect("topology");
+    boot.close();
+    // Let the close land so the next assertions see only the new connection.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Each shard's own port: the connection records THAT shard.
+    for (shard, port) in &topo {
+        let direct = TestServer::connect_to(&format!("127.0.0.1:{port}")).await;
+        let name = format!("probe_{shard}");
+        let filter = format!("probe{shard}.>");
+        direct
+            .create_stream(name.as_bytes(), filter.as_bytes(), 0, 0, 0, 1, 0, 0, 0, 0)
+            .await
+            .expect("stream");
+
+        let seen = server.registry().all_listener_shards();
+        assert!(
+            seen.contains(&Some(*shard)),
+            "a connection accepted on shard {shard}'s port (port {port}) \
+             recorded {seen:?} — the shard was lost between the listener \
+             and the session"
+        );
+        direct.close();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    server.shutdown().await;
+}
+
 /// The bootstrap port keeps working while the per-shard ports exist. The
 /// feature is additive; a client that never asks for the topology must not
 /// notice it is on.
