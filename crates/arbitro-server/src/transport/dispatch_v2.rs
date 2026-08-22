@@ -270,7 +270,13 @@ fn v2_publish(
         return;
     }
     let wire_stream = f.body.stream_id.get();
-    let seq_stream = match server.names().stream_seq(wire_stream) {
+    // One catalog guard for the whole frame. These four reads used to take
+    // four, and the guard — not the lookup — is what they cost: 43.6 ns of
+    // guards against 10.5 ns for one snapshot plus four indexes
+    // (`arbitro-common/benches/stream_shard.rs`). Straight-line code with
+    // no await here, so the pinned version cannot go stale under us.
+    let cat = server.names().snapshot();
+    let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
@@ -309,7 +315,7 @@ fn v2_publish(
     } else {
         &[]
     };
-    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
         // F26: per-stream lock. Different streams contend on different
@@ -334,9 +340,9 @@ fn v2_publish(
     // ── Stream quota pre-check (DiscardPolicy::New) ────────────────────
     // If the stream has DiscardPolicy::New (discard == 1) and the store
     // would exceed max_msgs or max_bytes, reject BEFORE appending.
-    if let Some(quota) = server.names().stream_quota(seq_stream) {
+    if let Some(quota) = cat.stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let info = server.sink_for(seq_stream).info();
+            let info = server.sink_with(&cat, seq_stream).info();
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -400,7 +406,7 @@ fn v2_publish(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
+    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -446,7 +452,11 @@ fn v2_publish_with_reply(
         return;
     }
     let wire_stream = f.body.stream_id.get();
-    let seq_stream = match server.names().stream_seq(wire_stream) {
+    // One catalog guard for the whole frame — see v2_publish for the
+    // measurement. Straight-line code with no await, so the pinned
+    // version cannot go stale under us.
+    let cat = server.names().snapshot();
+    let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
@@ -457,7 +467,7 @@ fn v2_publish_with_reply(
     // M10: idempotency for PublishWithReply — same pattern as v2_publish.
     // Fast-bail when no per-stream window or no msg_id.
     let msg_id = f.msg_id();
-    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
         let shared = server.idempotency_for(seq_stream);
@@ -499,7 +509,7 @@ fn v2_publish_with_reply(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
+    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -538,7 +548,11 @@ fn v2_publish_batch(
         }
     }
     let wire_stream = f.body.stream_id.get();
-    let seq_stream = match server.names().stream_seq(wire_stream) {
+    // One catalog guard for the whole frame — see v2_publish for the
+    // measurement. Straight-line code with no await, so the pinned
+    // version cannot go stale under us.
+    let cat = server.names().snapshot();
+    let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
@@ -555,14 +569,14 @@ fn v2_publish_batch(
     // that exceeds its quota when the same messages sent one-by-one
     // would be rejected. Bytes are the sum of (subject_len + payload_len)
     // across the batch, mirroring the single-publish accounting.
-    if let Some(quota) = server.names().stream_quota(seq_stream) {
+    if let Some(quota) = cat.stream_quota(seq_stream) {
         if quota.discard == 1 {
             let batch_count = f.body.count.get() as u64;
             let mut batch_bytes: u64 = 0;
             for v in f.iter() {
                 batch_bytes += (v.subject().len() + v.payload().len()) as u64;
             }
-            let info = server.sink_for(seq_stream).info();
+            let info = server.sink_with(&cat, seq_stream).info();
             if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -611,7 +625,7 @@ fn v2_publish_batch(
             .and_then(|hdrs| hdrs.get(arbitro_proto::wire::msg_headers::HDR_MSG_ID))
             .unwrap_or(&[])
     }
-    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0
         && f.iter()
             .any(|v| !msg_id_of_view(&v, batch_has_headers).is_empty())
@@ -715,7 +729,7 @@ fn v2_publish_batch(
     // One call: append and wake. The lock and the gate belong to the sink,
     // not here — forgetting the gate stored messages that were never
     // delivered, with no error anywhere.
-    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
+    let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -746,7 +760,11 @@ fn v2_publish_delayed(
         return;
     }
     let wire_stream = f.body.stream_id.get();
-    let seq_stream = match server.names().stream_seq(wire_stream) {
+    // One catalog guard for the whole frame — see v2_publish for the
+    // measurement. Straight-line code with no await, so the pinned
+    // version cannot go stale under us.
+    let cat = server.names().snapshot();
+    let seq_stream = match cat.stream_seq(wire_stream) {
         Some(s) => s,
         None => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound);
@@ -765,7 +783,7 @@ fn v2_publish_delayed(
     // rebuild only scans the main store) — documented in
     // ROBUSTNESS_AUDIT.md.
     let msg_id = f.msg_id();
-    let window_ms = server.names().stream_idempotency_window_ms(seq_stream);
+    let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
         let shared = server.idempotency_for(seq_stream);
@@ -788,9 +806,9 @@ fn v2_publish_delayed(
     // message that passes here may still mature into a store that has
     // since filled up — maturation appends without re-checking
     // (documented in ROBUSTNESS_AUDIT.md).
-    if let Some(quota) = server.names().stream_quota(seq_stream) {
+    if let Some(quota) = cat.stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let info = server.sink_for(seq_stream).info();
+            let info = server.sink_with(&cat, seq_stream).info();
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -831,7 +849,7 @@ fn v2_publish_delayed(
             deliver_at_ms: 0,
         }];
         let now_ms = server.now_ms();
-        let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
+        let first_seq = match server.sink_with(&cat, seq_stream).publish(&entries, now_ms) {
             Ok(seq) => seq,
             Err(_) => {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);

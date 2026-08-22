@@ -492,12 +492,33 @@ impl ShardRouter {
     /// `stream_id % len`, changing one and not the others meant publish
     /// wrote to one shard's store while the gate woke another's drain: the
     /// messages are stored and never delivered, with no error anywhere.
+    /// The rule itself, taking the placement rather than fetching it, so a
+    /// caller that already holds a catalog snapshot does not pay a second
+    /// guard for it. THE one copy — `shard_index` and `sink_with` are two
+    /// doors into this, never two implementations of it.
     #[inline]
-    fn shard_index(&self, stream_id: StreamId, len: usize) -> usize {
-        match self.names.stream_shard(stream_id) {
+    fn place(placement: Option<u16>, stream_id: StreamId, len: usize) -> usize {
+        match placement {
             Some(shard) => (shard as usize).min(len - 1),
             None => stream_id.raw() as usize % len,
         }
+    }
+
+    /// A stream's sink, resolved off a snapshot the caller already holds.
+    /// Same answer as `sink_for`, one guard cheaper.
+    #[inline]
+    pub fn sink_with(
+        &self,
+        snap: &arbitro_common::name_registry::Snapshot<'_>,
+        stream_id: StreamId,
+    ) -> crate::sink::SharedStoreSink<'_> {
+        let idx = Self::place(snap.stream_shard(stream_id), stream_id, self.stores.len());
+        crate::sink::SharedStoreSink::new(&self.stores[idx], &self.gates[idx])
+    }
+
+    #[inline]
+    fn shard_index(&self, stream_id: StreamId, len: usize) -> usize {
+        Self::place(self.names.stream_shard(stream_id), stream_id, len)
     }
 
     /// Where a NEWLY created stream should live. Same rule the routing uses

@@ -94,6 +94,42 @@ fn main() {
         "  one guard, N indexes    : {:>8.2} ns",
         one_guard.as_nanos() as f64 / N_ROUNDS as f64
     );
+
+    // The real API, on a realistic frame: a publish reads the wire→seq
+    // translation, the dedup window, the quota and the shard. Four reads,
+    // four guards today; four reads, one guard through `snapshot()`.
+    const FRAMES: usize = 1_000_000;
+
+    let t = Instant::now();
+    for r in 0..FRAMES {
+        let id = ids[r % ids.len()];
+        acc += reg.stream_idempotency_window_ms(id) as u64;
+        acc += reg.stream_quota(id).map(|q| q.max_msgs).unwrap_or(0);
+        acc += reg.stream_shard(id).unwrap_or(0) as u64;
+        acc += reg.stream_shard(id).unwrap_or(0) as u64;
+    }
+    let per_call = t.elapsed();
+
+    let t = Instant::now();
+    for r in 0..FRAMES {
+        let id = ids[r % ids.len()];
+        let snap = reg.snapshot();
+        acc += snap.stream_idempotency_window_ms(id) as u64;
+        acc += snap.stream_quota(id).map(|q| q.max_msgs).unwrap_or(0);
+        acc += snap.stream_shard(id).unwrap_or(0) as u64;
+        acc += snap.stream_shard(id).unwrap_or(0) as u64;
+    }
+    let per_frame = t.elapsed();
+
+    println!("\n── a publish frame's 4 catalog reads, {FRAMES} frames ──");
+    println!(
+        "  guard per read          : {:>8.2} ns/frame",
+        per_call.as_nanos() as f64 / FRAMES as f64
+    );
+    println!(
+        "  one snapshot per frame  : {:>8.2} ns/frame",
+        per_frame.as_nanos() as f64 / FRAMES as f64
+    );
     // Keep the accumulator observable so neither loop is optimized away.
     println!("  (checksum {acc})");
 }

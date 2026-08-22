@@ -94,6 +94,50 @@ impl Default for NameRegistry {
     }
 }
 
+/// A pinned view of the hot catalog, from [`NameRegistry::snapshot`].
+///
+/// Mirrors the `stream_*` accessors on the registry, minus the per-call
+/// `ArcSwap` guard. Same answers, same sentinels — the only difference is
+/// that every read here sees one consistent version of the catalog, and
+/// that version stops updating for as long as the handle lives.
+pub struct Snapshot<'a> {
+    hot: arc_swap::Guard<std::sync::Arc<HotSnapshot>, arc_swap::DefaultStrategy>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl Snapshot<'_> {
+    /// Wire stream id → engine id. `None` if never registered.
+    #[inline]
+    pub fn stream_seq(&self, wire_id: u32) -> Option<StreamId> {
+        self.hot.streams_by_wire.get(&wire_id).copied()
+    }
+
+    /// The shard owning this stream, or `None` when it was never recorded.
+    #[inline]
+    pub fn stream_shard(&self, seq: StreamId) -> Option<u16> {
+        match self.hot.streams_shard.get(seq.0 as usize).copied() {
+            Some(NOT_PLACED) | None => None,
+            Some(s) => Some(s),
+        }
+    }
+
+    /// Quota limits, or `None` when the stream has none.
+    #[inline]
+    pub fn stream_quota(&self, seq: StreamId) -> Option<StreamQuota> {
+        self.hot.stream_quotas.get(seq.0 as usize).copied()
+    }
+
+    /// Dedup window in ms; `0` means dedup is off for this stream.
+    #[inline]
+    pub fn stream_idempotency_window_ms(&self, seq: StreamId) -> u32 {
+        self.hot
+            .streams_idempotency_window_ms
+            .get(seq.0 as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Per-stream quota limits for the publish hot-path pre-check.
 /// Indexed by `StreamId.0`. A `max_msgs == 0` or `max_bytes == 0`
 /// means no limit for that dimension.
@@ -620,6 +664,26 @@ impl NameRegistry {
     /// a wire error code.
     pub const STREAM_SLOT_FULL_SENTINEL: u32 = u32::MAX;
     pub const STREAM_COLLISION_SENTINEL: u32 = u32::MAX - 1;
+
+    /// One `ArcSwap` guard, held for as long as the returned handle lives.
+    ///
+    /// Every `stream_*` accessor below takes its OWN guard, and the guard —
+    /// not the lookup — is what they cost: measured at 10.19 ns to acquire
+    /// against 0.27 ns to index, a 38x split (`benches/stream_shard.rs`).
+    /// A publish frame reads four or five of these, so paying the guard
+    /// once and indexing off the handle turns ~45 ns into ~11 ns.
+    ///
+    /// The handle pins one version of the snapshot. That is the point on a
+    /// single frame — every read sees the same catalog — but it also means
+    /// a handle held across an await would go stale, so keep it to the
+    /// straight-line stretch that needs it.
+    #[inline]
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        Snapshot {
+            hot: self.hot.load(),
+            _marker: std::marker::PhantomData,
+        }
+    }
 
     /// Lookup only — returns `None` if `wire_id` was never registered.
     /// **F1 hot path**: lock-free `ArcSwap` load, then HashMap lookup.
