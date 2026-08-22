@@ -287,6 +287,23 @@ cold_body! {
         pub errors:           Vec<SubscribeReject>,
         pub fanout_consumers: Vec<u32>,
     },
+
+    // ── Topology ─────────────────────────────────────────────────────
+    //
+    // The request carries nothing; the answer is the whole map. `port`
+    // is 0 for a shard with no listener of its own, which is what every
+    // shard reports when per-shard listeners are off — a client reading
+    // 0 must keep using the address it dialed.
+    Action::ShardTopology => pub struct ShardTopology {
+        pub shards: Vec<ShardEndpoint>,
+    },
+}
+
+/// One shard's listening port, as reported by [`ShardTopology`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShardEndpoint {
+    pub shard: u16,
+    pub port: u16,
 }
 
 /// Per-entry rejection inside [`RepSubscribeBatch`]. `code` is an

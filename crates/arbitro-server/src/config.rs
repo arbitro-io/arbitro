@@ -8,6 +8,14 @@ pub struct Config {
     pub listen_addr: String,
     /// Number of engine shards (default: CPU count).
     pub shard_count: usize,
+    /// Open one extra listener per shard on an OS-assigned port, on top of
+    /// `listen_addr` (default: false).
+    ///
+    /// The bootstrap port stays fixed and keeps serving every connection;
+    /// the extra ports are advertised through `Action::ShardTopology` so a
+    /// client can dial the shard it wants directly. Off by default because
+    /// it costs `shard_count` file descriptors and firewall rules.
+    pub shard_listeners: bool,
     /// mpsc channel capacity per shard (default: 4096).
     pub channel_capacity: usize,
     /// Maximum concurrent connections (default: 10_000).
@@ -111,6 +119,7 @@ impl Config {
                     .map(|p| p.get())
                     .unwrap_or(4),
             ),
+            shard_listeners: env_parse("ARBITRO_SHARD_LISTENERS", false),
             channel_capacity: env_parse("ARBITRO_CHANNEL_CAPACITY", 4096),
             max_feed_per_cycle: env_parse("ARBITRO_MAX_FEED_PER_CYCLE", 256),
             drain_batch_size: env_parse("ARBITRO_DRAIN_BATCH_SIZE", 256),
@@ -188,6 +197,11 @@ impl Config {
 
     pub fn shard_count(mut self, count: usize) -> Self {
         self.shard_count = count;
+        self
+    }
+
+    pub fn shard_listeners(mut self, on: bool) -> Self {
+        self.shard_listeners = on;
         self
     }
 
@@ -284,6 +298,7 @@ impl Default for Config {
             shard_count: std::thread::available_parallelism()
                 .map(|p| p.get())
                 .unwrap_or(4),
+            shard_listeners: false,
             channel_capacity: 4096,
             max_feed_per_cycle: 256,
             drain_batch_size: 256,

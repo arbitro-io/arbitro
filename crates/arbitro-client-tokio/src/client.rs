@@ -833,6 +833,20 @@ impl Client {
         .await
     }
 
+    /// Ask the broker which port each shard listens on.
+    ///
+    /// Returns `(shard, port)` per shard, in shard order. A port of 0 means
+    /// that shard has no listener of its own — which is every shard unless
+    /// the broker runs with per-shard listeners — and the caller should
+    /// keep using the address it dialed.
+    ///
+    /// The broker answers only on an authenticated connection, so this is
+    /// safe to call but never a way to discover an unknown deployment.
+    pub async fn shard_topology(&self) -> Result<Vec<(u16, u16)>, ClientError> {
+        crate::manage::shard_topology(&self.inner.pool, &self.inner.pending, &self.inner.seq_alloc)
+            .await
+    }
+
     /// Create a consumer with no per-subject inflight limits.
     ///
     /// This is the common case. Use [`Client::create_consumer_with_limits`]

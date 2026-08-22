@@ -215,6 +215,7 @@ pub async fn dispatch_frame_v2(
             v2_disconnect(conn_id, server, registry, cron_registry).await;
         }
         Action::Ping => v2_ping(conn_id, registry),
+        Action::ShardTopology => v2_shard_topology(conn_id, req_seq, server, registry),
         // Auth is consumed by the handshake, before dispatch ever runs. One
         // still reaching here means the broker has auth disabled and the
         // client sent its token anyway — the normal shape of a client
@@ -2477,6 +2478,37 @@ pub(crate) async fn v2_disconnect(
         "v2_disconnect: drains complete"
     );
     registry.remove(conn_id);
+}
+
+/// Answer `Action::ShardTopology` with one entry per shard.
+///
+/// Reaching this function already means the connection is authenticated:
+/// dispatch only runs once the read loop has seen Hello AND (when the
+/// broker requires credentials) an accepted Auth frame. That ordering is
+/// what keeps the port map from being readable by anyone who can open a
+/// socket — it is a map of the deployment, and handing it out before the
+/// token is checked would be a free reconnaissance endpoint.
+///
+/// A shard with no listener of its own reports port 0, which is also what
+/// every shard reports when per-shard listeners are off. The client's
+/// reading of 0 is "keep using the address you dialed", so the
+/// single-listener deployment needs no special case on either side.
+fn v2_shard_topology(
+    conn_id: u64,
+    req_seq: u64,
+    server: &ShardRouter,
+    registry: &ConnectionRegistry,
+) {
+    use arbitro_proto::v2::cold::{ColdBody, ShardEndpoint, ShardTopology};
+
+    let ports = server.shard_ports();
+    let shards = (0..server.shard_count())
+        .map(|shard| ShardEndpoint {
+            shard: shard as u16,
+            port: ports.get(shard).copied().unwrap_or(0),
+        })
+        .collect();
+    registry.send_bytes(conn_id, ShardTopology { shards }.encode(req_seq));
 }
 
 fn v2_ping(conn_id: u64, registry: &ConnectionRegistry) {

@@ -227,6 +227,12 @@ pub(crate) fn encode_list_streams_v2(seq: u64, offset: u32, limit: u32) -> Bytes
     ListStreams { offset, limit }.encode(seq)
 }
 
+/// ShardTopology request frame. The request asks for the whole map, so
+/// the same body type serves both directions with `shards` left empty.
+pub(crate) fn encode_shard_topology_v2(seq: u64) -> Bytes {
+    arbitro_proto::v2::cold::ShardTopology { shards: Vec::new() }.encode(seq)
+}
+
 /// CreateConsumer request frame.
 ///
 /// `subject_limits` is an optional list of `(pattern, max_inflight)` pairs.

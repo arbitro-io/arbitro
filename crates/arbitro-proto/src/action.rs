@@ -84,6 +84,11 @@ pub enum Action {
     // HelloFrame for the handshake, so these wire codes have no
     // dispatcher. Reserved; do not reuse the slots.
     Disconnect = 0x0605,
+    /// Ask the broker which port each shard listens on. No body.
+    /// Reply: `RepOk` with JSON `{ shards: [{ shard, port }] }`.
+    /// Answered only after the connection is authenticated — the port
+    /// list is topology, and topology is not public.
+    ShardTopology = 0x0606,
 
     // 0x08xx — Delayed publish
     /// Publish with a delivery delay. Body = normal PubFrame body + u64
@@ -170,6 +175,7 @@ impl Action {
             0x0602 => Some(Self::Pong),
             // 0x0603, 0x0604 reserved (deleted Connect/Connected) — L1.
             0x0605 => Some(Self::Disconnect),
+            0x0606 => Some(Self::ShardTopology),
 
             0x0801 => Some(Self::PublishDelayed),
 

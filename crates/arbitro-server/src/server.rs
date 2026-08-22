@@ -172,6 +172,34 @@ impl ArbitroServer {
             Err(_) => tracing::info!(addr = %self.config.listen_addr, "listening"),
         }
 
+        // ── Per-shard listeners (optional) ─────────────────────────────
+        // One extra socket per shard on an OS-assigned port, bound to the
+        // same interface as `listen_addr`. Purely additive: the bootstrap
+        // socket above still accepts everything, so a client that never
+        // asks for the topology is unaffected.
+        //
+        // A bind failure here is fatal rather than best-effort. A partial
+        // set would advertise ports for some shards and not others, and a
+        // client cannot tell "this shard has no listener" from "this shard
+        // failed to bind" — it would keep dialing the bootstrap port for a
+        // subset of streams and look like an intermittent routing bug.
+        let shard_listeners = if self.config.shard_listeners {
+            let host = listen_host(&self.config.listen_addr);
+            let mut bound = Vec::with_capacity(self.config.shard_count);
+            let mut ports = Vec::with_capacity(self.config.shard_count);
+            for shard in 0..self.config.shard_count {
+                let l = TcpListener::bind((host.as_str(), 0)).await?;
+                let port = l.local_addr()?.port();
+                tracing::info!(shard, port, "shard listener bound");
+                bound.push(l);
+                ports.push(port);
+            }
+            self.server.set_shard_ports(ports);
+            bound
+        } else {
+            Vec::new()
+        };
+
         // ── Startup state snapshot ─────────────────────────────────────
         // Always log post-replay state so operators see clean restarts
         // ("0 streams loaded") and not-so-clean ones ("12 streams loaded,
@@ -725,12 +753,65 @@ impl ArbitroServer {
         let max_ops_per_sec = self.config.max_ops_per_sec;
         let accept_background_tasks = Arc::clone(&background_tasks);
 
+        // Every listener feeds one accept loop. A per-socket task is the
+        // whole adaptation: the loop below still handles one connection at
+        // a time and still owns the rate limit, the connection cap and the
+        // shutdown edge — it just stopped caring which socket the
+        // connection arrived on.
+        //
+        // One real change, not a pure refactor: the feeders call `accept()`
+        // eagerly, so up to `channel capacity` connections can be accepted
+        // before the loop checks `max_connections`. The cap is still
+        // enforced — those connections are rejected as they are dequeued —
+        // but it can transiently overshoot by the channel size. 256 against
+        // a default cap of 10_000 is deliberate slack; a much larger
+        // capacity here would turn the overshoot into a way to hold file
+        // descriptors past the limit.
+        let (conn_tx, mut conn_rx) =
+            tokio::sync::mpsc::channel::<(tokio::net::TcpStream, std::net::SocketAddr)>(256);
+        for l in std::iter::once(listener).chain(shard_listeners) {
+            let tx = conn_tx.clone();
+            // Each feeder watches shutdown itself. Without this the task
+            // outlives `shutdown()` holding the listener, so the port stays
+            // bound and keeps completing TCP handshakes for a server that
+            // is gone — the client's redial connects and then waits forever
+            // for a reply nobody will send. Returning here drops `l`, which
+            // closes the socket and makes the redial fail fast instead.
+            let mut sd = shutdown_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = sd.changed() => return,
+                        res = l.accept() => match res {
+                            Ok(pair) => {
+                                // Receiver gone => the accept loop already
+                                // stopped; stop accepting on this socket too.
+                                if tx.send(pair).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "accept failed");
+                                // ROB-2: avoid a tight error loop (e.g. EMFILE)
+                                // from burning a CPU core while the fd table is
+                                // exhausted.
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        },
+                    }
+                }
+            });
+        }
+        // The loop's own handle would keep the channel open forever and
+        // turn the `None` below into a hang at shutdown.
+        drop(conn_tx);
+
         let accept_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    result = listener.accept() => {
+                    result = conn_rx.recv() => {
                         match result {
-                            Ok((stream, addr)) => {
+                            Some((stream, addr)) => {
                                 if accept_registry.active_count() >= max_connections as usize {
                                     tracing::warn!(%addr, "max connections reached, rejecting");
                                     let _ = reject_connection(stream).await;
@@ -808,11 +889,9 @@ impl ArbitroServer {
                                 };
                                 accept_background_tasks.lock().await.spawn(conn_task);
                             }
-                            Err(e) => {
-                                tracing::error!(error = %e, "accept failed");
-                                // ROB-2: avoid a tight error loop (e.g. EMFILE) from
-                                // burning a CPU core while the fd table is exhausted.
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            None => {
+                                tracing::info!("all listeners closed, accept loop stopping");
+                                break;
                             }
                         }
                     }
@@ -1363,6 +1442,16 @@ fn check_or_persist_shard_count(data_dir: &str, shard_count: usize) {
             }
             tracing::info!(shard_count, "M1: shard_count marker created");
         }
+    }
+}
+
+/// Host part of a `listen_addr`, so the per-shard listeners bind the same
+/// interface as the bootstrap socket instead of quietly widening to
+/// 0.0.0.0. Splits on the LAST colon: `[::1]:9898` has several.
+fn listen_host(listen_addr: &str) -> String {
+    match listen_addr.rsplit_once(':') {
+        Some((host, _)) => host.trim_matches(|c| c == '[' || c == ']').to_string(),
+        None => listen_addr.to_string(),
     }
 }
 

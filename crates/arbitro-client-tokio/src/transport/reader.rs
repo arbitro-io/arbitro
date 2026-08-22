@@ -152,13 +152,14 @@ async fn dispatch(inner: &Arc<Inner>, frame: Bytes) {
         return;
     }
 
-    // ListStreams / ListConsumers / RepSubscribeBatch — body is the raw
-    // payload, handed to the caller to decode. These carry their own action
-    // code rather than RepOk, so they need naming here or the round-trip
-    // never completes.
+    // ListStreams / ListConsumers / RepSubscribeBatch / ShardTopology —
+    // body is the raw payload, handed to the caller to decode. These carry
+    // their own action code rather than RepOk, so they need naming here or
+    // the round-trip never completes.
     if action == Action::ListStreams.as_u16()
         || action == Action::ListConsumers.as_u16()
         || action == Action::RepSubscribeBatch.as_u16()
+        || action == Action::ShardTopology.as_u16()
     {
         inner.pending.complete_ok(req_seq, body);
         return;

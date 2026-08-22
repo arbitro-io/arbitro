@@ -162,6 +162,29 @@ pub(crate) async fn list_streams(
     .await
 }
 
+pub(crate) async fn shard_topology(
+    pool: &Arc<WritePool>,
+    pending: &Pending,
+    seq_alloc: &SeqAllocator,
+) -> Result<Vec<(u16, u16)>, ClientError> {
+    let seq = seq_alloc.next();
+    let body = request(
+        pool,
+        pending,
+        seq,
+        crate::transport::encode::encode_shard_topology_v2(seq),
+    )
+    .await?;
+    use arbitro_proto::v2::cold::ColdBody;
+    let parsed = arbitro_proto::v2::cold::ShardTopology::decode_body(&body)
+        .map_err(|_| ClientError::Proto(arbitro_proto::error::ProtoError::InvalidLength))?;
+    Ok(parsed
+        .shards
+        .into_iter()
+        .map(|e| (e.shard, e.port))
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_consumer(
     pool: &Arc<WritePool>,

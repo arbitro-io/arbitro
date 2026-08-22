@@ -80,6 +80,11 @@ pub struct ShardRouter {
     /// dashboards / health checks. Lock contention is irrelevant —
     /// these RPCs are not on any hot path.
     list_cache: Arc<parking_lot::Mutex<ListCache>>,
+    /// Per-shard listening port, published once the sockets are bound and
+    /// read back by `Action::ShardTopology`. Empty until then, and empty
+    /// forever when `shard_listeners` is off — the answer in that case is
+    /// "no port of my own", not a guess.
+    shard_ports: Arc<std::sync::OnceLock<Vec<u16>>>,
     /// Optional replication sender — set when clustered. Shard workers
     /// send `ReplicationBatch`es through this channel; the replication
     /// loop forwards them to followers via the cluster transport.
@@ -408,6 +413,7 @@ impl ShardRouter {
             // F37: empty cache; first list_streams / list_consumers
             // populates it.
             list_cache: Arc::new(parking_lot::Mutex::new(ListCache::default())),
+            shard_ports: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "cluster")]
             replication_tx,
         }
@@ -458,6 +464,18 @@ impl ShardRouter {
     #[inline]
     pub fn sink_for(&self, stream_id: StreamId) -> crate::sink::SharedStoreSink<'_> {
         crate::sink::SharedStoreSink::new(self.store_for(stream_id), self.gate_for(stream_id))
+    }
+
+    /// Publish the per-shard listening ports. Called once, after the
+    /// sockets are bound; later calls are ignored rather than racing.
+    pub fn set_shard_ports(&self, ports: Vec<u16>) {
+        let _ = self.shard_ports.set(ports);
+    }
+
+    /// Port per shard, indexed by shard number. Empty when the server runs
+    /// on a single listener.
+    pub fn shard_ports(&self) -> &[u16] {
+        self.shard_ports.get().map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// THE routing decision, in one place.

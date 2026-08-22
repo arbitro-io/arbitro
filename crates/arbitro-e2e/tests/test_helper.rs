@@ -18,6 +18,7 @@ pub struct TestServerBuilder {
     max_feed_per_cycle: Option<usize>,
     max_connections: Option<u32>,
     auth_token: Option<String>,
+    shard_listeners: bool,
 }
 
 impl Default for TestServerBuilder {
@@ -41,6 +42,7 @@ impl TestServerBuilder {
             max_feed_per_cycle: None,
             max_connections: None,
             auth_token: None,
+            shard_listeners: false,
         }
     }
 
@@ -57,6 +59,11 @@ impl TestServerBuilder {
 
     pub fn shard_count(mut self, count: usize) -> Self {
         self.shard_count = count;
+        self
+    }
+
+    pub fn shard_listeners(mut self, on: bool) -> Self {
+        self.shard_listeners = on;
         self
     }
 
@@ -131,6 +138,7 @@ impl TestServerBuilder {
         let mut config = Config::default()
             .listen_addr(addr)
             .shard_count(self.shard_count)
+            .shard_listeners(self.shard_listeners)
             .shutdown_timeout(self.shutdown_timeout);
 
         if let Some(size) = self.max_frame_size {

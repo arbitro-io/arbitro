@@ -66,6 +66,7 @@ docker compose up -d   # default port: 9898
 | `ARBITRO_TLS_CERT` | _unset_ | Path to a PEM cert. Enables TLS; `ARBITRO_TLS_KEY` required. |
 | `ARBITRO_TLS_KEY` | _unset_ | Path to the matching PEM private key. |
 | `ARBITRO_SHARDS` | `num_cpus` | Number of shard workers (one OS thread each). |
+| `ARBITRO_SHARD_LISTENERS` | `false` | Open one extra listener per shard on an OS-assigned port, alongside `ARBITRO_LISTEN`. Ports are advertised through `ShardTopology` to authenticated clients only. |
 | `ARBITRO_SHUTDOWN_TIMEOUT` | `10` | Grace period (s) for in-flight writes before force-close on shutdown. |
 | `ARBITRO_CHANNEL_CAPACITY` | `4096` | Per-shard command channel capacity. |
 | `ARBITRO_MAX_FEED_PER_CYCLE` | `256` | Max store entries fed into the drain per cycle. |
