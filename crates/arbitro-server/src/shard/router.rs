@@ -461,9 +461,15 @@ impl ShardRouter {
     /// remain for the paths that genuinely need the raw handles.
     ///
     /// Free to build — it borrows the `Arc`s already held here.
+    ///
+    /// Resolves the shard ONCE. Going through `store_for` + `gate_for`
+    /// looked equivalent but asked the registry twice per publish frame,
+    /// and the store and the gate must belong to the same shard anyway —
+    /// two independent lookups is the shape that lets them disagree.
     #[inline]
     pub fn sink_for(&self, stream_id: StreamId) -> crate::sink::SharedStoreSink<'_> {
-        crate::sink::SharedStoreSink::new(self.store_for(stream_id), self.gate_for(stream_id))
+        let idx = self.shard_index(stream_id, self.stores.len());
+        crate::sink::SharedStoreSink::new(&self.stores[idx], &self.gates[idx])
     }
 
     /// Publish the per-shard listening ports. Called once, after the
