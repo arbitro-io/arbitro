@@ -1506,6 +1506,20 @@ async fn v2_create_stream(
             server
                 .names()
                 .set_stream_replicas(seq_stream, body.replicas);
+
+            // Pin this stream to a shard, now, and record it. Placement was
+            // `stream_id % shard_count` — computed everywhere, stored
+            // nowhere — so changing the shard count remapped every existing
+            // stream onto a shard its bytes are not on, and the broker had
+            // to refuse to start rather than corrupt routing. Recording it
+            // lets the count GROW: existing streams stay put, new shards
+            // take new streams.
+            //
+            // The value must come from the same decision that routes, or the
+            // recorded shard and the shard actually written to could differ.
+            server
+                .names()
+                .set_stream_shard(seq_stream, server.shard_index_for_new(seq_stream));
             // Honesty: replicas > 1 does NOT yet mean acknowledged-durable
             // replication (ROBUSTNESS_AUDIT.md §2.5 / action #8).
             #[cfg(feature = "cluster")]

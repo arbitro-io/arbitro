@@ -222,6 +222,18 @@ impl MetadataApplier for ReplayApplier {
                 self.server
                     .names()
                     .set_stream_filter(stream_id, sv.filter());
+                // Restore placement. Recomputed rather than read back: the
+                // shard is a SERVER decision and has no field in the v2
+                // body this record stores bytewise, and `_pad` belongs to
+                // the client-facing struct.
+                //
+                // Correct while the M1 marker pins `shard_count`, because
+                // the live path records this same value. It stops being
+                // correct the moment the count may change — which is
+                // exactly what persisting it would unlock, and is the
+                // follow-up this leaves open.
+                let placed = self.server.shard_index_for_new(stream_id);
+                self.server.names().set_stream_shard(stream_id, placed);
                 // AUDIT-6a: restore the stream quota — same call
                 // `v2_create_stream` makes on the live path. Without
                 // this, the publish pre-check sees no quota after a

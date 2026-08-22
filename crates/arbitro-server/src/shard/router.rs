@@ -460,14 +460,42 @@ impl ShardRouter {
         crate::sink::SharedStoreSink::new(self.store_for(stream_id), self.gate_for(stream_id))
     }
 
+    /// THE routing decision, in one place.
+    ///
+    /// A recorded placement wins; the modulo is the fallback for streams
+    /// created before placement was recorded. Every `*_for` below goes
+    /// through here — that is the point. When these each computed their own
+    /// `stream_id % len`, changing one and not the others meant publish
+    /// wrote to one shard's store while the gate woke another's drain: the
+    /// messages are stored and never delivered, with no error anywhere.
+    #[inline]
+    fn shard_index(&self, stream_id: StreamId, len: usize) -> usize {
+        match self.names.stream_shard(stream_id) {
+            Some(shard) => (shard as usize).min(len - 1),
+            None => stream_id.raw() as usize % len,
+        }
+    }
+
+    /// Where a NEWLY created stream should live. Same rule the routing uses
+    /// for an unplaced stream, so recording this value cannot disagree with
+    /// where the bytes actually go.
+    ///
+    /// Deliberately still the modulo: it spreads streams evenly with no
+    /// state to maintain. What changes is that the answer is now WRITTEN
+    /// DOWN, so a later change to the shard count cannot move the stream.
+    #[inline]
+    pub fn shard_index_for_new(&self, stream_id: StreamId) -> u16 {
+        (stream_id.raw() as usize % self.stores.len()) as u16
+    }
+
     pub fn store_for(&self, stream_id: StreamId) -> &SharedStore {
-        let idx = stream_id.raw() as usize % self.stores.len();
+        let idx = self.shard_index(stream_id, self.stores.len());
         &self.stores[idx]
     }
 
     #[inline]
     pub fn gate_for(&self, stream_id: StreamId) -> &Arc<Gate> {
-        let idx = stream_id.raw() as usize % self.gates.len();
+        let idx = self.shard_index(stream_id, self.gates.len());
         &self.gates[idx]
     }
 
@@ -478,7 +506,7 @@ impl ShardRouter {
     /// idempotent publish allocates it lazily.
     #[inline]
     pub fn idempotency_for(&self, stream_id: StreamId) -> &super::idempotency::SharedIdempotency {
-        let idx = stream_id.raw() as usize % self.idempotency.len();
+        let idx = self.shard_index(stream_id, self.idempotency.len());
         &self.idempotency[idx]
     }
 
@@ -488,13 +516,13 @@ impl ShardRouter {
     /// Arc just to call `Option::is_some()` (F10).
     #[inline]
     pub fn mark_idempotency_allocated(&self, stream_id: StreamId) {
-        let idx = stream_id.raw() as usize % self.has_idempotency.len();
+        let idx = self.shard_index(stream_id, self.has_idempotency.len());
         self.has_idempotency[idx].store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
     pub fn shard_for(&self, stream_id: StreamId) -> &ShardHandle {
-        let idx = stream_id.raw() as usize % self.shards.len();
+        let idx = self.shard_index(stream_id, self.shards.len());
         &self.shards[idx]
     }
 

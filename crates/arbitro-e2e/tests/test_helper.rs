@@ -178,6 +178,9 @@ impl TestServerBuilder {
             }
         }
 
+        // Grab the shared catalog before `server` moves into the task.
+        let names = std::sync::Arc::clone(server.server().names());
+
         let handle = tokio::spawn(async move {
             let _ = server.run_with_shutdown(rx).await;
         });
@@ -186,6 +189,7 @@ impl TestServerBuilder {
             addr: addr.to_string(),
             shutdown_tx: tx,
             handle: Some(handle),
+            names,
         }
     }
 }
@@ -196,6 +200,10 @@ pub struct TestServer {
     pub addr: String,
     shutdown_tx: watch::Sender<bool>,
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Captured before the server moves into its task, so tests can inspect
+    /// and steer catalog state (stream placement, filters) that has no wire
+    /// representation.
+    names: std::sync::Arc<arbitro_common::NameRegistry>,
 }
 
 #[allow(dead_code)]
@@ -244,6 +252,12 @@ impl TestServer {
             let _ = self.shutdown_tx.send(true);
             handle.await.expect("server task failed");
         }
+    }
+
+    /// The shared name registry — per-stream catalog state that never
+    /// crosses the wire (placement, filters, quotas).
+    pub fn names(&self) -> &arbitro_common::NameRegistry {
+        &self.names
     }
 
     /// Quick helper to parse response IDs.

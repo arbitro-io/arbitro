@@ -73,6 +73,10 @@ use arbitro_engine_v2::types::{ConsumerId, QueueId, StreamId, SubscriptionId};
 use crate::id_pool::IdPool;
 
 /// Shared wire-id → engine-id registry.
+/// `streams_shard` entry for a stream whose placement was never recorded.
+/// Distinct from shard 0, which is a real placement.
+const NOT_PLACED: u16 = u16::MAX;
+
 #[derive(Debug)]
 pub struct NameRegistry {
     /// Cold/admin path — sparse maps, allocation counters.
@@ -122,6 +126,17 @@ struct HotSnapshot {
     /// recover the stream id (v2 ack body has no stream_id field).
     /// Indexed by `ConsumerId.0`; gaps stay as `u32::MAX` (sentinel).
     consumer_stream: Vec<u32>,
+    /// Per-stream SHARD placement. Indexed by `StreamId.0`. `u16::MAX` means
+    /// "not recorded" — fall back to the modulo, which is what every stream
+    /// created before this field existed does.
+    ///
+    /// Recorded rather than computed so the shard count can GROW. With
+    /// `stream_id % shard_count`, changing the count remaps every existing
+    /// stream onto the wrong shard, which is why the broker refuses to start
+    /// on a mismatch. Recording it at creation pins each stream where its
+    /// bytes actually are, so new shards take new streams and the old ones
+    /// stay put.
+    streams_shard: Vec<u16>,
     /// Per-stream quota limits. Indexed by `StreamId.0`.
     stream_quotas: Vec<StreamQuota>,
 }
@@ -136,12 +151,14 @@ impl HotSnapshot {
         let streams_replicas = inner.streams_replicas.clone();
         let consumer_stream = inner.consumer_stream.clone();
         let stream_quotas = inner.stream_quotas.clone();
+        let streams_shard = inner.streams_shard.clone();
         Self {
             streams_by_wire,
             streams_seq_to_wire,
             streams_idempotency_window_ms,
             streams_replicas,
             consumer_stream,
+            streams_shard,
             stream_quotas,
         }
     }
@@ -161,6 +178,17 @@ struct Inner {
     /// Per-stream replication factor. Indexed by `StreamId.0`.
     /// Authoritative copy. 1 = no replication (default).
     streams_replicas: Vec<u8>,
+    /// Per-stream SHARD placement (authoritative copy). Indexed by `StreamId.0`. `u16::MAX` means
+    /// "not recorded" — fall back to the modulo, which is what every stream
+    /// created before this field existed does.
+    ///
+    /// Recorded rather than computed so the shard count can GROW. With
+    /// `stream_id % shard_count`, changing the count remaps every existing
+    /// stream onto the wrong shard, which is why the broker refuses to start
+    /// on a mismatch. Recording it at creation pins each stream where its
+    /// bytes actually are, so new shards take new streams and the old ones
+    /// stay put.
+    streams_shard: Vec<u16>,
     /// M7: original stream name stored alongside the wire_id so we can
     /// detect `wire_hash_32` collisions (two distinct names hashing to the
     /// same u32). Keyed by wire_id; bytes match the original CreateStream
@@ -253,6 +281,7 @@ impl Inner {
             consumer_filters: Vec::with_capacity(PREALLOC),
             streams_idempotency_window_ms: Vec::with_capacity(PREALLOC),
             streams_replicas: Vec::with_capacity(PREALLOC),
+            streams_shard: Vec::with_capacity(PREALLOC),
             streams_name_by_wire: HashMap::with_capacity_and_hasher(
                 PREALLOC,
                 foldhash::fast::FixedState::default(),
@@ -384,6 +413,13 @@ impl NameRegistry {
                 g.streams_replicas.resize((id.0 as usize) + 1, 1);
             }
             g.streams_replicas[id.0 as usize] = 1;
+            // NOT_PLACED until CreateStream records it. A recycled slot must
+            // forget its previous tenant's placement, or the new stream would
+            // inherit a shard its bytes are not on.
+            if (id.0 as usize) >= g.streams_shard.len() {
+                g.streams_shard.resize((id.0 as usize) + 1, NOT_PLACED);
+            }
+            g.streams_shard[id.0 as usize] = NOT_PLACED;
             (id, true)
         })
     }
@@ -440,6 +476,13 @@ impl NameRegistry {
                 g.streams_replicas.resize((id.0 as usize) + 1, 1);
             }
             g.streams_replicas[id.0 as usize] = 1;
+            // NOT_PLACED until CreateStream records it. A recycled slot must
+            // forget its previous tenant's placement, or the new stream would
+            // inherit a shard its bytes are not on.
+            if (id.0 as usize) >= g.streams_shard.len() {
+                g.streams_shard.resize((id.0 as usize) + 1, NOT_PLACED);
+            }
+            g.streams_shard[id.0 as usize] = NOT_PLACED;
             (id, true)
         })
     }
@@ -504,6 +547,13 @@ impl NameRegistry {
                 g.streams_replicas.resize((id.0 as usize) + 1, 1);
             }
             g.streams_replicas[id.0 as usize] = 1;
+            // NOT_PLACED until CreateStream records it. A recycled slot must
+            // forget its previous tenant's placement, or the new stream would
+            // inherit a shard its bytes are not on.
+            if (id.0 as usize) >= g.streams_shard.len() {
+                g.streams_shard.resize((id.0 as usize) + 1, NOT_PLACED);
+            }
+            g.streams_shard[id.0 as usize] = NOT_PLACED;
             if (id.0 as usize) >= g.stream_filters.len() {
                 g.stream_filters.resize((id.0 as usize) + 1, Vec::new());
             }
@@ -715,6 +765,44 @@ impl NameRegistry {
             .get(seq.0 as usize)
             .copied()
             .unwrap_or(1)
+    }
+
+    // ── Stream shard placement ─────────────────────────────────────────────
+
+    /// Record which shard owns this stream. Called once at `CreateStream`,
+    /// and on replay so a restart restores the same placement.
+    pub fn set_stream_shard(&self, seq: StreamId, shard: u16) {
+        self.with_inner_swap(|g| {
+            let idx = seq.0 as usize;
+            if idx >= g.streams_shard.len() {
+                g.streams_shard.resize(idx + 1, NOT_PLACED);
+            }
+            g.streams_shard[idx] = shard;
+        });
+    }
+
+    /// The shard owning this stream, or `None` when it was never recorded —
+    /// every stream created before this field existed. Callers fall back to
+    /// the modulo, which is what those streams were placed by.
+    #[inline]
+    pub fn stream_shard(&self, seq: StreamId) -> Option<u16> {
+        match self.hot.load().streams_shard.get(seq.0 as usize).copied() {
+            Some(NOT_PLACED) | None => None,
+            Some(s) => Some(s),
+        }
+    }
+
+    /// Highest shard index any stream is recorded on. `None` when nothing is
+    /// placed. Startup uses this to refuse a SHRINK — a stream recorded on
+    /// shard 12 has nowhere to go under a count of 8.
+    pub fn max_recorded_shard(&self) -> Option<u16> {
+        self.hot
+            .load()
+            .streams_shard
+            .iter()
+            .copied()
+            .filter(|&s| s != NOT_PLACED)
+            .max()
     }
 
     // ── Stream quotas ──────────────────────────────────────────────────────
