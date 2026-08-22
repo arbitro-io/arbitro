@@ -31,8 +31,18 @@ async fn spawn_server(addr: &str) -> tokio::task::JoinHandle<()> {
     let h = tokio::spawn(async move {
         let _ = ArbitroServer::new(cfg).run().await;
     });
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    h
+    // This test kills and restarts a server on the SAME address, so it
+    // cannot hand over a pre-bound listener the way the others do. POLL for
+    // readiness rather than guessing: a fixed 80ms sleep is a bet on machine
+    // load, and under the full suite it loses as ConnectionRefused.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return h;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("server never started listening on {addr}");
 }
 
 // ── test ──────────────────────────────────────────────────────────────────────

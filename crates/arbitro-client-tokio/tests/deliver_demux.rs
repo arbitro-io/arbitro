@@ -16,21 +16,30 @@ use bytes::Bytes;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn portpicker() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
+/// Bind the socket HERE and hand it to the server, so there is nothing to
+/// wait for: the port is listening before this returns, and it is never
+/// released, so a sibling test cannot take it.
+///
+/// The previous version picked a port by binding, DROPPING the listener, and
+/// returning the number — then slept 80ms hoping the server had bound it.
+/// Both halves were races: under the full suite the machine is loaded, 80ms
+/// was not enough, and the client hit ConnectionRefused; the freed port could
+/// also be claimed by a sibling test in the same binary.
 async fn start_server() -> String {
-    let port = portpicker();
-    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local_addr").to_string();
     let cfg = Config::default()
         .listen_addr(addr.clone())
         .max_connections(64);
+    let mut server = ArbitroServer::new(cfg);
+    server.set_listener(listener);
     tokio::spawn(async move {
-        let _ = ArbitroServer::new(cfg).run().await;
+        if let Err(e) = server.run().await {
+            panic!("test server exited: {e}");
+        }
     });
-    tokio::time::sleep(Duration::from_millis(80)).await;
     addr
 }
 
