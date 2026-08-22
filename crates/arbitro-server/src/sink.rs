@@ -81,3 +81,51 @@ impl StreamSink for SharedStoreSink<'_> {
         self.store.lock().info()
     }
 }
+
+/// The shard's journal reached from the shard's OWN thread. No lock.
+///
+/// This is the fast door, and it is only constructible when the calling
+/// thread actually owns the shard — see `ShardRouter::local_sink`. That is
+/// the whole safety argument: there is no lock because there is no second
+/// thread, and the type cannot be built where that is untrue.
+///
+/// A connection that arrived on this shard's listener is already here. One
+/// that arrived on the bootstrap port is not, and has to take the routed
+/// path instead — a channel hop, paid by the case that earned it.
+pub struct LocalSink<'a> {
+    shard_id: usize,
+    gate: &'a Gate,
+}
+
+impl<'a> LocalSink<'a> {
+    /// Caller must have established that this thread owns `shard_id`.
+    #[inline]
+    pub(crate) fn new(shard_id: usize, gate: &'a Gate) -> Self {
+        Self { shard_id, gate }
+    }
+}
+
+impl StreamSink for LocalSink<'_> {
+    #[inline]
+    fn publish(&self, entries: &[EntryRef<'_>], now_ms: u64) -> Result<u64, StoreError> {
+        // Same ordering rule as the shared sink: the borrow ends before the
+        // gate fires. Here it matters for a different reason — the drain is
+        // a task on THIS thread, so releasing the gate while the journal is
+        // still borrowed would let it wake into an outstanding borrow.
+        // `None` here means this thread does not own the shard, which is a
+        // construction error rather than a storage one — `local_sink` is
+        // supposed to have refused. Surfaced as an I/O error because the
+        // caller's contract is `StoreError`, and never reached in practice.
+        let first = crate::shard::local::with_store(self.shard_id, |s| {
+            s.append_batch(entries, now_ms)
+        })
+        .ok_or(StoreError::Io(std::io::ErrorKind::WouldBlock))??;
+        self.gate.release();
+        Ok(first)
+    }
+
+    #[inline]
+    fn info(&self) -> StoreInfo {
+        crate::shard::local::with_store(self.shard_id, |s| s.info()).unwrap_or_default()
+    }
+}

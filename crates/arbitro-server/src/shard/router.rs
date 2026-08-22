@@ -550,6 +550,23 @@ impl ShardRouter {
         }
     }
 
+    /// The lock-free sink, when THIS thread owns the stream's shard.
+    ///
+    /// `None` means the caller is somewhere else — the shared pool, the
+    /// accept loop, or another shard's thread — and must take the routed
+    /// path instead. Returning an `Option` rather than falling back to the
+    /// shared sink is deliberate: the two doors cost different things, and
+    /// a caller that cannot see which one it went through cannot be
+    /// measured or reasoned about.
+    #[inline]
+    pub fn local_sink(&self, stream_id: StreamId) -> Option<crate::sink::LocalSink<'_>> {
+        let idx = self.shard_index(stream_id, self.stores.len());
+        if !super::local::owns(idx) {
+            return None;
+        }
+        Some(crate::sink::LocalSink::new(idx, &self.gates[idx]))
+    }
+
     /// A stream's sink, resolved off a snapshot the caller already holds.
     /// Same answer as `sink_for`, one guard cheaper.
     #[inline]

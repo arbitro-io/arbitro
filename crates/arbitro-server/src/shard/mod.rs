@@ -22,6 +22,7 @@ pub mod handle;
 pub mod handlers;
 pub mod idempotency;
 pub mod router;
+pub(crate) mod local;
 pub(crate) mod runtime;
 pub mod shared;
 pub mod worker;
