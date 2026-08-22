@@ -31,6 +31,7 @@ pub mod config;
 pub mod cron;
 pub mod delayed;
 pub mod lifecycle_trace;
+pub mod sink;
 pub mod persistence;
 pub mod server;
 pub mod shard;

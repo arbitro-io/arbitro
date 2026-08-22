@@ -24,6 +24,7 @@ use arbitro_proto::v2::magic::ARBITRO_MAGIC_V2;
 use arbitro_proto::lifecycle::LifeCycle;
 
 use crate::config::Config;
+use crate::sink::StreamSink;
 use crate::persistence::command_log::SharedCommandLog;
 use crate::shard::router::ShardRouter;
 use crate::transport::dispatch_v2;
@@ -316,11 +317,12 @@ impl ArbitroServer {
                                 flags: entry.flags,
                                 deliver_at_ms: 0,
                             };
-                            let shared_store = self.server.store_for(seq_stream);
-                            match shared_store.lock().append(store_entry, now_ms) {
-                                Ok(_) => {
-                                    self.server.gate_for(seq_stream).release();
-                                }
+                            match self
+                                .server
+                                .sink_for(seq_stream)
+                                .publish(&[store_entry], now_ms)
+                            {
+                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::error!(
                                         stream_id = entry.stream_id,

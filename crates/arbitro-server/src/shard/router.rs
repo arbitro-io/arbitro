@@ -451,6 +451,16 @@ impl ShardRouter {
     }
 
     #[inline]
+    /// One stream's storage, with the lock, the gate and the shard index
+    /// hidden. This is what callers should use; `store_for` and `gate_for`
+    /// remain for the paths that genuinely need the raw handles.
+    ///
+    /// Free to build — it borrows the `Arc`s already held here.
+    #[inline]
+    pub fn sink_for(&self, stream_id: StreamId) -> crate::sink::SharedStoreSink<'_> {
+        crate::sink::SharedStoreSink::new(self.store_for(stream_id), self.gate_for(stream_id))
+    }
+
     pub fn store_for(&self, stream_id: StreamId) -> &SharedStore {
         let idx = stream_id.raw() as usize % self.stores.len();
         &self.stores[idx]

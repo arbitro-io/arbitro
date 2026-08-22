@@ -58,6 +58,7 @@ use crate::common::reply_v2::{
     send_ack_batch_resp_v2, send_ack_state_rep_v2, send_error_v2, send_rep_ok_v2,
 };
 use crate::shard::router::ShardRouter;
+use crate::sink::StreamSink;
 use crate::transport::ConnectionRegistry;
 
 use arbitro_proto::metadata::{
@@ -334,8 +335,7 @@ fn v2_publish(
     // would exceed max_msgs or max_bytes, reject BEFORE appending.
     if let Some(quota) = server.names().stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let shared_store = server.store_for(seq_stream);
-            let info = shared_store.lock().info();
+            let info = server.sink_for(seq_stream).info();
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -396,8 +396,10 @@ fn v2_publish(
     // state (drain takes it once per cycle); append_batch is a mmap memcpy
     // (sub-µs). The block_in_place wrapper costs more than the work it
     // guards. parking_lot::Mutex gives a faster uncontested path.
-    let shared_store = server.store_for(seq_stream);
-    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
+    // One call: append and wake. The lock and the gate belong to the sink,
+    // not here — forgetting the gate stored messages that were never
+    // delivered, with no error anywhere.
+    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -406,7 +408,6 @@ fn v2_publish(
     };
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
-    server.gate_for(seq_stream).release();
 }
 
 /// Hash an opaque `msg_id` for the idempotency tracker.
@@ -494,8 +495,10 @@ fn v2_publish_with_reply(
     let now_ms = server.now_ms();
 
     // F2: drop block_in_place; parking_lot::Mutex is uncontested fast.
-    let shared_store = server.store_for(seq_stream);
-    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
+    // One call: append and wake. The lock and the gate belong to the sink,
+    // not here — forgetting the gate stored messages that were never
+    // delivered, with no error anywhere.
+    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -504,7 +507,6 @@ fn v2_publish_with_reply(
     };
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
-    server.gate_for(seq_stream).release();
 }
 
 fn v2_publish_batch(
@@ -559,8 +561,7 @@ fn v2_publish_batch(
             for v in f.iter() {
                 batch_bytes += (v.subject().len() + v.payload().len()) as u64;
             }
-            let shared_store = server.store_for(seq_stream);
-            let info = shared_store.lock().info();
+            let info = server.sink_for(seq_stream).info();
             if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -710,8 +711,10 @@ fn v2_publish_batch(
     let now_ms = server.now_ms();
 
     // F2: drop block_in_place.
-    let shared_store = server.store_for(seq_stream);
-    let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
+    // One call: append and wake. The lock and the gate belong to the sink,
+    // not here — forgetting the gate stored messages that were never
+    // delivered, with no error anywhere.
+    let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
         Ok(seq) => seq,
         Err(_) => {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -720,7 +723,6 @@ fn v2_publish_batch(
     };
 
     send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
-    server.gate_for(seq_stream).release();
 }
 
 fn v2_publish_delayed(
@@ -787,8 +789,7 @@ fn v2_publish_delayed(
     // (documented in ROBUSTNESS_AUDIT.md).
     if let Some(quota) = server.names().stream_quota(seq_stream) {
         if quota.discard == 1 {
-            let shared_store = server.store_for(seq_stream);
-            let info = shared_store.lock().info();
+            let info = server.sink_for(seq_stream).info();
             if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
                 return;
@@ -829,8 +830,7 @@ fn v2_publish_delayed(
             deliver_at_ms: 0,
         }];
         let now_ms = server.now_ms();
-        let shared_store = server.store_for(seq_stream);
-        let first_seq = match shared_store.lock().append_batch(&entries, now_ms) {
+        let first_seq = match server.sink_for(seq_stream).publish(&entries, now_ms) {
             Ok(seq) => seq,
             Err(_) => {
                 send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -838,7 +838,6 @@ fn v2_publish_delayed(
             }
         };
         send_rep_ok_v2(registry, conn_id, req_seq, first_seq);
-        server.gate_for(seq_stream).release();
         return;
     }
 
@@ -970,7 +969,7 @@ async fn v2_ack_state(
     };
     let cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
     let generation = server.names().consumer_generation(consumer_id).unwrap_or(0);
-    let info = server.store_for(seq_stream).lock().info();
+    let info = server.sink_for(seq_stream).info();
     send_ack_state_rep_v2(
         registry,
         conn_id,
@@ -1040,7 +1039,7 @@ async fn v2_ack_batch(
     };
 
     let cursor_before = server.names().consumer_cursor(consumer_id).unwrap_or(0);
-    let low = server.store_for(seq_stream).lock().info().first_seq;
+    let low = server.sink_for(seq_stream).info().first_seq;
 
     let mut accepted_entries: Vec<AckEntry> = Vec::with_capacity(seqs.len());
     let mut accepted: u32 = 0;

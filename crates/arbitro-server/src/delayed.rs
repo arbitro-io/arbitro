@@ -9,6 +9,7 @@
 //! On restart the journal is scanned, the heap rebuilt, and already-matured
 //! entries are caught up immediately.
 
+use crate::sink::StreamSink;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::{Read, Write};
@@ -489,15 +490,13 @@ pub async fn delayed_maturation_loop(
                 deliver_at_ms: 0,
             };
 
-            let shared_store = server.store_for(seq_stream);
-            match shared_store.lock().append(store_entry, now_ms) {
+            match server.sink_for(seq_stream).publish(&[store_entry], now_ms) {
                 Ok(_seq) => {
                     tracing::debug!(
                         stream_id = entry.stream_id,
                         deliver_at_ms = entry.deliver_at_ms,
                         "delayed entry matured and appended to main store"
                     );
-                    server.gate_for(seq_stream).release();
                 }
                 Err(e) => {
                     tracing::error!(

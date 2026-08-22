@@ -81,3 +81,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "scratch_shape"
 harness = false
+
+[[bench]]
+name = "group_shape"
+harness = false
