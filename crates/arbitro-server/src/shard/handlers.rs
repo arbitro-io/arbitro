@@ -67,6 +67,28 @@ impl CommandWorker {
     /// while the store is still held hands it a lock it immediately blocks
     /// on. That ordering is why the sink owns both and callers get neither.
     pub(in crate::shard) fn handle_publish(&mut self, cmd: crate::shard::command::PublishCmd) {
+        // Dedup for the ROUTED path. The local door runs the same check at
+        // dispatch, where it costs no allocation; a publisher on another
+        // thread cannot, because the tracker is this thread's `Rc`. Same
+        // rule, applied by whoever can actually see the state.
+        if cmd.dedup_window_ms > 0 && !self.dedup_routed(&cmd) {
+            match cmd.reply_to {
+                PublishReply::Client { conn_id, req_seq } => {
+                    crate::common::reply_v2::send_error_v2(
+                        &self.registry,
+                        conn_id,
+                        req_seq,
+                        arbitro_proto::error::ErrorCode::IdempotencyDuplicate,
+                    );
+                }
+                PublishReply::Seq(tx) => {
+                    let _ = tx.send(None);
+                }
+                PublishReply::None => {}
+            }
+            return;
+        }
+
         let refs: Vec<arbitro_store::EntryRef<'_>> = cmd
             .entries
             .iter()
@@ -107,6 +129,75 @@ impl CommandWorker {
             }
             PublishReply::None => {}
         }
+    }
+
+    /// Record every msg-id in a routed publish. `false` = duplicate, reject.
+    ///
+    /// All-or-nothing, matching the local path: the first duplicate rolls
+    /// back the ids already recorded for this command, so a rejected batch
+    /// leaves the tracker exactly as it found it and a retry behaves the
+    /// same way the first attempt would have.
+    fn dedup_routed(&mut self, cmd: &crate::shard::command::PublishCmd) -> bool {
+        use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
+        use zerocopy::FromBytes;
+
+        let Some(map) = crate::shard::local::idempotency(self.shard_id) else {
+            return true;
+        };
+        let stream_id = cmd.stream_id;
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&map, stream_id);
+        let mut tracker = tracker_arc.borrow_mut();
+
+        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> = smallvec::SmallVec::new();
+        let mut duplicate = false;
+        for e in &cmd.entries {
+            if e.flags & arbitro_store::flags::HAS_HEADERS == 0 {
+                continue;
+            }
+            let Ok(ext) = ExtendedPayload::ref_from_bytes(&e.payload) else {
+                continue;
+            };
+            let msg_id = match ext.headers_block().and_then(|h| h.get(HDR_MSG_ID)) {
+                Some(id) if !id.is_empty() => id,
+                _ => continue,
+            };
+            let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
+            if !tracker.record(stream_id, hash, msg_id, cmd.dedup_window_ms) {
+                duplicate = true;
+                break;
+            }
+            inserted.push((hash, msg_id));
+        }
+        if duplicate {
+            for (hash, id) in &inserted {
+                tracker.forget(stream_id, *hash, id);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Record one msg-id for a caller that cannot reach this thread's tracker.
+    ///
+    /// No tracker map means dedup is off for this shard; answering `true`
+    /// keeps that the same "not a duplicate" it has always been rather than
+    /// rejecting a publish because a check could not run.
+    pub(in crate::shard) fn handle_record_dedup(
+        &mut self,
+        cmd: crate::shard::command::RecordDedupCmd,
+    ) {
+        let Some(map) = crate::shard::local::idempotency(self.shard_id) else {
+            let _ = cmd.reply.send(true);
+            return;
+        };
+        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&map, cmd.stream_id);
+        let fresh = tracker_arc.borrow_mut().record(
+            cmd.stream_id,
+            cmd.hash,
+            &cmd.msg_id,
+            cmd.window_ms,
+        );
+        let _ = cmd.reply.send(fresh);
     }
 
     /// Rebuild one stream's dedup tracker by scanning this shard's journal.

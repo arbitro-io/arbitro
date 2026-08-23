@@ -34,6 +34,7 @@
 //! shape all over again. `install` therefore refuses to overwrite.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use arbitro_store::Store;
 
@@ -117,6 +118,105 @@ pub(crate) fn install_for_test(shard_id: usize, store: Box<dyn Store>) {
 pub(crate) fn store<R>(shard_id: usize, f: impl FnOnce(&mut dyn Store) -> R) -> R {
     with_store(shard_id, f)
         .unwrap_or_else(|| panic!("shard {shard_id}: journal not installed on this thread"))
+}
+
+thread_local! {
+    /// Sockets this thread may write to directly, by connection id.
+    ///
+    /// ## Why a map and not a handle on the connection
+    ///
+    /// A socket has TWO writers: the connection's own task, replying to a
+    /// publish, and the shard's drain, delivering messages. Today both
+    /// push into a per-connection mpsc and a writer task serialises them —
+    /// that serialisation is the channel's real job, not the moving of
+    /// bytes.
+    ///
+    /// Writing directly from only one of them would leave two concurrent
+    /// writers on one socket: interleaved partial writes, corrupted
+    /// frames. So the entry lives here, where BOTH reach it, and the
+    /// `RefCell` is what orders them — which is sound precisely because
+    /// they are tasks on one thread.
+    ///
+    /// A connection appears here only if it was accepted on its shard's
+    /// listener. Anything else keeps the writer task, because for it the
+    /// two writers really are on different threads.
+    static EGRESS: RefCell<HashMap<u64, crate::transport::egress::DirectEgress>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Hand this thread a connection's write half. Called once, on accept,
+/// from the shard's runtime.
+pub(crate) fn install_egress(conn_id: u64, e: crate::transport::egress::DirectEgress) {
+    EGRESS.with(|m| {
+        m.borrow_mut().insert(conn_id, e);
+    });
+}
+
+/// Write to `conn_id` from this thread, if this thread owns its socket.
+///
+/// `None` means it does not — the caller falls back to the queue. Never
+/// hold the borrow across an `.await`: the drain and the connection are
+/// different tasks on this thread and would collide.
+pub(crate) fn with_egress<R>(
+    conn_id: u64,
+    f: impl FnOnce(&mut crate::transport::egress::DirectEgress) -> R,
+) -> Option<R> {
+    EGRESS.with(|m| m.borrow_mut().get_mut(&conn_id).map(f))
+}
+
+thread_local! {
+    /// Does any socket on this thread hold bytes the kernel would not take?
+    ///
+    /// A flag, not a scan: with no slow client the drain must not pay for
+    /// walking the connection map every cycle.
+    static OWES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A short write happened; this thread now owes bytes.
+#[inline]
+pub(crate) fn mark_owes() {
+    OWES.with(|c| c.set(true));
+}
+
+/// Push every owed byte this thread holds. `true` if any remains.
+///
+/// Nothing else drives these sockets. A frame sitting in `owed` is not
+/// delivered, so the drain must not park while this returns `true` — it
+/// would strand the bytes until the client's `ack_wait` expired and forced
+/// a redelivery (measured: 30s and 60s gaps in replay).
+pub(crate) fn flush_owed() -> bool {
+    if !OWES.with(|c| c.get()) {
+        return false;
+    }
+    use crate::transport::egress::{Delivery, Egress};
+    let mut any = false;
+    let mut dead: Vec<u64> = Vec::new();
+    EGRESS.with(|m| {
+        for (id, e) in m.borrow_mut().iter_mut() {
+            if e.backlog() == 0 {
+                continue;
+            }
+            // A dead peer never drains. Retire it here or this loop never
+            // clears and the drain never parks again.
+            if matches!(e.flush(), Delivery::Dead) {
+                dead.push(*id);
+            } else if e.backlog() > 0 {
+                any = true;
+            }
+        }
+    });
+    for id in dead {
+        remove_egress(id);
+    }
+    OWES.with(|c| c.set(any));
+    any
+}
+
+/// Drop a connection's write half when it closes.
+pub(crate) fn remove_egress(conn_id: u64) {
+    EGRESS.with(|m| {
+        m.borrow_mut().remove(&conn_id);
+    });
 }
 
 thread_local! {

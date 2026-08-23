@@ -278,16 +278,25 @@ impl ConnectionRegistry {
     ///
     /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
     pub fn register(&self, writer: ConnWriter) -> u64 {
-        self.register_on_shard(writer, None).0
+        self.register_on_shard(writer, None, false).0
     }
 
     /// Register a connection, recording which shard's listener accepted it.
     /// `None` is the bootstrap socket.
+    /// `listener_shard` is WHICH LISTENER accepted this — a topology fact,
+    /// `None` for the bootstrap port. `host_locally` is whether the caller
+    /// will run this connection on a shard's thread, which is a placement
+    /// decision and true for every connection once shards have runtimes.
+    ///
+    /// They are separate because conflating them made the topology lie:
+    /// a bootstrap connection hosted on shard 3 is not a connection that
+    /// arrived on shard 3's port, and `ShardTopology` must not say it was.
     pub fn register_on_shard(
         &self,
         writer: ConnWriter,
         listener_shard: Option<u16>,
-    ) -> (u64, crate::common::session::ConnHandle) {
+        host_locally: bool,
+    ) -> (u64, crate::common::session::ConnHandle, Option<ConnWriter>) {
         let conn_id = self.inner.conn_id_gen.next();
         // H13: honour the configured per-connection capacity. Fallback
         // is the historical default if the field is unset (zero).
@@ -308,14 +317,39 @@ impl ConnectionRegistry {
         // M15: supervise the writer task — panics here would silently
         // strand the connection's mpsc receiver. Watcher logs and exits
         // when the child resolves (normal or panic).
-        let writer_handle = tokio::spawn(conn_writer_task(
-            rx,
-            writer,
-            conn_id,
-            inner,
-            Arc::clone(&write_failed),
-            Arc::clone(&frames_written),
-        ));
+        // A pinned connection's socket is written by TWO tasks on the
+        // shard's thread — this drainer and the connection replying to a
+        // publish. Both go through `local::with_egress`, whose `RefCell`
+        // orders them. The socket itself is installed by the connection
+        // task, which is the one already on the right thread.
+        //
+        // The channel does NOT disappear for these. Cold paths — cron,
+        // list_streams, metrics — call `enqueue` from other threads and
+        // have no other way in. What changes is who performs the write.
+        // The writer half is HANDED BACK for a pinned connection instead of
+        // being consumed here. `register` runs on whichever thread accepted;
+        // installing the socket from here would put it in the wrong
+        // thread-local, and dropping it would close the connection.
+        let mut handed_back = None;
+        let writer_handle = if host_locally {
+            handed_back = Some(writer);
+            tokio::spawn(pinned_writer_task(
+                rx,
+                conn_id,
+                inner,
+                Arc::clone(&write_failed),
+                Arc::clone(&frames_written),
+            ))
+        } else {
+            tokio::spawn(conn_writer_task(
+                rx,
+                writer,
+                conn_id,
+                inner,
+                Arc::clone(&write_failed),
+                Arc::clone(&frames_written),
+            ))
+        };
         let cid_for_log = conn_id;
         tokio::spawn(async move {
             match writer_handle.await {
@@ -357,6 +391,7 @@ impl ConnectionRegistry {
         (
             conn_id,
             crate::common::session::ConnHandle::new(conn_id, tx_for_handle, last_activity, clock),
+            handed_back,
         )
     }
 
@@ -568,6 +603,40 @@ impl ConnectionRegistry {
 /// keep the channel open forever and stale entries would accumulate
 /// for every disconnect that hit a write error before the read loop
 /// noticed the EOF.
+/// Drains the channel for a connection whose socket lives on THIS thread.
+///
+/// Writes through `local::with_egress` instead of owning the writer, so it
+/// cannot race the connection's own direct replies — the `RefCell` there
+/// is what serialises the two. A missing socket means the connection is
+/// gone, which is the same conclusion the owning writer reaches on a
+/// closed fd.
+async fn pinned_writer_task(
+    mut rx: mpsc::Receiver<Bytes>,
+    conn_id: u64,
+    inner: Arc<Inner>,
+    write_failed: Arc<AtomicBool>,
+    frames_written: Arc<AtomicU64>,
+) {
+    use crate::transport::egress::{Delivery, Egress};
+    let mut err = false;
+    while let Some(frame) = rx.recv().await {
+        match crate::shard::local::with_egress(conn_id, |e| e.send(frame)) {
+            Some(Delivery::Dead) | None => {
+                write_failed.store(true, Relaxed);
+                err = true;
+                break;
+            }
+            Some(_) => {
+                frames_written.fetch_add(1, Relaxed);
+            }
+        }
+    }
+    crate::shard::local::remove_egress(conn_id);
+    if err {
+        inner.sessions.lock().remove(&conn_id);
+    }
+}
+
 async fn conn_writer_task(
     mut rx: mpsc::Receiver<Bytes>,
     mut w: ConnWriter,

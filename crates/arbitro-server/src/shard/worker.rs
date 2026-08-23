@@ -275,6 +275,16 @@ impl DrainWorker {
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
 
+                // A frame the socket refused is not delivered. This thread is
+                // the only thing that drives those fds, so parking on top of
+                // owed bytes strands them until the client's ack_wait forces
+                // a redelivery. Retry instead — the sleep gives the kernel
+                // room, and `flush_owed` is a flag read when nothing is owed.
+                if crate::shard::local::flush_owed() {
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    continue;
+                }
+
                 // INVARIANT: `park_verdict` is a SECOND, separate gate load,
                 // after the possible sleep — a concurrent `release()` during
                 // it must be observed. Never merge with the read above.
@@ -1244,6 +1254,7 @@ impl CommandWorker {
         match cmd {
             ShardCommand::Publish(cmd) => self.handle_publish(cmd),
             ShardCommand::RebuildIdempotency(cmd) => self.handle_rebuild_idempotency(cmd),
+            ShardCommand::RecordDedup(cmd) => self.handle_record_dedup(cmd),
             ShardCommand::ScanRange(cmd) => self.handle_scan_range(cmd),
             ShardCommand::Ack(cmd) => self.handle_ack(cmd),
             ShardCommand::Nack(cmd) => self.handle_nack(cmd),
@@ -1666,8 +1677,8 @@ mod tests {
             gate: Arc::new(Gate::new()),
             registry: crate::transport::ConnectionRegistry::new(64),
             names: Arc::new(crate::common::NameRegistry::new()),
-            rx,
-            notify_ring: notify_rx,
+            rx: Some(rx),
+            notify_ring: Some(notify_rx),
             drain_evt_tx,
             running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             drain_config_batch_size: 64,
@@ -1679,7 +1690,6 @@ mod tests {
             next_timer_ms: None,
             epoch: Instant::now(),
             last_idempotency_ms: 0,
-            idempotency_tracker: crate::shard::idempotency::new_shared_idempotency(),
             has_idempotency: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             silent_drops: Arc::new(crate::common::SilentDrops::new()),
             pending_consumer_remove: Vec::new(),

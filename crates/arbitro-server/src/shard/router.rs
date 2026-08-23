@@ -33,6 +33,19 @@ use arbitro_common::SharedClock;
 ///
 /// Getting this wrong sends two replies for one request, which desynchronises
 /// the client's sequence bookkeeping far more confusingly than sending none.
+/// Whether an append still owes a duplicate check.
+///
+/// Named rather than a bare `bool` because both call sites read as "publish
+/// this", and only the name says which of them is a client's first attempt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dedup {
+    /// A client's publish. Check it.
+    Check,
+    /// A re-append of something already admitted — a matured delayed entry,
+    /// a replicated one. Checking again would reject the only copy.
+    AlreadyAdmitted,
+}
+
 pub enum Append {
     /// Appended on this thread. The CALLER still owes the client its RepOk.
     Stored(u64),
@@ -516,6 +529,9 @@ impl ShardRouter {
     /// arrives from an arbitrary pool thread and the store's lock is what
     /// keeps that sound — so this is the prerequisite for the lock ever
     /// going away, not a scheduling nicety.
+    /// There is deliberately no `next_home_shard`. A connection that named
+    /// no shard is not assigned one round-robin: see the accept path in
+    /// `server.rs` for why a guessed pin measures worse than no pin.
     pub(crate) fn runtime_for_shard(&self, shard: u16) -> Option<tokio::runtime::Handle> {
         self._shard_runtimes
             .get(shard as usize)
@@ -563,6 +579,13 @@ impl ShardRouter {
     ///
     /// `None` means the append was refused (quota) or the shard is gone;
     /// both are "no sequence to report", which is all the caller can act on.
+    /// Is this append an ingress, or a re-append of something already let in?
+    ///
+    /// The distinction is not a hint, it decides correctness. A delayed
+    /// message is dedup-checked when the client sends it and then appended
+    /// again when it matures; checking the second time finds the id the
+    /// first time recorded and drops the only copy there was. Replication
+    /// is the same story with the leader doing the admitting.
     pub async fn append(
         &self,
         cat: &arbitro_common::name_registry::Snapshot<'_>,
@@ -571,8 +594,15 @@ impl ShardRouter {
         owned: impl FnOnce() -> Vec<crate::shard::command::PublishEntryOwned>,
         now_ms: u64,
         reply_to: crate::shard::command::PublishReply,
+        dedup: Dedup,
     ) -> Append {
         use crate::sink::StreamSink;
+        // Read here, not in the caller: the routed branch is the only one
+        // that needs it, and the catalog is already in hand.
+        let dedup_window_ms = match dedup {
+            Dedup::Check => cat.stream_idempotency_window_ms(stream_id),
+            Dedup::AlreadyAdmitted => 0,
+        };
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
         if super::local::owns(idx) {
             let _p = crate::transport::ingress_profile::append_local();
@@ -588,7 +618,7 @@ impl ShardRouter {
         // waiting here for the sequence just to forward it would serialise
         // a fire-and-forget publisher against its own broker.
         match self.shards[idx]
-            .publish_routed(stream_id, owned(), now_ms, reply_to)
+            .publish_routed(stream_id, owned(), now_ms, reply_to, dedup_window_ms)
             .await
         {
             Ok(()) => Append::Delegated,
@@ -624,6 +654,8 @@ impl ShardRouter {
                 owned(),
                 now_ms,
                 crate::shard::command::PublishReply::Seq(tx),
+                // Replication only: the leader already admitted this.
+                0,
             )
             .await
             .ok()?;
@@ -771,6 +803,46 @@ impl ShardRouter {
     ) -> Option<super::idempotency::SharedIdempotency> {
         let idx = self.shard_index(stream_id, self.shard_count);
         super::local::idempotency(idx)
+    }
+
+    /// Record `msg_id` against `stream_id`'s tracker. `false` = duplicate.
+    ///
+    /// One door for both cases: this thread's `Rc` when it owns the shard,
+    /// a round trip to the owning thread when it does not. Callers stop
+    /// having to know which, and a caller that cannot see the state stops
+    /// silently deciding there is no duplicate.
+    pub async fn record_dedup(
+        &self,
+        cat: &arbitro_common::name_registry::Snapshot<'_>,
+        stream_id: StreamId,
+        hash: u64,
+        msg_id: &[u8],
+        window_ms: u32,
+    ) -> bool {
+        let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
+        if let Some(shared) = super::local::idempotency(idx) {
+            let tracker = super::idempotency::idempotency_for_stream(&shared, stream_id);
+            self.mark_idempotency_allocated(stream_id);
+            return tracker
+                .borrow_mut()
+                .record(stream_id, hash, msg_id, window_ms);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sent = self.shards[idx]
+            .send(crate::shard::command::ShardCommand::RecordDedup(
+                crate::shard::command::RecordDedupCmd {
+                    stream_id,
+                    hash,
+                    msg_id: msg_id.to_vec(),
+                    window_ms,
+                    reply: tx,
+                },
+            ))
+            .await;
+        if sent.is_err() {
+            return true;
+        }
+        rx.await.unwrap_or(true)
     }
 
     /// Per-shard "tracker allocated" flag — flip to `true` after the

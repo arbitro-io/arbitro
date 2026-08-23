@@ -365,6 +365,8 @@ impl ArbitroServer {
                                     },
                                     now_ms,
                                     crate::shard::command::PublishReply::None,
+                                    // Already admitted when the client sent it.
+                                    crate::shard::router::Dedup::AlreadyAdmitted,
                                 )
                                 .await
                             {
@@ -851,6 +853,23 @@ impl ArbitroServer {
                                 }
 
                                 let _ = stream.set_nodelay(true);
+                                // Pin ONLY what arrived on a shard's own
+                                // listener. That listener is the statement
+                                // "this connection's data lives here"; the
+                                // bootstrap port makes no such statement, and
+                                // round-robin does not turn a guess into one.
+                                //
+                                // Guessing is not merely suboptimal, it is
+                                // slower than not pinning at all. A publisher
+                                // pinned to shard 0 writing a stream on shard
+                                // 8 crosses a bounded mpsc between two
+                                // `current_thread` runtimes on every message —
+                                // neither can absorb the other's burst and the
+                                // pair ping-pongs. Measured on replay 500K:
+                                // 2.57M msg/s unpinned against a 120s timeout
+                                // with 30s and 60s dead windows when the pin
+                                // was a round-robin guess.
+                                let home_shard = listener_shard;
 
                                 // SEC-2: the TLS handshake used to run inline in the
                                 // accept loop, so one slow/malicious client doing the
@@ -908,8 +927,33 @@ impl ArbitroServer {
                                         writer = ConnWriter::Plain(w);
                                     }
 
-                                    let (conn_id, conn) =
-                                        reg.register_on_shard(writer, listener_shard);
+                                    // ONE decision, read twice. `host_locally`
+                                    // and the runtime this task runs on must
+                                    // agree: the socket goes into the running
+                                    // thread's slot, so hosting it locally
+                                    // while running elsewhere puts it in a
+                                    // thread-local nobody can reach, and every
+                                    // write silently reports the peer dead.
+                                    let (conn_id, conn, own_socket) = reg.register_on_shard(
+                                        writer,
+                                        listener_shard,
+                                        home_shard.is_some(),
+                                    );
+                                    // Installed HERE because this task is
+                                    // already on the shard's runtime;
+                                    // installing at register time would put
+                                    // the socket in the accept thread's
+                                    // slot. Plain TCP only — TLS keeps
+                                    // record state and cannot be written
+                                    // from a synchronous call.
+                                    if let Some(crate::transport::registry::ConnWriter::Plain(w)) =
+                                        own_socket
+                                    {
+                                        crate::shard::local::install_egress(
+                                            conn_id,
+                                            crate::transport::egress::DirectEgress::new(w),
+                                        );
+                                    }
                                     tracing::debug!(conn_id, %addr, "accepted");
 
                                     read_loop(
@@ -930,15 +974,17 @@ impl ArbitroServer {
                                 // load-bearing.
                                 //
                                 // A bootstrap connection has no shard, so it
-                                // stays on the shared pool and keeps needing
-                                // the lock. Both models coexist by design:
-                                // the lock is correct for either.
-                                match listener_shard
-                                    .and_then(|s| accept_server.runtime_for_shard(s))
-                                {
+                                // stays on the shared pool. Its fast doors
+                                // then always miss, and that is the cheaper
+                                // outcome: a wrong pin costs a bounded mpsc
+                                // between two single-threaded runtimes on
+                                // every message, which measured 120s-timeout
+                                // against 194ms for the same replay.
+                                match home_shard.and_then(|s| accept_server.runtime_for_shard(s)) {
                                     Some(rt) => {
                                         rt.spawn(conn_task);
                                     }
+                                    // No per-shard runtimes at all.
                                     None => {
                                         accept_background_tasks.lock().await.spawn(conn_task);
                                     }

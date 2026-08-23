@@ -510,6 +510,8 @@ pub async fn delayed_maturation_loop(
                     },
                     now_ms,
                     crate::shard::command::PublishReply::None,
+                    // Already admitted when the client sent it.
+                    crate::shard::router::Dedup::AlreadyAdmitted,
                 )
                 .await
             {

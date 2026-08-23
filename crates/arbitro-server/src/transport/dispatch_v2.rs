@@ -432,6 +432,8 @@ async fn v2_publish(
             || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
+            // Client ingress: the shard checks it if this thread could not.
+            crate::shard::router::Dedup::Check,
         )
         .await
     {
@@ -555,6 +557,8 @@ async fn v2_publish_with_reply(
             || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
+            // Client ingress: the shard checks it if this thread could not.
+            crate::shard::router::Dedup::Check,
         )
         .await
     {
@@ -803,6 +807,8 @@ async fn v2_publish_batch(
             || owned_entries(frame, &entries),
             now_ms,
             crate::shard::command::PublishReply::Client { conn_id, req_seq },
+            // Client ingress: the shard checks it if this thread could not.
+            crate::shard::router::Dedup::Check,
         )
         .await
     {
@@ -867,20 +873,16 @@ async fn v2_publish_delayed(
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let hash = idempotency_hash(msg_id);
-        // `None` = this thread does not own the shard, so the dedup state
-        // is not reachable from here. The check then happens ON the shard,
-        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
-        // would let a duplicate through with nothing to show for it.
-        if let Some(shared) = server.idempotency_for(seq_stream) {
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
-        let mut t = tracker_arc.borrow_mut();
-        server.mark_idempotency_allocated(seq_stream);
-        if !t.record(seq_stream, hash, msg_id, window_ms) {
-            drop(t);
+        // Unlike an immediate publish there is no append to carry the
+        // check — a delayed message goes to the delayed journal, so it
+        // never reaches `handle_publish` while the window is still open.
+        // The router records it on the owning thread instead.
+        if !server
+            .record_dedup(&cat, seq_stream, hash, msg_id, window_ms)
+            .await
+        {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
             return;
-        }
-        drop(t);
         }
     }
 
@@ -943,6 +945,8 @@ async fn v2_publish_delayed(
                 || owned_entries(frame, &entries),
                 now_ms,
                 crate::shard::command::PublishReply::Client { conn_id, req_seq },
+                // Recorded already, by the `record_dedup` above.
+                crate::shard::router::Dedup::AlreadyAdmitted,
             )
             .await
         {

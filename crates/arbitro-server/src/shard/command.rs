@@ -78,6 +78,7 @@ pub enum ShardCommand {
     /// everything else did: the scan reads the journal, and the journal is
     /// only reachable from the shard's own thread.
     RebuildIdempotency(RebuildIdempotencyCmd),
+    RecordDedup(RecordDedupCmd),
 
     /// Read a range of this shard's journal as owned entries.
     ///
@@ -143,6 +144,18 @@ pub struct PublishCmd {
     /// theorised — it broke `drop_client_cancels_all_tasks_under_500ms`
     /// deterministically until the await came out.
     pub reply_to: PublishReply,
+    /// Dedup window for this stream, or 0 when it has none.
+    ///
+    /// The check cannot happen at dispatch for a routed publish: the
+    /// tracker is `Rc<RefCell<_>>` owned by the SHARD's thread, so a
+    /// connection on any other thread cannot reach it. Carrying the window
+    /// here is what lets the shard run the check itself.
+    ///
+    /// The msg-id is not carried alongside it because it is already in the
+    /// payload — a dedup-bearing entry is stored as an `ExtendedPayload`
+    /// with `HDR_MSG_ID` so restart recovery can find it, and the shard
+    /// reads it from the same place recovery does.
+    pub dedup_window_ms: u32,
 }
 
 /// Who, if anyone, is owed an answer for an append — and in what form.
@@ -168,6 +181,21 @@ pub enum PublishReply {
 
 /// Rebuild a stream's dedup tracker from the shard's journal at startup.
 /// The reply is how many entries were re-recorded.
+/// Record one msg-id against a stream's dedup tracker, on the shard's thread.
+///
+/// The delayed publish needs this and cannot use [`PublishCmd`]: a delayed
+/// message goes to the delayed journal, not the store, so there is no append
+/// to carry the check. It is a cold path — a msg-id, a window, and a wait —
+/// which is why a round trip is affordable here and nowhere else.
+pub struct RecordDedupCmd {
+    pub stream_id: StreamId,
+    pub hash: u64,
+    pub msg_id: Vec<u8>,
+    pub window_ms: u32,
+    /// `true` = recorded (new), `false` = duplicate.
+    pub reply: oneshot::Sender<bool>,
+}
+
 pub struct RebuildIdempotencyCmd {
     pub stream_id: StreamId,
     pub window_ms: u32,

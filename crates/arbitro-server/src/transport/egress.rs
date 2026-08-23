@@ -115,6 +115,50 @@ impl DirectEgress {
     }
 }
 
+impl DirectEgress {
+    /// Send bytes that are not already a `Bytes`.
+    ///
+    /// The point is the allocation, not the copy: a 32-byte reply frame
+    /// lives on the stack, and `try_write` takes a `&[u8]`, so the common
+    /// case — socket accepts it whole — never touches the heap. Only a
+    /// short write has to keep the remainder, and only then is a `Bytes`
+    /// built, for exactly the tail that did not fit.
+    #[inline]
+    pub fn send_slice(&mut self, bytes: &[u8]) -> Delivery {
+        if !self.owed.is_empty() {
+            match self.push_owed() {
+                Delivery::Dead => return Delivery::Dead,
+                Delivery::Buffered(_) => {
+                    self.owed_bytes += bytes.len();
+                    self.owed.push_back(Bytes::copy_from_slice(bytes));
+                    return Delivery::Buffered(self.owed_bytes);
+                }
+                Delivery::Sent => {}
+            }
+        }
+        let mut off = 0usize;
+        loop {
+            match self.w.try_write(&bytes[off..]) {
+                Ok(0) => return Delivery::Dead,
+                Ok(n) if off + n == bytes.len() => return Delivery::Sent,
+                Ok(n) => {
+                    off += n;
+                    self.owed_bytes += bytes.len() - off;
+                    self.owed.push_back(Bytes::copy_from_slice(&bytes[off..]));
+                    return Delivery::Buffered(self.owed_bytes);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.owed_bytes += bytes.len() - off;
+                    self.owed.push_back(Bytes::copy_from_slice(&bytes[off..]));
+                    return Delivery::Buffered(self.owed_bytes);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Delivery::Dead,
+            }
+        }
+    }
+}
+
 impl Egress for DirectEgress {
     #[inline]
     fn send(&mut self, mut frame: Bytes) -> Delivery {

@@ -74,12 +74,14 @@ impl ShardHandle {
         entries: Vec<PublishEntryOwned>,
         now_ms: u64,
         reply_to: PublishReply,
+        dedup_window_ms: u32,
     ) -> Result<(), SendError> {
         self.send(ShardCommand::Publish(crate::shard::command::PublishCmd {
             stream_id,
             entries,
             now_ms,
             reply_to,
+            dedup_window_ms,
         }))
         .await
     }

@@ -32,7 +32,26 @@ pub fn send_rep_ok_v2(registry: &ConnectionRegistry, conn_id: u64, req_seq: u64,
 #[inline]
 pub fn reply_ok(conn: &crate::common::session::ConnHandle, req_seq: u64, ref_seq: u64) -> bool {
     let frame = RepOkFrame::new(req_seq, ref_seq);
-    conn.send(bytes::Bytes::copy_from_slice(frame.as_bytes()))
+    write_frame(conn, frame.as_bytes())
+}
+
+/// Straight to the socket when this thread owns it; the queue otherwise.
+///
+/// The direct door skips the channel AND the allocation — `try_write`
+/// takes a `&[u8]`, so a 32-byte reply never becomes a heap `Bytes`.
+///
+/// The fallback is not a nicety. A connection whose socket is not on this
+/// thread has TWO writers — this reply and the shard's drain — and the
+/// channel's writer task is what stops them interleaving mid-frame.
+/// Bypassing it for one of them would corrupt the stream.
+#[inline]
+fn write_frame(conn: &crate::common::session::ConnHandle, bytes: &[u8]) -> bool {
+    use crate::transport::egress::Delivery;
+    match crate::shard::local::with_egress(conn.conn_id, |e| e.send_slice(bytes)) {
+        Some(Delivery::Dead) => false,
+        Some(_) => true,
+        None => conn.send(bytes::Bytes::copy_from_slice(bytes)),
+    }
 }
 
 /// Error reply through the connection's own handle.
@@ -43,7 +62,7 @@ pub fn reply_err(
     code: ErrorCode,
 ) -> bool {
     let frame = RepErrFrame::new(req_seq, req_seq, code.as_u16());
-    conn.send(bytes::Bytes::copy_from_slice(frame.as_bytes()))
+    write_frame(conn, frame.as_bytes())
 }
 
 /// Send a v2 `RepError`.

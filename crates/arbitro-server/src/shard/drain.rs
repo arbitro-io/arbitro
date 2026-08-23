@@ -502,6 +502,73 @@ fn process_entries<'a>(
     (more_pending, lowest_skipped)
 }
 
+/// Bytes a directly-written connection may owe before the drain calls it
+/// backpressured. The mpsc bounded a slow client by frame count; `owed` has
+/// no bound of its own, so the bound moves here. Same policy, read in bytes
+/// instead of slots: over it the frame is NOT taken, the cursor rewinds, and
+/// `stall_evict_ms` eventually retires the connection.
+const DIRECT_BACKLOG_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Hand one built frame to a connection.
+///
+/// When this thread owns the socket the frame goes straight to the fd. The
+/// channel is not a slower road to the same place — under pinning it is a
+/// road through a thread that no longer exists: drain, connection and writer
+/// task share one `current_thread` runtime, and the drain's inner loop has a
+/// single conditional `.await`. Queueing there means the writer only runs
+/// when the drain happens to sleep, so delivery falls to the timer's rate
+/// (measured: 2.5M msg/s unpinned against 834 msg/s pinned, with 60s stalls).
+///
+/// ORDER: direct only while the queue is empty. A non-empty queue means a
+/// cross-thread cold path — cron, metrics, list_streams — has frames in
+/// flight, and writing past them would reorder this connection's stream.
+#[inline]
+fn flush_frame(
+    writer: &crate::shard::shared::WriterIndexEntry,
+    conn: ConnectionId,
+    bytes: bytes::Bytes,
+) -> bool {
+    use crate::transport::egress::{Delivery, Egress};
+
+    let mut pending = Some(bytes);
+    let direct = if writer.write_tx.capacity() == writer.write_tx.max_capacity() {
+        crate::shard::local::with_egress(conn.0, |e| {
+            // Push what is owed first: nothing else drives this socket, so
+            // skipping it would strand the backlog forever.
+            if e.backlog() > 0 && matches!(e.flush(), Delivery::Dead) {
+                return false;
+            }
+            if e.backlog() > 0 {
+                crate::shard::local::mark_owes();
+            }
+            if e.backlog() >= DIRECT_BACKLOG_LIMIT {
+                return false;
+            }
+            let frame = pending.take().expect("frame taken once");
+            match e.send(frame) {
+                Delivery::Dead => false,
+                // Taken, but only as far as `owed`. Ordered and accounted;
+                // the flag is what stops the drain parking on top of it.
+                Delivery::Buffered(_) => {
+                    crate::shard::local::mark_owes();
+                    true
+                }
+                Delivery::Sent => true,
+            }
+        })
+    } else {
+        None
+    };
+
+    match direct {
+        Some(ok) => ok,
+        None => writer
+            .write_tx
+            .try_send(pending.take().expect("frame taken once"))
+            .is_ok(),
+    }
+}
+
 /// Phase 2+3 — flush accumulated frames to TCP + bookkeeping.
 ///
 /// Does NOT need the store. The store lock should be released before
@@ -603,7 +670,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
             let conn = frame.connection_id;
             let count = frame.count;
             let first_seq = frame.first_seq;
-            let ok = writer.write_tx.try_send(frame.bytes).is_ok();
+            let ok = flush_frame(writer, conn, frame.bytes);
 
             if ok {
                 probe.flush_ok(conn, first_seq, count);
