@@ -322,28 +322,19 @@ async fn v2_publish(
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
         let _p_dedup = crate::transport::ingress_profile::dedup();
-        let hash = idempotency_hash(msg_id);
-        // F26: per-stream lock. Different streams contend on different
-        // mutexes. The outer map read-lock + Arc clone is sub-µs in
-        // steady state (no allocation, no contention).
-        // `None` = this thread does not own the shard, so the dedup state
-        // is not reachable from here. The check then happens ON the shard,
-        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
-        // would let a duplicate through with nothing to show for it.
-        if let Some(shared) = server.idempotency_for(seq_stream) {
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
-        let mut t = tracker_arc.borrow_mut();
-        // F10: announce allocation so the worker's select! predicate
-        // stops paying the lock to test Option::is_some.
-        server.mark_idempotency_allocated(seq_stream);
-        // M2: pass the full msg_id so a hash collision between two
-        // distinct ids doesn't silently dedup the second publish.
-        if !t.record(seq_stream, hash, msg_id, window_ms) {
-            drop(t);
-            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
-            return;
-        }
-        drop(t);
+        // `None` = this thread does not own the shard, so the window is not
+        // reachable from here and the check happens ON the shard, inside
+        // `handle_publish`. That split is the case to delete, not to serve.
+        if let Some(window) = crate::shard::dedup::Dedup::open(
+            server.idempotency_for(seq_stream),
+            seq_stream,
+            window_ms,
+        ) {
+            server.mark_idempotency_allocated(seq_stream);
+            if !window.admit(msg_id) {
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
+                return;
+            }
         }
     }
 
@@ -504,21 +495,16 @@ async fn v2_publish_with_reply(
     let msg_id = f.msg_id();
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
-        let hash = idempotency_hash(msg_id);
-        // `None` = this thread does not own the shard, so the dedup state
-        // is not reachable from here. The check then happens ON the shard,
-        // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
-        // would let a duplicate through with nothing to show for it.
-        if let Some(shared) = server.idempotency_for(seq_stream) {
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
-        let mut t = tracker_arc.borrow_mut();
-        server.mark_idempotency_allocated(seq_stream);
-        if !t.record(seq_stream, hash, msg_id, window_ms) {
-            drop(t);
-            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
-            return;
-        }
-        drop(t);
+        if let Some(window) = crate::shard::dedup::Dedup::open(
+            server.idempotency_for(seq_stream),
+            seq_stream,
+            window_ms,
+        ) {
+            server.mark_idempotency_allocated(seq_stream);
+            if !window.admit(msg_id) {
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+                return;
+            }
         }
     }
 
@@ -691,39 +677,23 @@ async fn v2_publish_batch(
         // is not reachable from here. The check then happens ON the shard,
         // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
         // would let a duplicate through with nothing to show for it.
-        if let Some(shared) = server.idempotency_for(seq_stream) {
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&shared, seq_stream);
-        let mut tracker = tracker_arc.borrow_mut();
-        server.mark_idempotency_allocated(seq_stream);
-
-        // M2: track inserted `(hash, msg_id bytes)` for rollback on
-        // duplicate. We hold the msg_id slice borrowed from `frame`
-        // (lives for the duration of this dispatch), so the rollback
-        // doesn't need owned copies — except `forget` expects a slice,
-        // which we still have.
-        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> = smallvec::SmallVec::new();
-        let mut duplicate = false;
-        for v in f.iter() {
-            let id = msg_id_of_view(&v, batch_has_headers);
-            if id.is_empty() {
-                continue;
+        if let Some(window) = crate::shard::dedup::Dedup::open(
+            server.idempotency_for(seq_stream),
+            seq_stream,
+            window_ms,
+        ) {
+            server.mark_idempotency_allocated(seq_stream);
+            // All-or-nothing, rollback included: the window owns that rule
+            // so no caller can forget half of it.
+            let admitted = window.admit_all(
+                f.iter()
+                    .map(|v| msg_id_of_view(&v, batch_has_headers))
+                    .filter(|id| !id.is_empty()),
+            );
+            if !admitted {
+                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
+                return;
             }
-            let hash = idempotency_hash(id);
-            if !tracker.record(seq_stream, hash, id, window_ms) {
-                duplicate = true;
-                break;
-            }
-            inserted.push((hash, id));
-        }
-        if duplicate {
-            for (hash, id) in &inserted {
-                tracker.forget(seq_stream, *hash, id);
-            }
-            drop(tracker);
-            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
-            return;
-        }
-        drop(tracker);
         }
     }
 
@@ -1041,7 +1011,6 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         Some(s) => s,
         None => return,
     };
-    let shard = server.shard_for(seq_stream);
     // B2: bounds-checked entries view — silently drop the frame if the
     // count field is lying. Fire-and-forget ack has no reply channel
     // to surface the InvalidEntryCount, so we just terminate the
@@ -1193,7 +1162,6 @@ async fn v2_ack_batch(
         }
     }
 
-    let shard = server.shard_for(seq_stream);
     let _ = server
         .commands_for(seq_stream)
         .release(
@@ -1257,7 +1225,6 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         Some(s) => s,
         None => return,
     };
-    let shard = server.shard_for(seq_stream);
     // B2: bounds-checked entries view — silently drop the frame on
     // lying count (fire-and-forget, no reply channel).
     let Some(raw) = f.try_entries() else { return };

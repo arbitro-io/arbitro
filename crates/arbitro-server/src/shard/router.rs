@@ -822,12 +822,11 @@ impl ShardRouter {
         window_ms: u32,
     ) -> bool {
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
-        if let Some(shared) = super::local::idempotency(idx) {
-            let tracker = super::idempotency::idempotency_for_stream(&shared, stream_id);
+        if let Some(window) =
+            super::dedup::Dedup::open(super::local::idempotency(idx), stream_id, window_ms)
+        {
             self.mark_idempotency_allocated(stream_id);
-            return tracker
-                .borrow_mut()
-                .record(stream_id, hash, msg_id, window_ms);
+            return window.admit(msg_id);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let sent = self.shards[idx]

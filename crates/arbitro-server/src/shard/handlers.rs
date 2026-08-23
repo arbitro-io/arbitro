@@ -110,50 +110,33 @@ impl CommandWorker {
         }
     }
 
-    /// Record every msg-id in a routed publish. `false` = duplicate, reject.
+    /// Every msg-id a routed publish carries, admitted or none of them.
     ///
-    /// All-or-nothing, matching the local path: the first duplicate rolls
-    /// back the ids already recorded for this command, so a rejected batch
-    /// leaves the tracker exactly as it found it and a retry behaves the
-    /// same way the first attempt would have.
+    /// The ids are already in the payloads: a dedup-bearing entry is stored
+    /// as an `ExtendedPayload` with `HDR_MSG_ID`, which is where restart
+    /// recovery reads them from too.
     fn dedup_routed(&mut self, cmd: &crate::shard::command::PublishCmd) -> bool {
         use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
         use zerocopy::FromBytes;
 
-        let Some(map) = crate::shard::local::idempotency(self.shard_id) else {
+        let Some(window) = crate::shard::dedup::Dedup::open(
+            crate::shard::local::idempotency(self.shard_id),
+            cmd.stream_id,
+            cmd.dedup_window_ms,
+        ) else {
             return true;
         };
-        let stream_id = cmd.stream_id;
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&map, stream_id);
-        let mut tracker = tracker_arc.borrow_mut();
 
-        let mut inserted: smallvec::SmallVec<[(u64, &[u8]); 16]> = smallvec::SmallVec::new();
-        let mut duplicate = false;
-        for e in &cmd.entries {
+        window.admit_all(cmd.entries.iter().filter_map(|e| {
             if e.flags & arbitro_store::flags::HAS_HEADERS == 0 {
-                continue;
+                return None;
             }
-            let Ok(ext) = ExtendedPayload::ref_from_bytes(&e.payload) else {
-                continue;
-            };
-            let msg_id = match ext.headers_block().and_then(|h| h.get(HDR_MSG_ID)) {
-                Some(id) if !id.is_empty() => id,
-                _ => continue,
-            };
-            let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
-            if !tracker.record(stream_id, hash, msg_id, cmd.dedup_window_ms) {
-                duplicate = true;
-                break;
-            }
-            inserted.push((hash, msg_id));
-        }
-        if duplicate {
-            for (hash, id) in &inserted {
-                tracker.forget(stream_id, *hash, id);
-            }
-            return false;
-        }
-        true
+            ExtendedPayload::ref_from_bytes(&e.payload)
+                .ok()?
+                .headers_block()?
+                .get(HDR_MSG_ID)
+                .filter(|id| !id.is_empty())
+        }))
     }
 
     /// Record one msg-id for a caller that cannot reach this thread's tracker.
@@ -165,17 +148,17 @@ impl CommandWorker {
         &mut self,
         cmd: crate::shard::command::RecordDedupCmd,
     ) {
-        let Some(map) = crate::shard::local::idempotency(self.shard_id) else {
-            let _ = cmd.reply.send(true);
-            return;
-        };
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&map, cmd.stream_id);
-        let fresh = tracker_arc.borrow_mut().record(
+        let fresh = match crate::shard::dedup::Dedup::open(
+            crate::shard::local::idempotency(self.shard_id),
             cmd.stream_id,
-            cmd.hash,
-            &cmd.msg_id,
             cmd.window_ms,
-        );
+        ) {
+            Some(window) => window.admit(&cmd.msg_id),
+            // No window here means dedup is off for this shard; answering
+            // "not a duplicate" keeps that what it has always been rather
+            // than rejecting a publish because a check could not run.
+            None => true,
+        };
         let _ = cmd.reply.send(fresh);
     }
 
