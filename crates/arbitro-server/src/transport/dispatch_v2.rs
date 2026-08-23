@@ -341,18 +341,12 @@ async fn v2_publish(
     // ── Stream quota pre-check (DiscardPolicy::New) ────────────────────
     // If the stream has DiscardPolicy::New (discard == 1) and the store
     // would exceed max_msgs or max_bytes, reject BEFORE appending.
-    if let Some(quota) = cat.stream_quota(seq_stream) {
-        if quota.discard == 1 {
-            let info = server.store_stats(&cat, seq_stream).await;
-            if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
-                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
-                return;
-            }
-            let entry_bytes = (f.subject().len() + f.payload().len()) as u64;
-            if quota.max_bytes > 0 && info.bytes + entry_bytes > quota.max_bytes {
-                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
-                return;
-            }
+    if let Some(quota) = crate::shard::quota::Quota::of(&cat, seq_stream) {
+        let info = server.store_stats(&cat, seq_stream).await;
+        let bytes = (f.subject().len() + f.payload().len()) as u64;
+        if !quota.admits(&info, 1, bytes) {
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
+            return;
         }
     }
 
@@ -612,22 +606,16 @@ async fn v2_publish_batch(
     // that exceeds its quota when the same messages sent one-by-one
     // would be rejected. Bytes are the sum of (subject_len + payload_len)
     // across the batch, mirroring the single-publish accounting.
-    if let Some(quota) = cat.stream_quota(seq_stream) {
-        if quota.discard == 1 {
-            let batch_count = f.body.count.get() as u64;
-            let mut batch_bytes: u64 = 0;
-            for v in f.iter() {
-                batch_bytes += (v.subject().len() + v.payload().len()) as u64;
-            }
-            let info = server.store_stats(&cat, seq_stream).await;
-            if quota.max_msgs > 0 && info.messages + batch_count > quota.max_msgs {
-                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
-                return;
-            }
-            if quota.max_bytes > 0 && info.bytes + batch_bytes > quota.max_bytes {
-                crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
-                return;
-            }
+    if let Some(quota) = crate::shard::quota::Quota::of(&cat, seq_stream) {
+        let count = f.body.count.get() as u64;
+        let mut bytes: u64 = 0;
+        for v in f.iter() {
+            bytes += (v.subject().len() + v.payload().len()) as u64;
+        }
+        let info = server.store_stats(&cat, seq_stream).await;
+        if !quota.admits(&info, count, bytes) {
+            crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
+            return;
         }
     }
 
@@ -864,18 +852,12 @@ async fn v2_publish_delayed(
     // message that passes here may still mature into a store that has
     // since filled up — maturation appends without re-checking
     // (documented in ROBUSTNESS_AUDIT.md).
-    if let Some(quota) = cat.stream_quota(seq_stream) {
-        if quota.discard == 1 {
-            let info = server.store_stats(&cat, seq_stream).await;
-            if quota.max_msgs > 0 && info.messages >= quota.max_msgs {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
-                return;
-            }
-            let entry_bytes = (f.subject().len() + f.payload().len()) as u64;
-            if quota.max_bytes > 0 && info.bytes + entry_bytes > quota.max_bytes {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
-                return;
-            }
+    if let Some(quota) = crate::shard::quota::Quota::of(&cat, seq_stream) {
+        let info = server.store_stats(&cat, seq_stream).await;
+        let bytes = (f.subject().len() + f.payload().len()) as u64;
+        if !quota.admits(&info, 1, bytes) {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
+            return;
         }
     }
 
