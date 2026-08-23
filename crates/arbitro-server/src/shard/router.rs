@@ -358,7 +358,7 @@ impl ShardRouter {
                 registry: registry.clone(),
                 names: Arc::clone(&names),
                 rx: Some(rx),
-                notify_ring: Some(notify_rx),
+                timer_bump: std::sync::Arc::new(tokio::sync::Notify::new()),
                 drain_evt_tx,
                 running: Arc::clone(&running),
                 drain_config_batch_size: config.drain_batch_size,
@@ -732,7 +732,9 @@ impl ShardRouter {
             }
             None => {}
         }
-        if super::local::owns(idx) && self.counters[idx].notifications_settled() {
+        // Nothing to settle: the drain registers a delivery in the cycle
+        // that delivers it, so an ack can never arrive ahead of its pending.
+        if super::local::owns(idx) {
             return crate::shard::commands::CommandPath::Direct(
                 crate::shard::commands::DirectCommands::new(&self.shards[idx]),
             );

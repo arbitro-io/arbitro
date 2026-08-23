@@ -32,18 +32,24 @@ pub enum WheelEntryKind {
 
 /// Entry stored in the timing wheel. 24 bytes, Copy.
 ///
-/// The caller uses `consumer_id` + `seq` to look up whether the entry
-/// is still pending. If already acked, skip (lazy cancel).
+/// `(binding_id, seq)` names the pending delivery exactly. It used to be
+/// `(consumer_id, seq)`, and the difference is a nested search: a pending
+/// entry belongs to a BINDING, one consumer has many, so expiry had to
+/// walk every binding of the consumer probing `is_pending` to find which
+/// one owed the message. The binding is known when the timer is armed —
+/// it was simply thrown away.
+///
+/// `AckTimeout` reads it. `NackDelay` only rewinds a cursor and does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct WheelEntry {
     pub seq: u64,
     pub consumer_id: u32,
     pub subject_hash: u32,
+    pub binding_id: u32,
     pub kind: WheelEntryKind,
 }
-// Size is now 24 (16 + 1 byte tag + 7 bytes alignment padding). Compiler
-// keeps the struct 8-byte aligned because of the u64 seq.
+// Still 24: `binding_id` lands in padding the tag was already wasting.
 const _: () = assert!(core::mem::size_of::<WheelEntry>() == 24);
 
 /// Hashed timing wheel with lazy cancel semantics. Generic over the
@@ -203,6 +209,7 @@ mod tests {
             seq: 100,
             consumer_id: 1,
             subject_hash: 0xAB,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
 
@@ -226,18 +233,21 @@ mod tests {
             seq: 1,
             consumer_id: 10,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
         let e2 = WheelEntry {
             seq: 2,
             consumer_id: 20,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
         let e3 = WheelEntry {
             seq: 3,
             consumer_id: 10,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
 
@@ -260,6 +270,7 @@ mod tests {
             seq: 42,
             consumer_id: 1,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
 
@@ -284,6 +295,7 @@ mod tests {
             seq: 7,
             consumer_id: 1,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
         w.insert(e, 2); // should land in bucket (3+2)%4 = 1
@@ -302,7 +314,8 @@ mod tests {
                 seq: 1,
                 consumer_id: 0,
                 subject_hash: 0,
-                kind: WheelEntryKind::AckTimeout,
+                binding_id: 0,
+            kind: WheelEntryKind::AckTimeout,
             },
             1,
         );
@@ -311,7 +324,8 @@ mod tests {
                 seq: 2,
                 consumer_id: 0,
                 subject_hash: 0,
-                kind: WheelEntryKind::AckTimeout,
+                binding_id: 0,
+            kind: WheelEntryKind::AckTimeout,
             },
             1,
         );
@@ -329,6 +343,7 @@ mod tests {
             seq: 99,
             consumer_id: 5,
             subject_hash: 0,
+            binding_id: 0,
             kind: WheelEntryKind::AckTimeout,
         };
 

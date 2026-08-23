@@ -84,14 +84,16 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
             for ack in entries.iter() {
-                // Named entry: (connection, subscription) is a key, so the
-                // binding comes back in one hash. Nothing else in this arm
-                // can reach a binding the connection does not own.
+                // (connection, subscription) is the key, so a foreign id
+                // misses; consumer_id guards a frame naming its own
+                // subscription while crediting someone else's consumer.
                 if ack.sub_id != 0 {
                     if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
                     {
                         if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                            if binding.stream_id == ack.stream_id {
+                            if binding.stream_id == ack.stream_id
+                                && binding.consumer_id == consumer_id
+                            {
                                 if let Some(pending) = binding.pending.remove(&ack.seq) {
                                     let queue_raw = binding.queue_id.raw();
                                     events.subject_hashes_acked.push((
@@ -109,9 +111,13 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 }
                 // Unnamed entry (`AckBatchReq`, broker-side auto-nack).
                 // Invariant: each entry is matched at most once across bindings.
+                // This arm reaches bindings through the consumer, so the
+                // connection is checked here — nowhere else can.
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                        if binding.stream_id != ack.stream_id {
+                        if binding.stream_id != ack.stream_id
+                            || binding.connection_id != conn_id
+                        {
                             continue;
                         }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {
@@ -147,14 +153,16 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
             let mut matched = 0u64;
             for ack in entries.iter() {
-                // Named entry: (connection, subscription) is a key, so the
-                // binding comes back in one hash. Nothing else in this arm
-                // can reach a binding the connection does not own.
+                // (connection, subscription) is the key, so a foreign id
+                // misses; consumer_id guards a frame naming its own
+                // subscription while crediting someone else's consumer.
                 if ack.sub_id != 0 {
                     if let Some(bid) = ctx.catalog.binding_id_for_subscription(conn_id, ack.sub_id)
                     {
                         if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                            if binding.stream_id == ack.stream_id {
+                            if binding.stream_id == ack.stream_id
+                                && binding.consumer_id == consumer_id
+                            {
                                 if let Some(pending) = binding.pending.remove(&ack.seq) {
                                     let queue_raw = binding.queue_id.raw();
                                     events.subject_hashes_acked.push((
@@ -172,9 +180,13 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 }
                 // Unnamed entry (`AckBatchReq`, broker-side auto-nack).
                 // Invariant: each entry is matched at most once across bindings.
+                // This arm reaches bindings through the consumer, so the
+                // connection is checked here — nowhere else can.
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {
-                        if binding.stream_id != ack.stream_id {
+                        if binding.stream_id != ack.stream_id
+                            || binding.connection_id != conn_id
+                        {
                             continue;
                         }
                         if let Some(pending) = binding.pending.remove(&ack.seq) {

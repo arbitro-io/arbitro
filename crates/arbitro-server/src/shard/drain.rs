@@ -126,6 +126,9 @@ pub(in crate::shard) struct DrainScratch {
     flush_results: Vec<(ConnectionId, FlushOutcome)>,
     /// F12 — persistent buffer for the slow-path notify sort.
     sorted_notify: Vec<PendingNotify>,
+    /// Per-group delivery entries, reused. Was an owned `Vec` built per
+    /// binding per cycle so it could cross a queue that no longer exists.
+    delivered_buf: Vec<DeliveredEntry>,
 
     /// ROB-23 — per-connection stall clock, persistent ACROSS cycles
     /// (never cleared per cycle). An entry `(conn, since)` means
@@ -252,6 +255,7 @@ impl DrainScratch {
             ),
             flush_results: Vec::with_capacity(16),
             sorted_notify: Vec::with_capacity(256),
+            delivered_buf: Vec::with_capacity(256),
             stalled_conns: Vec::with_capacity(4),
         }
     }
@@ -765,24 +769,17 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
         });
     }
 
-    record_deliveries(
-        counters,
-        consumer_subjects,
-        &scratch.deliveries,
-        &flush_results,
-    );
-
-    // Group successful deliveries by binding_id and notify the command
-    // thread once per binding (same shape Command::Delivered expects).
+    // Group by binding and register each group against the engine, in this
+    // same cycle. There is no notification and nothing to catch up on.
     if !scratch.deliveries.is_empty() {
         notify_delivered_grouped(
-            notify_tx,
             counters,
+            consumer_subjects,
             &snap.bindings,
             &scratch.deliveries,
             &flush_results,
             &mut scratch.sorted_notify,
-            silent_drops,
+            &mut scratch.delivered_buf,
         );
     }
     // Return the persistent flush buffer for the next cycle.
@@ -796,24 +793,51 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
 
 // ── Drain-deliver tail components ───────────────────────────────────────────
 
-/// Bookkeeping for frames that flushed `Ok`: shared inflight, drain-owned
-/// per-(consumer, subject) inflight, and delivery-memory suppression — a
-/// re-walk must not re-send an in-flight seq until the command thread
-/// releases it (ack absorbs into the floor; nack/timeout/retirement re-arm).
+/// Write what went on the wire into the pending map, and count it.
+///
+/// This used to be two passes with a queue between them: the drain
+/// incremented its counters blindly and pushed a `Delivered` notification,
+/// and the command worker applied it later — after which someone had to
+/// work out which of those increments were wrong and reverse them, and
+/// whether the binding had died in between.
+///
+/// There is no in between now. `register_delivered` filters `entries` down
+/// to what it actually registered, so the counters below move for those and
+/// only those. A binding that vanished registers nothing and is counted as
+/// nothing, instead of being counted and then unwound.
 #[inline]
-fn record_deliveries(
+fn commit_deliveries(
     counters: &SharedCounters,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
-    deliveries: &[PendingNotify],
-    flush_results: &[(ConnectionId, FlushOutcome)],
+    binding: &ActiveBinding,
+    group: &[PendingNotify],
+    entries: &mut Vec<DeliveredEntry>,
 ) {
-    for d in deliveries {
-        if frame_ok_for(flush_results, d.conn) {
-            counters.inc_inflight(d.consumer_id, d.queue_id);
-            let cs = consumer_subjects_slot_mut(consumer_subjects, d.consumer_id);
-            cs.inc(d.subject_hash);
-            cs.suppress(d.seq);
-        }
+    entries.clear();
+    entries.extend(group.iter().map(|d| DeliveredEntry {
+        seq: d.seq,
+        subject_hash: d.subject_hash,
+        _pad: 0,
+    }));
+
+    // The worker is parked whenever the drain runs — every command handler
+    // is synchronous, so it is either published here or executing, and it
+    // cannot be executing while this is.
+    let reached = crate::shard::local::with_worker(
+        |w: &mut crate::shard::CommandWorker| w.register_delivered(binding.binding_id, entries),
+    );
+    if reached.is_none() {
+        // No worker on this thread means no engine to register against.
+        // Counting a delivery nobody recorded is what strands a seq.
+        entries.clear();
+        return;
+    }
+
+    for e in entries.iter() {
+        counters.inc_inflight(binding.consumer_id.0, binding.queue_id.0);
+        let cs = consumer_subjects_slot_mut(consumer_subjects, binding.consumer_id.0);
+        cs.inc(e.subject_hash);
+        cs.suppress(e.seq);
     }
 }
 
@@ -857,20 +881,18 @@ fn report_dead_connections(
     counters: &SharedCounters,
     silent_drops: &crate::common::SilentDrops,
 ) {
-    for conn_id in dead.drain(..) {
-        // Counted BEFORE the error branch so the count reflects what
-        // actually entered the ring — an uncounted push is a direct ack
-        // acting on a stale pending list, which shows up as a duplicate
-        // delivery and nothing else.
-        let pushed = notify_tx
-            .try_send(DrainNotification::ConnectionDead(conn_id));
-        if pushed.is_ok() {
-            counters.notif_pushed();
-        }
-        if pushed.is_err() {
-            silent_drops.inc_notify_ring();
-        }
-    }
+    // Retired here, not announced. A queue in the middle only bought a
+    // window in which the connection was dead and the engine did not know.
+    //
+    // KEPT when there is no worker to retire it against, never dropped: a
+    // connection that is dead in the drain's book and alive in the engine's
+    // holds its pendings forever. Retried next cycle.
+    dead.retain(|&conn_id| {
+        crate::shard::local::with_worker(|w: &mut crate::shard::CommandWorker| {
+            w.retire_connection(conn_id)
+        })
+        .is_none()
+    });
 }
 
 /// INVARIANT: only ever RE-OPEN the gate here — clearing is owned by the
@@ -1334,13 +1356,13 @@ fn dispatch_recipients(
 /// truth for ack-matching.
 #[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
-    notify_tx: &mut crate::shard::shared::NotifyProducer,
     counters: &SharedCounters,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
     flush_results: &[(ConnectionId, FlushOutcome)],
     sorted_buf: &mut Vec<PendingNotify>,
-    silent_drops: &crate::common::SilentDrops,
+    entries_buf: &mut Vec<DeliveredEntry>,
 ) {
     // F11: replace the per-cycle HashMap<conn, bool> with a linear scan
     // over `flush_results` (typically 1–8 entries). Cache locality wins.
@@ -1360,30 +1382,13 @@ fn notify_delivered_grouped(
         if deliveries.iter().all(|d| d.binding_idx == first_idx)
             && deliveries.iter().all(|d| frame_ok(d.conn))
         {
-            let binding = &bindings[first_idx];
-            // The notify ring transfers ownership across threads — the
-            // entries Vec must be owned. Build it once via collect.
-            let entries: Vec<DeliveredEntry> = deliveries
-                .iter()
-                .map(|d| DeliveredEntry {
-                    seq: d.seq,
-                    subject_hash: d.subject_hash,
-                    _pad: 0,
-                })
-                .collect();
-            if notify_tx
-                .try_send(DrainNotification::Delivered {
-                    binding_id: binding.binding_id,
-                    consumer_id: binding.consumer_id,
-                    queue_id: binding.queue_id,
-                    entries,
-                })
-                .is_err()
-            {
-                silent_drops.inc_notify_ring();
-            } else {
-                counters.notif_pushed();
-            }
+            commit_deliveries(
+                counters,
+                consumer_subjects,
+                &bindings[first_idx],
+                deliveries,
+                entries_buf,
+            );
             return;
         }
     }
@@ -1441,28 +1446,13 @@ fn notify_delivered_grouped(
         if start == end {
             continue;
         }
-        let entries: Vec<DeliveredEntry> = placed[start..end]
-            .iter()
-            .map(|p| DeliveredEntry {
-                seq: p.seq,
-                subject_hash: p.subject_hash,
-                _pad: 0,
-            })
-            .collect();
-        let binding = &bindings[idx];
-        if notify_tx
-            .try_send(DrainNotification::Delivered {
-                binding_id: binding.binding_id,
-                consumer_id: binding.consumer_id,
-                queue_id: binding.queue_id,
-                entries,
-            })
-            .is_err()
-        {
-            silent_drops.inc_notify_ring();
-        } else {
-            counters.notif_pushed();
-        }
+        commit_deliveries(
+            counters,
+            consumer_subjects,
+            &bindings[idx],
+            &placed[start..end],
+            entries_buf,
+        );
     }
 }
 
@@ -1658,12 +1648,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(40));
         run_cycle(&mut scratch, &mut consumer_subjects, &mut notify_tx);
         assert_eq!(counters.cursor(), 9, "cursor still pinned this cycle");
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Some(DrainNotification::ConnectionDead(ConnectionId(7)))
-            ),
-            "stalled conn must be reported dead after the eviction window",
+        // Retirement goes straight to the engine now. This test installs no
+        // worker, so the id must still be QUEUED rather than dropped —
+        // dropping it would leave the connection dead here and alive there,
+        // holding its pendings forever.
+        assert_eq!(
+            scratch.dead_connections.as_slice(),
+            &[ConnectionId(7)],
+            "stalled conn must be held for retirement after the eviction window",
         );
         assert!(gate.is_open(), "more_pending must re-open the gate");
     }

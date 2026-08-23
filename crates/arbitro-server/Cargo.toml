@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "group_shape"
 harness = false
+
+[[bench]]
+name = "owned_shape"
+harness = false

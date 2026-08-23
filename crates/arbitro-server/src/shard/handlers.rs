@@ -11,48 +11,7 @@ use crate::shard::command::*;
 use crate::shard::worker::{rewind_released, ActiveBinding, CommandWorker};
 
 impl CommandWorker {
-    /// Tenant isolation for an ack/nack batch: may `conn` release these
-    /// entries on `consumer_id`?
-    ///
-    /// For an entry that names its subscription, isolation IS the lookup —
-    /// the index is keyed by (connection, subscription), so an id belonging
-    /// to someone else's connection MISSES instead of resolving to a
-    /// stranger's binding and being rejected afterwards. The id is
-    /// client-authored, so the connection has to be in the key, not in a
-    /// check that follows it. Every named entry must resolve: one foreign id
-    /// rejects the whole batch rather than letting a later valid entry
-    /// vouch for it.
-    ///
-    /// Entries that name no subscription (`AckBatchReq`'s bare seqs, nacks —
-    /// `NackAction` spends its spare word on `delay_ms`) can only be checked
-    /// at consumer granularity, which is the coarser `(conn, consumer)`
-    /// index. Still one hash, no walk over the shard's bindings.
-    #[inline]
-    fn connection_owns(
-        &self,
-        conn: ConnectionId,
-        consumer_id: ConsumerId,
-        entries: &[AckEntry],
-    ) -> bool {
-        let catalog = &self.engine.ctx().catalog;
-        let mut named = false;
-        for entry in entries {
-            if entry.sub_id == 0 {
-                continue;
-            }
-
-            named = true;
-
-            let hit = catalog
-                .binding_for_subscription(conn, entry.sub_id)
-                .is_some_and(|b| b.consumer_id == consumer_id);
-
-            if !hit {
-                return false;
-            }
-        }
-        named || catalog.connection_owns_consumer(conn, consumer_id)
-    }
+    // Ack/nack tenant isolation lives in the engine's own walk, not here.
 
     // ── Hot path — publish ──────────────────────────────────────────────
 
@@ -89,25 +48,45 @@ impl CommandWorker {
             return;
         }
 
-        let refs: Vec<arbitro_store::EntryRef<'_>> = cmd
-            .entries
-            .iter()
-            .map(|e| arbitro_store::EntryRef {
-                stream_id: cmd.stream_id.raw(),
-                subject: &e.subject,
-                payload: &e.payload,
-                flags: e.flags,
-                deliver_at_ms: e.deliver_at_ms,
-            })
-            .collect();
-
         use crate::sink::StreamSink;
         // This worker IS the shard's thread, so it takes the same lock-free
         // door a local connection takes — the routed path exists to move
         // the work here, not to give it a second way in.
-        let first = crate::sink::LocalSink::new(self.shard_id, &self.gate)
-            .publish(&refs, cmd.now_ms)
-            .ok();
+        let sink = crate::sink::LocalSink::new(self.shard_id, &self.gate);
+        let stream_id = cmd.stream_id.raw();
+
+        // One entry IS the shape of a routed publish. It gets a stack array
+        // and no collection of any kind — no `Vec`, no iterator, no
+        // `collect`. Only a real batch builds the slice the store asks for.
+        let first = match cmd.entries.as_slice() {
+            [] => None,
+            [only] => sink
+                .publish(
+                    &[arbitro_store::EntryRef {
+                        stream_id,
+                        subject: &only.subject,
+                        payload: &only.payload,
+                        flags: only.flags,
+                        deliver_at_ms: only.deliver_at_ms,
+                    }],
+                    cmd.now_ms,
+                )
+                .ok(),
+            many => {
+                let mut refs: smallvec::SmallVec<[arbitro_store::EntryRef<'_>; 16]> =
+                    smallvec::SmallVec::with_capacity(many.len());
+                for e in many {
+                    refs.push(arbitro_store::EntryRef {
+                        stream_id,
+                        subject: &e.subject,
+                        payload: &e.payload,
+                        flags: e.flags,
+                        deliver_at_ms: e.deliver_at_ms,
+                    });
+                }
+                sink.publish(&refs, cmd.now_ms).ok()
+            }
+        };
 
         // Answer the client from HERE. Sending the sequence back to the
         // publisher to forward would make it wait, which is exactly what
@@ -351,69 +330,22 @@ impl CommandWorker {
         crate::lifecycle_trace!("a10_acker_enter", 0, cmd.entries.len() as u64, "shard");
 
         let conn = ConnectionId(cmd.conn_id);
-        if !self.connection_owns(conn, cmd.consumer_id, &cmd.entries) {
+        // One slab lookup: rejects the unknown consumer and yields queue_id.
+        let Some(consumer) = self.engine.consumer(cmd.consumer_id) else {
             cmd.answer(AckReply {
                 accepted: 0,
                 rejected: cmd.entries.len() as u32,
             });
             return;
-        }
+        };
+        let queue_id = consumer.queue_id;
 
-        // Process pending drain notifications first so pending list is current.
-        self.drain_notifications();
-
-        // Temporal-isolation floor: advance the consumer's contiguous-
-        // acked floor with the entries that will actually match a
-        // pending delivery — the engine's exact ack criterion, checked
-        // BEFORE `Command::Ack` removes them from `pending`. Feeding raw
-        // client seqs instead would let a bogus/double ack advance the
-        // floor past an owed (undelivered or nacked) seq and lose it.
-        // The updated floor rides the `DrainEvent::Ack` events emitted
-        // in `apply_delta_and_sync` below. See `shard/ack_floor.rs`.
-        {
-            let catalog = &self.engine.ctx().catalog;
-            let floors = &mut self.ack_floors;
-            for entry in &cmd.entries {
-                // Named acks reach their binding in one hash — the gate above
-                // already proved the pair resolves to this consumer.
-                if entry.sub_id != 0 {
-                    if let Some(b) = catalog.binding_for_subscription(conn, entry.sub_id) {
-                        if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
-                            floors.record_acked(cmd.consumer_id.0, entry.seq);
-                        }
-                    }
-                    continue;
-                }
-                for &bid in catalog.bindings_for_consumer(cmd.consumer_id) {
-                    if let Some(b) = catalog.binding(bid) {
-                        if b.stream_id == entry.stream_id && b.pending.contains_key(&entry.seq) {
-                            floors.record_acked(cmd.consumer_id.0, entry.seq);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
+        // The one pass over the entries; floor, DLQ and cursor derive from it.
         let delta = self.engine.execute(&Command::Ack {
             conn_id: conn,
             consumer_id: cmd.consumer_id,
             entries: &cmd.entries,
         });
-
-        // Clear DLQ nack counts for acked entries.
-        for entry in &cmd.entries {
-            self.dlq_nack_counts.remove(&(cmd.consumer_id.0, entry.seq));
-        }
-
-        // Persist consumer cursor: track the highest acked seq so
-        // reconnecting consumers can resume from where they left off.
-        if let Some(max_seq) = cmd.entries.iter().map(|e| e.seq).max() {
-            let cur = self.names.consumer_cursor(cmd.consumer_id).unwrap_or(0);
-            if max_seq > cur {
-                self.names.set_consumer_cursor(cmd.consumer_id, max_seq);
-            }
-        }
 
         // A4: decrement the shared atomics by what the engine actually
         // matched against pending — one `subject_hashes_acked` event is
@@ -425,19 +357,11 @@ impl CommandWorker {
         let accepted = cmd.entries.len() as u32;
         crate::lifecycle_trace!("a12_engine_ack_done", 0, accepted as u64, "shard");
 
-        // Decrement atomic inflight counters.
-        // The engine already decremented its internal counters via execute().
-        // Now sync the shared atomics so drain sees freed capacity.
-        if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
-            let queue_id = consumer.queue_id;
-            if matched > 0 {
-                self.counters
-                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
-            }
-        }
         // Subject inflight decremented by apply_delta_and_sync below.
-
         if matched > 0 {
+            self.counters
+                .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
+
             // Release gate so drain re-checks from current cursor.
             // Cursor already stopped at lowest_skipped in the drain cycle,
             // so freed capacity will be used on the next cycle.
@@ -446,11 +370,16 @@ impl CommandWorker {
             crate::lifecycle_trace!("a13_acker_gate_released", 0, 0, "shard");
         }
 
-        // Handle delta (demand changes, binding retirements).
-        // `true`: this delta comes from `Command::Ack` — every released
-        // seq was genuinely acked and enters the drain's redelivery-
-        // suppression set (see `drain_events::SuppressOp::Acked`).
-        self.apply_delta_and_sync(&delta, true);
+        // `true`: acked seqs enter the drain's redelivery-suppression set.
+        let high_water = self.apply_delta_and_sync(&delta, true);
+
+        // Resume point, from what MATCHED — a bogus seq must not advance it.
+        if let Some(max_seq) = high_water {
+            let cur = self.names.consumer_cursor(cmd.consumer_id).unwrap_or(0);
+            if max_seq > cur {
+                self.names.set_consumer_cursor(cmd.consumer_id, max_seq);
+            }
+        }
 
         cmd.answer(AckReply {
             accepted,
@@ -461,13 +390,15 @@ impl CommandWorker {
 
     pub(in crate::shard) fn handle_nack(&mut self, mut cmd: NackCmd) {
         let conn = ConnectionId(cmd.conn_id);
-        if !self.connection_owns(conn, cmd.consumer_id, &cmd.entries) {
+        // One slab lookup: rejects the unknown consumer and yields queue_id.
+        let Some(consumer) = self.engine.consumer(cmd.consumer_id) else {
             cmd.answer(NackReply {
                 requeued: 0,
                 not_found: cmd.entries.len() as u32,
             });
             return;
-        }
+        };
+        let queue_id = consumer.queue_id;
 
         // ── DLQ check ──────────────────────────────────────────────────
         // If the consumer has max_nack > 0, track per-(consumer, seq)
@@ -535,8 +466,6 @@ impl CommandWorker {
             cmd
         };
 
-        // Process pending drain notifications first.
-        self.drain_notifications();
 
         if cmd.delay_ms > 0 {
             // ── Delayed nack: insert into timing wheel, don't rewind yet ──
@@ -554,12 +483,9 @@ impl CommandWorker {
             // `subject_hashes_acked` event per pending entry actually
             // released), never blindly by request size — see handle_ack.
             let matched = delta.subject_hashes_acked.len() as u32;
-            if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
-                let queue_id = consumer.queue_id;
-                if matched > 0 {
-                    self.counters
-                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
-                }
+            if matched > 0 {
+                self.counters
+                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
             }
 
             self.apply_delta_and_sync(&delta, false);
@@ -579,6 +505,7 @@ impl CommandWorker {
                         seq: entry.seq,
                         consumer_id: cmd.consumer_id.0,
                         subject_hash: 0, // not needed for nack-delay rewind
+                        binding_id: 0,   // NackDelay only rewinds; never read
                         kind: arbitro_common::WheelEntryKind::NackDelay,
                     },
                     deadline_ms,
@@ -609,12 +536,9 @@ impl CommandWorker {
             // `subject_hashes_acked` event per pending entry actually
             // released), never blindly by request size — see handle_ack.
             let matched = delta.subject_hashes_acked.len() as u32;
-            if let Some(consumer) = self.engine.consumer(cmd.consumer_id) {
-                let queue_id = consumer.queue_id;
-                if matched > 0 {
-                    self.counters
-                        .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
-                }
+            if matched > 0 {
+                self.counters
+                    .dec_inflight_bulk(cmd.consumer_id.0, queue_id.0, matched);
             }
 
             self.apply_delta_and_sync(&delta, false);
@@ -977,8 +901,6 @@ impl CommandWorker {
         // case on the mainline retirement path; deliveries that land in
         // the notify ring after this point (the drain can be mid-cycle)
         // are caught by the retired-binding reversal in
-        // `handle_notification`.
-        self.drain_notifications();
 
         // Decrement demand for all bindings of this connection.
         let conn_bindings: Vec<_> = self
