@@ -717,6 +717,12 @@ impl CommandWorker {
                 }
             }
 
+            // Armed only when some stream has an age to expire. Without
+            // this the arm woke every shard every 5s forever, to call a
+            // function whose first line is "nothing has max_age, return" —
+            // measured as idle shards reporting `wake:evict` at ~4950ms
+            // intervals, on every shard, for the life of the process.
+            let evict_armed = me.stream_retention.values().any(|r| r.max_age_ms > 0);
             // Check if eviction is due.
             let eviction_sleep = me
                 .next_eviction
@@ -751,7 +757,7 @@ impl CommandWorker {
                 // A deadline armed while parked. Nothing to handle — the
                 // top of the loop recomputes the sleep.
                 _ = bump.notified() => Woke::Rearm,
-                _ = tokio::time::sleep(eviction_sleep) => Woke::Evict,
+                _ = tokio::time::sleep(eviction_sleep), if evict_armed => Woke::Evict,
                 _ = tokio::time::sleep(timer_sleep), if timers_armed => Woke::Timers,
             };
 
