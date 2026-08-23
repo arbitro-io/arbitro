@@ -7,7 +7,7 @@
 //! paused state, match tables, or ack bookkeeping. All of that is the
 //! drain's responsibility and already has working mechanisms elsewhere
 //! (`engine::inflight::InFlightCounters`, `catalog::Binding.pending`,
-//! `DrainNotification::Delivered` → `Command::Delivered`).
+//! the drain registers directly through `Command::Delivered`).
 //!
 //! Lifecycle per drain cycle:
 //!

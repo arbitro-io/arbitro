@@ -29,7 +29,7 @@ use crate::common::Gate;
 use crate::shard::accumulator::Accumulator;
 use crate::shard::consumer_subjects::ConsumerSubjects;
 use crate::shard::drain_probe::DrainProbe;
-use crate::shard::shared::{find_writer, DrainNotification, DrainSnapshot, SharedCounters};
+use crate::shard::shared::{find_writer, DrainSnapshot, SharedCounters};
 use crate::shard::worker::{consumer_subjects_slot, consumer_subjects_slot_mut, ActiveBinding};
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -51,10 +51,9 @@ pub(in crate::shard) struct DrainConfig {
 /// Per-entry metadata captured for ack-mode deliveries. Lives in
 /// `DrainScratch.deliveries` alongside the wire bytes held by the
 /// `Accumulator`. After a frame flushes successfully, the matching
-/// records bump the `SharedCounters` atomics and feed
-/// `DrainNotification::Delivered` to the command thread, which owns
-/// `Binding.pending` and `InFlightCounters`. Fire-and-forget never
-/// pushes here — no ack will ever arrive.
+/// records register the pending against the engine in this same cycle
+/// and then bump the counters for what was actually registered.
+/// Fire-and-forget never pushes here — no ack will ever arrive.
 #[allow(dead_code)] // `stream` kept for diagnostics
 #[derive(Clone, Copy)]
 struct PendingNotify {
@@ -1349,11 +1348,10 @@ fn dispatch_recipients(
 
 /// After the accumulator flushed this cycle's frames, walk the
 /// per-entry `deliveries` list, keep only the ones whose (conn, stream)
-/// frame succeeded, group them by `binding_idx`, and emit one
-/// `DrainNotification::Delivered` per binding. The command thread then
-/// turns each of those into a `Command::Delivered` which updates
-/// `Binding.pending` and `InFlightCounters` — the single source of
-/// truth for ack-matching.
+/// frame succeeded, group them by `binding_idx`, and register each group
+/// against `Binding.pending` — the single source of truth for
+/// ack-matching — in this same cycle. Nothing is announced and nothing
+/// is deferred, so no ack can arrive ahead of its own pending.
 #[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
     counters: &SharedCounters,

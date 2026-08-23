@@ -1868,7 +1868,6 @@ async fn metrics_loop(
         // H10: per-tick silent-drop deltas.
         let drops_now = silent_drops.snapshot();
         let drop_conn_write = drops_now.conn_write.saturating_sub(prev_drops.conn_write);
-        let drop_notify_ring = drops_now.notify_ring.saturating_sub(prev_drops.notify_ring);
         let drop_drain_evt = drops_now.drain_evt.saturating_sub(prev_drops.drain_evt);
         prev_drops = drops_now;
 
@@ -1904,7 +1903,6 @@ async fn metrics_loop(
                 .saturating_sub(prev.claim_skipped_subject_limit),
             // H10: silent drops at the conn-write / drain-event / notify-ring sites.
             drop_conn_write = drop_conn_write,
-            drop_notify_ring = drop_notify_ring,
             drop_drain_evt = drop_drain_evt,
             "metrics",
         );
@@ -2106,16 +2104,6 @@ async fn build_prometheus_text(server: &ShardRouter, registry: &ConnectionRegist
     let _ = writeln!(out, "# TYPE arbitro_silent_drops_conn_write counter");
     let _ = writeln!(out, "arbitro_silent_drops_conn_write {}", drops.conn_write);
 
-    let _ = writeln!(
-        out,
-        "# HELP arbitro_silent_drops_notify_ring Drain notify-ring drops."
-    );
-    let _ = writeln!(out, "# TYPE arbitro_silent_drops_notify_ring counter");
-    let _ = writeln!(
-        out,
-        "arbitro_silent_drops_notify_ring {}",
-        drops.notify_ring
-    );
 
     let _ = writeln!(
         out,
@@ -2187,7 +2175,7 @@ async fn build_diagnostic_dump(server: &ShardRouter, registry: &ConnectionRegist
          \"claim_entries_delivered\":{dl},\
          \"ack_accepted\":{ak},\"ack_not_found\":{anf},\
          \"nack_accepted\":{nk},\"nack_not_found\":{nnf},\
-         \"silent_drops\":{{\"conn_write\":{cw},\"notify_ring\":{nr},\"drain_evt\":{de}}},\
+         \"silent_drops\":{{\"conn_write\":{cw},\"drain_evt\":{de}}},\
          \"per_stream\":[{ps}]}}",
         pid = std::process::id(),
         ts = std::time::SystemTime::now()
@@ -2206,7 +2194,6 @@ async fn build_diagnostic_dump(server: &ShardRouter, registry: &ConnectionRegist
         nk = acc.nack_accepted,
         nnf = acc.nack_not_found,
         cw = drops.conn_write,
-        nr = drops.notify_ring,
         de = drops.drain_evt,
         ps = per_stream,
     )

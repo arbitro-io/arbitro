@@ -17,9 +17,6 @@ pub struct SilentDrops {
     /// Bumped when `ConnectionRegistry::enqueue` saw a full
     /// per-connection mpsc and dropped the outbound frame.
     pub conn_write: AtomicU64,
-    /// Bumped when the drain → command notification ring was full and
-    /// the producer (drain thread) had to drop the notification.
-    pub notify_ring: AtomicU64,
     /// Bumped when the command → drain event ring was full and the
     /// producer (command worker) had to drop the event.
     pub drain_evt: AtomicU64,
@@ -36,10 +33,6 @@ impl SilentDrops {
     }
 
     #[inline]
-    pub fn inc_notify_ring(&self) {
-        self.notify_ring.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline]
     pub fn inc_drain_evt(&self) {
         self.drain_evt.fetch_add(1, Ordering::Relaxed);
@@ -50,7 +43,6 @@ impl SilentDrops {
     pub fn snapshot(&self) -> SilentDropsSnapshot {
         SilentDropsSnapshot {
             conn_write: self.conn_write.load(Ordering::Relaxed),
-            notify_ring: self.notify_ring.load(Ordering::Relaxed),
             drain_evt: self.drain_evt.load(Ordering::Relaxed),
         }
     }
@@ -59,6 +51,5 @@ impl SilentDrops {
 #[derive(Default, Clone, Copy)]
 pub struct SilentDropsSnapshot {
     pub conn_write: u64,
-    pub notify_ring: u64,
     pub drain_evt: u64,
 }

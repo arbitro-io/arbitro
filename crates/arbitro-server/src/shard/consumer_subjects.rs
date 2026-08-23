@@ -1,6 +1,7 @@
 //! ConsumerSubjects — per-consumer subject inflight tracker.
 //!
-//! Owned by the drain OS thread; mutated only on the drain thread. The
+//! Owned by the drain task; mutated only there. There is no drain THREAD —
+//! the drain and the command worker are tasks on one runtime. The
 //! command thread sends decrement events via `DrainEvent::Ack` through the
 //! drain-event ring (`drain_events.rs`), so neither atomics nor locks are
 //! needed on the hot path.

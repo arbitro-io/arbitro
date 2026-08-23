@@ -697,21 +697,16 @@ impl ShardRouter {
 
     /// Which door this caller uses for commands against `stream_id`.
     ///
-    /// `Local` requires TWO things, and the second is the subtle one:
+    /// One condition now: does this thread own the shard. It used to be
+    /// two — the second was "and no drain notifications are waiting",
+    /// because an ack that ran ahead of an unapplied delivery matched
+    /// nothing and the message came back on `ack_wait` as a duplicate the
+    /// client did nothing to earn. Every ack arriving while anything was
+    /// owed was demoted to the queue for that reason.
     ///
-    /// 1. This thread owns the shard, so the state is reachable at all.
-    /// 2. No drain notifications are waiting to be applied.
-    ///
-    /// (2) matters because `handle_ack` refreshes the pending list from the
-    /// notification ring before releasing, and a direct caller cannot touch
-    /// that ring — the run loop holds it across its await. Acking against a
-    /// stale pending list would not find the entry, reject it, and have the
-    /// message redelivered later: no error, no loss, but a duplicate the
-    /// client did nothing to earn. So when anything is owed, this routes
-    /// instead, and the worker applies the notifications on its own wake.
-    ///
-    /// The check is one relaxed atomic load, and the ring is empty in the
-    /// ordinary case.
+    /// The drain registers a delivery in the cycle that delivers it, so
+    /// there is nothing to be owed and nothing to wait for. The condition
+    /// did not get cheaper; the state it guarded stopped existing.
     pub fn commands_for(&self, stream_id: StreamId) -> crate::shard::commands::CommandPath<'_> {
         let idx = self.shard_index(stream_id, self.shard_count);
         // `ARBITRO_COMMAND_PATH` forces one wiring, for measuring them

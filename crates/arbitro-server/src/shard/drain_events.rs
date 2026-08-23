@@ -1,7 +1,7 @@
 //! Drain-event ring — SPSC `command → drain` channel.
 //!
 //! The command thread (tokio task that owns the engine) emits events that
-//! mutate per-consumer drain-side state. The drain OS thread consumes
+//! mutate per-consumer drain-side state. The drain TASK consumes
 //! them at the start of each drain cycle via non-blocking `try_recv`,
 //! then re-evaluates delivery capacity.
 //!
