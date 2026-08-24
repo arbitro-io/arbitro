@@ -33,39 +33,48 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             m.claim_entries_delivered
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
-            // Get binding metadata before mutating.
-            let meta = ctx
-                .catalog
-                .binding(binding_id)
-                .map(|b| (b.consumer_id.raw(), b.queue_id.raw(), b.fire_and_forget));
+            // ONE probe of `bindings`. It used to resolve the binding
+            // twice — `binding()` for the metadata, then `binding_mut()`
+            // to mutate — hashing the same id on every command.
+            //
+            // Borrowed as separate fields so the pending map and the
+            // counters can be held at once; they are independent state
+            // that only shares an owner.
+            let EngineContext {
+                catalog, inflight, ..
+            } = ctx;
 
-            if let Some((consumer_raw, queue_raw, fire_and_forget)) = meta {
+            if let Some(binding) = catalog.binding_mut(binding_id) {
                 // Fire-and-forget bindings (AckPolicy::None) skip inflight
                 // tracking and pending list — acks never arrive, so the
-                // Vec would grow unbounded (500k × 16B = 8MB) causing
+                // map would grow unbounded (500k × 16B = 8MB) causing
                 // cache pollution and realloc spikes. retire_binding is
                 // a correct no-op when pending is empty and inflight = 0.
-                if !fire_and_forget {
-                    if let Some(binding) = ctx.catalog.binding_mut(binding_id) {
-                        for entry in entries.iter() {
-                            // ROB-12: skip if this seq is already pending on
-                            // this binding — avoids a duplicate entry (and a
-                            // duplicate inflight increment) on redelivery.
-                            if binding.pending.contains_key(&entry.seq) {
-                                continue;
-                            }
-                            binding.pending.insert(
-                                entry.seq,
-                                Pending {
-                                    seq: entry.seq,
-                                    subject_hash: entry.subject_hash,
-                                    deliveries: 1,
-                                    _pad: 0,
-                                },
-                            );
-                            ctx.inflight.inc_pending(consumer_raw, queue_raw);
+                if !binding.fire_and_forget {
+                    let consumer_raw = binding.consumer_id.raw();
+                    let queue_raw = binding.queue_id.raw();
+                    let mut admitted = 0u32;
+                    for entry in entries.iter() {
+                        // ROB-12: a seq already pending on this binding is
+                        // a redelivery — it must not become a second entry
+                        // or a second inflight credit.
+                        //
+                        // `entry()` and not `contains_key()` + `insert()`:
+                        // the pair hashed the same seq twice per entry.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            binding.pending.entry(entry.seq)
+                        {
+                            slot.insert(Pending {
+                                seq: entry.seq,
+                                subject_hash: entry.subject_hash,
+                                deliveries: 1,
+                                _pad: 0,
+                            });
+                            admitted += 1;
                         }
                     }
+                    // Once for the batch, not once per entry.
+                    inflight.inc_pending_by(consumer_raw, queue_raw, admitted);
                 }
             }
         }
@@ -78,10 +87,16 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             m.ack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
-            // F3+F4: SmallVec<[BindingId; 4]> — most consumers have 1-3 bindings,
-            // avoids a heap alloc per ack batch.
-            let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
-                smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+            // Built on FIRST need, not up front. A batch whose entries all
+            // name their subscription never reaches the unnamed arm, and
+            // this was a hash probe plus a copy paid for nothing on every
+            // such batch — which is the common shape.
+            //
+            // SmallVec<[BindingId; 4]>: most consumers have 1-3 bindings,
+            // so even when it is needed there is no heap allocation.
+            let mut binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
+                smallvec::SmallVec::new();
+            let mut have_binding_ids = false;
             let mut matched = 0u64;
             for ack in entries.iter() {
                 // (connection, subscription) is the key, so a foreign id
@@ -113,6 +128,11 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // Invariant: each entry is matched at most once across bindings.
                 // This arm reaches bindings through the consumer, so the
                 // connection is checked here — nowhere else can.
+                if !have_binding_ids {
+                    binding_ids =
+                        smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+                    have_binding_ids = true;
+                }
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {
                         if binding.stream_id != ack.stream_id
@@ -148,9 +168,11 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
             m.nack_accepted
                 .fetch_add(entries.len() as u64, Ordering::Relaxed);
 
-            // Release inflight — redelivery handled by drain.
-            let binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
-                smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+            // Release inflight — redelivery handled by drain. Built on
+            // first need; see the Ack arm.
+            let mut binding_ids: smallvec::SmallVec<[crate::types::BindingId; 4]> =
+                smallvec::SmallVec::new();
+            let mut have_binding_ids = false;
             let mut matched = 0u64;
             for ack in entries.iter() {
                 // (connection, subscription) is the key, so a foreign id
@@ -182,6 +204,11 @@ pub fn apply(ctx: &mut EngineContext, cmd: &Command<'_>) -> DeltaEvents {
                 // Invariant: each entry is matched at most once across bindings.
                 // This arm reaches bindings through the consumer, so the
                 // connection is checked here — nowhere else can.
+                if !have_binding_ids {
+                    binding_ids =
+                        smallvec::SmallVec::from_slice(ctx.catalog.bindings_for_consumer(consumer_id));
+                    have_binding_ids = true;
+                }
                 for &bid in &binding_ids {
                     if let Some(binding) = ctx.catalog.binding_mut(bid) {
                         if binding.stream_id != ack.stream_id

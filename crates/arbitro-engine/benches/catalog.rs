@@ -410,6 +410,57 @@ fn truth_vs_mirror(c: &mut Criterion) {
     g.finish();
 }
 
+// ── Lookups the teardown walks ──────────────────────────────────────────
+
+/// What it costs to ask a stream for what it owns.
+///
+/// Both used to be full scans -- `consumers_for_stream` over every
+/// consumer, `subscriptions_for_consumer` over every subscription -- which
+/// is what made the cascade quadratic. Measured at two sizes so a scan
+/// cannot hide: an index is flat per element, a scan is not.
+///
+/// `bindings_for_stream` returns a borrowed slice and allocates nothing;
+/// the other two clone their index because the caller mutates while it
+/// iterates. That clone is the honest remaining cost and it is measured
+/// here rather than assumed away.
+fn ownership_lookups(c: &mut Criterion) {
+    let mut g = c.benchmark_group("lookup");
+    for &(consumers, subs) in &[(20u32, 10u32), (100, 10)] {
+        let w = build(consumers, subs, 0);
+        let label = format!("{consumers}c_x{subs}s");
+        let consumer0 = w.consumers[0];
+
+        g.bench_function(BenchmarkId::new("bindings_for_stream", &label), |b| {
+            b.iter(|| black_box(w.engine.ctx().catalog.bindings_for_stream(w.stream).len()))
+        });
+        g.bench_function(BenchmarkId::new("consumers_for_stream", &label), |b| {
+            b.iter(|| black_box(w.engine.ctx().catalog.consumers_for_stream(w.stream)))
+        });
+        g.bench_function(BenchmarkId::new("subscriptions_for_consumer", &label), |b| {
+            b.iter(|| {
+                black_box(
+                    w.engine
+                        .ctx()
+                        .catalog
+                        .subscriptions_for_consumer(consumer0),
+                )
+            })
+        });
+        g.bench_function(BenchmarkId::new("bindings_for_consumer", &label), |b| {
+            b.iter(|| {
+                black_box(
+                    w.engine
+                        .ctx()
+                        .catalog
+                        .bindings_for_consumer(consumer0)
+                        .len(),
+                )
+            })
+        });
+    }
+    g.finish();
+}
+
 // ── Cold admin ──────────────────────────────────────────────────────────
 
 /// The list and snapshot paths. Cold, but they allocate per call and are
@@ -439,5 +490,13 @@ fn admin(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, teardown, setup_cost, hot_path, truth_vs_mirror, admin);
+criterion_group!(
+    benches,
+    teardown,
+    setup_cost,
+    hot_path,
+    truth_vs_mirror,
+    ownership_lookups,
+    admin
+);
 criterion_main!(benches);

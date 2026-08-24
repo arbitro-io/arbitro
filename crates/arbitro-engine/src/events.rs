@@ -29,7 +29,13 @@ pub struct DeltaEvents {
     /// suppression set: an ack keeps the seq suppressed forever, while
     /// a nack/timeout/retirement release removes it so the seq becomes
     /// deliverable again (the server distinguishes by call-site).
-    pub subject_hashes_acked: Vec<(u32, u32, u64)>,
+    ///
+    /// `SmallVec` because this is the one event the HOT path writes: a
+    /// single ack used to cost a heap allocation here, on a path the
+    /// rules budget at zero. Four entries inline covers a single ack and
+    /// a small batch; a 256-entry batch still allocates once, which is
+    /// the right place to pay it.
+    pub subject_hashes_acked: smallvec::SmallVec<[(u32, u32, u64); 4]>,
     /// Inflight credit released by binding retirement, one row per
     /// retired binding: `(consumer_raw, queue_raw, count)`.
     ///

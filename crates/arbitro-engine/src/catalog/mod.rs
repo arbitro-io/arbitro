@@ -214,6 +214,16 @@ pub struct Catalog {
     // Demand counters: streams with ≥1 active binding.
     demand: HashMap<StreamId, u32, foldhash::fast::FixedState>,
 
+    /// Which consumers a stream owns, and which subscriptions a consumer
+    /// owns. Both directions of the teardown cascade.
+    ///
+    /// Without them `consumers_for_stream` scanned every consumer and
+    /// `subscriptions_for_consumer` scanned every subscription — the
+    /// second once per consumer, so deleting a stream was
+    /// O(consumers x subscriptions).
+    consumers_by_stream: HashMap<StreamId, Vec<ConsumerId>, foldhash::fast::FixedState>,
+    subs_by_consumer: HashMap<ConsumerId, Vec<SubscriptionId>, foldhash::fast::FixedState>,
+
     // Per-stream match tables.
     match_tables: Vec<Option<MatchTable>>,
 }
@@ -234,6 +244,8 @@ impl Catalog {
             next_binding_id: 1,
             connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            consumers_by_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            subs_by_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             match_tables: Vec::with_capacity(16),
         }
     }
@@ -382,16 +394,30 @@ impl Catalog {
             max_nack: config.max_nack,
             filter: config.filter,
         });
+        self.consumers_by_stream
+            .entry(config.stream_id)
+            .or_default()
+            .push(config.id);
         Ok(true) // newly created
     }
 
     /// Remove a consumer entity. Does NOT cascade — caller retires
     /// bindings and subscriptions first.
     pub fn remove_consumer_entity(&mut self, id: ConsumerId) -> EngineResult<()> {
-        self.consumers
+        let info = self
+            .consumers
             .get_mut(id.0 as usize)
             .and_then(|s| s.take())
             .ok_or_else(EngineError::consumer_not_found)?;
+        // `None` when a cascade already took the whole list -- see
+        // `take_consumers_for_stream`.
+        if let Some(v) = self.consumers_by_stream.get_mut(&info.stream_id) {
+            v.retain(|c| *c != id);
+            if v.is_empty() {
+                self.consumers_by_stream.remove(&info.stream_id);
+            }
+        }
+        self.subs_by_consumer.remove(&id);
         Ok(())
     }
 
@@ -461,17 +487,12 @@ impl Catalog {
         // the consumer's slice when none is declared and rejects anything
         // reaching outside it. The engine's catalog is sharded and cannot
         // see the whole picture, so admission is decided above it.
-        let filters: Vec<Vec<u8>> = config.filters.clone();
-
-        self.subscriptions.insert(
-            config.id,
-            SubscriptionInfo {
-                stream_id: config.stream_id,
-                consumer_id: config.consumer_id,
-                external_id: config.external_id,
-                filters: filters.clone(),
-            },
-        );
+        //
+        // MOVED, not cloned. `config` is owned, and this used to clone it
+        // into a local and then clone the local into the stored info — the
+        // same bytes allocated twice, four allocations of the seven this
+        // call was measured making.
+        let filters = config.filters;
 
         // Update match table.
         // `binding_idx` is stamped by the server's `rebuild_and_swap_snapshot`
@@ -501,6 +522,22 @@ impl Catalog {
             }
         }
 
+        // Last, so `filters` could be used above by reference and then
+        // handed over whole.
+        self.subscriptions.insert(
+            config.id,
+            SubscriptionInfo {
+                stream_id: config.stream_id,
+                consumer_id: config.consumer_id,
+                external_id: config.external_id,
+                filters,
+            },
+        );
+        self.subs_by_consumer
+            .entry(config.consumer_id)
+            .or_default()
+            .push(config.id);
+
         Ok(())
     }
 
@@ -519,17 +556,33 @@ impl Catalog {
         {
             mt.remove_subscription(id);
         }
+        if let Some(v) = self.subs_by_consumer.get_mut(&info.consumer_id) {
+            v.retain(|s| *s != id);
+            if v.is_empty() {
+                self.subs_by_consumer.remove(&info.consumer_id);
+            }
+        }
 
         Ok(())
     }
 
     /// Subscription IDs owned by a consumer.
     pub fn subscriptions_for_consumer(&self, consumer_id: ConsumerId) -> Vec<SubscriptionId> {
-        self.subscriptions
-            .iter()
-            .filter(|(_, s)| s.consumer_id == consumer_id)
-            .map(|(id, _)| *id)
-            .collect()
+        self.subs_by_consumer
+            .get(&consumer_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// TAKE a consumer's subscription list, for a caller that is about to
+    /// remove them all.
+    ///
+    /// The borrowed form cannot serve that caller: it iterates the list
+    /// while mutating the catalog, so the borrow would still be live. It
+    /// used to clone for that reason -- an allocation and a copy of a list
+    /// whose index entry was about to be dropped anyway.
+    pub fn take_subscriptions_for_consumer(&mut self, consumer_id: ConsumerId) -> Vec<SubscriptionId> {
+        self.subs_by_consumer.remove(&consumer_id).unwrap_or_default()
     }
 
     // ── Connection ──────────────────────────────────────────────────────
@@ -906,19 +959,16 @@ impl Catalog {
     /// lifetime and a same-named recreate on a fresh stream silently
     /// aliases to a defunct id.
     pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
-        self.consumers
-            .iter()
-            .enumerate()
-            .filter_map(|(i, opt)| {
-                opt.as_ref().and_then(|info| {
-                    if info.stream_id == stream_id {
-                        Some(ConsumerId(i as u32))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect()
+        self.consumers_by_stream
+            .get(&stream_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// TAKE a stream's consumer list. See
+    /// [`Self::take_subscriptions_for_consumer`].
+    pub fn take_consumers_for_stream(&mut self, stream_id: StreamId) -> Vec<ConsumerId> {
+        self.consumers_by_stream.remove(&stream_id).unwrap_or_default()
     }
 }
 

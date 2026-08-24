@@ -163,7 +163,7 @@ impl ArbitroEngine {
 
         // Snapshot the consumer ids BEFORE we start removing entities —
         // the iteration runs on the catalog state at call time.
-        let consumer_ids = self.ctx.catalog.consumers_for_stream(id);
+        let consumer_ids = self.ctx.catalog.take_consumers_for_stream(id);
 
         // Remove each consumer's entity + subscriptions + retire its
         // bindings. We do this via the same path that `delete_consumer`
@@ -172,7 +172,7 @@ impl ArbitroEngine {
         // explicit DeleteConsumer wire frame or a cascade.
         for cid in &consumer_ids {
             runtime::retire::retire_bindings_for_consumer(&mut self.ctx, *cid, &mut events);
-            let sub_ids = self.ctx.catalog.subscriptions_for_consumer(*cid);
+            let sub_ids = self.ctx.catalog.take_subscriptions_for_consumer(*cid);
             for sid in sub_ids {
                 let _ = self.ctx.catalog.remove_subscription_entity(sid);
             }
@@ -214,7 +214,7 @@ impl ArbitroEngine {
         runtime::retire::retire_bindings_for_consumer(&mut self.ctx, id, &mut events);
 
         // Remove subscriptions for this consumer.
-        let sub_ids = self.ctx.catalog.subscriptions_for_consumer(id);
+        let sub_ids = self.ctx.catalog.take_subscriptions_for_consumer(id);
         for sid in sub_ids {
             let _ = self.ctx.catalog.remove_subscription_entity(sid);
         }

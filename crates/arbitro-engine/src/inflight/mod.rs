@@ -132,12 +132,25 @@ impl InFlightCounters {
     /// Hot path for `claim` — skips the per-scope match.
     #[inline]
     pub fn inc_pending(&mut self, consumer_id: u32, queue_id: u32) {
+        self.inc_pending_by(consumer_id, queue_id, 1);
+    }
+
+    /// Credit `n` at once.
+    ///
+    /// A batch delivery admits many entries against the same consumer and
+    /// queue, and doing that one at a time repeats two bounds checks and
+    /// two `ensure_len` calls per entry to add one each time.
+    #[inline]
+    pub fn inc_pending_by(&mut self, consumer_id: u32, queue_id: u32, n: u32) {
+        if n == 0 {
+            return;
+        }
         let ci = consumer_id as usize;
         Self::ensure_len(&mut self.consumer, ci);
-        self.consumer[ci] += 1;
+        self.consumer[ci] += n;
         let qi = queue_id as usize;
         Self::ensure_len(&mut self.queue, qi);
-        self.queue[qi] += 1;
+        self.queue[qi] += n;
     }
 }
 
