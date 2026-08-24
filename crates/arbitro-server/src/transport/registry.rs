@@ -273,14 +273,6 @@ impl ConnectionRegistry {
         *self.inner.clock.write() = Some(clock);
     }
 
-    /// Register a new connection. Spawns a writer task that owns `writer`
-    /// and drains the per-connection frame queue. Returns the `conn_id`.
-    ///
-    /// Accepts any `AsyncWrite` — plain TCP (`OwnedWriteHalf`) or TLS.
-    pub fn register(&self, writer: ConnWriter) -> u64 {
-        self.register_on_shard(writer, None, false).0
-    }
-
     /// Register a connection, recording which shard's listener accepted it.
     /// `None` is the bootstrap socket.
     /// `listener_shard` is WHICH LISTENER accepted this — a topology fact,
@@ -293,6 +285,7 @@ impl ConnectionRegistry {
     /// arrived on shard 3's port, and `ShardTopology` must not say it was.
     pub fn register_on_shard(
         &self,
+        shard: &std::rc::Rc<crate::shard::shard::Shard>,
         writer: ConnWriter,
         listener_shard: Option<u16>,
         host_locally: bool,
@@ -333,7 +326,8 @@ impl ConnectionRegistry {
         let mut handed_back = None;
         let writer_handle = if host_locally {
             handed_back = Some(writer);
-            tokio::spawn(pinned_writer_task(
+            tokio::task::spawn_local(pinned_writer_task(
+                std::rc::Rc::clone(shard),
                 rx,
                 conn_id,
                 inner,
@@ -390,7 +384,13 @@ impl ConnectionRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (
             conn_id,
-            crate::common::session::ConnHandle::new(conn_id, tx_for_handle, last_activity, clock),
+            crate::common::session::ConnHandle::new(
+                conn_id,
+                tx_for_handle,
+                last_activity,
+                clock,
+                std::rc::Rc::clone(shard),
+            ),
             handed_back,
         )
     }
@@ -611,6 +611,7 @@ impl ConnectionRegistry {
 /// gone, which is the same conclusion the owning writer reaches on a
 /// closed fd.
 async fn pinned_writer_task(
+    shard: std::rc::Rc<crate::shard::shard::Shard>,
     mut rx: mpsc::Receiver<Bytes>,
     conn_id: u64,
     inner: Arc<Inner>,
@@ -620,7 +621,7 @@ async fn pinned_writer_task(
     use crate::transport::egress::{Delivery, Egress};
     let mut err = false;
     while let Some(frame) = rx.recv().await {
-        match crate::shard::local::with_egress(conn_id, |e| e.send(frame)) {
+        match shard.with_egress(conn_id, |e| e.send(frame)) {
             Some(Delivery::Dead) | None => {
                 write_failed.store(true, Relaxed);
                 err = true;
@@ -631,7 +632,7 @@ async fn pinned_writer_task(
             }
         }
     }
-    crate::shard::local::remove_egress(conn_id);
+    shard.remove_egress(conn_id);
     if err {
         inner.sessions.lock().remove(&conn_id);
     }

@@ -85,6 +85,12 @@ pub struct ConnHandle {
     /// those pay a `SystemTime::now()` per touch, which is fine on a path
     /// nothing measures.
     clock: Option<arbitro_common::SharedClock>,
+    /// The shard this connection lives on.
+    ///
+    /// Not an `Option`: a connection is accepted BY a shard and belongs to
+    /// it. Holding it is what lets a reply write straight to the socket
+    /// instead of asking anyone whether it may.
+    shard: std::rc::Rc<crate::shard::shard::Shard>,
 }
 
 impl ConnHandle {
@@ -93,13 +99,21 @@ impl ConnHandle {
         write_tx: mpsc::Sender<Bytes>,
         last_activity: Arc<AtomicU64>,
         clock: Option<arbitro_common::SharedClock>,
+        shard: std::rc::Rc<crate::shard::shard::Shard>,
     ) -> Self {
         Self {
             conn_id,
             write_tx,
             last_activity,
             clock,
+            shard,
         }
+    }
+
+    /// The shard that owns this connection.
+    #[inline]
+    pub fn shard(&self) -> &std::rc::Rc<crate::shard::shard::Shard> {
+        &self.shard
     }
 
     /// Queue a frame for this connection. No lock, no lookup.

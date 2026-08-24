@@ -534,7 +534,7 @@ pub async fn follower_replication_loop(
                 // is just another producer.
                 let cat = store_lookup.names().snapshot();
                 {
-                    let info = store_lookup.store_stats(&cat, stream_id).await;
+                    let info = store_lookup.store_stats(crate::shard::router::Elsewhere, &cat, stream_id).await;
                     let expected = follower_expected_first_seq(info.last_seq);
                     if expected != leader_first_seq {
                         tracing::warn!(
@@ -554,6 +554,7 @@ pub async fn follower_replication_loop(
                 // waits for the number to come back.
                 let appended = store_lookup
                     .append_for_seq(
+            crate::shard::router::Elsewhere,
                         &cat,
                         stream_id,
                         &refs,
@@ -714,7 +715,7 @@ pub async fn handle_catch_up_request(
     let stream_id = StreamId(stream_id_raw);
     // The journal belongs to its shard's thread, so this asks rather than
     // reaches. Cold path — catch-up only.
-    let info = server.store_stats_for(stream_id).await;
+    let info = server.store_stats_for(crate::shard::router::Elsewhere, stream_id).await;
     if info.messages == 0 || from_seq > info.last_seq {
         // Nothing to catch up — the follower is already up to date
         // or the store is empty.

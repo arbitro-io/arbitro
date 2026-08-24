@@ -488,7 +488,6 @@ pub async fn rebuild_idempotency(server: &ShardRouter) {
                 .unwrap_or(0);
 
             if stream_recovered > 0 {
-                server.mark_idempotency_allocated(stream_id);
                 total_recovered += stream_recovered;
             }
         }

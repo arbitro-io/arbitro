@@ -56,6 +56,50 @@ pub enum Append {
     Refused,
 }
 
+/// The shard whose thread this call is running on, when there is one.
+///
+/// Replaces the old "does this thread own shard N" lookup: ownership is a
+/// field compare now, and a caller that has no shard simply queues.
+pub type Here<'a> = Option<&'a std::rc::Rc<super::shard::Shard>>;
+
+/// Which shard the caller is running on, for the paths that are also
+/// reachable from off a shard.
+///
+/// A trait rather than `Option<&Shard>` because a shard is `!Sync` — a
+/// reference to one makes the whole future `!Send` even when it is `None`,
+/// and the delayed-journal flush runs on the shared pool. [`Elsewhere`] is
+/// a zero-sized `Send` stand-in, so that path pays nothing and stays
+/// spawnable.
+pub trait OnShard {
+    fn shard(&self) -> Option<&super::shard::Shard>;
+}
+
+/// Not on any shard's thread. Every fast door is closed; the queued path
+/// is the only one, which is the same answer as before by a shorter route.
+#[derive(Clone, Copy)]
+pub struct Elsewhere;
+
+impl OnShard for Elsewhere {
+    #[inline]
+    fn shard(&self) -> Option<&super::shard::Shard> {
+        None
+    }
+}
+
+impl OnShard for &std::rc::Rc<super::shard::Shard> {
+    #[inline]
+    fn shard(&self) -> Option<&super::shard::Shard> {
+        Some(self)
+    }
+}
+
+impl<'a> OnShard for Here<'a> {
+    #[inline]
+    fn shard(&self) -> Option<&super::shard::Shard> {
+        self.map(|s| &**s)
+    }
+}
+
 /// `Some(true)` = force direct, `Some(false)` = force queued, `None` = let
 /// the router decide. Read once and cached: this is on the ack path.
 fn command_path_override() -> Option<bool> {
@@ -92,17 +136,6 @@ pub struct ShardRouter {
     /// Per-shard "running" flags, used by `shutdown` to flip drain
     /// tasks off so they exit their inner loop cleanly.
     drain_running: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
-    /// Per-shard idempotency dedup state. Each entry is a
-    /// lazily-allocated tracker (`Option<...>` starts None, fills in
-    /// on first idempotent publish for that shard). Shared between
-    /// the dispatch publish path (membership check + record) and the
-    /// shard worker's tick loop (expiration sweep).
-    /// Per-shard "tracker allocated" flag (F10) — flipped to `true` the
-    /// first time the publish hot path lazily allocates the idempotency
-    /// tracker for that shard. The command worker reads this with a
-    /// single relaxed atomic load in its `tokio::select!` predicate
-    /// instead of locking the shared `Arc<Mutex<Option<...>>>`.
-    has_idempotency: Arc<[Arc<std::sync::atomic::AtomicBool>]>,
     /// Optional persistent command log — set when `data_dir` is configured.
     /// Used by dispatch to record metadata mutations (create/delete stream/consumer)
     /// so they survive server restarts.
@@ -216,7 +249,6 @@ impl ShardRouter {
         let mut handles = Vec::with_capacity(shard_count);
         let mut gates = Vec::with_capacity(shard_count);
         let mut counter_set = Vec::with_capacity(shard_count);
-        let mut has_idempotency = Vec::with_capacity(shard_count);
         let mut drain_joins = Vec::with_capacity(shard_count);
         let mut drain_running = Vec::with_capacity(shard_count);
         // One runtime per shard, always — the journal is MOVED onto that
@@ -267,14 +299,6 @@ impl ShardRouter {
                 }
                 None => Box::new(MemoryStore::new()),
             };
-            // The journal moves onto the shard's own thread here and never
-            // comes back. Everything that touches it from now on is a task
-            // on that thread, which is why none of them takes a lock.
-            let runtime = super::runtime::ShardRuntime::start(id, store)
-                .unwrap_or_else(|e| panic!("shard {id} runtime failed to start: {e}"));
-            let rt = runtime.handle().clone();
-            shard_runtimes.push(runtime);
-
             // Shared atomics — zero Mutex, zero contention.
             let counters = Arc::new(SharedCounters::new());
 
@@ -283,12 +307,6 @@ impl ShardRouter {
 
             let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-            // Per-shard idempotency tracker handle. None inside the
-            // Arc<Mutex<>> means not allocated yet — the publish hot
-            // path allocates on first idempotent stream. Both the
-            // command worker (tick loop) and dispatch_v2 (publish
-            // check + record) hold clones of this Arc.
-                let shard_has_idempotency = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Notification ring: drain → command (deliveries + dead connections).
             // SPSC — drain owns the single producer, command task owns the consumer.
@@ -304,127 +322,132 @@ impl ShardRouter {
             // the producer, drain owns the consumer.
             let (drain_evt_tx, drain_evt_rx) = DrainEventRing::new();
 
-            // ── Drain task — pure: gate.acquire → fill/dispatch/deliver ──
-            let drain_worker = DrainWorker {
-                shard_id: id as u32,
-                counters: Arc::clone(&counters),
-                snapshot: Arc::clone(&snapshot),
-                gate: Arc::clone(&gate),
-                names: Arc::clone(&names),
-                drain_config: super::drain::DrainConfig {
-                    max_feed: config.max_feed_per_cycle,
-                    max_age_ms: 0,
-                    batch_size: config.drain_batch_size,
-                    stall_evict_ms: config.drain_stall_evict_ms,
-                },
-                drain_scratch: super::drain::DrainScratch::new(),
-                staged: super::drain::Staged::default(),
-                running: Arc::clone(&running),
-                notify_ring: notify_tx,
-                drain_evt_rx,
-                consumer_subjects: Vec::new(),
-                silent_drops: Arc::clone(&silent_drops),
-            };
-
-            // H5: keep the JoinHandle. shutdown() will flip `running`
-            // to false, release the gate, and await. After migrating to
-            // an async drain, this is a tokio task — no OS-thread join,
-            // no `spawn_blocking`, no impedance mismatch with the runtime.
+            // ── The shard's thread ─────────────────────────────────────
             //
-            // Probe monomorph selected ONCE here: recording drains carry
-            // `ProbeOn` (also serves the legacy ARBITRO_CHAOS_DEBUG drain
-            // prints); default drains compile every probe call to nothing.
-            // ARBITRO_DRAIN_PROBE keeps the cycle ring only — the quiet
-            // instrument for chasing a race. ARBITRO_CHAOS_DEBUG additionally
-            // restores the legacy per-frame prints, which cost a write(2)
-            // each and shift the timing they are meant to observe.
-            let verbose = std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
-            let probe_on = verbose || std::env::var("ARBITRO_DRAIN_PROBE").is_ok();
-            let join = if probe_on {
-                rt.spawn(drain_worker.run(ProbeOn::new(verbose)))
-            } else {
-                rt.spawn(drain_worker.run(ProbeOff))
+            // The journal moves here and never comes back, and so does the
+            // command worker: it is BUILT on that thread, which is what
+            // lets it hold the shard's own state in plain fields instead of
+            // fetching it from somewhere else on every use.
+            let shard_id_for_log = id;
+            let worker_counters = Arc::clone(&counters);
+            let worker_snapshot = Arc::clone(&snapshot);
+            let worker_gate = Arc::clone(&gate);
+            let worker_registry = registry.clone();
+            let worker_names = Arc::clone(&names);
+            let worker_running = Arc::clone(&running);
+            let worker_silent_drops = Arc::clone(&silent_drops);
+            let worker_batch_size = config.drain_batch_size;
+            let drain_counters = Arc::clone(&counters);
+            let drain_snapshot = Arc::clone(&snapshot);
+            let drain_gate = Arc::clone(&gate);
+            let drain_names = Arc::clone(&names);
+            let drain_running_h = Arc::clone(&running);
+            let drain_silent = Arc::clone(&silent_drops);
+            let drain_cfg = super::drain::DrainConfig {
+                max_feed: config.max_feed_per_cycle,
+                max_age_ms: 0,
+                batch_size: config.drain_batch_size,
+                stall_evict_ms: config.drain_stall_evict_ms,
             };
-            drain_joins.push(Some(join));
+            // The drain is spawned ON the shard's thread, so its handle has
+            // to come back for `shutdown` to await it.
+            let (join_tx, join_rx) = std::sync::mpsc::sync_channel(1);
+            let worker_data_path = shard_data_path;
+            #[cfg(feature = "cluster")]
+            let worker_replication_tx = Arc::clone(&replication_tx);
+
+            let runtime = super::runtime::ShardRuntime::start(id, store, move |shard| async move {
+                // ── Drain — same shard, same owner, so it holds the shard
+                // itself rather than reaching for it.
+                let drain_worker = DrainWorker {
+                    shard_id: id as u32,
+                    shard: std::rc::Rc::clone(&shard),
+                    counters: drain_counters,
+                    snapshot: drain_snapshot,
+                    gate: drain_gate,
+                    names: drain_names,
+                    drain_config: drain_cfg,
+                    drain_scratch: super::drain::DrainScratch::new(),
+                    staged: super::drain::Staged::default(),
+                    running: drain_running_h,
+                    notify_ring: notify_tx,
+                    drain_evt_rx,
+                    consumer_subjects: Vec::new(),
+                    silent_drops: drain_silent,
+                };
+                // Probe monomorph selected ONCE: recording drains carry
+                // `ProbeOn`; default drains compile every probe call away.
+                let verbose = std::env::var("ARBITRO_CHAOS_DEBUG").is_ok();
+                let probe_on = verbose || std::env::var("ARBITRO_DRAIN_PROBE").is_ok();
+                let join = if probe_on {
+                    tokio::task::spawn_local(drain_worker.run(ProbeOn::new(verbose)))
+                } else {
+                    tokio::task::spawn_local(drain_worker.run(ProbeOff))
+                };
+                let _ = join_tx.send(join);
+
+                let cmd_worker = CommandWorker {
+                    engine,
+                    shard,
+                    counters: worker_counters,
+                    snapshot: worker_snapshot,
+                    gate: worker_gate,
+                    registry: worker_registry,
+                    names: worker_names,
+                    rx: Some(rx),
+                    timer_bump: std::sync::Arc::new(tokio::sync::Notify::new()),
+                    drain_evt_tx,
+                    running: worker_running,
+                    drain_config_batch_size: worker_batch_size,
+                    stream_retention: std::collections::HashMap::with_hasher(
+                        foldhash::fast::FixedState::default(),
+                    ),
+                    bindings: Vec::new(),
+                    next_eviction: None,
+                    wheel: None,
+                    wheel_buf: Vec::new(),
+                    next_timer_ms: None,
+                    epoch: std::time::Instant::now(),
+                    silent_drops: worker_silent_drops,
+                    pending_consumer_remove: Vec::new(),
+                    pending_drain_acks: Vec::new(),
+                    ack_floors: crate::shard::ack_floor::AckFloors::new(),
+                    evict_resume_seq: 0,
+                    stream_oldest_ts: HashMap::default(),
+                    dlq_nack_counts: std::collections::HashMap::with_hasher(
+                        foldhash::fast::FixedState::default(),
+                    ),
+                    data_path: worker_data_path,
+                    replay_mode: true,
+                    #[cfg(feature = "cluster")]
+                    replication_tx: worker_replication_tx,
+                };
+
+                cmd_worker.run().await;
+
+                // M15: a silently-dead shard is the thing to avoid. A panic
+                // unwinds this task on the shard's own thread and the
+                // runtime reports it; a clean exit says so here.
+                tracing::debug!(
+                    target = "supervisor",
+                    shard = shard_id_for_log,
+                    "command worker exited cleanly"
+                );
+            })
+            .unwrap_or_else(|e| panic!("shard {id} runtime failed to start: {e}"));
+            let rt = runtime.handle().clone();
+
+            drain_joins.push(Some(
+                join_rx
+                    .recv()
+                    .expect("shard thread died before spawning its drain"),
+            ));
             drain_running.push(Arc::clone(&running));
 
-            // ── Command task — tokio::spawn, owns engine ────────────
-            let cmd_worker = CommandWorker {
-                engine,
-                shard_id: id,
-                counters: Arc::clone(&counters),
-                snapshot: Arc::clone(&snapshot),
-                gate: Arc::clone(&gate),
-                registry: registry.clone(),
-                names: Arc::clone(&names),
-                rx: Some(rx),
-                timer_bump: std::sync::Arc::new(tokio::sync::Notify::new()),
-                drain_evt_tx,
-                running: Arc::clone(&running),
-                drain_config_batch_size: config.drain_batch_size,
-                stream_retention: std::collections::HashMap::with_hasher(
-                    foldhash::fast::FixedState::default(),
-                ),
-                bindings: Vec::new(),
-                next_eviction: None,
-                wheel: None,
-                wheel_buf: Vec::new(),
-                next_timer_ms: None,
-                epoch: std::time::Instant::now(),
-                last_idempotency_ms: 0,
-                has_idempotency: Arc::clone(&shard_has_idempotency),
-                silent_drops: Arc::clone(&silent_drops),
-                pending_consumer_remove: Vec::new(),
-                pending_drain_acks: Vec::new(),
-                ack_floors: crate::shard::ack_floor::AckFloors::new(),
-                evict_resume_seq: 0,
-                stream_oldest_ts: HashMap::default(),
-                dlq_nack_counts: std::collections::HashMap::with_hasher(
-                    foldhash::fast::FixedState::default(),
-                ),
-                data_path: shard_data_path,
-                replay_mode: true,
-                #[cfg(feature = "cluster")]
-                replication_tx: Arc::clone(&replication_tx),
-            };
-
-            // M15: supervise the command-worker task — if it panics
-            // we want a loud log line in operators' eyes instead of a
-            // silently-dead shard. The `JoinHandle` is awaited in a
-            // watcher task that logs and exits when the child resolves.
-            let shard_id_for_log = id;
-            // Same runtime as this shard's drain — that pairing IS the
-            // change. Two tasks on one thread cannot contend for the store.
-            let cmd_handle = rt.spawn(cmd_worker.run());
-            tokio::spawn(async move {
-                match cmd_handle.await {
-                    Ok(()) => {
-                        tracing::debug!(
-                            target = "supervisor",
-                            shard = shard_id_for_log,
-                            "command worker exited cleanly"
-                        );
-                    }
-                    Err(e) if e.is_panic() => {
-                        tracing::error!(
-                            target = "supervisor",
-                            shard = shard_id_for_log,
-                            "command worker panicked: {e}"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target = "supervisor",
-                            shard = shard_id_for_log,
-                            "command worker join error: {e}"
-                        );
-                    }
-                }
-            });
+            shard_runtimes.push(runtime);
 
             gates.push(Arc::clone(&gate));
             counter_set.push(Arc::clone(&counters));
-            has_idempotency.push(Arc::clone(&shard_has_idempotency));
 
             handles.push(ShardHandle::new(
                 id as u32,
@@ -460,7 +483,6 @@ impl ShardRouter {
             names,
             drain_joins: Arc::new(parking_lot::Mutex::new(drain_joins)),
             drain_running: drain_running.into(),
-            has_idempotency: has_idempotency.into(),
             command_log: None,
             clock,
             silent_drops,
@@ -538,6 +560,30 @@ impl ShardRouter {
             .map(|r| r.handle().clone())
     }
 
+    /// Hand a connection to the shard that will own it.
+    ///
+    /// `build` runs ON that shard's thread with the shard in hand, so the
+    /// connection is constructed where it lives.
+    pub(crate) fn accept_on_shard<F, Fut>(&self, shard: usize, build: F) -> bool
+    where
+        F: FnOnce(std::rc::Rc<super::shard::Shard>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        match self._shard_runtimes.get(shard) {
+            Some(rt) => {
+                rt.spawn_local(build);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many shards have private runtimes. Zero means none do.
+    #[inline]
+    pub(crate) fn shard_runtime_count(&self) -> usize {
+        self._shard_runtimes.len()
+    }
+
     /// Publish the per-shard listening ports. Called once, after the
     /// sockets are bound; later calls are ignored rather than racing.
     pub fn set_shard_ports(&self, ports: Vec<u16>) {
@@ -588,6 +634,7 @@ impl ShardRouter {
     /// is the same story with the leader doing the admitting.
     pub async fn append(
         &self,
+        here: impl OnShard,
         cat: &arbitro_common::name_registry::Snapshot<'_>,
         stream_id: StreamId,
         entries: &[arbitro_store::EntryRef<'_>],
@@ -604,9 +651,9 @@ impl ShardRouter {
             Dedup::AlreadyAdmitted => 0,
         };
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
-        if super::local::owns(idx) {
+        if let Some(shard) = here.shard().filter(|s| s.shard_id == idx) {
             let _p = crate::transport::ingress_profile::append_local();
-            return match crate::sink::LocalSink::new(idx, &self.gates[idx])
+            return match crate::sink::LocalSink::new(shard, &self.gates[idx])
                 .publish(entries, now_ms)
             {
                 Ok(seq) => Append::Stored(seq),
@@ -634,6 +681,7 @@ impl ShardRouter {
     /// the number. `None` means refused or the shard is gone.
     pub async fn append_for_seq(
         &self,
+        here: impl OnShard,
         cat: &arbitro_common::name_registry::Snapshot<'_>,
         stream_id: StreamId,
         entries: &[arbitro_store::EntryRef<'_>],
@@ -642,8 +690,8 @@ impl ShardRouter {
     ) -> Option<u64> {
         use crate::sink::StreamSink;
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
-        if super::local::owns(idx) {
-            return crate::sink::LocalSink::new(idx, &self.gates[idx])
+        if let Some(shard) = here.shard().filter(|s| s.shard_id == idx) {
+            return crate::sink::LocalSink::new(shard, &self.gates[idx])
                 .publish(entries, now_ms)
                 .ok();
         }
@@ -669,13 +717,14 @@ impl ShardRouter {
     /// path — but only for streams that actually declare a quota.
     pub async fn store_stats(
         &self,
+        here: impl OnShard,
         cat: &arbitro_common::name_registry::Snapshot<'_>,
         stream_id: StreamId,
     ) -> arbitro_store::StoreInfo {
         use crate::sink::StreamSink;
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
-        if super::local::owns(idx) {
-            return crate::sink::LocalSink::new(idx, &self.gates[idx]).info();
+        if let Some(shard) = here.shard().filter(|s| s.shard_id == idx) {
+            return crate::sink::LocalSink::new(shard, &self.gates[idx]).info();
         }
         match self.shards[idx].store_info(stream_id).await {
             Ok(r) => arbitro_store::StoreInfo {
@@ -690,9 +739,13 @@ impl ShardRouter {
     /// `store_stats` for callers that hold no catalog snapshot — the cold
     /// ack-state paths, which read this once per request rather than per
     /// entry and have no reason to carry one.
-    pub async fn store_stats_for(&self, stream_id: StreamId) -> arbitro_store::StoreInfo {
+    pub async fn store_stats_for(
+        &self,
+        here: impl OnShard,
+        stream_id: StreamId,
+    ) -> arbitro_store::StoreInfo {
         let cat = self.names.snapshot();
-        self.store_stats(&cat, stream_id).await
+        self.store_stats(here, &cat, stream_id).await
     }
 
     /// Which door this caller uses for commands against `stream_id`.
@@ -707,7 +760,11 @@ impl ShardRouter {
     /// The drain registers a delivery in the cycle that delivers it, so
     /// there is nothing to be owed and nothing to wait for. The condition
     /// did not get cheaper; the state it guarded stopped existing.
-    pub fn commands_for(&self, stream_id: StreamId) -> crate::shard::commands::CommandPath<'_> {
+    pub fn commands_for<'a>(
+        &'a self,
+        here: Here<'a>,
+        stream_id: StreamId,
+    ) -> crate::shard::commands::CommandPath<'a> {
         let idx = self.shard_index(stream_id, self.shard_count);
         // `ARBITRO_COMMAND_PATH` forces one wiring, for measuring them
         // against each other. `direct` does NOT bypass safety: the direct
@@ -716,9 +773,17 @@ impl ShardRouter {
         // not a shortcut around it.
         match command_path_override() {
             Some(true) => {
-                return crate::shard::commands::CommandPath::Direct(
-                    crate::shard::commands::DirectCommands::new(&self.shards[idx]),
-                )
+                return match here {
+                    Some(shard) => crate::shard::commands::CommandPath::Direct(
+                        crate::shard::commands::DirectCommands::new(shard, &self.shards[idx]),
+                    ),
+                    // Forcing "direct" cannot conjure a shard the caller is
+                    // not on. Measuring the wiring must not change which
+                    // state it may touch.
+                    None => crate::shard::commands::CommandPath::Queued(
+                        crate::shard::commands::QueuedCommands::new(&self.shards[idx]),
+                    ),
+                }
             }
             Some(false) => {
                 return crate::shard::commands::CommandPath::Queued(
@@ -729,9 +794,9 @@ impl ShardRouter {
         }
         // Nothing to settle: the drain registers a delivery in the cycle
         // that delivers it, so an ack can never arrive ahead of its pending.
-        if super::local::owns(idx) {
+        if let Some(shard) = here.filter(|s| s.shard_id == idx) {
             return crate::shard::commands::CommandPath::Direct(
-                crate::shard::commands::DirectCommands::new(&self.shards[idx]),
+                crate::shard::commands::DirectCommands::new(shard, &self.shards[idx]),
             );
         }
         crate::shard::commands::CommandPath::Queued(
@@ -748,12 +813,10 @@ impl ShardRouter {
     /// a caller that cannot see which one it went through cannot be
     /// measured or reasoned about.
     #[inline]
-    pub fn local_sink(&self, stream_id: StreamId) -> Option<crate::sink::LocalSink<'_>> {
+    pub fn local_sink<'a>(&'a self, here: Here<'a>, stream_id: StreamId) -> Option<crate::sink::LocalSink<'_>> {
         let idx = self.shard_index(stream_id, self.shard_count);
-        if !super::local::owns(idx) {
-            return None;
-        }
-        Some(crate::sink::LocalSink::new(idx, &self.gates[idx]))
+        let shard = here.filter(|s| s.shard_id == idx)?;
+        Some(crate::sink::LocalSink::new(shard, &self.gates[idx]))
     }
 
 
@@ -794,12 +857,9 @@ impl ShardRouter {
     /// the map, no `Mutex` on the tracker, because only one thread ever
     /// touches either.
     #[inline]
-    pub fn idempotency_for(
-        &self,
-        stream_id: StreamId,
-    ) -> Option<super::idempotency::SharedIdempotency> {
+    pub fn dedup_for<'a>(&self, here: Here<'a>, stream_id: StreamId) -> Option<&'a super::dedup::Dedup> {
         let idx = self.shard_index(stream_id, self.shard_count);
-        super::local::idempotency(idx)
+        here.filter(|s| s.shard_id == idx).map(|s| &s.dedup)
     }
 
     /// Record `msg_id` against `stream_id`'s tracker. `false` = duplicate.
@@ -810,27 +870,25 @@ impl ShardRouter {
     /// silently deciding there is no duplicate.
     pub async fn record_dedup(
         &self,
+        here: Here<'_>,
         cat: &arbitro_common::name_registry::Snapshot<'_>,
         stream_id: StreamId,
-        hash: u64,
         msg_id: &[u8],
         window_ms: u32,
     ) -> bool {
         let idx = Self::place(cat.stream_shard(stream_id), stream_id, self.shard_count);
-        if let Some(window) =
-            super::dedup::Dedup::open(super::local::idempotency(idx), stream_id, window_ms)
-        {
-            self.mark_idempotency_allocated(stream_id);
-            return window.admit(msg_id);
+        let now_ms = self.clock.now_ms();
+        if let Some(shard) = here.filter(|s| s.shard_id == idx) {
+            return shard.dedup.admit(stream_id, msg_id, now_ms, window_ms);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let sent = self.shards[idx]
             .send(crate::shard::command::ShardCommand::RecordDedup(
                 crate::shard::command::RecordDedupCmd {
                     stream_id,
-                    hash,
                     msg_id: msg_id.to_vec(),
                     window_ms,
+                    now_ms,
                     reply: tx,
                 },
             ))
@@ -839,16 +897,6 @@ impl ShardRouter {
             return true;
         }
         rx.await.unwrap_or(true)
-    }
-
-    /// Per-shard "tracker allocated" flag — flip to `true` after the
-    /// publish hot path lazily allocates the idempotency tracker so
-    /// the command worker's `select!` predicate can stop locking the
-    /// Arc just to call `Option::is_some()` (F10).
-    #[inline]
-    pub fn mark_idempotency_allocated(&self, stream_id: StreamId) {
-        let idx = self.shard_index(stream_id, self.has_idempotency.len());
-        self.has_idempotency[idx].store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]

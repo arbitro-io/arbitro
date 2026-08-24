@@ -117,15 +117,15 @@ pub async fn dispatch_frame_v2(
         Action::Publish => v2_publish(conn, req_seq, &frame, server, registry).await,
         Action::PublishBatch => v2_publish_batch(conn, req_seq, &frame, server, registry).await,
         Action::PublishWithReply => {
-            v2_publish_with_reply(conn_id, req_seq, &frame, server, registry).await
+            v2_publish_with_reply(Some(conn.shard()), conn_id, req_seq, &frame, server, registry).await
         }
-        Action::Ack => v2_ack(conn_id, &frame, server).await,
+        Action::Ack => v2_ack(Some(conn.shard()), conn_id, &frame, server).await,
         Action::AckTerm => v2_ack_term(conn_id, &frame, server).await,
-        Action::BatchAck => v2_batch_ack(conn_id, &frame, server).await,
-        Action::AckStateReq => v2_ack_state(conn_id, req_seq, &frame, server, registry).await,
-        Action::AckBatch => v2_ack_batch(conn_id, req_seq, &frame, server, registry).await,
+        Action::BatchAck => v2_batch_ack(Some(conn.shard()), conn_id, &frame, server).await,
+        Action::AckStateReq => v2_ack_state(Some(conn.shard()), conn_id, req_seq, &frame, server, registry).await,
+        Action::AckBatch => v2_ack_batch(Some(conn.shard()), conn_id, req_seq, &frame, server, registry).await,
         Action::Nack => v2_nack(conn_id, &frame, server).await,
-        Action::BatchNack => v2_batch_nack(conn_id, &frame, server).await,
+        Action::BatchNack => v2_batch_nack(Some(conn.shard()), conn_id, &frame, server).await,
         Action::Subscribe => v2_subscribe(conn_id, req_seq, &frame, server, registry).await,
         Action::SubscribeBatch => {
             v2_subscribe_batch(conn_id, req_seq, &frame, server, registry).await
@@ -202,7 +202,7 @@ pub async fn dispatch_frame_v2(
 
         // ── Delayed publish ─────────────────────────────────────────
         Action::PublishDelayed => {
-            v2_publish_delayed(conn_id, req_seq, &frame, server, registry, delayed_journal).await
+            v2_publish_delayed(Some(conn.shard()), conn_id, req_seq, &frame, server, registry, delayed_journal).await
         }
 
         // ── Cron scheduling ─────────────────────────────────────────
@@ -320,18 +320,13 @@ async fn v2_publish(
         &[]
     };
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
-    if window_ms > 0 && !msg_id.is_empty() {
+    {
         let _p_dedup = crate::transport::ingress_profile::dedup();
         // `None` = this thread does not own the shard, so the window is not
         // reachable from here and the check happens ON the shard, inside
         // `handle_publish`. That split is the case to delete, not to serve.
-        if let Some(window) = crate::shard::dedup::Dedup::open(
-            server.idempotency_for(seq_stream),
-            seq_stream,
-            window_ms,
-        ) {
-            server.mark_idempotency_allocated(seq_stream);
-            if !window.admit(msg_id) {
+        if let Some(dedup) = server.dedup_for(Some(conn.shard()), seq_stream) {
+            if !dedup.admit(seq_stream, msg_id, server.clock().now_ms(), window_ms) {
                 crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
                 return;
             }
@@ -342,7 +337,7 @@ async fn v2_publish(
     // If the stream has DiscardPolicy::New (discard == 1) and the store
     // would exceed max_msgs or max_bytes, reject BEFORE appending.
     if let Some(quota) = crate::shard::quota::Quota::of(&cat, seq_stream) {
-        let info = server.store_stats(&cat, seq_stream).await;
+        let info = server.store_stats(Some(conn.shard()), &cat, seq_stream).await;
         let bytes = (f.subject().len() + f.payload().len()) as u64;
         if !quota.admits(&info, 1, bytes) {
             crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
@@ -411,6 +406,7 @@ async fn v2_publish(
     let _p_append = crate::transport::ingress_profile::append();
     let first_seq = match server
         .append(
+            Some(conn.shard()),
             &cat,
             seq_stream,
             &entries,
@@ -454,6 +450,7 @@ pub(crate) fn idempotency_hash(msg_id: &[u8]) -> u64 {
 }
 
 async fn v2_publish_with_reply(
+    here: crate::shard::router::Here<'_>,
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -488,17 +485,10 @@ async fn v2_publish_with_reply(
     // Fast-bail when no per-stream window or no msg_id.
     let msg_id = f.msg_id();
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
-    if window_ms > 0 && !msg_id.is_empty() {
-        if let Some(window) = crate::shard::dedup::Dedup::open(
-            server.idempotency_for(seq_stream),
-            seq_stream,
-            window_ms,
-        ) {
-            server.mark_idempotency_allocated(seq_stream);
-            if !window.admit(msg_id) {
-                send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
-                return;
-            }
+    if let Some(dedup) = server.dedup_for(here, seq_stream) {
+        if !dedup.admit(seq_stream, msg_id, server.clock().now_ms(), window_ms) {
+            send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
+            return;
         }
     }
 
@@ -531,6 +521,7 @@ async fn v2_publish_with_reply(
     // delivered, with no error anywhere.
     let first_seq = match server
         .append(
+            here,
             &cat,
             seq_stream,
             &entries,
@@ -612,7 +603,7 @@ async fn v2_publish_batch(
         for v in f.iter() {
             bytes += (v.subject().len() + v.payload().len()) as u64;
         }
-        let info = server.store_stats(&cat, seq_stream).await;
+        let info = server.store_stats(Some(conn.shard()), &cat, seq_stream).await;
         if !quota.admits(&info, count, bytes) {
             crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::StreamFull);
             return;
@@ -665,18 +656,16 @@ async fn v2_publish_batch(
         // is not reachable from here. The check then happens ON the shard,
         // inside `handle_publish` — see `PublishCmd::dedup`. Skipping it
         // would let a duplicate through with nothing to show for it.
-        if let Some(window) = crate::shard::dedup::Dedup::open(
-            server.idempotency_for(seq_stream),
-            seq_stream,
-            window_ms,
-        ) {
-            server.mark_idempotency_allocated(seq_stream);
-            // All-or-nothing, rollback included: the window owns that rule
+        if let Some(dedup) = server.dedup_for(Some(conn.shard()), seq_stream) {
+            // All-or-nothing, rollback included: the domain owns that rule
             // so no caller can forget half of it.
-            let admitted = window.admit_all(
+            let admitted = dedup.admit_all(
+                seq_stream,
                 f.iter()
                     .map(|v| msg_id_of_view(&v, batch_has_headers))
                     .filter(|id| !id.is_empty()),
+                server.clock().now_ms(),
+                window_ms,
             );
             if !admitted {
                 crate::common::reply_v2::reply_err(conn, req_seq, ErrorCode::IdempotencyDuplicate);
@@ -759,6 +748,7 @@ async fn v2_publish_batch(
     let _p_append = crate::transport::ingress_profile::append();
     let first_seq = match server
         .append(
+            Some(conn.shard()),
             &cat,
             seq_stream,
             &entries,
@@ -786,6 +776,7 @@ async fn v2_publish_batch(
 }
 
 async fn v2_publish_delayed(
+    here: crate::shard::router::Here<'_>,
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -830,13 +821,12 @@ async fn v2_publish_delayed(
     let msg_id = f.msg_id();
     let window_ms = cat.stream_idempotency_window_ms(seq_stream);
     if window_ms > 0 && !msg_id.is_empty() {
-        let hash = idempotency_hash(msg_id);
         // Unlike an immediate publish there is no append to carry the
         // check — a delayed message goes to the delayed journal, so it
         // never reaches `handle_publish` while the window is still open.
         // The router records it on the owning thread instead.
         if !server
-            .record_dedup(&cat, seq_stream, hash, msg_id, window_ms)
+            .record_dedup(here, &cat, seq_stream, msg_id, window_ms)
             .await
         {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::IdempotencyDuplicate);
@@ -853,7 +843,7 @@ async fn v2_publish_delayed(
     // since filled up — maturation appends without re-checking
     // (documented in ROBUSTNESS_AUDIT.md).
     if let Some(quota) = crate::shard::quota::Quota::of(&cat, seq_stream) {
-        let info = server.store_stats(&cat, seq_stream).await;
+        let info = server.store_stats(here, &cat, seq_stream).await;
         let bytes = (f.subject().len() + f.payload().len()) as u64;
         if !quota.admits(&info, 1, bytes) {
             send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -891,6 +881,7 @@ async fn v2_publish_delayed(
         let now_ms = server.now_ms();
         let first_seq = match server
             .append(
+            here,
                 &cat,
                 seq_stream,
                 &entries,
@@ -957,7 +948,7 @@ async fn v2_publish_delayed(
     }
 }
 
-async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
+async fn v2_ack(here: crate::shard::router::Here<'_>, conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match AckFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -970,7 +961,7 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     // No channel when this connection is already on the shard's thread —
     // the seam decides, this call site does not know which happened.
     let _ = server
-        .commands_for(seq_stream)
+        .commands_for(here, seq_stream)
         .release(
             consumer_id,
             arbitro_engine_v2::types::ConnectionId(conn_id),
@@ -983,7 +974,7 @@ async fn v2_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         .await;
 }
 
-async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
+async fn v2_batch_ack(here: crate::shard::router::Here<'_>, conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match BatchAckFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -1007,7 +998,7 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
         });
     }
     let _ = server
-        .commands_for(seq_stream)
+        .commands_for(here, seq_stream)
         .release(
             consumer_id,
             arbitro_engine_v2::types::ConnectionId(conn_id),
@@ -1018,6 +1009,7 @@ async fn v2_batch_ack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
 
 /// AckStateReq — read-only cursor/retention query, no mutation.
 async fn v2_ack_state(
+    here: crate::shard::router::Here<'_>,
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -1051,7 +1043,7 @@ async fn v2_ack_state(
     };
     let cursor = server.names().consumer_cursor(consumer_id).unwrap_or(0);
     let generation = server.names().consumer_generation(consumer_id).unwrap_or(0);
-    let info = server.store_stats_for(seq_stream).await;
+    let info = server.store_stats_for(here, seq_stream).await;
     send_ack_state_rep_v2(
         registry,
         conn_id,
@@ -1070,6 +1062,7 @@ async fn v2_ack_state(
 /// pre-counts accepted/ignored/below_retention before dispatch since
 /// `shard.ack` doesn't report per-entry outcomes.
 async fn v2_ack_batch(
+    here: crate::shard::router::Here<'_>,
     conn_id: u64,
     req_seq: u64,
     frame: &Bytes,
@@ -1121,7 +1114,7 @@ async fn v2_ack_batch(
     };
 
     let cursor_before = server.names().consumer_cursor(consumer_id).unwrap_or(0);
-    let low = server.store_stats_for(seq_stream).await.first_seq;
+    let low = server.store_stats_for(here, seq_stream).await.first_seq;
 
     let mut accepted_entries: Vec<AckEntry> = Vec::with_capacity(seqs.len());
     let mut accepted: u32 = 0;
@@ -1145,7 +1138,7 @@ async fn v2_ack_batch(
     }
 
     let _ = server
-        .commands_for(seq_stream)
+        .commands_for(here, seq_stream)
         .release(
             consumer_id,
             arbitro_engine_v2::types::ConnectionId(conn_id),
@@ -1197,7 +1190,7 @@ async fn v2_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
 }
 
 /// Batch NACK — fire-and-forget, no reply. Supports per-batch delay_ms.
-async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
+async fn v2_batch_nack(here: crate::shard::router::Here<'_>, conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     let f = match BatchNackFrame::ref_from_bytes(&frame[..]) {
         Ok(f) => f,
         Err(_) => return,
@@ -1221,7 +1214,7 @@ async fn v2_batch_nack(conn_id: u64, frame: &Bytes, server: &ShardRouter) {
     // All entries in a batch share the same delay — take max.
     let delay_ms = raw.iter().map(|e| e.delay_ms.get()).max().unwrap_or(0);
     let _ = server
-        .commands_for(seq_stream)
+        .commands_for(here, seq_stream)
         .requeue(
             consumer_id,
             arbitro_engine_v2::types::ConnectionId(conn_id),

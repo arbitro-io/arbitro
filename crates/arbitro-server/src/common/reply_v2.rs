@@ -47,7 +47,7 @@ pub fn reply_ok(conn: &crate::common::session::ConnHandle, req_seq: u64, ref_seq
 #[inline]
 fn write_frame(conn: &crate::common::session::ConnHandle, bytes: &[u8]) -> bool {
     use crate::transport::egress::Delivery;
-    match crate::shard::local::with_egress(conn.conn_id, |e| e.send_slice(bytes)) {
+    match conn.shard().with_egress(conn.conn_id, |e| e.send_slice(bytes)) {
         Some(Delivery::Dead) => false,
         Some(_) => true,
         None => conn.send(bytes::Bytes::copy_from_slice(bytes)),

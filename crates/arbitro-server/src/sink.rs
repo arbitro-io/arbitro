@@ -55,15 +55,16 @@ pub trait StreamSink {
 /// that arrived on the bootstrap port is not, and has to take the routed
 /// path instead — a channel hop, paid by the case that earned it.
 pub struct LocalSink<'a> {
-    shard_id: usize,
+    shard: &'a crate::shard::shard::Shard,
     gate: &'a Gate,
 }
 
 impl<'a> LocalSink<'a> {
-    /// Caller must have established that this thread owns `shard_id`.
+    /// Holding the shard IS the proof it may be used. There is no second
+    /// answer to ask for.
     #[inline]
-    pub(crate) fn new(shard_id: usize, gate: &'a Gate) -> Self {
-        Self { shard_id, gate }
+    pub(crate) fn new(shard: &'a crate::shard::shard::Shard, gate: &'a Gate) -> Self {
+        Self { shard, gate }
     }
 }
 
@@ -78,16 +79,13 @@ impl StreamSink for LocalSink<'_> {
         // construction error rather than a storage one — `local_sink` is
         // supposed to have refused. Surfaced as an I/O error because the
         // caller's contract is `StoreError`, and never reached in practice.
-        let first = crate::shard::local::with_store(self.shard_id, |s| {
-            s.append_batch(entries, now_ms)
-        })
-        .ok_or(StoreError::Io(std::io::ErrorKind::WouldBlock))??;
+        let first = self.shard.store(|s| s.append_batch(entries, now_ms))?;
         self.gate.release();
         Ok(first)
     }
 
     #[inline]
     fn info(&self) -> StoreInfo {
-        crate::shard::local::with_store(self.shard_id, |s| s.info()).unwrap_or_default()
+        self.shard.store(|s| s.info())
     }
 }

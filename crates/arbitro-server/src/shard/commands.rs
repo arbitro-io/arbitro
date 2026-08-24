@@ -110,13 +110,19 @@ impl Commands for QueuedCommands<'_> {
 /// sent, the broker never releases the pending entry, and the message comes
 /// back later with nothing in any log to explain it.
 pub struct DirectCommands<'a> {
+    /// The shard this call is running on. Holding it IS the right to reach
+    /// its parked worker.
+    shard: &'a crate::shard::shard::Shard,
     fallback: &'a crate::shard::handle::ShardHandle,
 }
 
 impl<'a> DirectCommands<'a> {
     #[inline]
-    pub fn new(fallback: &'a crate::shard::handle::ShardHandle) -> Self {
-        Self { fallback }
+    pub fn new(
+        shard: &'a crate::shard::shard::Shard,
+        fallback: &'a crate::shard::handle::ShardHandle,
+    ) -> Self {
+        Self { shard, fallback }
     }
 }
 
@@ -131,11 +137,10 @@ impl Commands for DirectCommands<'_> {
         // The closure runs only if the worker is here, so `owned` still
         // holds the entries when it is not — nothing is lost either way.
         let mut owned = Some(entries);
-        if let Some(r) = crate::shard::local::with_worker(
-            |w: &mut crate::shard::CommandWorker| {
-                w.release_direct(consumer, conn, owned.take().unwrap())
-            },
-        ) {
+        if let Some(r) = self
+            .shard
+            .with_worker(|w| w.release_direct(consumer, conn, owned.take().unwrap()))
+        {
             return r;
         }
         QueuedCommands::new(self.fallback)
@@ -152,11 +157,10 @@ impl Commands for DirectCommands<'_> {
         delay_ms: u32,
     ) -> Option<Released> {
         let mut owned = Some(entries);
-        if let Some(r) = crate::shard::local::with_worker(
-            |w: &mut crate::shard::CommandWorker| {
-                w.requeue_direct(consumer, conn, owned.take().unwrap(), delay_ms)
-            },
-        ) {
+        if let Some(r) = self
+            .shard
+            .with_worker(|w| w.requeue_direct(consumer, conn, owned.take().unwrap(), delay_ms))
+        {
             return r;
         }
         QueuedCommands::new(self.fallback)

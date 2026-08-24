@@ -52,7 +52,7 @@ impl CommandWorker {
         // This worker IS the shard's thread, so it takes the same lock-free
         // door a local connection takes — the routed path exists to move
         // the work here, not to give it a second way in.
-        let sink = crate::sink::LocalSink::new(self.shard_id, &self.gate);
+        let sink = crate::sink::LocalSink::new(&self.shard, &self.gate);
         let stream_id = cmd.stream_id.raw();
 
         // One entry IS the shape of a routed publish. It gets a stack array
@@ -119,24 +119,21 @@ impl CommandWorker {
         use arbitro_proto::wire::msg_headers::{ExtendedPayload, HDR_MSG_ID};
         use zerocopy::FromBytes;
 
-        let Some(window) = crate::shard::dedup::Dedup::open(
-            crate::shard::local::idempotency(self.shard_id),
+        self.shard.dedup.admit_all(
             cmd.stream_id,
+            cmd.entries.iter().filter_map(|e| {
+                if e.flags & arbitro_store::flags::HAS_HEADERS == 0 {
+                    return None;
+                }
+                ExtendedPayload::ref_from_bytes(&e.payload)
+                    .ok()?
+                    .headers_block()?
+                    .get(HDR_MSG_ID)
+                    .filter(|id| !id.is_empty())
+            }),
+            cmd.now_ms,
             cmd.dedup_window_ms,
-        ) else {
-            return true;
-        };
-
-        window.admit_all(cmd.entries.iter().filter_map(|e| {
-            if e.flags & arbitro_store::flags::HAS_HEADERS == 0 {
-                return None;
-            }
-            ExtendedPayload::ref_from_bytes(&e.payload)
-                .ok()?
-                .headers_block()?
-                .get(HDR_MSG_ID)
-                .filter(|id| !id.is_empty())
-        }))
+        )
     }
 
     /// Record one msg-id for a caller that cannot reach this thread's tracker.
@@ -148,17 +145,7 @@ impl CommandWorker {
         &mut self,
         cmd: crate::shard::command::RecordDedupCmd,
     ) {
-        let fresh = match crate::shard::dedup::Dedup::open(
-            crate::shard::local::idempotency(self.shard_id),
-            cmd.stream_id,
-            cmd.window_ms,
-        ) {
-            Some(window) => window.admit(&cmd.msg_id),
-            // No window here means dedup is off for this shard; answering
-            // "not a duplicate" keeps that what it has always been rather
-            // than rejecting a publish because a check could not run.
-            None => true,
-        };
+        let fresh = self.shard.dedup.admit(cmd.stream_id, &cmd.msg_id, cmd.now_ms, cmd.window_ms);
         let _ = cmd.reply.send(fresh);
     }
 
@@ -173,21 +160,16 @@ impl CommandWorker {
         let stream_id = cmd.stream_id;
         let cutoff_ms = cmd.now_ms.saturating_sub(cmd.window_ms as u64);
 
-        let info = crate::shard::local::store(self.shard_id, |s| s.info());
+        let info = self.shard.store( |s| s.info());
         if info.messages == 0 {
             let _ = cmd.reply.send(0);
             return;
         }
 
-        let Some(map) = crate::shard::local::idempotency(self.shard_id) else {
-            let _ = cmd.reply.send(0);
-            return;
-        };
-        let tracker_arc = crate::shard::idempotency::idempotency_for_stream(&map, stream_id);
-        let mut tracker = tracker_arc.borrow_mut();
+        let dedup = &self.shard.dedup;
         let mut recovered = 0u64;
 
-        crate::shard::local::store(self.shard_id, |store| {
+        self.shard.store( |store| {
             store
                 .for_each(info.first_seq, info.last_seq + 1, &mut |entry| {
                     // Older than the window — its dedup key has expired.
@@ -209,33 +191,31 @@ impl CommandWorker {
                         Some(id) if !id.is_empty() => id,
                         _ => return,
                     };
-                    let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
                     // Re-record with the REMAINING window, not the full one:
                     // restoring the original TTL would keep a key alive past
                     // the point the publisher was promised it would expire.
                     let elapsed = cmd.now_ms.saturating_sub(entry.timestamp);
                     let remaining_ms = (cmd.window_ms as u64).saturating_sub(elapsed);
                     if remaining_ms > 0 {
-                        tracker.record(stream_id, hash, msg_id, remaining_ms as u32);
+                        dedup.admit(stream_id, msg_id, cmd.now_ms, remaining_ms as u32);
                         recovered += 1;
                     }
                 })
                 .ok();
         });
 
-        drop(tracker);
         let _ = cmd.reply.send(recovered);
     }
 
     /// Copy a range of this shard's journal out for a caller on another
     /// thread. Cold path — cluster catch-up only.
     pub(in crate::shard) fn handle_scan_range(&mut self, cmd: ScanRangeCmd) {
-        let info = crate::shard::local::store(self.shard_id, |s| s.info());
+        let info = self.shard.store( |s| s.info());
         let start = cmd.from_seq.max(info.first_seq);
         let end = (start + cmd.limit as u64).min(info.last_seq.saturating_add(1));
         let mut out = Vec::new();
         if start < end {
-            crate::shard::local::store(self.shard_id, |store| {
+            self.shard.store( |store| {
                 let _ = store.for_each(start, end, &mut |entry| {
                     out.push(ScannedEntry {
                         seq: entry.seq,
@@ -738,7 +718,7 @@ impl CommandWorker {
             let created_at_seq = if self.replay_mode {
                 0
             } else {
-                crate::shard::local::store(self.shard_id, |s| s.info()).last_seq.wrapping_add(1)
+                self.shard.store( |s| s.info()).last_seq.wrapping_add(1)
             };
 
             self.stream_retention.insert(
@@ -770,9 +750,7 @@ impl CommandWorker {
         let events = self.engine.delete_stream(cmd.stream_id);
         self.apply_delta_and_sync(&events, false);
         self.stream_retention.remove(&cmd.stream_id);
-        if let Some(map) = crate::shard::local::idempotency(self.shard_id) {
-            map.borrow_mut().remove(&cmd.stream_id.raw());
-        }
+        self.shard.dedup.remove_stream(cmd.stream_id);
         // NOTE: tombstone_stream removed — created_at_seq filtering in the
         // drain is O(1) and replaces the O(N) tombstone walk. The Store
         // trait method is kept for future compaction use.
@@ -792,7 +770,7 @@ impl CommandWorker {
         // and is still delivered — over-delivery to a brand-new consumer
         // is benign, silently skipping a message published after creation
         // would be loss.
-        let journal_tail = crate::shard::local::store(self.shard_id, |s| s.info()).last_seq;
+        let journal_tail = self.shard.store( |s| s.info()).last_seq;
         match self.engine.create_consumer(cmd.config) {
             Ok(true) => {
                 // Newly created — apply subject limits.
@@ -1012,7 +990,7 @@ impl CommandWorker {
     }
 
     pub(in crate::shard) fn handle_store_info(&mut self, cmd: StoreInfoCmd) {
-        let info = crate::shard::local::store(self.shard_id, |s| s.info());
+        let info = self.shard.store( |s| s.info());
         let _ = cmd.reply.send(StoreInfoReply {
             messages: info.messages,
             bytes: info.bytes,
@@ -1023,7 +1001,7 @@ impl CommandWorker {
 
     pub(in crate::shard) fn handle_purge_stream(&mut self, cmd: PurgeStreamCmd) {
         let new_last_seq = {
-            crate::shard::local::store(self.shard_id, |g| {
+            self.shard.store( |g| {
             // Scope the purge to the named stream. `Store::purge()` clears
             // the WHOLE shard, and a shard holds every stream routed to it
             // — so purging one stream destroyed its neighbours' messages
@@ -1054,12 +1032,12 @@ impl CommandWorker {
         // nowhere to go, because `Store::drain` only took a subject and
         // swept the whole shard. Same defect class as PurgeStream.
         let deleted =
-            crate::shard::local::store(self.shard_id, |s| s.drain(cmd.stream_id.0, &cmd.subject));
+            self.shard.store( |s| s.drain(cmd.stream_id.0, &cmd.subject));
         let _ = cmd.reply.send(deleted);
     }
 
     pub(in crate::shard) fn handle_delete_message(&mut self, cmd: DeleteMessageCmd) {
-        let found = crate::shard::local::store(self.shard_id, |s| s.tombstone_at(cmd.seq));
+        let found = self.shard.store( |s| s.tombstone_at(cmd.seq));
         let _ = cmd.reply.send(found);
     }
 
@@ -1067,7 +1045,7 @@ impl CommandWorker {
     pub(in crate::shard) fn handle_ack_term(&mut self, mut cmd: AckCmd) {
         // Tombstone each entry in the store.
         {
-            crate::shard::local::store(self.shard_id, |store| {
+            self.shard.store( |store| {
                 for entry in &cmd.entries {
                     store.tombstone_at(entry.seq);
                 }
@@ -1111,8 +1089,7 @@ impl CommandWorker {
         // borrow held across that would collide; splitting also keeps the
         // journal free while this computes cutoffs, which matters now that
         // the drain is a task on this same thread.
-        let shard = self.shard_id;
-        let info = crate::shard::local::store(shard, |s| s.info());
+        let info = self.shard.store(|s| s.info());
 
         if info.messages == 0 {
             return;
@@ -1169,7 +1146,7 @@ impl CommandWorker {
 
         // Collect oldest_ts updates in a local vec to avoid borrow conflict.
         let mut ts_updates: Vec<(u32, u64)> = Vec::new();
-        crate::shard::local::store(shard, |store| {
+        self.shard.store(|store| {
         let _ = store.for_each(start, end, &mut |entry| {
             let sid = entry.stream_id as usize;
             if sid >= resolved.len() {
@@ -1210,7 +1187,7 @@ impl CommandWorker {
         // Truncate if we found a valid boundary past current first_seq.
         if min_valid_seq > info.first_seq {
             let deleted =
-                crate::shard::local::store(shard, |s| s.truncate_front(min_valid_seq));
+                self.shard.store(|s| s.truncate_front(min_valid_seq));
             if deleted > 0 {
                 tracing::debug!(
                     deleted,

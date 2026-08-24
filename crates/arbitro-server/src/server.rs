@@ -352,6 +352,7 @@ impl ArbitroServer {
                             match self
                                 .server
                                 .append(
+                                    crate::shard::router::Elsewhere,
                                     &cat,
                                     seq_stream,
                                     &[store_entry],
@@ -841,6 +842,8 @@ impl ArbitroServer {
         drop(conn_tx);
 
         let accept_handle = tokio::spawn(async move {
+            // Round-robin host for connections that named no shard.
+            let mut next_home: usize = 0;
             loop {
                 tokio::select! {
                     result = conn_rx.recv() => {
@@ -887,7 +890,7 @@ impl ArbitroServer {
                                 #[cfg(feature = "tls")]
                                 let tls_acceptor_for_conn = tls_acceptor_shared.clone();
 
-                                let conn_task = async move {
+                                let conn_task = move |shard: std::rc::Rc<crate::shard::shard::Shard>| async move {
                                     let (reader, writer): (ConnReader, ConnWriter);
 
                                     #[cfg(feature = "tls")]
@@ -935,9 +938,10 @@ impl ArbitroServer {
                                     // thread-local nobody can reach, and every
                                     // write silently reports the peer dead.
                                     let (conn_id, conn, own_socket) = reg.register_on_shard(
+                                        &shard,
                                         writer,
                                         listener_shard,
-                                        home_shard.is_some(),
+                                        true,
                                     );
                                     // Installed HERE because this task is
                                     // already on the shard's runtime;
@@ -949,7 +953,7 @@ impl ArbitroServer {
                                     if let Some(crate::transport::registry::ConnWriter::Plain(w)) =
                                         own_socket
                                     {
-                                        crate::shard::local::install_egress(
+                                        shard.install_egress(
                                             conn_id,
                                             crate::transport::egress::DirectEgress::new(w),
                                         );
@@ -980,14 +984,27 @@ impl ArbitroServer {
                                 // between two single-threaded runtimes on
                                 // every message, which measured 120s-timeout
                                 // against 194ms for the same replay.
-                                match home_shard.and_then(|s| accept_server.runtime_for_shard(s)) {
-                                    Some(rt) => {
-                                        rt.spawn(conn_task);
-                                    }
-                                    // No per-shard runtimes at all.
+                                // A connection belongs to a shard. It is
+                                // built ON that shard's thread, so it holds
+                                // the shard itself and never has to ask
+                                // whether it may touch what is already its
+                                // own.
+                                //
+                                // A connection that arrived on the bootstrap
+                                // port named no shard, so one is picked. It
+                                // publishes through the queued path for every
+                                // stream that is not its host's — the same
+                                // cost the shared pool paid, now bounded to
+                                // clients that never asked for the topology.
+                                let owner = match home_shard {
+                                    Some(s) => s as usize,
                                     None => {
-                                        accept_background_tasks.lock().await.spawn(conn_task);
+                                        next_home = next_home.wrapping_add(1);
+                                        next_home % accept_server.shard_runtime_count().max(1)
                                     }
+                                };
+                                if !accept_server.accept_on_shard(owner, conn_task) {
+                                    tracing::error!(%addr, "no shard runtime to host the connection");
                                 }
                             }
                             None => {

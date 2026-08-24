@@ -497,6 +497,7 @@ pub async fn delayed_maturation_loop(
             let cat = server.names().snapshot();
             match server
                 .append(
+                    crate::shard::router::Elsewhere,
                     &cat,
                     seq_stream,
                     &[store_entry],

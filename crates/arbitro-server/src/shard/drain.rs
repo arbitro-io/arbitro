@@ -527,6 +527,7 @@ const DIRECT_BACKLOG_LIMIT: usize = 8 * 1024 * 1024;
 /// flight, and writing past them would reorder this connection's stream.
 #[inline]
 fn flush_frame(
+    shard: &crate::shard::shard::Shard,
     writer: &crate::shard::shared::WriterIndexEntry,
     conn: ConnectionId,
     bytes: bytes::Bytes,
@@ -535,14 +536,14 @@ fn flush_frame(
 
     let mut pending = Some(bytes);
     let direct = if writer.write_tx.capacity() == writer.write_tx.max_capacity() {
-        crate::shard::local::with_egress(conn.0, |e| {
+        shard.with_egress(conn.0, |e| {
             // Push what is owed first: nothing else drives this socket, so
             // skipping it would strand the backlog forever.
             if e.backlog() > 0 && matches!(e.flush(), Delivery::Dead) {
                 return false;
             }
             if e.backlog() > 0 {
-                crate::shard::local::mark_owes();
+                shard.mark_owes();
             }
             if e.backlog() >= DIRECT_BACKLOG_LIMIT {
                 return false;
@@ -553,7 +554,7 @@ fn flush_frame(
                 // Taken, but only as far as `owed`. Ordered and accounted;
                 // the flag is what stops the drain parking on top of it.
                 Delivery::Buffered(_) => {
-                    crate::shard::local::mark_owes();
+                    shard.mark_owes();
                     true
                 }
                 Delivery::Sent => true,
@@ -582,6 +583,7 @@ fn flush_frame(
 /// see `DrainConfig::stall_evict_ms`.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
+    shard: &crate::shard::shard::Shard,
     counters: &SharedCounters,
     snap: &DrainSnapshot,
     gate: &Gate,
@@ -673,7 +675,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
             let conn = frame.connection_id;
             let count = frame.count;
             let first_seq = frame.first_seq;
-            let ok = flush_frame(writer, conn, frame.bytes);
+            let ok = flush_frame(shard, writer, conn, frame.bytes);
 
             if ok {
                 probe.flush_ok(conn, first_seq, count);
@@ -772,6 +774,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     // same cycle. There is no notification and nothing to catch up on.
     if !scratch.deliveries.is_empty() {
         notify_delivered_grouped(
+            shard,
             counters,
             consumer_subjects,
             &snap.bindings,
@@ -786,7 +789,13 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
 
     advance_cursor(counters, &result, probe);
     close_window(&mut result);
-    report_dead_connections(&mut scratch.dead_connections, notify_tx, counters, silent_drops);
+    report_dead_connections(
+        shard,
+        &mut scratch.dead_connections,
+        notify_tx,
+        counters,
+        silent_drops,
+    );
     reopen_if_pending(gate, &result);
 }
 
@@ -806,6 +815,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
 /// nothing, instead of being counted and then unwound.
 #[inline]
 fn commit_deliveries(
+    shard: &crate::shard::shard::Shard,
     counters: &SharedCounters,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     binding: &ActiveBinding,
@@ -822,9 +832,7 @@ fn commit_deliveries(
     // The worker is parked whenever the drain runs — every command handler
     // is synchronous, so it is either published here or executing, and it
     // cannot be executing while this is.
-    let reached = crate::shard::local::with_worker(
-        |w: &mut crate::shard::CommandWorker| w.register_delivered(binding.binding_id, entries),
-    );
+    let reached = shard.with_worker(|w| w.register_delivered(binding.binding_id, entries));
     if reached.is_none() {
         // No worker on this thread means no engine to register against.
         // Counting a delivery nobody recorded is what strands a seq.
@@ -875,6 +883,7 @@ fn close_window(result: &mut DrainReadResult) {
 /// thread. Backpressured conns are transient and NOT reported here.
 #[inline]
 fn report_dead_connections(
+    shard: &crate::shard::shard::Shard,
     dead: &mut Vec<ConnectionId>,
     notify_tx: &mut crate::shard::shared::NotifyProducer,
     counters: &SharedCounters,
@@ -887,10 +896,9 @@ fn report_dead_connections(
     // connection that is dead in the drain's book and alive in the engine's
     // holds its pendings forever. Retried next cycle.
     dead.retain(|&conn_id| {
-        crate::shard::local::with_worker(|w: &mut crate::shard::CommandWorker| {
-            w.retire_connection(conn_id)
-        })
-        .is_none()
+        shard
+            .with_worker(|w| w.retire_connection(conn_id))
+            .is_none()
     });
 }
 
@@ -980,9 +988,10 @@ fn process_drain_entry(
     scratch.matches.clear();
     scratch.matches.extend(lookup.iter());
     if mt.pattern_count() > 0 {
-        let resolved = scratch
-            .caches
-            .resolve_patterns(stream_raw, birth_seq, subject_hash, entry.subject, mt);
+        let resolved =
+            scratch
+                .caches
+                .resolve_patterns(stream_raw, birth_seq, subject_hash, entry.subject, mt);
         // Dedup across the merge: one subscription can sit in both buckets
         // (literal + pattern). A duplicate delivers twice AND increments
         // inflight twice against a single ack, permanently starving the
@@ -1341,7 +1350,6 @@ fn dispatch_recipients(
             scratch.served_queues.push(queue_id);
         }
     }
-
 }
 
 // ── Ack-mode notifications ──────────────────────────────────────────────────
@@ -1354,6 +1362,7 @@ fn dispatch_recipients(
 /// is deferred, so no ack can arrive ahead of its own pending.
 #[allow(clippy::too_many_arguments)]
 fn notify_delivered_grouped(
+    shard: &crate::shard::shard::Shard,
     counters: &SharedCounters,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     bindings: &[ActiveBinding],
@@ -1381,6 +1390,7 @@ fn notify_delivered_grouped(
             && deliveries.iter().all(|d| frame_ok(d.conn))
         {
             commit_deliveries(
+                shard,
                 counters,
                 consumer_subjects,
                 &bindings[first_idx],
@@ -1445,6 +1455,7 @@ fn notify_delivered_grouped(
             continue;
         }
         commit_deliveries(
+            shard,
             counters,
             consumer_subjects,
             &bindings[idx],
@@ -1496,6 +1507,13 @@ mod tests {
     /// `Binding.pending`, so no retirement rewind ever recovers them).
     #[tokio::test(flavor = "current_thread")]
     async fn writer_gone_leaves_cursor_before_failed_batch() {
+        let shard = &*crate::shard::shard::Shard::new(
+            0,
+            Box::new(arbitro_store::MemoryStore::new()),
+        );
+        let shard_owned =
+            crate::shard::shard::Shard::new(0, Box::new(arbitro_store::MemoryStore::new()));
+        let shard = &*shard_owned;
         let counters = SharedCounters::new();
         let gate = Gate::new();
         let names = Arc::new(NameRegistry::default());
@@ -1532,6 +1550,7 @@ mod tests {
         };
 
         drain_deliver(
+            shard,
             &counters,
             &snap,
             &gate,
@@ -1567,6 +1586,13 @@ mod tests {
     /// shard.
     #[tokio::test(flavor = "current_thread")]
     async fn backpressured_conn_evicted_after_stall_window() {
+        let shard = &*crate::shard::shard::Shard::new(
+            0,
+            Box::new(arbitro_store::MemoryStore::new()),
+        );
+        let shard_owned =
+            crate::shard::shard::Shard::new(0, Box::new(arbitro_store::MemoryStore::new()));
+        let shard = &*shard_owned;
         let counters = SharedCounters::new();
         let gate = Gate::new();
         let names = Arc::new(NameRegistry::default());
@@ -1610,6 +1636,7 @@ mod tests {
                     b"payload",
                 );
                 drain_deliver(
+                    shard,
                     &counters,
                     &snap,
                     &gate,
@@ -1662,6 +1689,13 @@ mod tests {
     /// clock, so a slow-but-alive consumer is never evicted.
     #[tokio::test(flavor = "current_thread")]
     async fn flush_progress_resets_stall_clock() {
+        let shard = &*crate::shard::shard::Shard::new(
+            0,
+            Box::new(arbitro_store::MemoryStore::new()),
+        );
+        let shard_owned =
+            crate::shard::shard::Shard::new(0, Box::new(arbitro_store::MemoryStore::new()));
+        let shard = &*shard_owned;
         let counters = SharedCounters::new();
         let gate = Gate::new();
         let names = Arc::new(NameRegistry::default());
@@ -1702,6 +1736,7 @@ mod tests {
                     b"payload",
                 );
                 drain_deliver(
+                    shard,
                     &counters,
                     &snap,
                     &gate,

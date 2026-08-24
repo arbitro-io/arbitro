@@ -25,7 +25,7 @@ pub mod router;
 pub(crate) mod commands;
 pub(crate) mod dedup;
 pub(crate) mod quota;
-pub(crate) mod local;
+pub(crate) mod shard;
 pub(crate) mod runtime;
 pub mod shared;
 pub mod worker;

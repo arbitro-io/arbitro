@@ -28,6 +28,11 @@ type MsgHash = u64;
 type TimestampMs = u64;
 type Token = u64;
 
+/// Scheduler resolution. Dedup windows are configured in whole seconds, so
+/// retiring within 100 ms of the deadline is far finer than anything the
+/// contract promises.
+pub(crate) const TICK_MS: u64 = 100;
+
 /// Returns the key it was handed.
 ///
 /// `seen` is keyed by a hash already. std's default is SipHash-1-3, which
@@ -229,10 +234,13 @@ impl Dedup {
         now_ms: TimestampMs,
         window_ms: u32,
     ) -> bool {
-        // Dedup disabled: literally nothing else happens.
-        if window_ms == 0 {
+        // Nothing to dedup by: no window, or a message carrying no id.
+        // Two empty ids are not each other's duplicate.
+        if window_ms == 0 || msg_id.is_empty() {
             return true;
         }
+
+        self.advance(now_ms);
 
         let hash = crate::transport::dispatch_v2::idempotency_hash(msg_id);
 
@@ -311,6 +319,24 @@ impl Dedup {
         true
     }
 
+    /// Move the scheduler to `now_ms`, retiring whatever ran out.
+    ///
+    /// Driven from admission rather than from the shard timer on purpose:
+    /// the timer reads an `Instant` from the worker's own epoch, while a
+    /// publish carries `SharedClock`'s UNIX ms. Two clocks on one wheel is
+    /// how deadlines end up either always past or never reached, so the
+    /// wheel is advanced by the same clock that sets the deadlines.
+    ///
+    /// A shard that stops publishing therefore stops retiring. That costs
+    /// memory bounded by one window and nothing else — nothing reads an
+    /// entry whose stream is idle, and the next publish catches up in full.
+    ///
+    /// No borrow of `tables` is held here: the listener takes it.
+    #[inline]
+    fn advance(&self, now_ms: TimestampMs) {
+        self.scheduler.borrow_mut().tick(now_ms);
+    }
+
     /// Admit a whole batch, or none of it.
     ///
     /// The wire gives a batch one `first_seq`, so its sequence numbers are
@@ -333,6 +359,8 @@ impl Dedup {
         if window_ms == 0 {
             return true;
         }
+
+        self.advance(now_ms);
 
         let expires_at = now_ms.saturating_add(window_ms as TimestampMs);
         let mut staged: smallvec::SmallVec<[(MsgHash, Token); 16]> = smallvec::SmallVec::new();

@@ -38,12 +38,27 @@
 //! publish to originate on the owning thread, which is a client-steering
 //! property, not a server one.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
+
+/// A task to be built and run on the shard's thread, handed the shard.
+///
+/// The closure is `Send` — it is only a recipe. What it builds is not, and
+/// must not be: it belongs to the shard.
+///
+/// This channel crosses a REAL ownership boundary. The acceptor and the
+/// shard are different owners, and a connection arriving later cannot be
+/// handed over any other way. That is the one case message passing is for.
+type LocalJob = Box<dyn FnOnce(Rc<super::shard::Shard>) -> Pin<Box<dyn Future<Output = ()>>> + Send>;
 
 /// A shard's private runtime: a `current_thread` tokio runtime driven by
 /// one dedicated OS thread.
 pub(crate) struct ShardRuntime {
     handle: tokio::runtime::Handle,
+    /// Hands later work to the shard's thread. See [`LocalJob`].
+    local_tx: tokio::sync::mpsc::UnboundedSender<LocalJob>,
     /// Dropping this stops the runtime's `block_on`, which lets the thread
     /// finish. Held so the runtime outlives the tasks spawned onto it.
     shutdown: Arc<tokio::sync::Notify>,
@@ -63,10 +78,18 @@ impl ShardRuntime {
     /// tasks spawned onto the handle could run before the journal exists
     /// and see "this thread owns no shard" — indistinguishable from a
     /// misrouted connection, and intermittent.
-    pub(crate) fn start(
+    /// The `Shard` is created HERE, by the thing that owns the thread, and
+    /// handed to `main` and to every task accepted later. Nothing it holds
+    /// has to be `Send`, because nothing it holds ever leaves this thread.
+    pub(crate) fn start<F, Fut>(
         id: usize,
         store: Box<dyn arbitro_store::Store>,
-    ) -> std::io::Result<Self> {
+        main: F,
+    ) -> std::io::Result<Self>
+    where
+        F: FnOnce(Rc<super::shard::Shard>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -74,20 +97,34 @@ impl ShardRuntime {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let stop = Arc::clone(&shutdown);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel::<LocalJob>();
 
         let thread = std::thread::Builder::new()
             .name(format!("arbitro-shard-{id}"))
             .spawn(move || {
-                super::local::install(id, store);
-                super::local::install_idempotency(
-                    id,
-                    super::idempotency::new_shared_idempotency(),
-                );
+                let shard = super::shard::Shard::new(id, store);
                 let _ = ready_tx.send(());
-                // `block_on` drives every task spawned through the handle,
-                // not just this future. Parking on the notify is what keeps
-                // the runtime alive and polling until shutdown.
-                rt.block_on(async move { stop.notified().await });
+                // A `LocalSet` so this thread can also run tasks that hold
+                // what the shard owns. `Handle::spawn` requires the whole
+                // future to be `Send`, which would force every such field
+                // into a lookup somewhere else.
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async move {
+                    tokio::task::spawn_local(main(Rc::clone(&shard)));
+                    loop {
+                        tokio::select! {
+                            job = local_rx.recv() => match job {
+                                Some(job) => {
+                                    tokio::task::spawn_local(job(Rc::clone(&shard)));
+                                }
+                                None => break,
+                            },
+                            // Keeps the runtime alive and polling until
+                            // shutdown.
+                            _ = stop.notified() => break,
+                        }
+                    }
+                });
             })?;
         // A dropped sender means the thread died before installing; treat
         // that as the fatal condition it is rather than returning a runtime
@@ -98,6 +135,7 @@ impl ShardRuntime {
 
         Ok(Self {
             handle,
+            local_tx,
             shutdown,
             thread: Some(thread),
         })
@@ -105,6 +143,18 @@ impl ShardRuntime {
 
     pub(crate) fn handle(&self) -> &tokio::runtime::Handle {
         &self.handle
+    }
+
+    /// Hand work to this shard, to be built and run on its thread with the
+    /// shard in hand. For connections, which arrive after startup.
+    pub(crate) fn spawn_local<F, Fut>(&self, build: F)
+    where
+        F: FnOnce(Rc<super::shard::Shard>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let _ = self
+            .local_tx
+            .send(Box::new(move |shard| Box::pin(build(shard))));
     }
 }
 

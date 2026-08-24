@@ -189,9 +189,11 @@ pub enum PublishReply {
 /// which is why a round trip is affordable here and nowhere else.
 pub struct RecordDedupCmd {
     pub stream_id: StreamId,
-    pub hash: u64,
     pub msg_id: Vec<u8>,
     pub window_ms: u32,
+    /// The publisher's clock, carried so the shard dates the entry from
+    /// when the publish happened rather than from when the queue drained.
+    pub now_ms: u64,
     /// `true` = recorded (new), `false` = duplicate.
     pub reply: oneshot::Sender<bool>,
 }

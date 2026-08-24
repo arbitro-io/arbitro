@@ -19,6 +19,7 @@
 
 use crate::shard::source::WindowSource;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -114,6 +115,8 @@ pub struct DrainWorker {
     /// feature is off — hence unread in default builds.
     #[cfg_attr(not(feature = "lifecycle_trace"), allow(dead_code))]
     pub(super) shard_id: u32,
+    /// The shard this drain belongs to — same owner as the command loop.
+    pub(super) shard: Rc<crate::shard::shard::Shard>,
     pub(super) counters: Arc<SharedCounters>,
     pub(super) snapshot: Arc<SnapshotSwap<DrainSnapshot>>,
     pub(super) gate: Arc<Gate>,
@@ -150,7 +153,7 @@ impl DrainWorker {
     pub(in crate::shard) async fn run<P: DrainProbe>(mut self, mut probe: P) {
         // ── Store init ───────────────────────────────────────────────────
         {
-            let info = crate::shard::local::store(self.shard_id as usize, |s| {
+            let info = self.shard.store(|s| {
                 if let Err(e) = s.init() {
                     tracing::error!(error = ?e, "store init failed");
                 }
@@ -209,7 +212,7 @@ impl DrainWorker {
                 // wall time and blocks publish ~10x longer (measured, memory
                 // and disk journals): the drain holds the lock for the whole
                 // walk while every publisher waits on it.
-                let w = crate::shard::source::LocalSource::new(self.shard_id as usize).take_window(
+                let w = crate::shard::source::LocalSource::new(&self.shard).take_window(
                     &self.counters,
                     &self.drain_config,
                     &mut self.staged,
@@ -251,6 +254,7 @@ impl DrainWorker {
                 if let ReadVerdict::Fed(result) = verdict {
                     let _p = super::drain_profile::flush();
                     super::drain::drain_deliver(
+                        &self.shard,
                         &self.counters,
                         &snap,
                         &self.gate,
@@ -280,7 +284,7 @@ impl DrainWorker {
                 // owed bytes strands them until the client's ack_wait forces
                 // a redelivery. Retry instead — the sleep gives the kernel
                 // room, and `flush_owed` is a flag read when nothing is owed.
-                if crate::shard::local::flush_owed() {
+                if self.shard.flush_owed() {
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                     continue;
                 }
@@ -469,9 +473,8 @@ enum Woke {
 pub struct CommandWorker {
     /// Engine — owned exclusively. `&mut self`, no sharing, no lock.
     pub(super) engine: ArbitroEngine,
-    /// Which shard's journal this worker may touch. It runs on that shard's
-    /// thread and the journal lives there; this is the key that reaches it.
-    pub(super) shard_id: usize,
+    /// What this worker IS. Store, dedup, sockets — all reached as fields.
+    pub(super) shard: Rc<crate::shard::shard::Shard>,
     /// Atomic counters shared with drain.
     pub(super) counters: Arc<SharedCounters>,
     /// Structural snapshot shared with drain.
@@ -526,31 +529,7 @@ pub struct CommandWorker {
     pub(super) next_timer_ms: Option<u64>,
     /// Origin for every millisecond the worker deals in.
     pub(super) epoch: Instant,
-    /// When the idempotency trackers were last advanced. The difference
-    /// against now is what they get, so their windows follow wall time
-    /// rather than a count of wakeups.
-    pub(super) last_idempotency_ms: u64,
-    /// Per-shard idempotency dedup, shared with `dispatch_v2` so the
-    /// publish hot path can check membership and record new entries
-    /// (publishes don't go through this worker — they hit the store
-    /// directly via `ShardRouter::store_for`). Wrapped in `Arc<Mutex>`
-    /// for the same reason `SharedStore` is: the publish path locks,
-    /// the worker's tick loop also locks (1Hz), uncontended in normal
-    /// operation.
-    ///
-    /// `Option<...>` inside the Mutex stays `None` until the first
-    /// publish that hits an idempotent stream owned by this shard
-    /// (lazy allocation). Cost when None: zero — the publish hot path
-    /// fast-bails via `NameRegistry::stream_idempotency_window_ms`
-    /// before touching this Arc.
 
-    /// F10 — cached "has idempotency tracker been allocated" flag.
-    /// Used in `tokio::select!` predicates to avoid locking the shared
-    /// `Arc<Mutex<Option<IdempotencyTracker>>>` on every iteration just
-    /// to call `Option::is_some()`. Flipped to `true` the first time the
-    /// publish hot path allocates the tracker; never goes back to false
-    /// in steady state (the tracker only drops when the shard shuts down).
-    pub(super) has_idempotency: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// H10: shared silent-drop counters.
     pub(super) silent_drops: Arc<crate::common::SilentDrops>,
     /// H11: ConsumerRemoved events that lost a `try_send` to the drain
@@ -626,8 +605,6 @@ impl CommandWorker {
 
     /// How often dedup windows are retired. Coarser than the wheel on
     /// purpose: a window is minutes long, the tracker buckets in seconds,
-    /// and there is one tracker per stream.
-    const IDEMPOTENCY_INTERVAL_MS: u64 = 1_000;
 
         /// Async command loop — runs as a `tokio::spawn` task.
     ///
@@ -641,6 +618,9 @@ impl CommandWorker {
     /// across the `await` below would panic the moment a connection task
     /// tried to use it.
     pub async fn run(self) {
+        // Held outside the box so the loop can reach the shard while the
+        // worker itself is parked inside it.
+        let shard = Rc::clone(&self.shard);
         let mut me = Box::new(self);
         me.next_eviction = Some(Instant::now() + Self::EVICTION_INTERVAL);
         // `rx` leaves the struct for good — it is awaited here and nowhere
@@ -747,7 +727,7 @@ impl CommandWorker {
             // is not using it. The drain registers deliveries through it.
             let timers_armed = me.next_timer_ms.is_some();
             let bump = std::sync::Arc::clone(&me.timer_bump);
-            crate::shard::local::install_worker(me);
+            shard.park_worker(me);
 
             let event = tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -763,14 +743,14 @@ impl CommandWorker {
 
             // Take it back BEFORE touching any state. Nothing between the
             // await and here may use the worker.
-            me = match crate::shard::local::take_worker::<Self>() {
+            me = match shard.take_worker() {
                 Some(w) => w,
                 // A direct caller is mid-flight with it; it will be back on
                 // the next poll. Losing the loop here would strand the
                 // shard, so yield rather than return.
                 None => {
                     tokio::task::yield_now().await;
-                    match crate::shard::local::take_worker::<Self>() {
+                    match shard.take_worker() {
                         Some(w) => w,
                         None => return,
                     }
@@ -780,12 +760,12 @@ impl CommandWorker {
             match event {
                 Woke::Command(cmd) => {
                     if me.handle_or_shutdown(cmd) {
-                        crate::shard::local::uninstall_worker();
+                        shard.clear_worker();
                         return;
                     }
                 }
                 Woke::Closed => {
-                    crate::shard::local::uninstall_worker();
+                    shard.clear_worker();
                     return;
                 }
                 Woke::Rearm => {}
@@ -810,6 +790,7 @@ impl CommandWorker {
         Instant::now().duration_since(self.epoch).as_millis() as u64
     }
 
+
     /// Ensure the wheel is initialized. Called lazily on first need.
     pub(super) fn ensure_wheel(&mut self) {
         if self.wheel.is_none() {
@@ -828,14 +809,7 @@ impl CommandWorker {
     pub(super) fn rearm_timer(&mut self) {
         let previous = self.next_timer_ms;
         let wheel_due = self.wheel.as_ref().and_then(|w| w.next_expiry_ms());
-        let idempotency_due = self
-            .has_idempotency
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .then(|| self.last_idempotency_ms + Self::IDEMPOTENCY_INTERVAL_MS);
-        self.next_timer_ms = match (wheel_due, idempotency_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (only, None) | (None, only) => only,
-        };
+        self.next_timer_ms = wheel_due;
         // Only when it moved EARLIER. Later or unchanged needs no wake, and
         // the run loop recomputes its sleep every turn anyway.
         let earlier = match (previous, self.next_timer_ms) {
@@ -1067,26 +1041,12 @@ impl CommandWorker {
         let now_ms = self.now_ms();
         self.wheel_advance(now_ms);
 
-        // F26: every per-stream tracker. Handing over elapsed wall time
-        // rather than a tick count keeps the windows honest even though
-        // this arm competes with command traffic and is regularly late.
-        let elapsed = now_ms.saturating_sub(self.last_idempotency_ms);
-        if elapsed >= Self::IDEMPOTENCY_INTERVAL_MS
-            && self
-                .has_idempotency
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            // Same thread as every publish that records into these, so
-            // the sweep needs no lock — only the discipline of not
-            // holding the borrow while calling out.
-            if let Some(map) = crate::shard::local::idempotency(self.shard_id) {
-                let trackers: Vec<_> = map.borrow().values().cloned().collect();
-                for tracker in trackers {
-                    tracker.borrow_mut().advance_by_ms(elapsed);
-                }
-            }
-            self.last_idempotency_ms = now_ms;
-        }
+        // Dedup windows are NOT retired here. This timer reads an `Instant`
+        // from the worker's own epoch, while a publish carries
+        // `SharedClock`'s UNIX ms — and the dedup deadlines are set from
+        // the latter. Advancing one wheel from two clocks is how deadlines
+        // end up either always past or never reached, so the domain moves
+        // its own clock, from the same `now_ms` that sets its deadlines.
 
         self.rearm_timer();
     }
@@ -1108,17 +1068,17 @@ impl CommandWorker {
     fn handle_or_shutdown(&mut self, cmd: ShardCommand) -> bool {
         if matches!(cmd, ShardCommand::Shutdown) {
             if crate::shard::drain::chaos_debug() {
-                let info = crate::shard::local::store(self.shard_id, |s| s.info());
+                let info = self.shard.store( |s| s.info());
                 eprintln!(
                     "[SHUTDOWN-BEGIN] store_first={} store_last={} messages={}",
                     info.first_seq, info.last_seq, info.messages
                 );
             }
-            if let Err(e) = crate::shard::local::store(self.shard_id, |s| s.shutdown()) {
+            if let Err(e) = self.shard.store( |s| s.shutdown()) {
                 tracing::error!(error = ?e, "store shutdown failed");
             }
             if crate::shard::drain::chaos_debug() {
-                let info = crate::shard::local::store(self.shard_id, |s| s.info());
+                let info = self.shard.store( |s| s.info());
                 eprintln!(
                     "[SHUTDOWN-DONE] store_first={} store_last={} messages={}",
                     info.first_seq, info.last_seq, info.messages
@@ -1561,15 +1521,13 @@ mod tests {
             crate::shard::shared::NotifyRing::new(1);
         let _notify_tx = notify_producers.pop();
         let (drain_evt_tx, drain_evt_rx) = crate::shard::drain_events::DrainEventRing::new();
-        // The journal now belongs to the shard's thread, not to the worker
-        // struct, so the test installs one on ITS thread instead of handing
-        // the worker a store. `install_for_test` replaces rather than
-        // refuses: cargo reuses threads between tests, so an earlier test's
-        // journal is normally still here, and each test wants an empty one.
-        crate::shard::local::install_for_test(0, Box::new(arbitro_store::MemoryStore::new()));
+        // A test builds its own shard, with its own store. Nothing is
+        // installed anywhere, so tests cannot inherit each other's journal
+        // the way a thread-local one let them.
+        let shard = crate::shard::shard::Shard::new(0, Box::new(arbitro_store::MemoryStore::new()));
         let worker = CommandWorker {
             engine: ArbitroEngine::new(),
-            shard_id: 0,
+            shard,
             counters: Arc::new(SharedCounters::new()),
             snapshot: Arc::new(SnapshotSwap::new(DrainSnapshot::empty())),
             gate: Arc::new(Gate::new()),
@@ -1587,8 +1545,6 @@ mod tests {
             wheel_buf: Vec::new(),
             next_timer_ms: None,
             epoch: Instant::now(),
-            last_idempotency_ms: 0,
-            has_idempotency: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             silent_drops: Arc::new(crate::common::SilentDrops::new()),
             pending_consumer_remove: Vec::new(),
             pending_drain_acks: Vec::new(),

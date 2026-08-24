@@ -45,18 +45,18 @@ pub(in crate::shard) trait WindowSource {
 /// measurement — the doc above puts it at ~82us per cycle at 8KB payloads
 /// — and doing it in the same pass as the ownership move would make a
 /// regression in either impossible to attribute.
-pub(in crate::shard) struct LocalSource {
-    shard_id: usize,
+pub(in crate::shard) struct LocalSource<'a> {
+    shard: &'a crate::shard::shard::Shard,
 }
 
-impl LocalSource {
+impl<'a> LocalSource<'a> {
     #[inline]
-    pub(in crate::shard) fn new(shard_id: usize) -> Self {
-        Self { shard_id }
+    pub(in crate::shard) fn new(shard: &'a crate::shard::shard::Shard) -> Self {
+        Self { shard }
     }
 }
 
-impl WindowSource for LocalSource {
+impl WindowSource for LocalSource<'_> {
     #[inline]
     fn take_window(
         &self,
@@ -64,7 +64,7 @@ impl WindowSource for LocalSource {
         cfg: &DrainConfig,
         staged: &mut Staged,
     ) -> Window {
-        crate::shard::local::store(self.shard_id, |s| {
+        self.shard.store(|s| {
             let w = drain::window(counters, s, cfg);
             if let Window::Range { start, end, .. } = w {
                 let _p = crate::shard::drain_profile::fill();
