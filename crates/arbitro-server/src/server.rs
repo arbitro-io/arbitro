@@ -969,7 +969,7 @@ impl ArbitroServer {
                                         &shard,
                                         writer,
                                         listener_shard,
-                                        true,
+                                        listener_shard.is_some(),
                                     );
                                     // Installed HERE because this task is
                                     // already on the shard's runtime;
