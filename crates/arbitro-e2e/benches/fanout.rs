@@ -19,6 +19,12 @@
 //! 4 fanout subscriptions on the same stream with different filters,
 //! `DIST_TOTAL` (300k) messages spread across 3 subject shapes (100k each).
 //!
+//! Each stream owns a slice of the subject space and nothing else — the
+//! broker refuses a `>` filter outright, and refuses two streams whose
+//! slices overlap. So the three stages take `bench.>`, `message.>` and
+//! `scms.>`, which are disjoint. This bench predates that rule and was
+//! creating every stream with `>`, so it had been failing at setup.
+//!
 //! Rule: compile from /mnt, run from /tmp/arbitro, timeout 120, tee log.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -70,8 +76,12 @@ const DIST_SUBS: &[DistSub] = &[
         expected: DIST_PER_SUBJECT,
     },
     DistSub {
-        label: "ignore.me",
-        filter: b"ignore.me",
+        // Inside the stream's slice, matching none of its subjects. It has
+        // to be inside: a filter reaching outside `message.>` is refused at
+        // creation, and this stage is about what gets DELIVERED, not about
+        // what the rules reject.
+        label: "message.ignore.me",
+        filter: b"message.ignore.me",
         expected: 0,
     },
 ];
@@ -283,7 +293,7 @@ async fn run_stage(label: &str, mode: Mode, pub_mode: Pub) {
     // Setup: stream.
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(STREAM, b"bench.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -371,7 +381,7 @@ async fn run_distribution() {
     let addr = spawn_server().await;
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(DIST_STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(DIST_STREAM, b"message.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
@@ -513,7 +523,7 @@ async fn run_single_conn_multi_sub() {
     let addr = spawn_server().await;
     let setup = connect(&addr).await;
     let resp = setup
-        .create_stream(SCMS_STREAM, b">", 0, 0, 0, 1, 0, 0, 0, 0)
+        .create_stream(SCMS_STREAM, b"scms.>", 0, 0, 0, 1, 0, 0, 0, 0)
         .await
         .unwrap();
     let stream_id = u64::from_le_bytes(resp[..8].try_into().unwrap()) as u32;
