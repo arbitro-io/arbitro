@@ -4,6 +4,9 @@
 
 mod subject;
 mod trie;
+/// Experimental: same trie keyed by segment hash instead of bytes.
+/// Public so a benchmark can compare the two head to head.
+pub mod hash_trie;
 
 pub use subject::{next_token, strictly_nested, subject_covers, subject_matches, subjects_overlap};
 pub use trie::{validate_pattern, PatternError, SubjectTrie, TrieNode};

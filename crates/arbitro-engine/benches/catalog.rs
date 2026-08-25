@@ -419,10 +419,9 @@ fn truth_vs_mirror(c: &mut Criterion) {
 /// is what made the cascade quadratic. Measured at two sizes so a scan
 /// cannot hide: an index is flat per element, a scan is not.
 ///
-/// `bindings_for_stream` returns a borrowed slice and allocates nothing;
-/// the other two clone their index because the caller mutates while it
-/// iterates. That clone is the honest remaining cost and it is measured
-/// here rather than assumed away.
+/// Both forms return a borrowed slice and allocate nothing. The cloning
+/// forms are gone: their only caller was the cascade, which now TAKES the
+/// list it is about to destroy.
 fn ownership_lookups(c: &mut Criterion) {
     let mut g = c.benchmark_group("lookup");
     for &(consumers, subs) in &[(20u32, 10u32), (100, 10)] {
@@ -432,19 +431,6 @@ fn ownership_lookups(c: &mut Criterion) {
 
         g.bench_function(BenchmarkId::new("bindings_for_stream", &label), |b| {
             b.iter(|| black_box(w.engine.ctx().catalog.bindings_for_stream(w.stream).len()))
-        });
-        g.bench_function(BenchmarkId::new("consumers_for_stream", &label), |b| {
-            b.iter(|| black_box(w.engine.ctx().catalog.consumers_for_stream(w.stream)))
-        });
-        g.bench_function(BenchmarkId::new("subscriptions_for_consumer", &label), |b| {
-            b.iter(|| {
-                black_box(
-                    w.engine
-                        .ctx()
-                        .catalog
-                        .subscriptions_for_consumer(consumer0),
-                )
-            })
         });
         g.bench_function(BenchmarkId::new("bindings_for_consumer", &label), |b| {
             b.iter(|| {
@@ -457,6 +443,485 @@ fn ownership_lookups(c: &mut Criterion) {
                 )
             })
         });
+    }
+    g.finish();
+}
+
+// ── The delivery lookup ─────────────────────────────────────────────────
+
+/// What the drain asks per message: given a stream and a subject, who
+/// gets it -- and then walking the answer, which is what it does next.
+///
+/// Shaped like a real deployment: 8 consumers, 30 subscriptions each, 240
+/// subscriptions on one stream. Only ONE subscription per consumer matches
+/// any given subject, so a lookup returns 8 entries out of 240.
+///
+/// The `inherited` variant is the case where subscriptions declare no
+/// filter of their own and inherit the consumer's. `transport::rules`
+/// resolves that above the engine, and an EMPTY filter reaches the match
+/// table as a catch-all -- which is appended to EVERY lookup, matched or
+/// not. That is the shape that stops being free.
+fn delivery_lookup(c: &mut Criterion) {
+    use arbitro_engine::common::wire_hash_32;
+
+    const CONSUMERS: u32 = 8;
+    const SUBS_EACH: u32 = 30;
+    const SHORT: &[u8] = b"orders.eu.west.created";
+    const UUID: &[u8] =
+        b"orders.eu-west-1.tenant-4f3a9c22-8b1e-4d7a-9c3f-2e6b8a1d5f04.created";
+
+    /// `inherited` = how many of each consumer's subscriptions carry no
+    /// filter and therefore land in `catch_all`.
+    fn world(subject: &[u8], inherited: u32) -> (ArbitroEngine, StreamId) {
+        let mut engine = ArbitroEngine::new();
+        let stream = StreamId(1);
+        engine
+            .create_stream(StreamConfig {
+                id: stream,
+                name: b"bench".to_vec(),
+            })
+            .unwrap();
+        let mut next = 1u32;
+        for c in 0..CONSUMERS {
+            engine
+                .create_consumer(ConsumerConfig {
+                    id: ConsumerId(c + 1),
+                    queue_id: QueueId(0),
+                    stream_id: stream,
+                    durable: true,
+                    ack_policy: AckPolicy::Explicit,
+                    max_inflight: 100_000,
+                    ack_wait_ms: 0,
+                    max_nack: 0,
+                    filter: Box::from(&b""[..]),
+                })
+                .unwrap();
+            for k in 0..SUBS_EACH {
+                // One subscription per consumer matches the subject; some
+                // inherit (empty filter -> catch-all); the rest are exact
+                // filters on other subjects.
+                let filters = if k == 0 {
+                    vec![subject.to_vec()]
+                } else if k <= inherited {
+                    Vec::new()
+                } else {
+                    vec![format!("other.c{c}.sub{k}").into_bytes()]
+                };
+                engine
+                    .create_subscription(SubscriptionConfig {
+                        id: SubscriptionId(next),
+                        external_id: k,
+                        stream_id: stream,
+                        consumer_id: ConsumerId(c + 1),
+                        filters,
+                    })
+                    .unwrap();
+                engine.open_connection(ConnectionId(next as u64), NodeId(0));
+                let _ = engine.subscribe(ConnectionId(next as u64), SubscriptionId(next));
+                next += 1;
+            }
+        }
+        (engine, stream)
+    }
+
+    let mut g = c.benchmark_group("lookup_subject");
+    for (sname, subject) in [("short_22B", SHORT), ("uuid_68B", UUID)] {
+        for &inherited in &[0u32, 1, 29] {
+            let (engine, stream) = world(subject, inherited);
+            let mt = engine.ctx().catalog.match_table(stream).unwrap();
+            let label = format!("{sname}/{CONSUMERS}c_x{SUBS_EACH}s_inh{inherited}");
+
+            // Report how many entries come back, so the timings are read
+            // against a known answer rather than a guessed one.
+            let r = mt.lookup_verified(wire_hash_32(subject), subject);
+            println!(
+                "  [{label}] exact={} catch_all={}",
+                r.exact.len(),
+                r.catch_all.len()
+            );
+
+            g.bench_function(BenchmarkId::new("hash_and_lookup", &label), |b| {
+                b.iter(|| {
+                    let h = wire_hash_32(black_box(subject));
+                    let r = mt.lookup_verified(h, black_box(subject));
+                    black_box(r.exact.len() + r.catch_all.len())
+                })
+            });
+
+            // Lookup AND walk every recipient -- what dispatch does next.
+            g.bench_function(BenchmarkId::new("lookup_and_walk", &label), |b| {
+                b.iter(|| {
+                    let h = wire_hash_32(black_box(subject));
+                    let r = mt.lookup_verified(h, black_box(subject));
+                    let mut acc = 0u64;
+                    for e in r.exact.iter().chain(r.catch_all.iter()) {
+                        acc += e.consumer_id.raw() as u64 + e.binding_idx as u64;
+                    }
+                    black_box(acc)
+                })
+            });
+        }
+    }
+    g.finish();
+}
+
+// ── The worst case: wildcards at scale ──────────────────────────────────
+
+/// 20 consumers x 15 subscriptions = 300 on one stream, a third of them
+/// carrying wildcards.
+///
+/// The earlier lookup numbers used ONLY literal filters, which is the best
+/// case: a literal lands in `exact` and costs one probe. A wildcard cannot
+/// be precomputed -- the subject is not known until the message arrives --
+/// so it goes to the pattern trie and is walked per subject, then cached
+/// by the caller.
+///
+/// Three costs are separated here, because they are paid at different
+/// rates:
+///  * `exact` -- the probe, paid on every message
+///  * `patterns_cold` -- the trie walk, paid ONCE per distinct subject
+///  * `patterns_warm` -- what a cached resolve costs (a Vec copy)
+///
+/// The `>` in the mix matters: it matches one or more trailing tokens, so
+/// it fires for every subject under its prefix and its entries end up in
+/// every result.
+fn wildcards_at_scale(c: &mut Criterion) {
+    use arbitro_engine::catalog::match_table::MatchEntry;
+    use arbitro_engine::common::wire_hash_32;
+
+    const CONSUMERS: u32 = 20;
+    const SUBS_EACH: u32 = 15;
+    const WILDCARDS_EACH: u32 = 5;
+    const SUBJECT: &[u8] = b"orders.eu-west-1.tenant-4f3a9c22-8b1e-4d7a-9c3f-2e6b8a1d5f04.created";
+
+    let mut engine = ArbitroEngine::new();
+    let stream = StreamId(1);
+    engine
+        .create_stream(StreamConfig {
+            id: stream,
+            name: b"bench".to_vec(),
+        })
+        .unwrap();
+
+    let mut next = 1u32;
+    for c in 0..CONSUMERS {
+        engine
+            .create_consumer(ConsumerConfig {
+                id: ConsumerId(c + 1),
+                queue_id: QueueId(0),
+                stream_id: stream,
+                durable: true,
+                ack_policy: AckPolicy::Explicit,
+                max_inflight: 100_000,
+                ack_wait_ms: 0,
+                max_nack: 0,
+                filter: Box::from(&b""[..]),
+            })
+            .unwrap();
+        for k in 0..SUBS_EACH {
+            let filters = if k == 0 {
+                // One literal that matches the subject exactly.
+                vec![SUBJECT.to_vec()]
+            } else if k <= WILDCARDS_EACH {
+                // Wildcards. Some match the subject, some do not -- a real
+                // stream has both, and a trie walk visits candidates either
+                // way.
+                match k % 5 {
+                    1 => vec![b"orders.*.*.created".to_vec()],
+                    2 => vec![b"orders.eu-west-1.>".to_vec()],
+                    3 => vec![b"orders.>".to_vec()],
+                    4 => vec![format!("billing.*.tenant-{c}.>").into_bytes()],
+                    _ => vec![b"events.*.>".to_vec()],
+                }
+            } else {
+                vec![format!("other.c{c}.sub{k}").into_bytes()]
+            };
+            engine
+                .create_subscription(SubscriptionConfig {
+                    id: SubscriptionId(next),
+                    external_id: k,
+                    stream_id: stream,
+                    consumer_id: ConsumerId(c + 1),
+                    filters,
+                })
+                .unwrap();
+            engine.open_connection(ConnectionId(next as u64), NodeId(0));
+            let _ = engine.subscribe(ConnectionId(next as u64), SubscriptionId(next));
+            next += 1;
+        }
+    }
+
+    let mt = engine.ctx().catalog.match_table(stream).unwrap();
+    let h = wire_hash_32(SUBJECT);
+    let r = mt.lookup_verified(h, SUBJECT);
+    let mut scratch: Vec<MatchEntry> = Vec::new();
+    mt.resolve_patterns_readonly(h, SUBJECT, &mut scratch);
+    println!(
+        "  [{}c x {}s, {} wildcard each] exact={} catch_all={} from_patterns={}",
+        CONSUMERS,
+        SUBS_EACH,
+        WILDCARDS_EACH,
+        r.exact.len(),
+        r.catch_all.len(),
+        scratch.len()
+    );
+
+    // Does the dedup find anything at all?
+    {
+        let mut raw: Vec<MatchEntry> = Vec::new();
+        mt.walk_patterns(SUBJECT, |e| raw.push(*e));
+        let mut deduped: Vec<MatchEntry> = Vec::new();
+        mt.resolve_patterns_readonly(h, SUBJECT, &mut deduped);
+        let mut subs: Vec<u32> = raw.iter().map(|e| e.subscription_id.raw()).collect();
+        subs.sort_unstable();
+        let distinct_subs = {
+            let mut d = subs.clone();
+            d.dedup();
+            d.len()
+        };
+        println!(
+            "  [dedup check] walked={} after_dedup={} distinct_subscriptions={} -> duplicates removed={}",
+            raw.len(),
+            deduped.len(),
+            distinct_subs,
+            raw.len() - deduped.len()
+        );
+    }
+
+    let mut g = c.benchmark_group("wildcards");
+
+    g.bench_function("exact_lookup", |b| {
+        b.iter(|| {
+            let h = wire_hash_32(black_box(SUBJECT));
+            let r = mt.lookup_verified(h, black_box(SUBJECT));
+            black_box(r.exact.len() + r.catch_all.len())
+        })
+    });
+
+    // Cold: the trie walk, paid once per distinct subject.
+    g.bench_function("patterns_cold", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(64);
+        b.iter(|| {
+            out.clear();
+            mt.resolve_patterns_readonly(black_box(h), black_box(SUBJECT), &mut out);
+            black_box(out.len())
+        })
+    });
+
+    // The SAME resolve, but with `out` pre-filled past DEDUP_THRESHOLD so
+    // the HashSet branch is taken instead of the linear one.
+    //
+    // The threshold tests the INPUT length, and the drain clears its
+    // buffer before every call -- so the linear branch always wins the
+    // decision no matter how many entries come out. With 60 results that
+    // is ~1830 `contains` comparisons.
+    g.bench_function("patterns_cold_hashset_branch", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(128);
+        // Four entries that cannot match anything real, only there to trip
+        // the threshold.
+        let filler: Vec<MatchEntry> = (0..4)
+            .map(|i| MatchEntry {
+                consumer_id: ConsumerId(9000 + i),
+                queue_id: QueueId(0),
+                subscription_id: SubscriptionId(9000 + i),
+                connection_id: ConnectionId(9000 + i as u64),
+                binding_idx: 0,
+            })
+            .collect();
+        b.iter(|| {
+            out.clear();
+            out.extend_from_slice(&filler);
+            mt.resolve_patterns_readonly(black_box(h), black_box(SUBJECT), &mut out);
+            black_box(out.len())
+        })
+    });
+
+    // ── The dedup, four ways, over the SAME walk ────────────────────
+    //
+    // `walk_patterns` hands every match to a closure with no dedup at all,
+    // so what changes between these rows is only how duplicates are
+    // settled. The walk itself was measured at 46 ns; everything above
+    // that is the dedup.
+
+    // No dedup at all -- the floor. NOT correct on its own: a subscription
+    // reachable through two patterns lands twice.
+    g.bench_function("dedup/none", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(128);
+        b.iter(|| {
+            out.clear();
+            mt.walk_patterns(black_box(SUBJECT), |e| out.push(*e));
+            black_box(out.len())
+        })
+    });
+
+    // What the engine does today, reached through the raw walk so the
+    // comparison is like for like.
+    g.bench_function("dedup/linear_matchentry", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(128);
+        b.iter(|| {
+            out.clear();
+            mt.walk_patterns(black_box(SUBJECT), |e| {
+                if !out.contains(e) {
+                    out.push(*e);
+                }
+            });
+            black_box(out.len())
+        })
+    });
+
+    // Same shape, but comparing the 4-byte subscription id instead of the
+    // whole 24-byte entry. A subscription cannot legitimately appear twice.
+    g.bench_function("dedup/linear_sub_id", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(128);
+        let mut seen: Vec<u32> = Vec::with_capacity(128);
+        b.iter(|| {
+            out.clear();
+            seen.clear();
+            mt.walk_patterns(black_box(SUBJECT), |e| {
+                let id = e.subscription_id.raw();
+                if !seen.contains(&id) {
+                    seen.push(id);
+                    out.push(*e);
+                }
+            });
+            black_box(out.len())
+        })
+    });
+
+    // A visited bitmap over pattern-entry indices. Reused across calls and
+    // cleared by touching only the words that were set, so the cost does
+    // not grow with the table -- only with the number of hits.
+    g.bench_function("dedup/bitmap", |b| {
+        let words = mt.pattern_count().div_ceil(64).max(1);
+        let mut seen: Vec<u64> = vec![0; words];
+        let mut touched: Vec<usize> = Vec::with_capacity(64);
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(128);
+        b.iter(|| {
+            out.clear();
+            for &w in touched.iter() {
+                seen[w] = 0;
+            }
+            touched.clear();
+            mt.walk_patterns_indexed(black_box(SUBJECT), |idx, e| {
+                let (w, bit) = (idx as usize / 64, 1u64 << (idx as usize % 64));
+                if seen[w] & bit == 0 {
+                    if seen[w] == 0 {
+                        touched.push(w);
+                    }
+                    seen[w] |= bit;
+                    out.push(*e);
+                }
+            });
+            black_box(out.len())
+        })
+    });
+
+    // Warm: what the drain actually pays after the first message -- copying
+    // the cached answer into its scratch.
+    let cached = scratch.clone();
+    g.bench_function("patterns_warm_copy", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(64);
+        b.iter(|| {
+            out.clear();
+            out.extend_from_slice(black_box(&cached));
+            black_box(out.len())
+        })
+    });
+
+    // Everything a message pays on its FIRST appearance.
+    g.bench_function("first_message_total", |b| {
+        let mut out: Vec<MatchEntry> = Vec::with_capacity(64);
+        b.iter(|| {
+            let h = wire_hash_32(black_box(SUBJECT));
+            let r = mt.lookup_verified(h, black_box(SUBJECT));
+            out.clear();
+            mt.resolve_patterns_readonly(h, black_box(SUBJECT), &mut out);
+            let mut acc = 0u64;
+            for e in r.exact.iter().chain(r.catch_all.iter()).chain(out.iter()) {
+                acc += e.consumer_id.raw() as u64 + e.binding_idx as u64;
+            }
+            black_box(acc)
+        })
+    });
+    g.finish();
+}
+
+// ── Byte trie vs hash trie ──────────────────────────────────────────────
+
+/// The two tries walking the SAME patterns and the SAME subject, with a
+/// closure that only counts.
+///
+/// No deduplication, no cache, no `Vec` to fill -- just the walk, so the
+/// only difference is how a level decides which child to descend into:
+/// comparing segment BYTES through a `Box<[u8]>`, or comparing a `u64`
+/// sitting next to the child index.
+///
+/// Three hash walks are measured because two questions are open:
+///  * fused vs two-pass -- does folding the hash into the scan pay?
+///  * FNV vs foldhash -- one byte per multiply, or eight?
+fn trie_shootout(c: &mut Criterion) {
+    use arbitro_engine::common::hash_trie::HashTrie;
+    use arbitro_engine::common::SubjectTrie;
+
+    const SHORT: &[u8] = b"orders.eu.west.created";
+    const UUID: &[u8] = b"orders.eu-west-1.tenant-4f3a9c22-8b1e-4d7a-9c3f-2e6b8a1d5f04.created";
+    const MISS: &[u8] = b"billing.eu.west.created";
+
+    /// `width` distinct literal siblings per level, plus the wildcards a
+    /// real stream carries. The subject's own path is inserted LAST, which
+    /// is the worst position for a linear scan of children.
+    fn patterns(width: u32, subject: &[u8]) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        for k in 0..width {
+            v.push(format!("other{k}.a.b.c").into_bytes());
+        }
+        v.push(b"orders.>".to_vec());
+        v.push(b"orders.*.*.created".to_vec());
+        v.push(b"orders.eu-west-1.>".to_vec());
+        v.push(subject.to_vec());
+        v
+    }
+
+    let mut g = c.benchmark_group("trie");
+    for (sname, subject) in [("short_22B", SHORT), ("uuid_68B", UUID), ("miss_at_lvl1", MISS)] {
+        for &width in &[4u32, 32] {
+            let pats = patterns(width, if sname == "miss_at_lvl1" { SHORT } else { subject });
+
+            let mut bytes_trie = SubjectTrie::new();
+            let mut hash_trie = HashTrie::new(0x51ed_5eed_51ed_5eed);
+            for (i, p) in pats.iter().enumerate() {
+                bytes_trie.insert(p, i as u32);
+                hash_trie.insert(p, i as u32);
+            }
+
+            // Every walk must agree, or the comparison is meaningless.
+            let count = |f: &dyn Fn(&mut dyn FnMut(u32))| {
+                let mut n = 0u32;
+                f(&mut |_| n += 1);
+                n
+            };
+            let a = count(&|cb| bytes_trie.find_matches(subject, cb));
+            let b_ = count(&|cb| hash_trie.find_matches(subject, cb));
+            assert_eq!(a, b_, "walks disagree on {sname}/w{width}");
+            println!("  [{sname}/w{width}] hits={a} nodes bytes={} hash={}",
+                bytes_trie.node_count(), hash_trie.node_count());
+
+            let label = format!("{sname}/w{width}");
+            g.bench_function(BenchmarkId::new("bytes", &label), |b| {
+                b.iter(|| {
+                    let mut n = 0u32;
+                    bytes_trie.find_matches(black_box(subject), |_| n += 1);
+                    black_box(n)
+                })
+            });
+            g.bench_function(BenchmarkId::new("hash_level_sync", &label), |b| {
+                b.iter(|| {
+                    let mut n = 0u32;
+                    hash_trie.find_matches(black_box(subject), |_| n += 1);
+                    black_box(n)
+                })
+            });
+        }
     }
     g.finish();
 }
@@ -497,6 +962,9 @@ criterion_group!(
     hot_path,
     truth_vs_mirror,
     ownership_lookups,
+    delivery_lookup,
+    wildcards_at_scale,
+    trie_shootout,
     admin
 );
 criterion_main!(benches);

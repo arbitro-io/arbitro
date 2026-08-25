@@ -71,7 +71,9 @@ dependencies = [
  "arbitro-engine",
  "arbitro-kit",
  "arc-swap",
+ "criterion 0.5.1",
  "foldhash",
+ "parking_lot",
  "tokio",
 ]
 

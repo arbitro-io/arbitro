@@ -12,6 +12,10 @@ foldhash          = "0.1"
 arc-swap          = { workspace = true }
 tokio             = { workspace = true }
 
+[dev-dependencies]
+criterion    = { version = "0.5", features = ["html_reports"] }
+parking_lot  = { workspace = true }
+
 [[bench]]
 name = "consumer_cursor"
 harness = false
@@ -22,4 +26,16 @@ harness = false
 
 [[bench]]
 name = "stream_shard"
+harness = false
+
+[[bench]]
+name = "sync_primitives"
+harness = false
+
+[[bench]]
+name = "index_shapes"
+harness = false
+
+[[bench]]
+name = "subject_walk"
 harness = false
