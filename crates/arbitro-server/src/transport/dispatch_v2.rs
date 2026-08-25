@@ -1574,7 +1574,7 @@ async fn v2_create_stream(
     // leave by, so the two cannot disagree.
     server
         .names()
-        .set_stream_shard(seq_stream, conn.shard().shard_id as u16);
+        .set_stream_shard(seq_stream, server.shard_index_for_new(seq_stream));
     let shard = server.shard_for(seq_stream);
 
     let max_msgs = body.max_msgs;
