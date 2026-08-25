@@ -20,7 +20,6 @@ pub mod drain_profile;
 pub(in crate::shard) mod source;
 pub mod handle;
 pub mod handlers;
-pub mod idempotency;
 pub mod router;
 pub(crate) mod commands;
 pub(crate) mod dedup;

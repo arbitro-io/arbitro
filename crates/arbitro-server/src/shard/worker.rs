@@ -218,8 +218,12 @@ impl DrainWorker {
                     &mut self.staged,
                 );
                 let verdict = match w {
-                    super::drain::Window::NoDemand => ReadVerdict::NoDemand,
+                    super::drain::Window::NoDemand => {
+                        super::drain_profile::no_demand();
+                        ReadVerdict::NoDemand
+                    }
                     super::drain::Window::UpToDate { last_seq, cursor } => {
+                        super::drain_profile::up_to_date();
                         ReadVerdict::UpToDate { last_seq, cursor }
                     }
                     super::drain::Window::Range {
@@ -276,6 +280,7 @@ impl DrainWorker {
                 // downstream writer full. Yield so it can drain. (First gate
                 // read; the park decision below takes its own.)
                 if stalled && self.gate.is_open() {
+                    super::drain_profile::stall_sleep();
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
 

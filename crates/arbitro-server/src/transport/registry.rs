@@ -621,6 +621,9 @@ async fn pinned_writer_task(
     use crate::transport::egress::{Delivery, Egress};
     let mut err = false;
     while let Some(frame) = rx.recv().await {
+        let _p = crate::shard::drain_profile::socket(
+            crate::shard::drain_profile::SocketDoor::Pinned,
+        );
         match shard.with_egress(conn_id, |e| e.send(frame)) {
             Some(Delivery::Dead) | None => {
                 write_failed.store(true, Relaxed);
@@ -665,6 +668,8 @@ async fn conn_writer_task(
                 frame.len()
             );
         }
+        let _p =
+            crate::shard::drain_profile::socket(crate::shard::drain_profile::SocketDoor::Pool);
         if w.write_all(&frame).await.is_err() {
             if crate::shard::drain::chaos_debug() {
                 eprintln!("[SOCKET-WRITE-FAILED] conn={conn_id}");
