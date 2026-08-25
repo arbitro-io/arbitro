@@ -100,6 +100,12 @@ pub struct ConsumerInfo {
     /// [`ConsumerConfig::filter`] for why it lives here and not on
     /// [`Binding`].
     pub filter: Box<[u8]>,
+    /// Highest sequence this consumer has acknowledged.
+    ///
+    /// Per CONSUMER, never per binding: a consumer may hold several
+    /// bindings and they all advance one progress. `Binding.pending` dies
+    /// with its connection; this outlives it.
+    pub cursor: u64,
 }
 
 /// Subscription metadata.
@@ -168,6 +174,29 @@ pub struct Recipient {
 
 // ── Catalog ─────────────────────────────────────────────────────────────────
 
+/// Drop `binding_id` from one secondary index, and drop the key with it
+/// when nothing is left under it.
+///
+/// `swap_remove` because these are membership lists with no meaningful
+/// order, and `retain` would rewrite the whole Vec to remove one element.
+#[inline]
+fn remove_from_index<K: std::hash::Hash + Eq>(
+    index: &mut HashMap<K, Vec<BindingId>, foldhash::fast::FixedState>,
+    key: K,
+    binding_id: BindingId,
+) {
+    let std::collections::hash_map::Entry::Occupied(mut slot) = index.entry(key) else {
+        return;
+    };
+    let v = slot.get_mut();
+    if let Some(pos) = v.iter().position(|b| *b == binding_id) {
+        v.swap_remove(pos);
+    }
+    if v.is_empty() {
+        slot.remove();
+    }
+}
+
 /// The catalog: entity lifecycle, match tables, bindings, demand tracking.
 pub struct Catalog {
     // Entity storage — Vec<Option<..>> for dense monotonic IDs (O(1) index).
@@ -210,6 +239,10 @@ pub struct Catalog {
 
     // Connection tracking.
     connections: HashMap<ConnectionId, NodeId, foldhash::fast::FixedState>,
+    /// Lowest consumer cursor, and how many sit on it. Maintained on
+    /// every advance so reading it is a load, not a walk.
+    floor: u64,
+    at_floor: u32,
 
     // Demand counters: streams with ≥1 active binding.
     demand: HashMap<StreamId, u32, foldhash::fast::FixedState>,
@@ -243,6 +276,8 @@ impl Catalog {
             by_conn_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             next_binding_id: 1,
             connections: HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            floor: u64::MAX,
+            at_floor: 0,
             demand: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             consumers_by_stream: HashMap::with_hasher(foldhash::fast::FixedState::default()),
             subs_by_consumer: HashMap::with_hasher(foldhash::fast::FixedState::default()),
@@ -361,6 +396,104 @@ impl Catalog {
     /// mismatch returns `ConsumerConfigMismatch` so the caller knows
     /// the create was NOT idempotent — delete + recreate is required.
     /// Same-config re-creation still returns `Ok(())` (idempotent).
+    /// Highest sequence this consumer has acknowledged. 0 when unknown.
+    #[inline]
+    pub fn consumer_cursor(&self, id: ConsumerId) -> u64 {
+        self.consumers
+            .get(id.0 as usize)
+            .and_then(|c| c.as_ref())
+            .map_or(0, |c| c.cursor)
+    }
+
+    /// Monotonic: an ack that arrives out of order cannot pull the cursor
+    /// back over ground a later one already covered.
+    #[inline]
+    pub fn advance_consumer_cursor(&mut self, id: ConsumerId, seq: u64) {
+        let Some(Some(c)) = self.consumers.get_mut(id.0 as usize) else {
+            return;
+        };
+        if seq <= c.cursor {
+            return;
+        }
+        let was_on_floor = c.cursor == self.floor;
+        c.cursor = seq;
+        if was_on_floor {
+            self.at_floor -= 1;
+            if self.at_floor == 0 {
+                self.refloor();
+            }
+        }
+    }
+
+    /// Lowest cursor across live consumers. `u64::MAX` when there are
+    /// none — nobody is owed anything, so no floor constrains a reader.
+    ///
+    /// O(1). The scan behind it runs only when the last consumer sitting
+    /// ON the floor leaves it, which is once per n advances — the walk is
+    /// paid once and spread across the n moves that made it necessary.
+    #[inline]
+    pub fn read_floor(&self) -> u64 {
+        self.floor
+    }
+
+    /// Recompute the floor and how many sit on it. Called only when the
+    /// count reaches zero.
+    fn refloor(&mut self) {
+        let mut min = u64::MAX;
+        let mut at = 0u32;
+        for c in self.consumers.iter().flatten() {
+            if c.cursor < min {
+                min = c.cursor;
+                at = 1;
+            } else if c.cursor == min {
+                at += 1;
+            }
+        }
+        self.floor = min;
+        self.at_floor = at;
+    }
+
+    /// Every binding this subject reaches, on this stream.
+    ///
+    /// Literals come from the hash index — one lookup, no walk. Patterns
+    /// are walked only when the stream has any, so a stream with no
+    /// wildcards never pays for the trie at all.
+    #[inline]
+    pub fn for_each_recipient<F: FnMut(&MatchEntry)>(
+        &self,
+        stream: StreamId,
+        subject_hash: u32,
+        subject: &[u8],
+        mut f: F,
+    ) {
+        let Some(Some(mt)) = self.match_tables.get(stream.0 as usize) else {
+            return;
+        };
+        for e in mt.lookup_verified(subject_hash, subject).iter() {
+            f(e);
+        }
+        if mt.pattern_count() > 0 {
+            mt.walk_patterns(subject, &mut f);
+        }
+    }
+
+    /// This stream's consumers, straight from the index.
+    #[inline]
+    pub fn consumers_of_stream(&self, id: StreamId) -> &[ConsumerId] {
+        self.consumers_by_stream
+            .get(&id)
+            .map_or(&[], |v| v.as_slice())
+    }
+
+    /// Every live consumer's cursor.
+    pub fn cursor_snapshot(&self) -> Vec<(ConsumerId, u64)> {
+        self.consumers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.as_ref().map(|c| (ConsumerId(i as u32), c.cursor)))
+            .collect()
+    }
+
     pub fn ensure_consumer(&mut self, config: ConsumerConfig) -> EngineResult<bool> {
         if !self.stream_exists(config.stream_id) {
             return Err(EngineError::stream_not_found());
@@ -393,7 +526,15 @@ impl Catalog {
             ack_wait_ms: config.ack_wait_ms,
             max_nack: config.max_nack,
             filter: config.filter,
+            cursor: 0,
         });
+        // A new consumer starts at 0, which is at or below any floor.
+        if self.floor == 0 {
+            self.at_floor += 1;
+        } else {
+            self.floor = 0;
+            self.at_floor = 1;
+        }
         self.consumers_by_stream
             .entry(config.stream_id)
             .or_default()
@@ -418,6 +559,13 @@ impl Catalog {
             }
         }
         self.subs_by_consumer.remove(&id);
+        // The floor can only rise when a consumer leaves, never fall.
+        if info.cursor == self.floor {
+            self.at_floor -= 1;
+            if self.at_floor == 0 {
+                self.refloor();
+            }
+        }
         Ok(())
     }
 
@@ -566,14 +714,6 @@ impl Catalog {
         Ok(())
     }
 
-    /// Subscription IDs owned by a consumer.
-    pub fn subscriptions_for_consumer(&self, consumer_id: ConsumerId) -> Vec<SubscriptionId> {
-        self.subs_by_consumer
-            .get(&consumer_id)
-            .cloned()
-            .unwrap_or_default()
-    }
-
     /// TAKE a consumer's subscription list, for a caller that is about to
     /// remove them all.
     ///
@@ -696,15 +836,20 @@ impl Catalog {
         let binding = self.bindings.remove(&binding_id)?;
 
         // Remove from secondary indices.
-        if let Some(v) = self.by_stream.get_mut(&binding.stream_id) {
-            v.retain(|b| *b != binding_id);
-        }
-        if let Some(v) = self.by_consumer.get_mut(&binding.consumer_id) {
-            v.retain(|b| *b != binding_id);
-        }
-        if let Some(v) = self.by_connection.get_mut(&binding.connection_id) {
-            v.retain(|b| *b != binding_id);
-        }
+        //
+        // `swap_remove` at a found position, not `retain`: retain rewrites
+        // the whole Vec to drop one element, so emptying a stream's index
+        // one binding at a time cost N^2/2 compares. Order does not matter
+        // here — these are membership lists, and every reader either
+        // iterates all of them or looks one up.
+        //
+        // The entry goes when it empties. It used to be left behind as an
+        // empty Vec, so a broker that created and deleted streams in a
+        // loop accumulated dead keys forever, and every iteration of these
+        // maps kept paying for them.
+        remove_from_index(&mut self.by_stream, binding.stream_id, binding_id);
+        remove_from_index(&mut self.by_consumer, binding.consumer_id, binding_id);
+        remove_from_index(&mut self.by_connection, binding.connection_id, binding_id);
         // Only clear the subscription index if it still points at this
         // binding — a replacement binding may have already overwritten it.
         if self.by_subscription.get(&binding.subscription_id) == Some(&binding_id) {
@@ -950,19 +1095,6 @@ impl Catalog {
                 })
             })
             .collect()
-    }
-
-    /// List the `ConsumerId`s of every consumer attached to `stream_id`.
-    /// Used by `engine.delete_stream` to cascade-remove consumers when
-    /// their owning stream is deleted — without this, consumer entities
-    /// (and their NameRegistry mappings) leak past the stream's
-    /// lifetime and a same-named recreate on a fresh stream silently
-    /// aliases to a defunct id.
-    pub fn consumers_for_stream(&self, stream_id: StreamId) -> Vec<ConsumerId> {
-        self.consumers_by_stream
-            .get(&stream_id)
-            .cloned()
-            .unwrap_or_default()
     }
 
     /// TAKE a stream's consumer list. See

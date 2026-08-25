@@ -203,6 +203,54 @@ impl ArbitroEngine {
         self.ctx.catalog.ensure_consumer(config)
     }
 
+    /// Highest sequence this consumer has acknowledged.
+    pub fn consumer_cursor(&self, id: ConsumerId) -> u64 {
+        self.ctx.catalog.consumer_cursor(id)
+    }
+
+    /// Move the cursor forward. Never backwards — an out-of-order ack
+    /// must not un-acknowledge what a later one already covered.
+    pub fn ack_upto(&mut self, id: ConsumerId, seq: u64) {
+        self.ctx.catalog.advance_consumer_cursor(id, seq);
+    }
+
+    /// Lowest sequence any live consumer still needs. Nothing below it
+    /// is owed to anyone, so a reader may start here.
+    pub fn read_floor(&self) -> u64 {
+        self.ctx.catalog.read_floor()
+    }
+
+    /// Restore cursors at startup. The only direction anything flows
+    /// inward — after this, nothing outside sets a cursor.
+    pub fn restore_cursor(&mut self, id: ConsumerId, seq: u64) {
+        self.ctx.catalog.advance_consumer_cursor(id, seq);
+    }
+
+    /// Every live consumer's cursor, for whoever persists them.
+    pub fn cursor_snapshot(&self) -> Vec<(ConsumerId, u64)> {
+        self.ctx.catalog.cursor_snapshot()
+    }
+
+    /// This stream's consumers. Indexed, not filtered — listing one
+    /// stream must not walk every consumer in the shard.
+    pub fn consumers_of_stream(&self, id: StreamId) -> &[ConsumerId] {
+        self.ctx.catalog.consumers_of_stream(id)
+    }
+
+    /// Every binding this subject reaches, on this stream.
+    #[inline]
+    pub fn for_each_recipient<F: FnMut(&catalog::match_table::MatchEntry)>(
+        &self,
+        stream: StreamId,
+        subject_hash: u32,
+        subject: &[u8],
+        f: F,
+    ) {
+        self.ctx
+            .catalog
+            .for_each_recipient(stream, subject_hash, subject, f)
+    }
+
     /// Delete a consumer. Retires all bindings + subscriptions for this
     /// consumer. Reports the removed id in `events.consumers_removed`
     /// so the server mirrors the cleanup into NameRegistry — same
