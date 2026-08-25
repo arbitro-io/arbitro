@@ -796,14 +796,37 @@ impl ArbitroServer {
         // order they were bound. The shard travels WITH the socket because
         // this is the only place it is knowable — once the connection is in
         // the channel, one accepted socket looks like any other.
-        let feeds: Vec<(tokio::net::TcpListener, Option<u16>)> = std::iter::once((listener, None))
-            .chain(
-                shard_listeners
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, l)| (l, Some(i as u16))),
-            )
-            .collect();
+        // A shard's listener accepts ON that shard's thread. The socket is
+        // the shard's from the first syscall, and `Some(shard)` is a fact
+        // the listener owns rather than a number attached in transit.
+        for (i, l) in shard_listeners.into_iter().enumerate() {
+            let tx = conn_tx.clone();
+            let mut sd = shutdown_rx.clone();
+            let shard = i as u16;
+            let hosted = self.server.accept_on_shard(i, move |_shard| async move {
+                loop {
+                    tokio::select! {
+                        _ = sd.changed() => return,
+                        res = l.accept() => match res {
+                            Ok((sock, peer)) => {
+                                if tx.send((sock, peer, Some(shard))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "shard accept failed");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        },
+                    }
+                }
+            });
+            if !hosted {
+                tracing::error!(shard, "no runtime to accept on this shard");
+            }
+        }
+
+        let feeds: Vec<(tokio::net::TcpListener, Option<u16>)> = vec![(listener, None)];
         for (l, shard) in feeds {
             let tx = conn_tx.clone();
             // Each feeder watches shutdown itself. Without this the task
@@ -937,6 +960,11 @@ impl ArbitroServer {
                                     // while running elsewhere puts it in a
                                     // thread-local nobody can reach, and every
                                     // write silently reports the peer dead.
+                                    // Hosting the socket on the shard's own
+                                    // thread puts the writer task behind the
+                                    // drain on that thread; the direct door
+                                    // needs an EMPTY channel, so once one
+                                    // frame queues nothing drains it.
                                     let (conn_id, conn, own_socket) = reg.register_on_shard(
                                         &shard,
                                         writer,
@@ -984,18 +1012,12 @@ impl ArbitroServer {
                                 // between two single-threaded runtimes on
                                 // every message, which measured 120s-timeout
                                 // against 194ms for the same replay.
-                                // A connection belongs to a shard. It is
-                                // built ON that shard's thread, so it holds
-                                // the shard itself and never has to ask
-                                // whether it may touch what is already its
-                                // own.
-                                //
-                                // A connection that arrived on the bootstrap
-                                // port named no shard, so one is picked. It
-                                // publishes through the queued path for every
-                                // stream that is not its host's — the same
-                                // cost the shared pool paid, now bounded to
-                                // clients that never asked for the topology.
+                                // A connection named by a shard's listener is
+                                // built ON that shard, holding it directly.
+                                // One that named none still needs a thread to
+                                // run its read loop; it gets one, but its
+                                // socket stays on the pool (above), so no
+                                // drain ever looks for it in the wrong shard.
                                 let owner = match home_shard {
                                     Some(s) => s as usize,
                                     None => {

@@ -535,7 +535,17 @@ fn flush_frame(
     use crate::transport::egress::{Delivery, Egress};
 
     let mut pending = Some(bytes);
-    let direct = if writer.write_tx.capacity() == writer.write_tx.max_capacity() {
+    // The socket is this shard's or it is not. Nothing else decides.
+    //
+    // This used to also require the write channel to be EMPTY, so that a
+    // direct frame could not overtake a queued one. That condition was a
+    // latch: every reply goes through the channel, so under load it was
+    // never empty again and the direct door never opened once — measured,
+    // `direct=0` across 3979 frames. Ordering is kept by the egress
+    // itself: both writers reach the fd through it, and it owns the
+    // backlog, so a frame handed to it is behind whatever it already
+    // holds.
+    let direct = {
         shard.with_egress(conn.0, |e| {
             // Push what is owed first: nothing else drives this socket, so
             // skipping it would strand the backlog forever.
@@ -549,6 +559,9 @@ fn flush_frame(
                 return false;
             }
             let frame = pending.take().expect("frame taken once");
+            let _p = crate::shard::drain_profile::socket(
+                crate::shard::drain_profile::SocketDoor::Direct,
+            );
             match e.send(frame) {
                 Delivery::Dead => false,
                 // Taken, but only as far as `owed`. Ordered and accounted;
@@ -560,10 +573,11 @@ fn flush_frame(
                 Delivery::Sent => true,
             }
         })
-    } else {
-        None
     };
 
+    if direct.is_none() {
+        crate::shard::drain_profile::no_direct(false);
+    }
     match direct {
         Some(ok) => ok,
         None => writer
