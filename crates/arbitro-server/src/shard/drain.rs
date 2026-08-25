@@ -545,7 +545,8 @@ fn flush_frame(
     // itself: both writers reach the fd through it, and it owns the
     // backlog, so a frame handed to it is behind whatever it already
     // holds.
-    let direct = {
+    let empty = writer.write_tx.capacity() == writer.write_tx.max_capacity();
+    let direct = if empty {
         shard.with_egress(conn.0, |e| {
             // Push what is owed first: nothing else drives this socket, so
             // skipping it would strand the backlog forever.
@@ -573,9 +574,12 @@ fn flush_frame(
                 Delivery::Sent => true,
             }
         })
+    } else {
+        crate::shard::drain_profile::no_direct(true);
+        None
     };
 
-    if direct.is_none() {
+    if direct.is_none() && empty {
         crate::shard::drain_profile::no_direct(false);
     }
     match direct {
