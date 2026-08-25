@@ -791,12 +791,16 @@ impl CommandWorker {
                     journal_tail,
                 });
             }
-            // Config mismatch and any other error → rejection.
-            Err(_) => {
-                let _ = cmd.reply.send(CreateConsumerReply {
-                    code: 2,
-                    journal_tail,
-                });
+            // Code 2 means "exists with a different config" and nothing
+            // else. Flattening every error into it reported a missing
+            // stream as a config mismatch, which sends whoever hits it
+            // comparing configs that were never the problem.
+            Err(e) => {
+                let code = match e.code() {
+                    arbitro_engine_v2::error::ErrorCode::StreamNotFound => 3,
+                    _ => 2,
+                };
+                let _ = cmd.reply.send(CreateConsumerReply { code, journal_tail });
             }
         }
     }

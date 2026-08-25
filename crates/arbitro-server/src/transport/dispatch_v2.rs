@@ -139,10 +139,10 @@ pub async fn dispatch_frame_v2(
                 v2_create_stream_raft(conn_id, req_seq, &frame, server, registry, cluster_state)
                     .await;
             } else {
-                v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
+                v2_create_stream(conn, req_seq, &frame, server, registry).await;
             }
             #[cfg(not(feature = "cluster"))]
-            v2_create_stream(conn_id, req_seq, &frame, server, registry).await;
+            v2_create_stream(conn, req_seq, &frame, server, registry).await;
         }
         Action::DeleteStream => {
             #[cfg(feature = "cluster")]
@@ -1496,13 +1496,14 @@ async fn v2_unsubscribe(
 // ── Stream CRUD ────────────────────────────────────────────────────────────
 
 async fn v2_create_stream(
-    conn_id: u64,
+    conn: &crate::common::session::ConnHandle,
     req_seq: u64,
     frame: &Bytes,
     server: &ShardRouter,
     registry: &ConnectionRegistry,
 ) {
     use arbitro_proto::v2::cold::{ColdBody, CreateStream as CreateStreamCold};
+    let conn_id = conn.conn_id;
     // SEC-6: bound how many streams a single connection may create.
     if !registry.check_and_incr_quota(conn_id, crate::transport::registry::QuotaKind::Stream) {
         send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamFull);
@@ -1563,6 +1564,17 @@ async fn v2_create_stream(
         send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamAlreadyExists);
         return;
     }
+    // Record the placement BEFORE routing: `shard_for` reads what is
+    // recorded, so resolving first sends the create to one shard's engine
+    // and records another — and every later lookup finds a stream the
+    // engine holding it never heard of.
+    //
+    // A stream is born on the shard of the connection that created it. That
+    // shard owns the store the bytes land in and the socket the deliveries
+    // leave by, so the two cannot disagree.
+    server
+        .names()
+        .set_stream_shard(seq_stream, conn.shard().shard_id as u16);
     let shard = server.shard_for(seq_stream);
 
     let max_msgs = body.max_msgs;
@@ -1605,9 +1617,7 @@ async fn v2_create_stream(
             //
             // The value must come from the same decision that routes, or the
             // recorded shard and the shard actually written to could differ.
-            server
-                .names()
-                .set_stream_shard(seq_stream, server.shard_index_for_new(seq_stream));
+            // Placement was recorded before routing, above.
             // Honesty: replicas > 1 does NOT yet mean acknowledged-durable
             // replication (ROBUSTNESS_AUDIT.md §2.5 / action #8).
             #[cfg(feature = "cluster")]
@@ -1752,7 +1762,15 @@ async fn v2_get_stream(
     let name = body.name.as_slice();
     let wire_stream = arbitro_engine_v2::common::wire_hash_32(name);
     match server.names().stream_seq(wire_stream) {
-        Some(_) => send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64),
+        // The reply carries the shard in bits 32..48. A client that only
+        // reads the low 32 sees exactly what it saw before; one that
+        // reads the rest learns which port this stream's data lives
+        // behind, which is the only thing standing between it and a
+        // delivery written straight to its socket.
+        Some(seq) => {
+            let shard = server.names().stream_shard(seq).unwrap_or(0) as u64;
+            send_rep_ok_v2(registry, conn_id, req_seq, wire_stream as u64 | (shard << 32))
+        }
         None => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
     }
 }
@@ -2201,6 +2219,7 @@ async fn v2_create_consumer(
             // GAP-3: consumer exists with different config.
             send_error_v2(registry, conn_id, req_seq, ErrorCode::InvalidConsumerConfig)
         }
+        Some(3) => send_error_v2(registry, conn_id, req_seq, ErrorCode::StreamNotFound),
         _ => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
 }
