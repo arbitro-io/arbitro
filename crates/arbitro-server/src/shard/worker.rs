@@ -1261,6 +1261,8 @@ impl CommandWorker {
         // explicit one). H11 retry on ring-full, same as the handler.
         for &cid in &delta.consumers_removed {
             self.ack_floors.remove(cid.raw());
+            // A recycled id must not inherit the deleted consumer's pause.
+            self.counters.set_paused(cid.raw(), false);
             // A removed consumer's queued Ack retries are moot — and must
             // never be applied AFTER its ConsumerRemoved lands: consumer
             // ids are pool-recycled, and a stale floor-raise or dec on the

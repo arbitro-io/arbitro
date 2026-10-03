@@ -115,13 +115,12 @@ impl CommandWorker {
             self.dlq_nack_counts.remove(&(cmd.consumer_id.0, entry.seq));
         }
 
-        // Persist consumer cursor: track the highest acked seq so
-        // reconnecting consumers can resume from where they left off.
-        if let Some(max_seq) = cmd.entries.iter().map(|e| e.seq).max() {
-            let cur = self.names.consumer_cursor(cmd.consumer_id).unwrap_or(0);
-            if max_seq > cur {
-                self.names.set_consumer_cursor(cmd.consumer_id, max_seq);
-            }
+        // Persist the contiguous ack floor, never the raw max: a resume
+        // after the max skips any unacked seq below it, and a client-sent
+        // seq the engine never matched could move it anywhere.
+        let floor = self.ack_floors.floor(cmd.consumer_id.0);
+        if floor > self.names.consumer_cursor(cmd.consumer_id).unwrap_or(0) {
+            self.names.set_consumer_cursor(cmd.consumer_id, floor);
         }
 
         // A4: decrement the shared atomics by what the engine actually
@@ -410,6 +409,14 @@ impl CommandWorker {
                 if deliver_floor > 0 {
                     self.ack_floors.seed(consumer_id.0, deliver_floor);
                 }
+                // Everything at or below the persisted cursor was acked
+                // contiguously, so it is a valid floor too. Without it a
+                // resumed consumer's acks start above an empty floor, wait
+                // out of order forever, and the cursor never moves again.
+                let persisted = self.names.consumer_cursor(consumer_id).unwrap_or(0);
+                if persisted > 0 {
+                    self.ack_floors.seed(consumer_id.0, persisted);
+                }
 
                 // Skip binding if connection disappeared before subscribe
                 // applied — stale demand cleaned up by mark_connection_dead.
@@ -512,7 +519,7 @@ impl CommandWorker {
         let binding_ids: Vec<_> = self
             .bindings
             .iter()
-            .filter(|b| b.consumer_id == consumer_id)
+            .filter(|b| b.consumer_id == consumer_id && b.connection_id == cmd.connection_id)
             .map(|b| (b.binding_id, b.stream_id))
             .collect();
 

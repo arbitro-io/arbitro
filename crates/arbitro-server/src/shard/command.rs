@@ -135,6 +135,9 @@ pub struct SubscribeCmd {
 
 /// Unsubscribe: retire bindings for this subscription.
 pub struct UnsubscribeCmd {
+    /// Only this connection's bindings are retired; other connections on
+    /// the same consumer keep theirs.
+    pub connection_id: ConnectionId,
     pub subscription_id: SubscriptionId,
     pub reply: oneshot::Sender<bool>,
 }

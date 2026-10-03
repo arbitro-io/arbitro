@@ -174,9 +174,14 @@ impl ShardHandle {
         rx.await.map_err(|_| SendError::SHARD_DOWN)
     }
 
-    pub async fn unsubscribe(&self, subscription_id: SubscriptionId) -> Result<bool, SendError> {
+    pub async fn unsubscribe(
+        &self,
+        connection_id: ConnectionId,
+        subscription_id: SubscriptionId,
+    ) -> Result<bool, SendError> {
         let (tx, rx) = oneshot::channel();
         self.send(ShardCommand::Unsubscribe(UnsubscribeCmd {
+            connection_id,
             subscription_id,
             reply: tx,
         }))

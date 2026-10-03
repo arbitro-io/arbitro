@@ -329,6 +329,19 @@ impl ArbitroStateMachine {
 
         let is_fanout = deliver_mode == 0;
 
+        // Before the consumer is registered, so a refusal leaves nothing.
+        let queue_id = if is_fanout {
+            QueueId(0)
+        } else {
+            match router.names().get_or_create_queue(seq_stream, group_bytes) {
+                Some(q) => q,
+                None => {
+                    tracing::warn!(name, "state_machine: queue slots exhausted");
+                    return;
+                }
+            }
+        };
+
         let (seq_consumer, _created) = router
             .names()
             .get_or_create_consumer(seq_stream, name_bytes);
@@ -338,12 +351,6 @@ impl ArbitroStateMachine {
         }
 
         let shard = router.shard_for(seq_stream);
-
-        let queue_id = if is_fanout {
-            QueueId(0)
-        } else {
-            router.names().get_or_create_queue(seq_stream, group_bytes)
-        };
         let create_res = shard
             .create_consumer(
                 ConsumerConfig {

@@ -1181,10 +1181,13 @@ async fn subscribe_one(
         Some(s) => s,
         None => return Err(ErrorCode::ConsumerNotFound),
     };
-    let queue_id = server
-        .names()
-        .consumer_queue(consumer_id)
-        .unwrap_or_else(|| server.names().get_or_create_queue(seq_stream, b""));
+    let queue_id = match server.names().consumer_queue(consumer_id) {
+        Some(q) => q,
+        None => server
+            .names()
+            .get_or_create_queue(seq_stream, b"")
+            .ok_or(ErrorCode::ConsumerAlreadyExists)?,
+    };
     let shard = server.shard_for(seq_stream);
 
     // Drop empty filters (legacy "single empty-filter == catch-all"
@@ -1400,7 +1403,10 @@ async fn v2_unsubscribe(
     };
     let shard = server.shard_for(seq_stream);
 
-    match shard.unsubscribe(SubscriptionId(consumer_id.0)).await {
+    match shard
+        .unsubscribe(ConnectionId(conn_id), SubscriptionId(consumer_id.0))
+        .await
+    {
         Ok(_) => send_rep_ok_v2(registry, conn_id, req_seq, req_seq),
         Err(_) => send_error_v2(registry, conn_id, req_seq, ErrorCode::InternalError),
     }
@@ -1935,6 +1941,20 @@ async fn v2_create_consumer(
         return;
     }
 
+    // Before the consumer is registered, so a refusal leaves nothing behind.
+    let queue_id = if is_fanout {
+        QueueId(0)
+    } else {
+        match server.names().get_or_create_queue(seq_stream, group) {
+            Some(q) => q,
+            None => {
+                registry.release_quota(conn_id, QuotaKind::Consumer);
+                send_error_v2(registry, conn_id, req_seq, ErrorCode::ConsumerAlreadyExists);
+                return;
+            }
+        }
+    };
+
     let (seq_consumer, _created) = server.names().get_or_create_consumer(seq_stream, name);
     // C3/C4 — the consumer must live inside its stream's slice, and inherits
     // it when it declares none. The registry holds the stream filter because
@@ -1966,11 +1986,6 @@ async fn v2_create_consumer(
     }
     let shard = server.shard_for(seq_stream);
 
-    let queue_id = if is_fanout {
-        QueueId(0)
-    } else {
-        server.names().get_or_create_queue(seq_stream, group)
-    };
     let create_res = shard
         .create_consumer(
             ConsumerConfig {

@@ -293,24 +293,34 @@ impl MetadataApplier for ReplayApplier {
                 let wire_stream = cv.stream_id();
                 let (stream_id, _) = self.server.names().get_or_create_stream(wire_stream);
 
-                let consumer_name = cv.name();
-                let (consumer_id, _) = self
-                    .server
-                    .names()
-                    .get_or_create_consumer(stream_id, consumer_name);
-
                 // GAP-5 (mirrored from live dispatch): Fanout consumers
                 // (deliver_mode == 0) use QueueId(0) directly — the
                 // drain worker skips queue-dedup for id 0, giving every
                 // consumer its own copy. Queue consumers go through the
                 // content-addressed allocator so members of the same
-                // group share a single QueueId.
+                // group share a single QueueId. Resolved before the
+                // consumer is registered, so a refusal leaves nothing.
                 let group = cv.group();
                 let queue_id = if cv.deliver_mode() == 0 {
                     QueueId(0)
                 } else {
-                    self.server.names().get_or_create_queue(stream_id, group)
+                    match self.server.names().get_or_create_queue(stream_id, group) {
+                        Some(q) => q,
+                        None => {
+                            tracing::warn!(
+                                consumer = %String::from_utf8_lossy(cv.name()),
+                                "replay CreateConsumer: queue slots exhausted — skipping"
+                            );
+                            return;
+                        }
+                    }
                 };
+
+                let consumer_name = cv.name();
+                let (consumer_id, _) = self
+                    .server
+                    .names()
+                    .get_or_create_consumer(stream_id, consumer_name);
                 self.server
                     .names()
                     .set_consumer_queue(consumer_id, queue_id);

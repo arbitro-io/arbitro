@@ -875,17 +875,24 @@ impl NameRegistry {
 
     /// Resolve `(seq_stream, group)` → `QueueId`, allocating a fresh
     /// sequential id the first time the tuple is seen.
-    pub fn get_or_create_queue(&self, stream: StreamId, group: &[u8]) -> QueueId {
+    ///
+    /// `None` once `MAX_SLOT_COUNT` ids are minted: every QueueId indexes a
+    /// fixed slice in the shard counters, so the caller must refuse the
+    /// create — same contract as the stream and consumer pools (B1).
+    pub fn get_or_create_queue(&self, stream: StreamId, group: &[u8]) -> Option<QueueId> {
         // Queues only live in `Inner`; no snapshot rebuild needed for them.
         let mut g = self.inner.lock().expect("name registry poisoned");
         let key = (stream, group.to_vec());
         if let Some(&id) = g.queues_by_key.get(&key) {
-            return id;
+            return Some(id);
+        }
+        if g.next_queue >= Self::MAX_SLOT_COUNT {
+            return None;
         }
         let id = QueueId(g.next_queue);
         g.next_queue += 1;
         g.queues_by_key.insert(key, id);
-        id
+        Some(id)
     }
 
     /// Translate a client-chosen subscription id into a broker-unique one.
@@ -1103,14 +1110,14 @@ mod tests {
         let s0 = StreamId(0);
         let s1 = StreamId(1);
         // Same stream + same group → same queue (round-robin sharing).
-        let q_a = r.get_or_create_queue(s0, b"workers");
-        let q_b = r.get_or_create_queue(s0, b"workers");
+        let q_a = r.get_or_create_queue(s0, b"workers").unwrap();
+        let q_b = r.get_or_create_queue(s0, b"workers").unwrap();
         assert_eq!(q_a, q_b);
         // Same group on a different stream → different queue.
-        let q_other_stream = r.get_or_create_queue(s1, b"workers");
+        let q_other_stream = r.get_or_create_queue(s1, b"workers").unwrap();
         assert_ne!(q_a, q_other_stream);
         // Different group on the same stream → different queue.
-        let q_other_group = r.get_or_create_queue(s0, b"audit");
+        let q_other_group = r.get_or_create_queue(s0, b"audit").unwrap();
         assert_ne!(q_a, q_other_group);
     }
 
@@ -1119,7 +1126,7 @@ mod tests {
         let r = NameRegistry::new();
         let s = StreamId(0);
         let (c, _) = r.get_or_create_consumer(s, b"alice");
-        let q = r.get_or_create_queue(s, b"workers");
+        let q = r.get_or_create_queue(s, b"workers").unwrap();
         r.set_consumer_queue(c, q);
         assert_eq!(r.consumer_queue(c), Some(q));
         // Removing the consumer also drops the queue association.
@@ -1199,5 +1206,29 @@ mod tests {
         assert_ne!(r.consumer_generation(carol).unwrap(), gen_before);
         assert!(!r.is_consumer_current(alice, gen_before));
         assert!(r.is_consumer_current(carol, r.consumer_generation(carol).unwrap()));
+    }
+
+    /// AUDIT R-03. Every QueueId indexes a fixed `SLOT_COUNT` slice in the
+    /// server's counters, so the registry must never mint one past it —
+    /// a fresh `(stream, group)` per job is enough to get there.
+    #[test]
+    fn queue_ids_stay_inside_the_slot_space() {
+        let r = NameRegistry::new();
+        let (stream, _) = r.get_or_create_stream(0xA0D1_7001);
+        let mut refused = 0;
+        for i in 0..=NameRegistry::MAX_SLOT_COUNT {
+            match r.get_or_create_queue(stream, format!("job-{i}").as_bytes()) {
+                Some(id) => assert!(
+                    id.0 < NameRegistry::MAX_SLOT_COUNT,
+                    "group #{i} got QueueId {} — past the {} slots the counters hold",
+                    id.0,
+                    NameRegistry::MAX_SLOT_COUNT
+                ),
+                None => refused += 1,
+            }
+        }
+        assert!(refused > 0, "past capacity the registry must refuse, not wrap");
+        // A group that already has an id keeps getting it at capacity.
+        assert!(r.get_or_create_queue(stream, b"job-0").is_some());
     }
 }

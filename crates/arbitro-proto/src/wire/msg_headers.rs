@@ -176,8 +176,10 @@ impl<'a> Iterator for HeaderIter<'a> {
         if self.remaining == 0 {
             return None;
         }
-        let entry = HeaderEntry::ref_from_bytes(&self.data[self.offset..]).ok()?;
-        self.offset += entry.wire_size();
+        // The entry's length comes off the wire: an offset past the block
+        // ends the walk instead of slicing out of bounds.
+        let entry = HeaderEntry::ref_from_bytes(self.data.get(self.offset..)?).ok()?;
+        self.offset = self.offset.saturating_add(entry.wire_size());
         self.remaining -= 1;
         Some(entry)
     }
@@ -329,5 +331,22 @@ mod tests {
         let ext = ExtendedPayload::ref_from_bytes(&buf).unwrap();
         let hdr = ext.headers_block().unwrap();
         assert_eq!(hdr.get(HDR_MSG_ID).unwrap(), b"wf:123:0:0");
+    }
+
+    /// AUDIT P0-1. An entry whose declared length runs past the block must
+    /// end the walk, not move the offset past the end and panic on the next
+    /// entry. The payload is stored raw, so a panic here also fires at boot.
+    #[test]
+    fn entry_length_past_the_block_does_not_panic() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&11u32.to_le_bytes()); // headers_len
+        buf.extend_from_slice(&2u16.to_le_bytes()); // count: two entries claimed
+        buf.push(1); // key_len
+        buf.extend_from_slice(&1000u16.to_le_bytes()); // val_len far past the end
+        buf.extend_from_slice(b"kv");
+        let hdr = HeadersBlock::ref_from_bytes(&buf).unwrap();
+
+        assert_eq!(hdr.get(HDR_MSG_ID), None);
+        assert!(hdr.iter().count() <= 1);
     }
 }

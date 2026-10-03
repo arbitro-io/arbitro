@@ -56,7 +56,6 @@ pub(in crate::shard) struct DrainConfig {
 /// `DrainNotification::Delivered` to the command thread, which owns
 /// `Binding.pending` and `InFlightCounters`. Fire-and-forget never
 /// pushes here — no ack will ever arrive.
-#[allow(dead_code)] // `stream` kept for diagnostics
 #[derive(Clone, Copy)]
 struct PendingNotify {
     conn: ConnectionId,
@@ -124,7 +123,7 @@ pub(in crate::shard) struct DrainScratch {
     /// F11 — persistent flush-outcome buffer reused across drain
     /// cycles. Avoids an alloc per cycle. Stores `(ConnectionId, FlushOutcome)`
     /// pairs from Phase 2; Phase 3 consumes and clears.
-    flush_results: Vec<(ConnectionId, FlushOutcome)>,
+    flush_results: Vec<(ConnectionId, StreamId, FlushOutcome)>,
     /// F12 — persistent buffer for the slow-path notify sort.
     sorted_notify: Vec<PendingNotify>,
 
@@ -137,6 +136,8 @@ pub(in crate::shard) struct DrainScratch {
     /// the clock only measures CONTINUOUS stall. Bounded: at most one
     /// entry per connection with a currently-full writer channel.
     stalled_conns: Vec<(ConnectionId, std::time::Instant)>,
+    /// Delivery memory for fire-and-forget bindings — see `ff_floor.rs`.
+    ff: crate::shard::ff_floor::FireAndForgetFloors,
 }
 
 /// Everything the drain memoizes about one stream's subjects.
@@ -254,6 +255,7 @@ impl DrainScratch {
             flush_results: Vec::with_capacity(16),
             sorted_notify: Vec::with_capacity(256),
             stalled_conns: Vec::with_capacity(4),
+            ff: Default::default(),
         }
     }
 
@@ -338,6 +340,19 @@ pub(in crate::shard) fn drain_read(
 ) -> ReadVerdict {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
 
+    // Pattern/subject-limit caches are pure functions of the snapshot's
+    // match tables — valid while the snapshot Arc is unchanged (ptr_eq
+    // in the worker, ABA-safe because it holds the previous Arc). Stale
+    // entries after a swap would drop late-binding fanout subscribers.
+    //
+    // Before the early returns: the worker marks the snapshot seen on
+    // EVERY turn, so a swap first seen on a NoDemand/UpToDate turn was
+    // never applied at all.
+    if snap_changed {
+        scratch.caches.clear();
+        scratch.ff.remap(&snap.bindings);
+    }
+
     if !counters.has_any_demand() {
         return ReadVerdict::NoDemand;
     }
@@ -361,19 +376,14 @@ pub(in crate::shard) fn drain_read(
     scratch.local_subject.clear();
     scratch.deliveries.clear();
     scratch.acc.clear();
-    // Pattern/subject-limit caches are pure functions of the snapshot's
-    // match tables — valid while the snapshot Arc is unchanged (ptr_eq
-    // in the worker, ABA-safe because it holds the previous Arc). Stale
-    // entries after a swap would drop late-binding fanout subscribers.
-    if snap_changed {
-        scratch.caches.clear();
-    }
 
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
     // Walk the store, accumulate into per-connection buckets.
-    store
+    let mut read_to = start - 1;
+    let walked = store
         .for_each(start, end, &mut |entry| {
+            read_to = entry.seq;
             // Per-stream max_age_ms takes precedence over the global default;
             // falls back to global cfg if the stream has no specific limit.
             let stream_max_age = snap
@@ -393,8 +403,14 @@ pub(in crate::shard) fn drain_read(
                 &mut more_pending,
                 &mut lowest_skipped,
             );
-        })
-        .ok();
+        });
+    // A walk that failed part-way read nothing past `read_to`: pin the
+    // cursor there and retry, never report the window as fully read.
+    if let Err(e) = walked {
+        tracing::warn!(error = ?e, start, end, read_to, "drain: store read failed mid-window");
+        track_skipped(&mut lowest_skipped, read_to + 1);
+        more_pending = true;
+    }
 
     ReadVerdict::Fed(DrainReadResult {
         start,
@@ -470,6 +486,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, true);
                 flush_results.push((
                     frame.connection_id,
+                    frame.stream_id,
                     FlushOutcome::WriterGone(frame.first_seq),
                 ));
                 return false;
@@ -487,6 +504,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 probe.flush_writer_gone(frame.connection_id, frame.first_seq, frame.count, false);
                 flush_results.push((
                     frame.connection_id,
+                    frame.stream_id,
                     FlushOutcome::WriterGone(frame.first_seq),
                 ));
                 return false;
@@ -504,6 +522,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
             // `try_send` hands the bytes back inside the Err so we can
             // safely keep `frame.first_seq` for tracking.
             let conn = frame.connection_id;
+            let stream = frame.stream_id;
             let count = frame.count;
             let first_seq = frame.first_seq;
             let ok = writer.write_tx.try_send(frame.bytes).is_ok();
@@ -511,10 +530,10 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
             if ok {
                 probe.flush_ok(conn, first_seq, count);
                 crate::lifecycle_trace!("30_send_bytes_done", conn.0, count as u64, "shard");
-                flush_results.push((conn, FlushOutcome::Ok));
+                flush_results.push((conn, stream, FlushOutcome::Ok));
             } else {
                 probe.flush_backpressured(conn, first_seq, count);
-                flush_results.push((conn, FlushOutcome::Backpressured(first_seq)));
+                flush_results.push((conn, stream, FlushOutcome::Backpressured(first_seq)));
             }
             ok
         });
@@ -523,7 +542,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     // Phase 3 — post-flush bookkeeping (atomics + command-thread
     // notifications). Fire-and-forget entries never hit scratch.deliveries,
     // so this loop is a no-op in the pub/sub default path.
-    for &(conn, outcome) in &flush_results {
+    for &(conn, _, outcome) in &flush_results {
         match outcome {
             FlushOutcome::Ok => {}
             FlushOutcome::Backpressured(first_seq) => {
@@ -588,7 +607,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
         scratch.stalled_conns.retain(|&(c, _)| {
             let mut backpressured = false;
             let mut progressed = false;
-            for &(fc, o) in flush_results.iter() {
+            for &(fc, _, o) in flush_results.iter() {
                 if fc == c {
                     match o {
                         FlushOutcome::Ok => progressed = true,
@@ -607,6 +626,9 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
         &scratch.deliveries,
         &flush_results,
     );
+    scratch
+        .ff
+        .commit(&snap.bindings, |c, s| frame_ok_for(&flush_results, c, s));
 
     // Group successful deliveries by binding_id and notify the command
     // thread once per binding (same shape Command::Delivered expects).
@@ -640,10 +662,10 @@ fn record_deliveries(
     counters: &SharedCounters,
     consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
     deliveries: &[PendingNotify],
-    flush_results: &[(ConnectionId, FlushOutcome)],
+    flush_results: &[(ConnectionId, StreamId, FlushOutcome)],
 ) {
     for d in deliveries {
-        if frame_ok_for(flush_results, d.conn) {
+        if frame_ok_for(flush_results, d.conn, d.stream) {
             counters.inc_inflight(d.consumer_id, d.queue_id);
             let cs = consumer_subjects_slot_mut(consumer_subjects, d.consumer_id);
             cs.inc(d.subject_hash);
@@ -1022,6 +1044,13 @@ fn dispatch_recipients(
             continue;
         }
 
+        // Fire-and-forget delivery memory: a re-walk of a window a sibling
+        // pinned must not send this binding what its socket already got.
+        // Not owed, so no `track_skipped` — same discipline as above.
+        if binding.fire_and_forget && scratch.ff.already_sent(binding_idx, entry.seq) {
+            continue;
+        }
+
         // BUG4: a binding whose writer has already failed is ineligible.
         // Skip it WITHOUT marking `served_queues` so a queue's live sibling
         // falls through and takes this entry, instead of the dead binding
@@ -1139,6 +1168,9 @@ fn dispatch_recipients(
                 reply_to,
                 actual_payload,
             );
+            if fire_and_forget {
+                scratch.ff.stage(binding_idx, entry.seq);
+            }
         }
 
         // Every subscription that will see the message owes an ack, whether
@@ -1188,27 +1220,19 @@ fn notify_delivered_grouped(
     notify_tx: &mut crate::shard::shared::NotifyProducer,
     bindings: &[ActiveBinding],
     deliveries: &[PendingNotify],
-    flush_results: &[(ConnectionId, FlushOutcome)],
+    flush_results: &[(ConnectionId, StreamId, FlushOutcome)],
     sorted_buf: &mut Vec<PendingNotify>,
     silent_drops: &crate::common::SilentDrops,
 ) {
-    // F11: replace the per-cycle HashMap<conn, bool> with a linear scan
-    // over `flush_results` (typically 1–8 entries). Cache locality wins.
-    let frame_ok = |conn: ConnectionId| -> bool {
-        for &(c, o) in flush_results.iter() {
-            if c == conn {
-                return matches!(o, FlushOutcome::Ok);
-            }
-        }
-        false
-    };
+    // F11: a linear scan over `flush_results` (typically 1–8 entries).
+    let frame_ok = |d: &PendingNotify| frame_ok_for(flush_results, d.conn, d.stream);
 
     // Fast path — every delivery belongs to the same binding AND all
     // frames succeeded. Pub/sub of a single consumer hits this path.
     if let Some(first) = deliveries.first() {
         let first_idx = first.binding_idx;
         if deliveries.iter().all(|d| d.binding_idx == first_idx)
-            && deliveries.iter().all(|d| frame_ok(d.conn))
+            && deliveries.iter().all(frame_ok)
         {
             let binding = &bindings[first_idx];
             // The notify ring transfers ownership across threads — the
@@ -1242,7 +1266,7 @@ fn notify_delivered_grouped(
     // by bindings.len()) replaces the comparison sort — O(N + K) vs
     // O(N log N) where K = bindings.len().
     sorted_buf.clear();
-    sorted_buf.extend(deliveries.iter().copied().filter(|d| frame_ok(d.conn)));
+    sorted_buf.extend(deliveries.iter().copied().filter(frame_ok));
 
     if sorted_buf.is_empty() {
         return;
@@ -1323,9 +1347,15 @@ fn track_skipped(lowest: &mut Option<u64>, seq: u64) {
 /// beats HashMap on inserts and lookups at this size and removes the
 /// per-cycle HashMap allocation entirely.
 #[inline]
-fn frame_ok_for(results: &[(ConnectionId, FlushOutcome)], conn: ConnectionId) -> bool {
-    for &(c, o) in results.iter() {
-        if c == conn {
+fn frame_ok_for(
+    results: &[(ConnectionId, StreamId, FlushOutcome)],
+    conn: ConnectionId,
+    stream: StreamId,
+) -> bool {
+    // Keyed by (conn, stream): the accumulator emits one frame per pair, so
+    // one connection can have a frame that left and one that bounced.
+    for &(c, s, o) in results.iter() {
+        if c == conn && s == stream {
             return matches!(o, FlushOutcome::Ok);
         }
     }
@@ -1597,5 +1627,224 @@ mod tests {
             rx.try_recv().is_none(),
             "no eviction: the stall was never continuous for the window",
         );
+    }
+
+    /// AUDIT R-02. One connection, two streams on this shard: the
+    /// accumulator emits one frame per (conn, stream), so one can go out
+    /// and the other bounce off a full channel. Only the entry that left
+    /// may be counted in flight — the other was never sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_outcome_is_per_frame_not_per_connection() {
+        let counters = SharedCounters::new();
+        let gate = Gate::new();
+        let names = Arc::new(NameRegistry::default());
+        let silent = SilentDrops::new();
+        let (mut producers, _rx, _sd) = NotifyRing::new(1);
+        let mut notify_tx = producers.pop().unwrap();
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+
+        // Room for exactly ONE frame: the first flush lands, the second is
+        // backpressured.
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        let write_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn = ConnectionId(7);
+        let consumer = ConsumerId(3);
+        let binding = |idx: u32, stream: u32| ActiveBinding {
+            binding_id: BindingId(idx),
+            connection_id: conn,
+            consumer_id: consumer,
+            subscription_id: SubscriptionId(idx),
+            group_idx: 0,
+            external_sub_id: idx,
+            stream_id: StreamId(stream),
+            queue_id: QueueId(0),
+            max_inflight: 16,
+            fire_and_forget: false,
+            ack_wait_ms: 0,
+            deliver_floor: 0,
+            write_tx: write_tx.clone(),
+            write_failed: Arc::clone(&write_failed),
+        };
+        let mut snap = DrainSnapshot::empty();
+        snap.bindings = Arc::from(vec![binding(0, 1), binding(1, 2)].into_boxed_slice());
+        snap.writers_by_conn.insert(
+            conn.0,
+            crate::shard::shared::WriterIndexEntry {
+                write_tx: write_tx.clone(),
+                write_failed: Arc::clone(&write_failed),
+            },
+        );
+
+        scratch.acc.clear();
+        for (stream, seq, idx) in [(1u32, 10u64, 0usize), (2, 11, 1)] {
+            scratch.acc.add(conn, StreamId(stream), consumer, seq, b"subj", 0, &[], b"payload");
+            scratch.deliveries.push(PendingNotify {
+                conn,
+                stream: StreamId(stream),
+                binding_idx: idx,
+                seq,
+                subject_hash: wire_hash_32(b"subj"),
+                consumer_id: consumer.0,
+                queue_id: 0,
+            });
+        }
+
+        drain_deliver(
+            &counters,
+            &snap,
+            &gate,
+            &names,
+            &mut scratch,
+            &mut consumer_subjects,
+            &mut notify_tx,
+            &silent,
+            0,
+            DrainReadResult {
+                start: 10,
+                end: 12,
+                more_pending: false,
+                lowest_skipped: None,
+                last_seq: 11,
+            },
+            &mut ProbeOff,
+        );
+
+        assert_eq!(
+            counters.consumer_inflight(consumer.0),
+            1,
+            "two frames, one sent: exactly one entry may be in flight"
+        );
+    }
+
+    /// A store whose walk hands out `served` entries and then fails.
+    struct FailsMidWalk {
+        inner: arbitro_store::MemoryStore,
+        served: usize,
+    }
+
+    impl Store for FailsMidWalk {
+        fn append(
+            &mut self,
+            e: arbitro_store::EntryRef<'_>,
+            ts: u64,
+        ) -> Result<u64, arbitro_store::StoreError> {
+            self.inner.append(e, ts)
+        }
+        fn append_batch(
+            &mut self,
+            e: &[arbitro_store::EntryRef<'_>],
+            ts: u64,
+        ) -> Result<u64, arbitro_store::StoreError> {
+            self.inner.append_batch(e, ts)
+        }
+        fn read(
+            &self,
+            seq: u64,
+        ) -> Result<Option<arbitro_store::Entry<'_>>, arbitro_store::StoreError> {
+            self.inner.read(seq)
+        }
+        fn read_range(
+            &self,
+            s: u64,
+            e: u64,
+        ) -> Result<Vec<arbitro_store::Entry<'_>>, arbitro_store::StoreError> {
+            self.inner.read_range(s, e)
+        }
+        fn get(
+            &self,
+            seq: u64,
+            f: &mut dyn FnMut(&arbitro_store::Entry<'_>),
+        ) -> Result<bool, arbitro_store::StoreError> {
+            self.inner.get(seq, f)
+        }
+        fn for_each(
+            &self,
+            start: u64,
+            end: u64,
+            f: &mut dyn FnMut(&arbitro_store::Entry<'_>),
+        ) -> Result<(), arbitro_store::StoreError> {
+            let mut left = self.served;
+            let _ = self.inner.for_each(start, end, &mut |e| {
+                if left > 0 {
+                    left -= 1;
+                    f(e);
+                }
+            });
+            Err(arbitro_store::StoreError::Io(std::io::ErrorKind::Other))
+        }
+        fn purge(&mut self) -> u64 {
+            self.inner.purge()
+        }
+        fn truncate_front(&mut self, first_seq: u64) -> u64 {
+            self.inner.truncate_front(first_seq)
+        }
+        fn drain(&mut self, stream_id: u32, subject: &[u8]) -> u64 {
+            self.inner.drain(stream_id, subject)
+        }
+        fn tombstone_at(&mut self, seq: u64) -> bool {
+            self.inner.tombstone_at(seq)
+        }
+        fn tombstone_stream(&mut self, stream_id: u32) -> u64 {
+            self.inner.tombstone_stream(stream_id)
+        }
+        fn info(&self) -> arbitro_store::StoreInfo {
+            self.inner.info()
+        }
+    }
+
+    /// AUDIT P1-1 (maintainability). A store read that fails part-way must
+    /// not be reported as a fully read window: the cursor would then move
+    /// past entries nobody read, and they would never be delivered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn store_read_error_does_not_advance_past_unread_entries() {
+        let mut store = FailsMidWalk {
+            inner: arbitro_store::MemoryStore::new(),
+            served: 3,
+        };
+        for _ in 0..10 {
+            store
+                .append(
+                    arbitro_store::EntryRef {
+                        stream_id: 1,
+                        subject: b"subj",
+                        payload: b"payload",
+                        flags: 0,
+                        deliver_at_ms: 0,
+                    },
+                    0,
+                )
+                .unwrap();
+        }
+        let counters = SharedCounters::new();
+        counters.inc_demand(1);
+        let cfg = DrainConfig {
+            max_feed: 256,
+            max_age_ms: 0,
+            batch_size: 256,
+            stall_evict_ms: 0,
+        };
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+
+        let verdict = drain_read(
+            &counters,
+            &DrainSnapshot::empty(),
+            &store,
+            &cfg,
+            &mut scratch,
+            &mut consumer_subjects,
+            0,
+            true,
+        );
+
+        if let ReadVerdict::Fed(r) = verdict {
+            let next_cursor = r.lowest_skipped.map_or(r.end - 1, |s| s.saturating_sub(1));
+            assert!(
+                next_cursor <= 3,
+                "store served 3 entries then failed, yet the drain would move \
+                 the cursor to {next_cursor}: seqs 4..={next_cursor} are lost"
+            );
+        }
     }
 }

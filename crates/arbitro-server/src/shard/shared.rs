@@ -95,7 +95,11 @@ impl SharedCounters {
     #[inline]
     pub fn inc_inflight(&self, consumer_id: u32, queue_id: u32) {
         self.consumer[consumer_id as usize].fetch_add(1, Ordering::Relaxed);
-        self.queue[queue_id as usize].fetch_add(1, Ordering::Relaxed);
+        // Same bound check indexing already paid; an id past the slice is
+        // refused at creation, so this never skips a live queue.
+        if let Some(q) = self.queue.get(queue_id as usize) {
+            q.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Saturating atomic subtract — clamps at 0 instead of wrapping.
@@ -122,7 +126,9 @@ impl SharedCounters {
     #[inline]
     pub fn dec_inflight(&self, consumer_id: u32, queue_id: u32) {
         Self::saturating_dec(&self.consumer[consumer_id as usize], 1);
-        Self::saturating_dec(&self.queue[queue_id as usize], 1);
+        if let Some(q) = self.queue.get(queue_id as usize) {
+            Self::saturating_dec(q, 1);
+        }
     }
 
     /// Bulk decrement consumer + queue inflight (for retire_binding).
@@ -130,7 +136,9 @@ impl SharedCounters {
     #[inline]
     pub fn dec_inflight_bulk(&self, consumer_id: u32, queue_id: u32, count: u32) {
         Self::saturating_dec(&self.consumer[consumer_id as usize], count);
-        Self::saturating_dec(&self.queue[queue_id as usize], count);
+        if let Some(q) = self.queue.get(queue_id as usize) {
+            Self::saturating_dec(q, count);
+        }
     }
 
     /// Current consumer inflight count.
@@ -501,5 +509,17 @@ mod tests {
         c.signal_rewind(20); // 10 wins via min
         c.clear_rewind();
         assert_eq!(c.take_rewind(), None);
+    }
+
+    /// AUDIT R-03. A QueueId past the slice must not take the drain task
+    /// down with it: the shard would stop delivering and nothing would say.
+    #[test]
+    fn queue_id_past_the_slots_does_not_panic() {
+        let c = SharedCounters::new();
+        let outcome = std::panic::catch_unwind(|| {
+            c.inc_inflight(1, SLOT_COUNT as u32);
+            c.dec_inflight(1, SLOT_COUNT as u32);
+        });
+        assert!(outcome.is_ok(), "QueueId {SLOT_COUNT} panicked the counters");
     }
 }
