@@ -328,6 +328,39 @@ pub(in crate::shard) struct DrainReadResult {
     pub retry_on_timer: bool,
 }
 
+/// Pattern/subject-limit caches are pure functions of the snapshot's match
+/// tables — valid while the snapshot Arc is unchanged (ptr_eq in the worker,
+/// ABA-safe because it holds the previous Arc). Stale entries after a swap
+/// would drop late-binding fanout subscribers.
+#[inline]
+fn apply_snapshot_change(scratch: &mut DrainScratch, snap: &DrainSnapshot, snap_changed: bool) {
+    if snap_changed {
+        scratch.caches.clear();
+        scratch.ff.remap(&snap.bindings);
+    }
+}
+
+/// Phase 1 behind the shard's store lock, taken only when some binding wants messages.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::shard) fn drain_read_shared(
+    counters: &SharedCounters,
+    snap: &DrainSnapshot,
+    store: &parking_lot::Mutex<Box<dyn Store>>,
+    cfg: &DrainConfig,
+    scratch: &mut DrainScratch,
+    consumer_subjects: &mut Vec<Option<ConsumerSubjects>>,
+    now_ms: u64,
+    snap_changed: bool,
+) -> ReadVerdict {
+    // Every publish wakes the drain; without demand it must not contend for the publisher's lock.
+    if !counters.has_any_demand() {
+        apply_snapshot_change(scratch, snap, snap_changed);
+        return ReadVerdict::NoDemand;
+    }
+    let store_guard = store.lock();
+    drain_read(counters, snap, &**store_guard, cfg, scratch, consumer_subjects, now_ms, snap_changed)
+}
+
 /// Phase 1 — read entries from the store into scratch buffers.
 ///
 /// Holds the store reference only for the `for_each` walk. After this
@@ -347,18 +380,10 @@ pub(in crate::shard) fn drain_read(
 ) -> ReadVerdict {
     crate::lifecycle_trace!("21_drainer_enter", 0, snap.bindings.len() as u64, "shard");
 
-    // Pattern/subject-limit caches are pure functions of the snapshot's
-    // match tables — valid while the snapshot Arc is unchanged (ptr_eq
-    // in the worker, ABA-safe because it holds the previous Arc). Stale
-    // entries after a swap would drop late-binding fanout subscribers.
-    //
     // Before the early returns: the worker marks the snapshot seen on
     // EVERY turn, so a swap first seen on a NoDemand/UpToDate turn was
     // never applied at all.
-    if snap_changed {
-        scratch.caches.clear();
-        scratch.ff.remap(&snap.bindings);
-    }
+    apply_snapshot_change(scratch, snap, snap_changed);
 
     if !counters.has_any_demand() {
         return ReadVerdict::NoDemand;
@@ -1971,6 +1996,42 @@ mod tests {
             "no binding had credit, yet the walk read {} of {WINDOW} entries",
             store.visited()
         );
+    }
+
+    /// With no consumer on the shard every publish still wakes the drain, and
+    /// each wake took the store lock the publisher appends under — measured
+    /// at -19% on single-connection batch publish. No demand means no read.
+    #[test]
+    fn a_shard_without_demand_never_takes_the_store_lock() {
+        let store: parking_lot::Mutex<Box<dyn Store>> =
+            parking_lot::Mutex::new(Box::new(WalkProbe::with_entries(WINDOW, None)));
+        let counters = SharedCounters::new();
+        let snap = DrainSnapshot::empty();
+        let cfg = DrainConfig {
+            max_feed: WINDOW,
+            max_age_ms: 0,
+            batch_size: 256,
+            stall_evict_ms: 0,
+        };
+        let held = store.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut scratch = DrainScratch::new();
+                let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+                let verdict = drain_read_shared(
+                    &counters, &snap, &store, &cfg, &mut scratch, &mut consumer_subjects, 0, true,
+                );
+                done_tx.send(matches!(verdict, ReadVerdict::NoDemand)).unwrap();
+            });
+            let answered = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+            drop(held);
+            assert_eq!(
+                answered,
+                Ok(true),
+                "a cycle with no demand blocked on the store lock the publisher holds"
+            );
+        });
     }
 
     /// Guard for the early exit: a fire-and-forget binding never runs out of

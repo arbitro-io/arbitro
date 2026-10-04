@@ -201,19 +201,16 @@ impl DrainWorker {
 
                 // Phase split: store lock held for the walk only; delivery
                 // and bookkeeping run lock-free.
-                let verdict = {
-                    let store_guard = self.store.lock();
-                    super::drain::drain_read(
-                        &self.counters,
-                        &snap,
-                        &**store_guard,
-                        &self.drain_config,
-                        &mut self.drain_scratch,
-                        &mut self.consumer_subjects,
-                        now_ms,
-                        snap_changed,
-                    )
-                };
+                let verdict = super::drain::drain_read_shared(
+                    &self.counters,
+                    &snap,
+                    &self.store,
+                    &self.drain_config,
+                    &mut self.drain_scratch,
+                    &mut self.consumer_subjects,
+                    now_ms,
+                    snap_changed,
+                );
                 probe.read_verdict(verdict);
                 // `drain_deliver` re-opens the gate iff more work remains;
                 // non-`Fed` verdicts leave it cleared by the top-of-loop lock.
