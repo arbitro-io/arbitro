@@ -47,6 +47,9 @@ pub(in crate::shard) struct DrainConfig {
     pub stall_evict_ms: u64,
 }
 
+/// Entries per store walk call; bounds what a cycle reads after its bindings ran out of credit.
+const WALK_CHUNK: u64 = 32;
+
 // ── Per-cycle ack-mode delivery record ──────────────────────────────────────
 
 /// Per-entry metadata captured for ack-mode deliveries. Lives in
@@ -138,6 +141,7 @@ pub(in crate::shard) struct DrainScratch {
     stalled_conns: Vec<(ConnectionId, std::time::Instant)>,
     /// Delivery memory for fire-and-forget bindings — see `ff_floor.rs`.
     ff: crate::shard::ff_floor::FireAndForgetFloors,
+    credit: crate::shard::credit_exit::CreditExit,
 }
 
 /// Everything the drain memoizes about one stream's subjects.
@@ -256,6 +260,7 @@ impl DrainScratch {
             sorted_notify: Vec::with_capacity(256),
             stalled_conns: Vec::with_capacity(4),
             ff: Default::default(),
+            credit: Default::default(),
         }
     }
 
@@ -319,6 +324,8 @@ pub(in crate::shard) struct DrainReadResult {
     pub more_pending: bool,
     pub lowest_skipped: Option<u64>,
     pub last_seq: u64,
+    /// Skip no event announces (full/dead writer, failed read); credit skips are woken by their release().
+    pub retry_on_timer: bool,
 }
 
 /// Phase 1 — read entries from the store into scratch buffers.
@@ -380,10 +387,18 @@ pub(in crate::shard) fn drain_read(
     crate::lifecycle_trace!("25_drain_loop_start", start, end, "shard");
 
     // Walk the store, accumulate into per-connection buckets.
+    scratch.credit.begin_cycle(snap.bindings.len());
     let mut read_to = start - 1;
-    let walked = store
-        .for_each(start, end, &mut |entry| {
+    let mut walked = Ok(());
+    let mut from = start;
+    // In chunks, so a cycle that ran out of credit stops reading as well as processing.
+    while from < end && !scratch.credit.exhausted() && walked.is_ok() {
+        let to = (from + WALK_CHUNK).min(end);
+        walked = store.for_each(from, to, &mut |entry| {
             read_to = entry.seq;
+            if scratch.credit.exhausted() {
+                return;
+            }
             // Per-stream max_age_ms takes precedence over the global default;
             // falls back to global cfg if the stream has no specific limit.
             let stream_max_age = snap
@@ -404,8 +419,11 @@ pub(in crate::shard) fn drain_read(
                 &mut lowest_skipped,
             );
         });
+        from = to;
+    }
     // A walk that failed part-way read nothing past `read_to`: pin the
     // cursor there and retry, never report the window as fully read.
+    let retry_on_timer = walked.is_err();
     if let Err(e) = walked {
         tracing::warn!(error = ?e, start, end, read_to, "drain: store read failed mid-window");
         track_skipped(&mut lowest_skipped, read_to + 1);
@@ -418,6 +436,7 @@ pub(in crate::shard) fn drain_read(
         more_pending,
         lowest_skipped,
         last_seq: info.last_seq,
+        retry_on_timer,
     })
 }
 
@@ -426,6 +445,8 @@ pub(in crate::shard) fn drain_read(
 /// Does NOT need the store. The store lock should be released before
 /// calling this. All entry data lives in `scratch.acc` (copied during
 /// Phase 1's `for_each`).
+///
+/// Returns `retry_on_timer`: whether a stalled cycle owes a timed retry.
 ///
 /// `stall_evict_ms` — ROB-23 slow-consumer eviction bound (0 = disabled),
 /// see `DrainConfig::stall_evict_ms`.
@@ -442,7 +463,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     stall_evict_ms: u64,
     mut result: DrainReadResult,
     probe: &mut P,
-) {
+) -> bool {
     // Phase 2 — flush every accumulator bucket as one RepBatch frame.
     // Results are captured into a small Vec so Phase 3 can do ack
     // bookkeeping without borrowing scratch inside the for_each closure.
@@ -549,6 +570,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 // Treat as skipped — cursor won't advance past these entries.
                 track_skipped(&mut result.lowest_skipped, first_seq);
                 result.more_pending = true;
+                result.retry_on_timer = true;
                 // ROB-23 (audit #7a): a full writer channel is transient
                 // ONLY for a bounded window. The reply path already ejects
                 // a non-reading connection the moment its queue fills
@@ -592,6 +614,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
                 // sibling picks it up.
                 track_skipped(&mut result.lowest_skipped, first_seq);
                 result.more_pending = true;
+                result.retry_on_timer = true;
                 scratch.dead_connections.push(conn);
             }
         }
@@ -649,6 +672,7 @@ pub(in crate::shard) fn drain_deliver<P: DrainProbe>(
     close_window(&mut result);
     report_dead_connections(&mut scratch.dead_connections, notify_tx, silent_drops);
     reopen_if_pending(gate, &result);
+    result.retry_on_timer
 }
 
 // ── Drain-deliver tail components ───────────────────────────────────────────
@@ -727,9 +751,10 @@ fn report_dead_connections(
 /// drain worker's top-of-cycle `lock()`, so a concurrent publish's
 /// `release()` can never be wiped by a stale end-of-cycle clear (the
 /// tail-message lost-wakeup). No path here may call `gate.lock()`.
+/// A credit-only pin stays closed: the ack/resume/timeout that frees it releases the gate.
 #[inline]
 fn reopen_if_pending(gate: &Gate, result: &DrainReadResult) {
-    if result.more_pending {
+    if result.more_pending && (result.lowest_skipped.is_none() || result.retry_on_timer) {
         gate.release();
         crate::lifecycle_trace!("33_drainer_exit_released", 0, 0, "shard");
     }
@@ -1069,6 +1094,7 @@ fn dispatch_recipients(
             *more_pending = true;
             track_skipped(lowest_skipped, entry.seq);
             dbg_tracked = true;
+            scratch.credit.out_of_credit(binding_idx, bindings, counters, &scratch.local_inflight);
             continue;
         }
 
@@ -1081,6 +1107,7 @@ fn dispatch_recipients(
                 *more_pending = true;
                 track_skipped(lowest_skipped, entry.seq);
                 dbg_tracked = true;
+                scratch.credit.out_of_credit(binding_idx, bindings, counters, &scratch.local_inflight);
                 continue;
             }
 
@@ -1417,6 +1444,7 @@ mod tests {
             more_pending: false,
             lowest_skipped: None,
             last_seq: 10,
+            retry_on_timer: false,
         };
 
         drain_deliver(
@@ -1513,6 +1541,7 @@ mod tests {
                         more_pending: false,
                         lowest_skipped: None,
                         last_seq: 10,
+                        retry_on_timer: false,
                     },
                     &mut ProbeOff,
                 );
@@ -1603,6 +1632,7 @@ mod tests {
                         more_pending: false,
                         lowest_skipped: None,
                         last_seq: 10,
+                        retry_on_timer: false,
                     },
                     &mut ProbeOff,
                 );
@@ -1706,6 +1736,7 @@ mod tests {
                 more_pending: false,
                 lowest_skipped: None,
                 last_seq: 11,
+                retry_on_timer: false,
             },
             &mut ProbeOff,
         );
@@ -1717,13 +1748,42 @@ mod tests {
         );
     }
 
-    /// A store whose walk hands out `served` entries and then fails.
-    struct FailsMidWalk {
+    /// A store that counts the entries its walks hand out and, with
+    /// `fail_after`, fails once it has served that many.
+    struct WalkProbe {
         inner: arbitro_store::MemoryStore,
-        served: usize,
+        fail_after: Option<usize>,
+        visited: std::sync::atomic::AtomicUsize,
     }
 
-    impl Store for FailsMidWalk {
+    impl WalkProbe {
+        fn visited(&self) -> usize {
+            self.visited.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn count_visit(&self) {
+            self.visited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl WalkProbe {
+        fn with_entries(count: usize, fail_after: Option<usize>) -> Self {
+            let mut inner = arbitro_store::MemoryStore::new();
+            for _ in 0..count {
+                let entry = arbitro_store::EntryRef {
+                    stream_id: 1,
+                    subject: b"subj",
+                    payload: b"payload",
+                    flags: 0,
+                    deliver_at_ms: 0,
+                };
+                inner.append(entry, 0).unwrap();
+            }
+            Self { inner, fail_after, visited: std::sync::atomic::AtomicUsize::new(0) }
+        }
+    }
+
+    impl Store for WalkProbe {
         fn append(
             &mut self,
             e: arbitro_store::EntryRef<'_>,
@@ -1764,10 +1824,17 @@ mod tests {
             end: u64,
             f: &mut dyn FnMut(&arbitro_store::Entry<'_>),
         ) -> Result<(), arbitro_store::StoreError> {
-            let mut left = self.served;
+            let Some(fail_after) = self.fail_after else {
+                return self.inner.for_each(start, end, &mut |e| {
+                    self.count_visit();
+                    f(e);
+                });
+            };
+            let mut left = fail_after.saturating_sub(self.visited());
             let _ = self.inner.for_each(start, end, &mut |e| {
                 if left > 0 {
                     left -= 1;
+                    self.count_visit();
                     f(e);
                 }
             });
@@ -1798,24 +1865,7 @@ mod tests {
     /// past entries nobody read, and they would never be delivered.
     #[tokio::test(flavor = "current_thread")]
     async fn store_read_error_does_not_advance_past_unread_entries() {
-        let mut store = FailsMidWalk {
-            inner: arbitro_store::MemoryStore::new(),
-            served: 3,
-        };
-        for _ in 0..10 {
-            store
-                .append(
-                    arbitro_store::EntryRef {
-                        stream_id: 1,
-                        subject: b"subj",
-                        payload: b"payload",
-                        flags: 0,
-                        deliver_at_ms: 0,
-                    },
-                    0,
-                )
-                .unwrap();
-        }
+        let store = WalkProbe::with_entries(10, Some(3));
         let counters = SharedCounters::new();
         counters.inc_demand(1);
         let cfg = DrainConfig {
@@ -1846,5 +1896,95 @@ mod tests {
                  the cursor to {next_cursor}: seqs 4..={next_cursor} are lost"
             );
         }
+    }
+
+    const WINDOW: usize = 256;
+
+    /// A snapshot of stream 1 whose every subject reaches `bindings`, each
+    /// on its own connection; `fire_and_forget[i]` sets binding `i`'s mode.
+    fn catch_all_snapshot(fire_and_forget: &[bool]) -> DrainSnapshot {
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(1);
+        let mut mt = arbitro_engine_v2::catalog::match_table::MatchTable::new();
+        let mut bindings = Vec::new();
+        for (i, &ff) in fire_and_forget.iter().enumerate() {
+            let idx = i as u32;
+            mt.add_catch_all(MatchEntry {
+                consumer_id: ConsumerId(idx + 1),
+                queue_id: QueueId(0),
+                subscription_id: SubscriptionId(idx),
+                connection_id: ConnectionId(u64::from(idx) + 1),
+                binding_idx: idx,
+            });
+            bindings.push(ActiveBinding {
+                binding_id: BindingId(idx),
+                connection_id: ConnectionId(u64::from(idx) + 1),
+                consumer_id: ConsumerId(idx + 1),
+                subscription_id: SubscriptionId(idx),
+                group_idx: idx,
+                external_sub_id: idx,
+                stream_id: StreamId(1),
+                queue_id: QueueId(0),
+                max_inflight: 1,
+                fire_and_forget: ff,
+                ack_wait_ms: 0,
+                deliver_floor: 0,
+                write_tx: write_tx.clone(),
+                write_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        }
+        let mut snap = DrainSnapshot::empty();
+        snap.match_tables = vec![None, Some(mt)];
+        snap.bindings = Arc::from(bindings.into_boxed_slice());
+        snap
+    }
+
+    fn walk(store: &WalkProbe, counters: &SharedCounters, snap: &DrainSnapshot) -> ReadVerdict {
+        let cfg = DrainConfig {
+            max_feed: WINDOW,
+            max_age_ms: 0,
+            batch_size: 256,
+            stall_evict_ms: 0,
+        };
+        let mut scratch = DrainScratch::new();
+        let mut consumer_subjects: Vec<Option<ConsumerSubjects>> = Vec::new();
+        drain_read(counters, snap, store, &cfg, &mut scratch, &mut consumer_subjects, 0, true)
+    }
+
+    /// AUDIT Egr F1 follow-up. The only consumer is at its `max_inflight`:
+    /// nothing in the window can go anywhere, yet every ack-woken cycle read
+    /// and resolved all 256 entries to deliver at most one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_window_nobody_has_credit_for_is_not_read_to_the_end() {
+        let store = WalkProbe::with_entries(WINDOW, None);
+        let counters = SharedCounters::new();
+        counters.inc_demand(1);
+        counters.inc_inflight(1, 0);
+        let snap = catch_all_snapshot(&[false]);
+
+        let verdict = walk(&store, &counters, &snap);
+
+        let ReadVerdict::Fed(r) = verdict else { panic!("window must be fed") };
+        assert_eq!(r.lowest_skipped, Some(1), "the capped entry pins the cursor");
+        assert!(r.more_pending, "the skipped window is still owed");
+        assert!(
+            store.visited() <= WALK_CHUNK as usize,
+            "no binding had credit, yet the walk read {} of {WINDOW} entries",
+            store.visited()
+        );
+    }
+
+    /// Guard for the early exit: a fire-and-forget binding never runs out of
+    /// credit, so a capped sibling must not cut its window short.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fire_and_forget_sibling_keeps_the_whole_window_read() {
+        let store = WalkProbe::with_entries(WINDOW, None);
+        let counters = SharedCounters::new();
+        counters.inc_demand(1);
+        counters.inc_inflight(1, 0);
+        let snap = catch_all_snapshot(&[false, true]);
+
+        walk(&store, &counters, &snap);
+
+        assert_eq!(store.visited(), WINDOW, "the fire-and-forget binding is owed every entry");
     }
 }

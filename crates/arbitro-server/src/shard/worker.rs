@@ -217,8 +217,9 @@ impl DrainWorker {
                 probe.read_verdict(verdict);
                 // `drain_deliver` re-opens the gate iff more work remains;
                 // non-`Fed` verdicts leave it cleared by the top-of-loop lock.
+                let mut retry_on_timer = false;
                 if let ReadVerdict::Fed(result) = verdict {
-                    super::drain::drain_deliver(
+                    retry_on_timer = super::drain::drain_deliver(
                         &self.counters,
                         &snap,
                         &self.gate,
@@ -236,10 +237,8 @@ impl DrainWorker {
 
                 let stalled = self.counters.cursor() == prev_cursor;
 
-                // Backpressure: work remains but the cursor didn't advance →
-                // downstream writer full. Yield so it can drain. (First gate
-                // read; the park decision below takes its own.)
-                if stalled && self.gate.is_open() {
+                // Only an unannounced stall sleeps (tokio rounds it to ≥1 ms); credit stalls wake on the ack.
+                if stalled && retry_on_timer && self.gate.is_open() {
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
 

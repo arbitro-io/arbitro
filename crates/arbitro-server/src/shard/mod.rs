@@ -13,6 +13,7 @@ pub mod accumulator;
 pub mod ack_floor;
 pub mod command;
 pub mod consumer_subjects;
+pub(crate) mod credit_exit;
 pub mod drain;
 pub mod drain_events;
 pub mod drain_probe;

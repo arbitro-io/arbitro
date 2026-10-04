@@ -239,3 +239,35 @@ async fn dropping_one_subscription_leaves_other_connections_subscribed() {
     );
     server.shutdown().await;
 }
+
+/// AUDIT Egr F1. A consumer at its `max_inflight` pins the drain cursor; the
+/// drain then slept a "50 µs" timer that tokio rounds up to ≥ 1 ms, and the
+/// ack that freed the slot could not wake it. With `max_inflight = 1` every
+/// delivery after the first paid that timer: 100 messages took ≥ 99 ms.
+/// Refilled by the ack's own gate release, they take a few ack round trips.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capped_consumer_is_refilled_by_its_ack_not_a_timer() {
+    const MESSAGES: u64 = 100;
+    let mut server = TestServerBuilder::new().spawn().await;
+    let client = server.connect().await;
+    let sid = stream(&client, b"cap", 0).await;
+    publish(&client, sid, b"cap.a", MESSAGES).await;
+    let cid = consumer(&client, sid, b"capped", ACK_EXPLICIT, 1).await;
+
+    let mut handle = client.subscribe(sid, cid, b"").await.expect("subscribe");
+    let started = std::time::Instant::now();
+    for _ in 0..MESSAGES {
+        let msg = tokio::time::timeout(Duration::from_secs(5), handle.recv())
+            .await
+            .expect("delivery stalled 5s")
+            .expect("subscription closed");
+        msg.ack();
+    }
+    let elapsed = started.elapsed();
+    // The timer floor is ≥ 99 ms; 70 ms leaves the ack path ~3x headroom.
+    assert!(
+        elapsed < Duration::from_millis(70),
+        "{MESSAGES} capped deliveries took {elapsed:?}: each refill waited on a timer, not the ack"
+    );
+    server.shutdown().await;
+}
